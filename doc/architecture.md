@@ -75,9 +75,11 @@ Poin penting:
 2. Kalau `now - last_start < RESPAWN_DELAY` (2 detik): set `need_respawn = 1`,
    catat "respawn ditunda" sekali, lalu `return` — **tanpa `sleep()`**; timer
    `ppoll` di loop utama yang akan memanggilnya lagi.
-3. `fork()`; di anak: `setsid()`, reset semua handler ke `SIG_DFL`,
-   stdin ← `/dev/null`, stdout/stderr ← `/run/log.fifo` (`O_NONBLOCK`, fallback
-   `/dev/console`), lalu `execl("/bin/sh", "sh", "-c", cmd)`.
+3. `fork()`; di anak: `setsid()`, **kosongkan signal mask yang diwarisi dari
+   PID 1** (`sigprocmask(SIG_SETMASK, &empty, NULL)` — tanpa ini layanan tidak
+   pernah menerima `SIGTERM` dan mati lewat `SIGKILL`), reset semua handler ke
+   `SIG_DFL`, stdin ← `/dev/null`, stdout/stderr ← `/run/log.fifo`
+   (`O_NONBLOCK`, fallback `/dev/console`), lalu `execl("/bin/sh", "sh", "-c", cmd)`.
 4. Di induk: simpan pid, log `started <nama> (pid N)`, pindahkan ke cgroup v2.
 
 Kegagalan `fork()`/`mount()`/cgroup hanya di-log; init tidak berhenti.

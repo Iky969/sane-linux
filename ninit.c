@@ -43,6 +43,7 @@ static volatile sig_atomic_t sigusr1_flag  = 0;
 static volatile sig_atomic_t sigusr2_flag  = 0;
 
 static int log_file_fd = -1;
+static int g_log_fifo_fd = -1;  /* ujung baca /run/log.fifo; dipakai juga saat shutdown */
 static int shutting_down = 0;   /* 1 = shutdown sedang berjalan: jangan respawn layanan */
 
 /* ---------- logging ---------- */
@@ -300,6 +301,18 @@ static void spawn_service(service_t *svc)
 
     if (pid == 0) {
         setsid();
+
+        /* Anak mewarisi signal mask PID 1 (SIGCHLD/SIGTERM/SIGINT/SIGUSR1/
+           SIGUSR2 diblokir di main() untuk ppoll). Selama mask itu masih
+           terpasang, layanan TIDAK PERNAH menerima SIGTERM -> shutdown_all()
+           akhirnya membunuhnya dengan SIGKILL. Kosongkan mask di child supaya
+           handler/trap milik layanan benar-benar jalan. */
+        sigset_t empty;
+        sigemptyset(&empty);
+        if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) {
+            _exit(126);
+        }
+
         signal(SIGCHLD, SIG_DFL); signal(SIGTERM, SIG_DFL);
         signal(SIGINT,  SIG_DFL); signal(SIGUSR1, SIG_DFL); signal(SIGUSR2, SIG_DFL);
 
@@ -362,6 +375,29 @@ static int respawn_pending(void)
     return 0;
 }
 
+/* Baca SEMUA output layanan yang tertunda di /run/log.fifo dan teruskan ke
+   stderr + log init. Dipakai event loop DAN shutdown_all(): tanpa itu, pesan
+   terakhir dari layanan yang menuruti SIGTERM (mis. "bye!") tidak akan pernah
+   terbaca, karena loop utama sudah tidak men-drain FIFO selama shutdown. */
+static void drain_log_fifo(void)
+{
+    if (g_log_fifo_fd < 0) return;
+
+    for (;;) {
+        char log_buf[1024];
+        ssize_t n = read(g_log_fifo_fd, log_buf, sizeof(log_buf) - 1);
+        if (n <= 0) return;   /* EAGAIN (kosong) atau EOF */
+        log_buf[n] = 0;
+
+        char time_buf[32]; time_t now = time(NULL);
+        struct tm tm_info; localtime_r(&now, &tm_info);
+        strftime(time_buf, sizeof(time_buf), "[%Y-%m-%d %H:%M:%S]", &tm_info);
+
+        fprintf(stderr, "%s [service] %s", time_buf, log_buf);
+        if (log_file_fd >= 0) dprintf(log_file_fd, "%s [service] %s", time_buf, log_buf);
+    }
+}
+
 /* ---------- shutdown ---------- */
 static void shutdown_all(int reboot_cmd, int force)
 {
@@ -382,7 +418,9 @@ static void shutdown_all(int reboot_cmd, int force)
         int alive = 0;
         for (int j = 0; j < num_services; j++) if (services[j].pid > 0) { alive = 1; break; }
         if (!alive) break;
-        reap_zombies(); usleep(100000);
+        reap_zombies();
+        drain_log_fifo();   /* pesan terakhir layanan sebelum mati (mis. "bye!") */
+        usleep(100000);
     }
 
     for (int i = 0; i < num_services; i++) if (services[i].pid > 0) kill(services[i].pid, SIGKILL);
@@ -526,6 +564,7 @@ int main(int argc, char **argv)
 
     int initctl_fd = setup_initctl();
     int log_fifo_fd = setup_log_fifo();
+    g_log_fifo_fd = log_fifo_fd;
 
     for (int i = 0; i < num_services; i++) spawn_service(&services[i]);
 
@@ -580,16 +619,7 @@ int main(int argc, char **argv)
                 }
             } 
             else if (fds[i].fd == log_fifo_fd) {
-                char log_buf[1024]; ssize_t n = read(log_fifo_fd, log_buf, sizeof(log_buf) - 1);
-                if (n > 0) {
-                    log_buf[n] = 0;
-                    char time_buf[32]; time_t now = time(NULL);
-                    struct tm tm_info; localtime_r(&now, &tm_info);
-                    strftime(time_buf, sizeof(time_buf), "[%Y-%m-%d %H:%M:%S]", &tm_info);
-                    
-                    fprintf(stderr, "%s [service] %s", time_buf, log_buf);
-                    if (log_file_fd >= 0) dprintf(log_file_fd, "%s [service] %s", time_buf, log_buf);
-                }
+                drain_log_fifo();
             }
         }
 
