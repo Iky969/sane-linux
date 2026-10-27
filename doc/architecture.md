@@ -22,7 +22,8 @@ cek getpid()==1  ->  umask(022)  ->  blokir sinyal + sigemptyset(&orig)
    ->  mount_fstab()                pasang filesystem dari /etc/fstab
    ->  buka /var/log/ninit.log, cetak banner
    ->  set_hostname()               dari /etc/hostname
-   ->  parse_config(argv[1] atau /etc/init.conf)
+   ->  parse_config(argv[1] atau /etc/init.conf)   gagal => rescue shell /bin/sh
+   ->  validate_dependencies()      dependensi hilang => rescue shell /bin/sh
    ->  sort_services()              urut topologis; siklus => rescue shell /bin/sh
    ->  setup_initctl() / run/initctl, setup_log_fifo() /run/log.fifo
    ->  spawn_service() untuk semua layanan
@@ -31,6 +32,22 @@ cek getpid()==1  ->  umask(022)  ->  blokir sinyal + sigemptyset(&orig)
 
 Catatan urutan: `mount_fstab()` sengaja dipanggil **sebelum** file log dibuka,
 jadi pesan fstab hanya terlihat di console dan `/dev/kmsg`.
+
+### Rescue mode (`enter_rescue_mode`)
+
+Tiga jalur menyerahkan sistem ke shell darurat: config tidak terbaca
+(`parse_config()` gagal), ada `:requires=` yang menunjuk layanan tak dikenal, dan
+siklus dependensi. Semuanya lewat satu helper `enter_rescue_mode(reason)` yang:
+
+1. menulis alasan + `Masuk rescue mode (shell).` ke log;
+2. mengosongkan signal mask PID 1 (`sigprocmask(SIG_SETMASK, &empty, NULL)`) —
+   `main()` memblokir `SIGINT`/`SIGTERM`/`SIGCHLD`/`SIGUSR1`/`SIGUSR2` untuk
+   `ppoll`, dan tanpa reset ini rescue shell tidak akan pernah menerima Ctrl+C;
+3. `execl("/bin/sh", "sh", NULL)` menggantikan PID 1; bila gagal, `_exit(1)`.
+
+Helper ini tidak pernah kembali, jadi tidak ada jalur boot yang berlanjut dengan
+state setengah jadi (dulu `parse_config()` gagal hanya di-log dan boot lanjut
+dengan nol layanan). Diuji oleh bagian 4 `scripts/test-config.sh`.
 
 ## Event loop
 
@@ -49,7 +66,8 @@ for (;;) {
     SIGUSR2 -> shutdown_all(RB_AUTOBOOT,   1)   /* force */
     SIGCHLD -> reap_zombies()
 
-    /* 2. fd siap dibaca: /run/initctl (perintah) dan /run/log.fifo (log layanan) */
+    /* 2. fd siap dibaca: /run/initctl (perintah, diproses PER BARIS) dan
+       /run/log.fifo (log layanan) */
 
     /* 3. selalu terakhir: respawn_services() — juga terpanggil saat ppoll timeout */
     respawn_services();
@@ -66,6 +84,12 @@ Poin penting:
   terbangun 10× per detik.
 - `errno` disimpan tepat setelah `ppoll` (`perr`) supaya cabang error tidak salah
   terpicu oleh `errno` yang berubah karena panggilan log.
+- Perintah `/run/initctl` dibaca sekali lalu dipecah **per baris**
+  (`strtok(cmd, "\n")`, spasi/`\r` di ujung dipangkas, baris kosong dilewati).
+  Perintah penutup langsung memanggil `shutdown_all()` dan tidak pernah kembali ke
+  loop, jadi pembacaan berhenti di situ; tetapi baris sebelum perintah penutup
+  tidak lagi hilang seperti pada parser lama yang memotong buffer di newline
+  pertama.
 
 ## Manajemen layanan
 
@@ -104,11 +128,35 @@ Dipanggil di akhir tiap iterasi loop: untuk tiap layanan dengan `respawn = 1` da
 `pid == 0`, panggil `spawn_service()`. Guard `shutting_down` di dalamnya memastikan
 tidak ada respawn setelah shutdown dimulai.
 
-### Dependensi (`sort_services`)
+### Dependensi (`validate_dependencies` + `sort_services`)
 
-`/etc/init.conf` boleh menyatakan `:requires=a,b`. `sort_services()` melakukan
-urut topologis (DFS iteratif) supaya prasyarat dijalankan lebih dulu; siklus
-dilaporkan `FATAL: CYCLE DETECTED` dan init jatuh ke rescue shell (`/bin/sh`).
+`/etc/init.conf` boleh menyatakan `:requires=a,b`. Dua tahap dijalankan sebelum
+layanan apa pun di-spawn:
+
+1. `validate_dependencies()` — setiap nama dependensi harus benar-benar ada di
+   daftar layanan. Nama tak dikenal dilaporkan
+   `FATAL: Dependensi '<x>' untuk '<y>' tidak ditemukan` lalu init masuk rescue
+   shell; lebih baik daripada menjalankan layanan tanpa prasyaratnya.
+2. `sort_services()` — urut topologis dengan DFS **iteratif** (stack eksplisit,
+   bukan rekursi) supaya prasyarat dijalankan lebih dulu. Siklus dilaporkan
+   `FATAL: CYCLE DETECTED` dan init jatuh ke rescue shell (`/bin/sh`).
+
+Detail yang penting untuk yang menyentuh fungsi ini:
+
+- Setiap node ditandai `temp_visited[...] = 1` **sebelum** `stack[stack_top++]`,
+  jadi satu layanan hanya masuk stack sekali. Versi lama menandai saat node
+  di-*expand*: layanan yang masih "pending" bisa di-push berulang sampai
+  `stack_top` melewati `MAX_SERVICES` dan menulis di luar array `stack[]`
+  (terbukti stack-buffer-overflow dengan AddressSanitizer — lihat
+  [build-and-test.md](build-and-test.md)).
+- Setiap push dijaga `if (stack_top >= MAX_SERVICES)` →
+  `FATAL: Stack overflow pada topological sort!` (jaring pengaman, bukan jalur
+  normal; konfigurasi maksimum 64 layanan selalu muat).
+- Karena dependensi diproses satu per satu dan node "abu-abu" selalu berada di
+  jalur DFS yang sedang aktif, dependensi berbentuk berlian (dua layanan butuh
+  satu layanan yang sama) tidak salah dianggap siklus.
+- Progres baca tiap `deps_str` disimpan di `dep_off[]`; `next_dep()` membaca token
+  tanpa memodifikasi string aslinya dan mengabaikan spasi di sekitar koma.
 
 ## Shutdown (`shutdown_all`)
 

@@ -18,9 +18,10 @@ make            # -> ./ninit  (gcc -static -O2 -Wall)
 ## Uji otomatis
 
 ```bash
-make test                            # menjalankan kedua script di bawah ini
+make test                            # menjalankan ketiga script di bawah ini
 sudo sh ./scripts/smoke-test.sh      # 1) smoke test PID 1
 sudo sh ./scripts/test-sigterm.sh    # 2) SIGTERM sampai ke layanan
+sudo sh ./scripts/test-config.sh     # 3) urut dependensi + rescue mode + initctl
 ```
 
 ### 1. Smoke test PID 1 (`scripts/smoke-test.sh`)
@@ -97,6 +98,47 @@ penanda `[ -- ]`; pemeriksaan lain tetap menentukan hasil. Contoh log yang lulus
   | [2026-01-01 00:00:06] [service] Menerima SIGTERM, bye!
 ```
 
+### 3. Uji konfigurasi & IPC (`scripts/test-config.sh`)
+
+Uji ini mengunci empat perbaikan reliabilitas sekaligus (tujuh run ninit
+terpisah, tiap run memakai rootfs sendiri):
+
+| Bagian | Yang diperiksa |
+|---|---|
+| 1a | dependensi berlian (`a:requires=b,c` + `b:requires=c`) dijalankan berurutan `c → b → a` dan **tidak** dilaporkan sebagai cycle |
+| 1b | konfigurasi padat tepat 64 layanan (`root` butuh `s2..s64`, `s63` butuh `s62,s61`) → 64/64 dijalankan tanpa `FATAL` |
+| 2 | `web:once:echo web:requires=db` → `FATAL: Dependensi 'db' untuk 'web' tidak ditemukan` + rescue shell; `main loop siap` tidak pernah muncul |
+| 3a | `printf 'poweroff\nreboot\n' > /run/initctl` → hanya baris pertama yang dieksekusi (`reboot` tidak pernah dilaporkan) |
+| 3b | `printf 'status\npoweroff\n' > /run/initctl` → baris tak dikenal tetap dicatat dan `poweroff` di baris kedua tidak hilang tanpa jejak |
+| 4a | config tidak bisa dibuka → `Config gagal dibaca/di-parse!` + rescue shell; `main loop siap` tidak pernah muncul (regresi lama: hanya di-log lalu boot dengan nol layanan) |
+| 4b | siklus `a:requires=b` + `b:requires=a` → `FATAL: CYCLE DETECTED` + rescue shell, dan `SigBlk` shell itu `0` (Ctrl+C berfungsi; biner lama mewarisi `0000000000014a02`) |
+
+**Kenapa bagian 1b penting.** `sort_services()` versi lama menandai node saat
+di-*expand*, bukan saat di-*push*, sehingga layanan yang masih "pending" di stack
+bisa di-push berulang. Pada konfigurasi 1b `stack_top` mencapai 65 untuk
+`stack[64]`. Terbukti dengan AddressSanitizer pada kode sebelum perbaikan (harness
+yang memanggil `sort_services()` langsung):
+
+```
+==1731==ERROR: AddressSanitizer: stack-buffer-overflow ...
+WRITE of size 4 ... in sort_services ninit-old.c:250
+    [672, 928) 'stack' (line 228) <== Memory access at offset 928 overflows this variable
+```
+
+Versi sekarang menandai `temp_visited[...] = 1` **sebelum** `stack[stack_top++]`
+dan menolak push saat `stack_top >= MAX_SERVICES`, jadi satu layanan hanya masuk
+stack sekali. Bagian 1b juga menjaga agar konfigurasi valid selalu berakhir di
+64/64 `started` tanpa `FATAL`.
+
+**Kenapa bagian 4 penting.** Sebelum v1.0.0, `parse_config()` yang gagal hanya
+menulis `config gagal, masuk rescue mode` lalu **melanjutkan boot** dengan nol
+layanan, dan rescue shell (jalur dependensi/siklus) mewarisi signal mask PID 1 —
+`SIGINT` tetap diblokir sehingga Ctrl+C di shell darurat tidak berfungsi.
+`enter_rescue_mode()` mengosongkan mask lalu `execl("/bin/sh", "sh", NULL)`.
+Bagian 4b membaca `/proc/<pid>/status` shell darurat dan menuntut `SigBlk=0`;
+pada biner lama nilainya `0000000000014a02` (bit `SIGINT` + `SIGTERM` + `SIGCHLD`
++ `SIGUSR1` + `SIGUSR2` terpasang).
+
 ### Kenapa bukan `unshare --mount-proc=<dir>`?
 
 Pada sebagian kernel (termasuk sandbox/CI tertentu) util-linux melakukan
@@ -141,7 +183,7 @@ install -m0755 ninit /sbin/init      # pastikan /etc/init.conf sudah ada
 Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` →
 `make` → cek biner statis lewat `readelf` (tidak boleh ada `INTERP`) →
 `sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
-`make CFLAGS="-static -O2 -Wall -Werror"`.
+`sudo sh ./scripts/test-config.sh` → `make CFLAGS="-static -O2 -Wall -Werror"`.
 
 ## Troubleshooting
 
@@ -157,3 +199,6 @@ Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` 
 | Layanan `exit status=0x9` (dibunuh paksa) | `SIGTERM` tidak sampai ke layanan: mask sinyal warisan PID 1 tidak dibersihkan, atau layanan memang mengabaikan `SIGTERM`. Verifikasi dengan `sudo sh ./scripts/test-sigterm.sh`. |
 | `collect2: cannot find -lc` saat build | Libc statis tidak terpasang; gunakan `gcc-multilib`/`libc6-dev-static` sesuai distro atau `make CC=musl-gcc`. |
 | Pesan fstab hanya di console, bukan di file log | Urutan yang disengaja: `mount_fstab()` berjalan sebelum `/var/log/ninit.log` dibuka. |
+| `FATAL: Dependensi '<x>' untuk '<y>' tidak ditemukan` | `:requires=` menunjuk layanan yang tidak ada di `/etc/init.conf` (termasuk bila barisnya terpotong karena melewati batas 64 layanan). Init masuk rescue shell; perbaiki konfigurasi lalu boot ulang. |
+| `FATAL: CYCLE DETECTED di <x> -> <y>` | Dependensi melingkar; pecahkan salah satu `:requires=` agar tidak ada siklus. |
+| `FATAL: Stack overflow pada topological sort!` | Jaring pengaman `sort_services()`; bila muncul pada konfigurasi < 64 layanan, laporkan sebagai bug. |

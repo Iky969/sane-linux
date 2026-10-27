@@ -21,7 +21,8 @@ teknis yang lebih dalam, dengan indeks di bawah.
 
 - **PID 1 + reaping** semua anak, termasuk proses yatim (orphan) yang diadopsi.
 - **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` dan
-  dependensi `:requires=` (urut topologis, deteksi siklus → rescue shell).
+  dependensi `:requires=` (urut topologis DFS, deteksi siklus, dependensi hilang
+  → rescue shell).
 - **Respawn non-blocking**: jeda 2 detik dijalankan lewat timer `ppoll` 100 ms,
   bukan `sleep()`, sehingga init tetap responsif terhadap sinyal.
 - **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
@@ -33,7 +34,7 @@ teknis yang lebih dalam, dengan indeks di bawah.
   jalur `/run/log.fifo` agar output layanan ikut tercatat dengan prefiks
   `[service]`.
 - **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
-  `force-reboot`.
+  `force-reboot`, dibaca per baris (satu penulisan boleh memuat beberapa perintah).
 - **Biner statis** (`gcc -static`), 0 warning dengan `-Wall -Werror`.
 
 ## Struktur repository
@@ -44,8 +45,9 @@ ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
+scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), initctl per baris
 doc/                     dokumentasi ini
-.github/workflows/ci.yml CI: build statis, cek statis, kedua uji, -Werror
+.github/workflows/ci.yml CI: build statis, cek statis, ketiga uji, -Werror
 SECURITY.md              kebijakan keamanan
 LICENSE                  MIT
 ```
@@ -54,7 +56,8 @@ LICENSE                  MIT
 
 ```bash
 make          # hasilkan biner statis ./ninit
-make test     # uji sebagai PID 1: smoke test + test SIGTERM (butuh root/sudo)
+make test     # uji sebagai PID 1: smoke test + test SIGTERM + test konfigurasi
+              # (butuh root/sudo)
 ```
 
 Menjalankannya di sistem nyata berarti memasang biner ini sebagai `/sbin/init`
@@ -63,9 +66,17 @@ seperti di [build-and-test.md](build-and-test.md).
 
 ## Status
 
-Seri pengembangan terakhir diberi label **v10** (commit
-`feat: ninit v10 - production ready init system with cgroups, fstab, and non-blocking timer`),
-dan banner saat boot kini mencetak `=== ninit start (PID 1) v10 ===`.
+Rilis terakhir adalah **v1.0.0** (commit
+`feat: v1.0.0 release - robust topo-sort, validation, and rescue mode`), dan
+banner saat boot mencetak `=== ninit start (PID 1) v1.0.0 ===`.
+
+Putaran reliabilitas terakhir menambahkan: urut topologis yang tidak bisa
+melewati `MAX_SERVICES` (dulu *stack-buffer-overflow*), `validate_dependencies()`
+yang mengirim init ke rescue shell bila ada `:requires=` menunjuk layanan tak
+ada, dan pembacaan `/run/initctl` per baris. v1.0.0 menutup dua lubang terakhir:
+rescue mode yang sebelumnya hanya di-log (config rusak kini benar-benar masuk
+shell) dan rescue shell yang mewarisi signal mask PID 1 (Ctrl+C mati). Semuanya
+dijaga `scripts/test-config.sh`.
 
 ## Batasan yang diketahui
 

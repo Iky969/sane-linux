@@ -9,10 +9,10 @@ melaporkan masalah keamanan dan apa saja yang termasuk/ tidak termasuk cakupan.
 
 | Versi | Didukung |
 |---|---|
-| `main` (commit terbaru, rilis internal "v10") | ✅ |
+| `main` (rilis terbaru: **v1.0.0**) | ✅ |
 | Commit/tag lama | ❌ (silakan uji ulang di `main` dulu) |
 
-Proyek ini belum punya rilis stabil bernomor. Perbaikan keamanan hanya
+v1.0.0 adalah rilis pertama yang diberi nomor versi. Perbaikan keamanan hanya
 diterapkan pada `main`.
 
 ## Melaporkan kerentanan

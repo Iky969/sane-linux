@@ -2,6 +2,12 @@
  * ninit - minimal init system (PID 1)
  * Compile : gcc -static -O2 -Wall -o ninit ninit.c
  * v5 Fixes: ppoll nfds, O_RDWR FIFO, strict cycle detection, robust parser.
+ * v10+    : opsi data fstab, cgroup v2, timer respawn non-blocking, mask sinyal
+ *           anak, validasi dependensi, initctl per baris, topo-sort tanpa
+ *           stack overflow.
+ * v1.0.0  : rescue mode sungguhan lewat enter_rescue_mode() (config rusak,
+ *           dependensi hilang, siklus) + signal mask dikosongkan sebelum
+ *           execl supaya Ctrl+C berfungsi di shell darurat.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -72,6 +78,16 @@ static void init_log(const char *fmt, ...)
     if (log_file_fd >= 0) {
         dprintf(log_file_fd, "%s ninit: %s\n", time_buf, buf);
     }
+}
+
+/* Buang spasi/tab/CR di ujung string (di tempat) dan kembalikan pointer ke awal
+   teks yang sudah dipangkas. Dipakai pembaca perintah /run/initctl. */
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\r') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) s[--n] = 0;
+    return s;
 }
 
 /* ---------- signal handlers ---------- */
@@ -218,59 +234,117 @@ static int parse_config(const char *path)
     return 0;
 }
 
-/* ---------- Topological Sort (FIXED: Return -1 on cycle) ---------- */
-static int sort_services(void) {
-    int visited[MAX_SERVICES] = {0}, temp_visited[MAX_SERVICES] = {0};
-    service_t sorted[MAX_SERVICES]; int sorted_count = 0;
-    
+/* ---------- dependensi ---------- */
+static int find_service(const char *name)
+{
+    for (int i = 0; i < num_services; i++)
+        if (strcmp(services[i].name, name) == 0) return i;
+    return -1;
+}
+
+/* Token berikutnya dari deps_str (dipisah koma) TANPA mengubah string aslinya:
+   posisi baca disimpan di *off supaya pemanggil bisa melanjutkan dari titik
+   terakhir. Token kosong (mis. "a,,b") dan spasi di ujung dibuang.
+   Mengembalikan 1 bila ada token, 0 bila sudah habis. */
+static int next_dep(const char *deps_str, int *off, char *out, size_t outsz)
+{
+    const char *s = deps_str + *off;
+
+    for (;;) {
+        size_t n = 0;
+        while (*s == ',' || *s == ' ' || *s == '\t') s++;
+        if (*s == 0) { *off = (int)(s - deps_str); return 0; }
+
+        while (*s && *s != ',' && n < outsz - 1) out[n++] = *s++;
+        while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\t')) n--;
+        if (n > 0) { out[n] = 0; *off = (int)(s - deps_str); return 1; }
+        /* token kosong -> lanjut ke token berikutnya */
+    }
+}
+
+/* Setiap nama di `:requires=` harus benar-benar ada di daftar layanan.
+   Dependensi yang menunjuk layanan tak dikenal bikin urutan boot diam-diam salah
+   (layanan jalan tanpa prasyaratnya), jadi lebih baik menyerahkan sistem ke
+   rescue shell daripada boot setengah jalan. */
+static int validate_dependencies(void)
+{
     for (int i = 0; i < num_services; i++) {
-        if (visited[i]) continue;
-        int stack[MAX_SERVICES], stack_top = 0; 
-        stack[stack_top++] = i;
-        
-        while (stack_top > 0) {
-            int curr = stack[stack_top - 1];
-            if (!visited[curr]) {
-                if (!temp_visited[curr]) {
-                    temp_visited[curr] = 1;
-                    char deps_copy[256]; 
-                    snprintf(deps_copy, sizeof(deps_copy), "%s", services[curr].deps_str);
-                    
-                    char *token = strtok(deps_copy, ",");
-                    while (token) {
-                        int dep_idx = -1;
-                        for (int j = 0; j < num_services; j++)
-                            if (strcmp(services[j].name, token) == 0) { dep_idx = j; break; }
-                        
-                        if (dep_idx != -1 && !visited[dep_idx]) {
-                            if (temp_visited[dep_idx]) {
-                                init_log("FATAL: CYCLE DETECTED di %s -> %s", services[curr].name, token);
-                                return -1; /* Abort! */
-                            }
-                            stack[stack_top++] = dep_idx;
-                        }
-                        token = strtok(NULL, ",");
-                    }
-                }
-                int all_deps_done = 1; char deps_copy2[256]; 
-                snprintf(deps_copy2, sizeof(deps_copy2), "%s", services[curr].deps_str);
-                
-                char *tok2 = strtok(deps_copy2, ",");
-                while (tok2) {
-                    for (int j = 0; j < num_services; j++)
-                        if (strcmp(services[j].name, tok2) == 0 && !visited[j]) all_deps_done = 0;
-                    tok2 = strtok(NULL, ",");
-                }
-                if (all_deps_done) {
-                    visited[curr] = 1; temp_visited[curr] = 0;
-                    sorted[sorted_count++] = services[curr]; 
-                    stack_top--;
-                }
-            } else {
-                stack_top--;
+        int off = 0;
+        char token[256];
+        while (next_dep(services[i].deps_str, &off, token, sizeof(token))) {
+            if (find_service(token) < 0) {
+                init_log("FATAL: Dependensi '%s' untuk '%s' tidak ditemukan",
+                         token, services[i].name);
+                return -1;
             }
         }
     }
+    return 0;
+}
+
+/* ---------- Topological Sort (DFS iteratif; tandai SEBELUM push) ----------
+   Versi lama menandai node saat di-expand, bukan saat di-push. Akibatnya layanan
+   yang masih "pending" di stack bisa di-push ulang setiap kali layanan lain
+   meng-expand dependensinya, dan stack_top bisa melewati MAX_SERVICES -> tulis di
+   luar batas array stack[] (stack overflow). Dengan penandaan saat push, satu
+   layanan hanya masuk stack sekali; dan karena dependensi diproses satu per satu,
+   node "abu-abu" selalu berarti leluhur (bukan saudara), sehingga dependensi
+   berbentuk berlian tidak salah dilaporkan sebagai cycle. */
+static int sort_services(void)
+{
+    int visited[MAX_SERVICES]      = {0};   /* hitam: sudah masuk urutan akhir */
+    int temp_visited[MAX_SERVICES] = {0};   /* abu-abu: ada di dalam stack */
+    int dep_off[MAX_SERVICES]      = {0};   /* progres baca deps_str per layanan */
+    service_t sorted[MAX_SERVICES];
+    int sorted_count = 0;
+
+    for (int i = 0; i < num_services; i++) {
+        if (visited[i]) continue;
+
+        int stack[MAX_SERVICES], stack_top = 0;
+
+        if (stack_top >= MAX_SERVICES) {        /* guard sebelum setiap push */
+            init_log("FATAL: Stack overflow pada topological sort!");
+            return -1;
+        }
+        temp_visited[i] = 1;                    /* tandai SEBELUM push */
+        stack[stack_top++] = i;
+
+        while (stack_top > 0) {
+            int curr = stack[stack_top - 1];
+            char token[256];
+
+            if (next_dep(services[curr].deps_str, &dep_off[curr], token, sizeof(token))) {
+                int dep_idx = find_service(token);
+
+                /* Nama tak dikenal sudah ditolak validate_dependencies();
+                   kalau tetap sampai di sini, dependensi itu dilewati saja. */
+                if (dep_idx < 0) continue;
+
+                if (temp_visited[dep_idx]) {
+                    init_log("FATAL: CYCLE DETECTED di %s -> %s", services[curr].name, token);
+                    return -1; /* Abort! */
+                }
+                if (!visited[dep_idx]) {
+                    if (stack_top >= MAX_SERVICES) {
+                        init_log("FATAL: Stack overflow pada topological sort!");
+                        return -1;
+                    }
+                    temp_visited[dep_idx] = 1;  /* tandai SEBELUM push */
+                    dep_off[dep_idx]      = 0;
+                    stack[stack_top++]    = dep_idx;
+                }
+                continue;   /* dependensi berikutnya setelah anak selesai */
+            }
+
+            /* Semua dependensi selesai -> masukkan ke urutan akhir */
+            visited[curr]          = 1;
+            temp_visited[curr]     = 0;
+            sorted[sorted_count++] = services[curr];
+            stack_top--;
+        }
+    }
+
     for (int i = 0; i < sorted_count; i++) services[i] = sorted[i];
     return 0; /* Sukses */
 }
@@ -519,6 +593,35 @@ static void mount_fstab(void)
     fclose(f);
 }
 
+/* ---------- rescue mode ----------
+   Satu-satunya jalan keluar bila init tidak bisa memulai boot dengan benar.
+   Dua hal yang wajib terjadi di sini:
+
+     1. Signal mask PID 1 dikosongkan. main() memblokir SIGINT/SIGTERM/SIGCHLD/
+        SIGUSR1/SIGUSR2 untuk ppoll; tanpa reset, rescue shell mewarisi mask itu
+        dan Ctrl+C di shell darurat tidak akan pernah sampai (SIGINT tertahan).
+        spawn_service() melakukan hal yang sama untuk anak layanan.
+     2. execl() menggantikan proses PID 1 ini dengan /bin/sh. Kalau gagal (mis.
+        /bin/sh tidak ada di rootfs), proses keluar dengan status 1 -- JANGAN
+        kembali ke alur boot dengan state yang sudah tidak valid.
+
+   Fungsi ini tidak pernah kembali. */
+static void enter_rescue_mode(const char *reason)
+{
+    sigset_t empty;
+
+    if (reason) init_log("%s", reason);
+
+    sigemptyset(&empty);
+    if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
+        init_log("Peringatan: gagal mengosongkan signal mask: %s", strerror(errno));
+
+    init_log("Masuk rescue mode (shell).");
+    execl("/bin/sh", "sh", (char *)NULL);
+    init_log("FATAL: execl /bin/sh gagal: %s", strerror(errno));
+    _exit(1);
+}
+
 /* ---------- main ---------- */
 int main(int argc, char **argv)
 {
@@ -546,21 +649,24 @@ int main(int argc, char **argv)
     mount_fstab();
     
     log_file_fd = open("/var/log/ninit.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    init_log("=== ninit start (PID 1) v10 ===");
+    init_log("=== ninit start (PID 1) v1.0.0 ===");
 
     set_hostname();
 
+    /* Tanpa config yang terbaca, boot tidak punya rencana sama sekali; jangan
+       lanjut dengan nol layanan dan mengaku "siap". */
     const char *conf = (argc > 1) ? argv[1] : "/etc/init.conf";
-    if (parse_config(conf) < 0) init_log("config gagal, masuk rescue mode");
-    
+    if (parse_config(conf) < 0)
+        enter_rescue_mode("Config gagal dibaca/di-parse!");
+
+    /* Dipanggil tepat setelah parse_config(): dependensi harus menunjuk layanan
+       yang ada. Bila ada yang hilang, sistem diserahkan ke rescue shell. */
+    if (validate_dependencies() < 0)
+        enter_rescue_mode("Dependensi tidak valid!");
+
     /* Panggil sort, jika return -1 (cycle), jangan spawn apa-apa */
-    if (num_services > 0) {
-        if (sort_services() < 0) {
-            init_log("Cycle terdeteksi! Masuk rescue mode (shell).");
-            execl("/bin/sh", "sh", (char *)NULL);
-            _exit(1);
-        }
-    }
+    if (num_services > 0 && sort_services() < 0)
+        enter_rescue_mode("Cycle terdeteksi!");
 
     int initctl_fd = setup_initctl();
     int log_fifo_fd = setup_log_fifo();
@@ -608,16 +714,28 @@ int main(int argc, char **argv)
             if (!(fds[i].revents & POLLIN)) continue;
 
             if (fds[i].fd == initctl_fd) {
-                char cmd[256]; ssize_t n = read(initctl_fd, cmd, sizeof(cmd) - 1);
+                char cmd[256];
+                ssize_t n = read(initctl_fd, cmd, sizeof(cmd) - 1);
                 if (n > 0) {
-                    cmd[n] = 0; cmd[strcspn(cmd, "\n")] = 0;
-                    init_log("initctl cmd: '%s'", cmd);
-                    if (!strcmp(cmd, "poweroff")) shutdown_all(RB_POWER_OFF, 0);
-                    else if (!strcmp(cmd, "reboot")) shutdown_all(RB_AUTOBOOT, 0);
-                    else if (!strcmp(cmd, "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
-                    else if (!strcmp(cmd, "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
+                    cmd[n] = 0;
+
+                    /* Baca PER BARIS: satu penulisan bisa memuat beberapa perintah
+                       (printf 'poweroff\nreboot\n' > /run/initctl). Versi lama
+                       memotong buffer di newline pertama, jadi perintah kedua dan
+                       seterusnya hilang tanpa jejak -- bahkan tidak tercatat log.
+                       Perintah penutup tidak pernah kembali dari shutdown_all(),
+                       jadi praktis hanya baris pertama yang benar-benar jalan. */
+                    for (char *line = strtok(cmd, "\n"); line; line = strtok(NULL, "\n")) {
+                        char *cmdline = trim(line);
+                        if (*cmdline == 0) continue;   /* abaikan baris kosong */
+                        init_log("initctl cmd: '%s'", cmdline);
+                        if (!strcmp(cmdline, "poweroff")) shutdown_all(RB_POWER_OFF, 0);
+                        else if (!strcmp(cmdline, "reboot")) shutdown_all(RB_AUTOBOOT, 0);
+                        else if (!strcmp(cmdline, "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
+                        else if (!strcmp(cmdline, "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
+                    }
                 }
-            } 
+            }
             else if (fds[i].fd == log_fifo_fd) {
                 drain_log_fifo();
             }

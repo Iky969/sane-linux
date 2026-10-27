@@ -2,7 +2,7 @@
 #
 #   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall)
 #   make test       uji PID 1 di chroot sementara: smoke test + test SIGTERM
-#                   (butuh root/sudo)
+#                   + test konfigurasi (butuh root/sudo)
 #   make clean      hapus biner hasil build
 #
 # Butuh: build-essential + busybox-static (busybox dipakai sebagai /bin/sh di rootfs uji).
@@ -21,6 +21,7 @@ $(BIN): $(SRC)
 test: $(BIN)
 	sh ./scripts/smoke-test.sh
 	sh ./scripts/test-sigterm.sh
+	sh ./scripts/test-config.sh
 
 clean:
 	rm -f $(BIN)

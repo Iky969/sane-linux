@@ -19,8 +19,16 @@ Aturan umum:
 
 - Baris komentar dimulai `#` (spasi/tab di depan diizinkan) dan baris kosong diabaikan.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
+- File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
+  `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
+  nol layanan.
 - Maksimum **64 layanan** (`MAX_SERVICES`); baris selebihnya tidak dibaca.
 - Siklus dependensi → `FATAL: CYCLE DETECTED`, init masuk rescue shell.
+- Nama dependensi yang tidak ada di daftar layanan →
+  `FATAL: Dependensi '<dep>' untuk '<layanan>' tidak ditemukan`, init masuk
+  rescue shell (lebih baik daripada boot setengah jalan tanpa prasyaratnya).
+  Pemeriksaan ini (`validate_dependencies()`) berjalan setelah parsing, sebelum
+  urut topologis. Spasi di sekitar koma diizinkan (`:requires=a, b`).
 - Path konfigurasi bisa diganti sebagai argumen pertama init
   (`/sbin/init /path/init.conf`); default `/etc/init.conf`.
 
@@ -102,7 +110,18 @@ FIFO (mode `0600`) berisi perintah berbasis baris:
 echo reboot > /run/initctl
 ```
 
-Perintah tak dikenal hanya dicatat di log. FIFO dibuat ulang tiap boot.
+Perintah dibaca **per baris**, jadi satu penulisan boleh memuat beberapa perintah:
+
+```bash
+printf 'poweroff\nreboot\n' > /run/initctl   # hanya baris pertama yang jalan
+```
+
+- Baris kosong dan spasi/`\r` di ujung diabaikan; perintah tak dikenal dicatat di log.
+- Perintah penutup (`poweroff`, `reboot`, `force-*`) tidak pernah kembali ke event
+  loop, jadi perintah penutup pertama yang sudah diproses langsung mengakhiri
+  pembacaan. Perintah/baris di depannya selalu tetap dicatat dan diproses —
+  perilaku lama yang memotong buffer di newline pertama tidak dipakai lagi.
+- FIFO dibuat ulang tiap boot (mode `0600`, hanya root).
 
 ## Hostname
 

@@ -36,5 +36,8 @@ jobs:
       - name: SIGTERM benar-benar sampai ke layanan (bukan SIGKILL)
         run: sudo sh ./scripts/test-sigterm.sh
 
+      - name: Dependensi, rescue mode, dan initctl per baris
+        run: sudo sh ./scripts/test-config.sh
+
       - name: Build tanpa warning (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"

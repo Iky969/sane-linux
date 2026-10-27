@@ -16,7 +16,8 @@ responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
 - **PID 1 + reaping** semua anak, termasuk proses yatim (orphan) yang diadopsi.
 - **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` dan
-  dependensi `:requires=` (urut topologis, deteksi siklus → rescue shell).
+  dependensi `:requires=` (urut topologis DFS tanpa stack overflow, deteksi
+  siklus, dan dependensi hilang → rescue shell).
 - **Respawn non-blocking**: jeda 2 detik dijalankan lewat timer `ppoll` 100 ms,
   bukan `sleep()`, sehingga init tidak pernah buta terhadap sinyal.
 - **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
@@ -27,7 +28,8 @@ responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 - **Logging ganda**: `/dev/kmsg`, console, `/var/log/ninit.log`, plus jalur
   `/run/log.fifo` agar output layanan ikut tercatat dengan prefiks `[service]`.
 - **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
-  `force-reboot`.
+  `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
+  penulisan tidak saling menelan.
 - **Biner statis** (`gcc -static`): cukup libc, tanpa library tambahan.
 
 ## Mulai cepat
@@ -42,16 +44,22 @@ make test     # smoke test + test SIGTERM (butuh root/sudo)
 make clean
 ```
 
-`make test` menjalankan dua uji otomatis. Keduanya menyiapkan rootfs sementara
-(busybox sebagai `/bin/sh`), menjalankan ninit sebagai PID 1 di PID + mount
-namespace baru, lalu mengirim `SIGTERM`:
+`make test` menjalankan tiga uji otomatis. Semuanya menyiapkan rootfs sementara
+(busybox sebagai `/bin/sh`) lalu menjalankan ninit sebagai PID 1 di PID + mount
+namespace baru:
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
   (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
-  setelah shutdown, latensi shutdown < 2000 ms.
+  setelah shutdown, latensi shutdown < 2000 ms (mengirim `SIGTERM`).
 - **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — `SIGTERM` benar-benar
   *sampai* ke proses layanan: trap-nya jalan, `exit status=0x0` (bukan `0x9`),
   mask sinyal anak bersih, penutupan terjadi sebelum jendela grace 5 detik.
+- **[`scripts/test-config.sh`](scripts/test-config.sh)** — urut topologis
+  `:requires=` (berlian `a→b,c ; b→c` dan konfigurasi padat 64 layanan → tanpa
+  stack overflow), config tak terbaca / dependensi hilang / siklus → `FATAL` +
+  rescue shell (signal mask-nya kosong, jadi Ctrl+C berfungsi), dan
+  `/run/initctl` dibaca per baris (`poweroff\nreboot` → hanya `poweroff` yang
+  dieksekusi).
 
 Contoh output dan penjelasan tiap pemeriksaan ada di
 [doc/build-and-test.md](doc/build-and-test.md).
@@ -106,6 +114,7 @@ ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
+scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
 doc/                     dokumentasi teknis (lihat di bawah)
 .github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror
 SECURITY.md              kebijakan keamanan & cara melaporkan kerentanan
@@ -124,8 +133,11 @@ LICENSE                  MIT
 
 ## Status
 
-Seri terakhir dilabeli **v10**. Ini proyek eksperimental untuk belajar cara kerja
-init di level OS — belum siap dipakai di mesin produksi. Batasan yang diketahui:
+Rilis **v1.0.0** (perbaikan reliabilitas terakhir: anti-overflow pada urut
+topologis, validasi dependensi, initctl per baris, dan rescue mode sungguhan
+lewat `enter_rescue_mode()` dengan signal mask yang dikosongkan). Ini proyek
+eksperimental untuk belajar cara kerja init di level OS — belum siap dipakai di
+mesin produksi. Batasan yang diketahui:
 semua layanan berjalan sebagai root (belum ada seccomp/user per layanan), belum
 ada limit resource cgroup (hanya pemindahan PID), dan ini bukan pengganti
 systemd. Uji selalu di VM/container, dan siapkan jalur pemulihan lebih dulu.
