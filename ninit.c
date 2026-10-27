@@ -188,7 +188,7 @@ static int sort_services(void) {
                         if (dep_idx != -1 && !visited[dep_idx]) {
                             if (temp_visited[dep_idx]) {
                                 init_log("FATAL: CYCLE DETECTED di %s -> %s", services[curr].name, token);
-                                return -1; /* 🛑 Abort! */
+                                return -1; /* Abort! */
                             }
                             stack[stack_top++] = dep_idx;
                         }
