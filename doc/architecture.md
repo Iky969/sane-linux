@@ -116,7 +116,7 @@ dilaporkan `FATAL: CYCLE DETECTED` dan init jatuh ke rescue shell (`/bin/sh`).
 |---|---|---|
 | Set `shutting_down = 1` | ✅ | ✅ |
 | Kirim `SIGTERM` ke semua layanan | ✅ | — |
-| Tunggu sampai 50 × 100 ms (maks 5 detik), `reap_zombies()` tiap iterasi | ✅ | — |
+| Tunggu sampai 50 × 100 ms (maks 5 detik): `reap_zombies()` + `drain_log_fifo()` tiap iterasi | ✅ | — |
 | `SIGKILL` ke sisa layanan | ✅ | langsung |
 | `sync()` → `reboot(cmd)` → `while(1) pause()` | ✅ | ✅ |
 
@@ -143,7 +143,7 @@ berhenti di `pause()`.
 | `/dev/kmsg` | `ninit: <pesan>` — masuk ring buffer kernel |
 | stderr (console) | `[YYYY-mm-dd HH:MM:SS] ninit: <pesan>` |
 | `/var/log/ninit.log` | format sama dengan console (dibuka setelah fstab) |
-| `/run/log.fifo` | output layanan; dibaca loop utama dan dicetak sebagai `[service] <baris>` |
+| `/run/log.fifo` | output layanan; di-drain `drain_log_fifo()` dari loop utama **dan** dari loop grace `shutdown_all()`, dicetak sebagai `[service] <baris>` |
 
 `/run` di-mount `tmpfs`, jadi FIFO (`/run/initctl`, `/run/log.fifo`, mode `0600`)
 selalu dibuat ulang tiap boot.

@@ -546,7 +546,7 @@ int main(int argc, char **argv)
     mount_fstab();
     
     log_file_fd = open("/var/log/ninit.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    init_log("=== ninit start (PID 1) v5 ===");
+    init_log("=== ninit start (PID 1) v10 ===");
 
     set_hostname();
 

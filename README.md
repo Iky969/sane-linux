@@ -38,16 +38,23 @@ Butuh `build-essential` dan (untuk uji) `busybox-static`:
 sudo apt-get install build-essential busybox-static
 
 make          # hasilkan biner statis ./ninit
-make test     # uji sebagai PID 1 di chroot + unshare (butuh root/sudo)
+make test     # smoke test + test SIGTERM (butuh root/sudo)
 make clean
 ```
 
-`make test` menjalankan uji otomatis penuh: menyiapkan rootfs sementara dengan
-busybox sebagai `/bin/sh`, menjalankan ninit sebagai PID 1 di PID + mount
-namespace baru, menunggu `main loop siap`, mengirim `SIGTERM`, lalu memeriksa
-banner, event loop, layanan, `graceful shutdown`, ketiadaan respawn setelah
-shutdown, dan latensi shutdown (< 2000 ms). Untuk contoh output dan penjelasan
-tiap pemeriksaan, lihat [doc/build-and-test.md](doc/build-and-test.md).
+`make test` menjalankan dua uji otomatis. Keduanya menyiapkan rootfs sementara
+(busybox sebagai `/bin/sh`), menjalankan ninit sebagai PID 1 di PID + mount
+namespace baru, lalu mengirim `SIGTERM`:
+
+- **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
+  (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
+  setelah shutdown, latensi shutdown < 2000 ms.
+- **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — `SIGTERM` benar-benar
+  *sampai* ke proses layanan: trap-nya jalan, `exit status=0x0` (bukan `0x9`),
+  mask sinyal anak bersih, penutupan terjadi sebelum jendela grace 5 detik.
+
+Contoh output dan penjelasan tiap pemeriksaan ada di
+[doc/build-and-test.md](doc/build-and-test.md).
 
 ### Uji manual (chroot)
 
@@ -98,6 +105,7 @@ Detail lengkap (grammar, tabel opsi, tabel sinyal, batas 64 layanan) ada di
 ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
+scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 doc/                     dokumentasi teknis (lihat di bawah)
 .github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror
 SECURITY.md              kebijakan keamanan & cara melaporkan kerentanan

@@ -33,5 +33,8 @@ jobs:
       - name: Smoke test PID 1 (SIGTERM -> shutdown bersih)
         run: sudo sh ./scripts/smoke-test.sh
 
+      - name: SIGTERM benar-benar sampai ke layanan (bukan SIGKILL)
+        run: sudo sh ./scripts/test-sigterm.sh
+
       - name: Build tanpa warning (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"

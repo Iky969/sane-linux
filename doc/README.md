@@ -43,8 +43,9 @@ README.md                ringkasan proyek (landing page GitHub)
 ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
+scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 doc/                     dokumentasi ini
-.github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror
+.github/workflows/ci.yml CI: build statis, cek statis, kedua uji, -Werror
 SECURITY.md              kebijakan keamanan
 LICENSE                  MIT
 ```
@@ -53,7 +54,7 @@ LICENSE                  MIT
 
 ```bash
 make          # hasilkan biner statis ./ninit
-make test     # uji sebagai PID 1 (butuh root/sudo + busybox-static)
+make test     # uji sebagai PID 1: smoke test + test SIGTERM (butuh root/sudo)
 ```
 
 Menjalankannya di sistem nyata berarti memasang biner ini sebagai `/sbin/init`
@@ -63,9 +64,8 @@ seperti di [build-and-test.md](build-and-test.md).
 ## Status
 
 Seri pengembangan terakhir diberi label **v10** (commit
-`feat: ninit v10 - production ready init system with cgroups, fstab, and non-blocking timer`).
-Catatan kosmetik: banner yang dicetak saat boot masih
-`=== ninit start (PID 1) v5 ===` dan belum diubah agar konsisten.
+`feat: ninit v10 - production ready init system with cgroups, fstab, and non-blocking timer`),
+dan banner saat boot kini mencetak `=== ninit start (PID 1) v10 ===`.
 
 ## Batasan yang diketahui
 
