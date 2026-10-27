@@ -5,6 +5,10 @@ selain libc. Dibuat untuk eksperimen membangun distro/OS sendiri: membaca daftar
 layanan, menjalankan dan menjaganya, memindahkan proses ke cgroup v2, memasang
 filesystem dari `/etc/fstab`, dan mematikan sistem dengan rapi.
 
+Ringkasan proyek, mulai cepat, dan contoh konfigurasi ada di
+**[README utama di akar repository](../README.md)**; folder ini berisi dokumen
+teknis yang lebih dalam, dengan indeks di bawah.
+
 | Dokumen | Isi |
 |---|---|
 | [architecture.md](architecture.md) | cara kerja internal: urutan boot, event loop, sinyal, respawn, shutdown, cgroup, logging |
@@ -35,6 +39,7 @@ filesystem dari `/etc/fstab`, dan mematikan sistem dengan rapi.
 ## Struktur repository
 
 ```
+README.md                ringkasan proyek (landing page GitHub)
 ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
