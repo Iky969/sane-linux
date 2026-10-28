@@ -41,6 +41,8 @@ sudo apt-get install build-essential busybox-static
 
 make          # hasilkan biner statis ./ninit
 make test     # smoke test + test SIGTERM (butuh root/sudo)
+make rootfs   # rootfs distro minimal + initramfs (busybox statis, ninit PID 1)
+make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
 make clean
 ```
 
@@ -63,6 +65,30 @@ namespace baru:
 
 Contoh output dan penjelasan tiap pemeriksaan ada di
 [doc/build-and-test.md](doc/build-and-test.md).
+
+### Uji akhir: boot sebagai distro di QEMU
+
+`make rootfs` membangun rootfs minimal dari nol (BusyBox 1.36.1 statis + `ninit`
+sebagai `/sbin/init`), lalu `make qemu` mem-boot-nya di `qemu-system-x86_64`
+dengan konsol serial:
+
+```bash
+make rootfs               # unduh + kompilasi busybox statis, susun distro/rootfs, bungkus initramfs
+SECS=5 make qemu          # boot 5 detik, cetak konsol serial + pemeriksaan penanda boot
+make qemu                 # mode interaktif (keluar: Ctrl-A X)
+```
+
+Hasil nyata di sandbox (emulasi TCG tanpa KVM): banner
+`=== ninit start (PID 1) v1.0.0 ===` dan `main loop siap` muncul di konsol
+serial **~1,9–2,1 detik** setelah QEMU dijalankan, shell hidup di konsol
+(`console:respawn:cttyhack /bin/sh -i`), dan di dalam guest `poweroff` benar-benar
+**mematikan** mesin (`reboot: Power down`) sementara `reboot` benar-benar
+**me-restart** (boot ninit kedua terlihat). Applet BusyBox dipetakan ulang lewat
+wrapper `/sbin/{poweroff,reboot,halt}` → `/run/initctl`.
+
+Detail (stdin layanan `/dev/null`, `cttyhack`, tabel sinyal BusyBox vs ninit),
+hasil uji, dan *known limitations*-nya ada di
+[doc/distro-builder.md](doc/distro-builder.md).
 
 ### Uji manual (chroot)
 
@@ -115,6 +141,9 @@ Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
+scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
+scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda
+distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
 doc/                     dokumentasi teknis (lihat di bawah)
 .github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror
 SECURITY.md              kebijakan keamanan & cara melaporkan kerentanan
@@ -128,6 +157,7 @@ LICENSE                  MIT
 | [doc/architecture.md](doc/architecture.md) | urutan boot, event loop, sinyal, respawn, shutdown, cgroup, logging |
 | [doc/configuration.md](doc/configuration.md) | format `/etc/init.conf`, `/etc/fstab`, `/run/initctl`, lokasi log |
 | [doc/build-and-test.md](doc/build-and-test.md) | build statis, smoke test, CI, uji manual, troubleshooting |
+| [doc/distro-builder.md](doc/distro-builder.md) | rootfs minimal, initramfs, boot di QEMU, temuan integrasi |
 | [doc/README.md](doc/README.md) | indeks dokumentasi + status & roadmap |
 | [SECURITY.md](SECURITY.md) | model ancaman dan cara melaporkan masalah keamanan |
 

@@ -5,3 +5,11 @@
 # core dump dari uji PID 1
 /core
 /core.*
+
+# artefak distro builder (`make rootfs`, `make qemu`)
+/distro/rootfs/
+/distro/build/
+/distro/cache/
+/distro/initramfs.cpio.gz
+/distro/qemu-console.log
+/distro/qemu.log

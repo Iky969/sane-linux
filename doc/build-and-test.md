@@ -178,6 +178,10 @@ Menjalankan langsung di VM sebagai init sungguhan (uji akhir):
 install -m0755 ninit /sbin/init      # pastikan /etc/init.conf sudah ada
 ```
 
+Cara yang sudah otomatis ada di repo: `make rootfs && make qemu` -- rootfs
+minimal (BusyBox statis) + initramfs di-boot QEMU dengan konsol serial; lihat
+[distro-builder.md](distro-builder.md).
+
 ## CI (`.github/workflows/ci.yml`)
 
 Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` →

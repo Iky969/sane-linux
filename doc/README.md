@@ -14,6 +14,7 @@ teknis yang lebih dalam, dengan indeks di bawah.
 | [architecture.md](architecture.md) | cara kerja internal: urutan boot, event loop, sinyal, respawn, shutdown, cgroup, logging |
 | [configuration.md](configuration.md) | format `/etc/init.conf`, `/etc/fstab`, tabel sinyal, `/run/initctl`, lokasi log |
 | [build-and-test.md](build-and-test.md) | build statis, smoke test PID 1, CI, uji manual dengan `unshare`/`chroot`, troubleshooting |
+| [distro-builder.md](distro-builder.md) | rootfs minimal + initramfs dan boot di QEMU (distro nyata, bukan chroot) |
 | [../SECURITY.md](../SECURITY.md) | kebijakan keamanan dan cara melaporkan kerentanan |
 | [../LICENSE](../LICENSE) | MIT License |
 
