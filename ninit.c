@@ -191,6 +191,16 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     close(fd);
 }
 
+/* Hapus direktori cgroup layanan saat layanan berhenti */
+static void cleanup_cgroup(const char *svc_name)
+{
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
+    if (rmdir(dir) == 0) {
+        init_log("cgroup: dibersihkan '%s'", svc_name);
+    }
+}
+
 /* ---------- config parser (FIXED: Robust) ---------- */
 static int parse_config(const char *path)
 {
@@ -459,6 +469,7 @@ static void reap_zombies(void)
                         services[i].state = SVC_STATE_DONE;
                     else
                         services[i].state = SVC_STATE_FAILED;
+                    cleanup_cgroup(services[i].name);
                 } else {
                     services[i].state = SVC_STATE_STOPPED;
                 }
@@ -604,7 +615,9 @@ static void shutdown_all(int reboot_cmd, int force)
         init_log("FORCE shutdown (cmd=%d)", reboot_cmd);
         for (int i = 0; i < num_services; i++) {
             if (services[i].pid > 0) kill_service_group(&services[i], SIGKILL);
+            cleanup_cgroup(services[i].name);
         }
+        rmdir(CGROUP_BASE);
         reap_zombies(); sync();
         if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
         while (1) pause();
@@ -626,7 +639,9 @@ static void shutdown_all(int reboot_cmd, int force)
 
     for (int i = 0; i < num_services; i++) {
         if (services[i].pid > 0) kill_service_group(&services[i], SIGKILL);
+        cleanup_cgroup(services[i].name);
     }
+    rmdir(CGROUP_BASE);
     sync();
     if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
     while (1) pause();
@@ -828,7 +843,11 @@ int main(int argc, char **argv)
 
         int ret = ppoll(fds, nfds, pto, &orig);
         int perr = errno;   /* simpan segera: errno mudah berubah oleh panggilan lain */
-        if (ret < 0 && perr != EINTR) { init_log("ppoll error: %s", strerror(perr)); continue; }
+        if (ret < 0 && perr != EINTR) {
+            init_log("ppoll error: %s", strerror(perr));
+            usleep(100000); /* jeda 100ms cegah log spam bila terjadi error berulang */
+            continue;
+        }
 
         /* 1. Cek Sinyal: shutdown DIPRIORITASKAN sebelum reap_zombies()/respawn,
            supaya SIGTERM yang datang bersamaan SIGCHLD tidak tertunda. */
