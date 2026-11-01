@@ -569,6 +569,31 @@ static void drain_log_fifo(void)
     }
 }
 
+/* Kirim sinyal ke seluruh grup proses layanan, dan coba cgroup.kill bila SIGKILL */
+static void kill_service_group(const service_t *svc, int sig)
+{
+    if (svc->pid <= 0) return;
+
+    /* 1. Kirim sinyal ke seluruh grup proses (-pid).
+       Jika gagal (misal leader sudah mati), tetap coba ke PID langsung. */
+    if (kill(-svc->pid, sig) < 0 && errno == ESRCH) {
+        kill(svc->pid, sig);
+    }
+
+    /* 2. Bila SIGKILL dan cgroup v2 aktif, picu cgroup.kill */
+    if (sig == SIGKILL) {
+        char kill_path[320];
+        snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, svc->name);
+        int fd = open(kill_path, O_WRONLY);
+        if (fd >= 0) {
+            if (write(fd, "1\n", 2) < 0) {
+                /* abaikan bila cgroup.kill belum didukung kernel */
+            }
+            close(fd);
+        }
+    }
+}
+
 /* ---------- shutdown ---------- */
 static void shutdown_all(int reboot_cmd, int force)
 {
@@ -576,14 +601,18 @@ static void shutdown_all(int reboot_cmd, int force)
 
     if (force) {
         init_log("FORCE shutdown (cmd=%d)", reboot_cmd);
-        for (int i = 0; i < num_services; i++) if (services[i].pid > 0) kill(services[i].pid, SIGKILL);
+        for (int i = 0; i < num_services; i++) {
+            if (services[i].pid > 0) kill_service_group(&services[i], SIGKILL);
+        }
         reap_zombies(); sync();
         if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
         while (1) pause();
     }
 
     init_log("graceful shutdown (cmd=%d)", reboot_cmd);
-    for (int i = 0; i < num_services; i++) if (services[i].pid > 0) kill(services[i].pid, SIGTERM);
+    for (int i = 0; i < num_services; i++) {
+        if (services[i].pid > 0) kill_service_group(&services[i], SIGTERM);
+    }
 
     for (int i = 0; i < 50; i++) {
         int alive = 0;
@@ -594,7 +623,9 @@ static void shutdown_all(int reboot_cmd, int force)
         usleep(100000);
     }
 
-    for (int i = 0; i < num_services; i++) if (services[i].pid > 0) kill(services[i].pid, SIGKILL);
+    for (int i = 0; i < num_services; i++) {
+        if (services[i].pid > 0) kill_service_group(&services[i], SIGKILL);
+    }
     sync();
     if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
     while (1) pause();
