@@ -21,7 +21,7 @@ diterapkan pada `main`.
 
 1. **GitHub Private Vulnerability Reporting** (disarankan):
    tab **Security → Report a vulnerability** di
-   <https://github.com/Iky969/build-distros/security/advisories/new>.
+   <https://github.com/Iky969/sane-linux/security/advisories/new>.
 2. **Email:** `ryuzarza@gmail.com` dengan subjek `[SECURITY] ninit: <ringkas>`.
 
 Sertakan bila ada:
