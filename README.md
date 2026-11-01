@@ -16,7 +16,8 @@ responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
 - **PID 1 + reaping** semua anak, termasuk proses yatim (orphan) yang diadopsi.
 - **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` dan
-  dependensi `:requires=` (urut topologis DFS tanpa stack overflow, deteksi
+  dependensi `:requires=` (urut topologis DFS tanpa stack overflow, layanan once
+  ditunggu hingga sukses selesai sebelum dependensinya jalan, deteksi
   siklus, dan dependensi hilang → rescue shell).
 - **Respawn non-blocking**: jeda 2 detik dijalankan lewat timer `ppoll` 100 ms,
   bukan `sleep()`, sehingga init tidak pernah buta terhadap sinyal.

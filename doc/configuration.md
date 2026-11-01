@@ -13,7 +13,7 @@ Format per baris:
 | `<nama>` | Maks 127 karakter (dipotong otomatis). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
 | `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
 | `<perintah>` | Maks 511 karakter, dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari `:requires=` dari kanan). |
-| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. |
+| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
 
 Aturan umum:
 

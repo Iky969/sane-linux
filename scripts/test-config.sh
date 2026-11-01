@@ -160,6 +160,19 @@ else
 	bad "urut topologis salah (harap cba, dapat: '$order')"
 fi
 
+# Layanan once harus benar-benar selesai (exit status) sebelum dependensinya jalan
+seq_c_exit=$(grep -nE 'ninit: c \(pid [0-9]+\) exit status=0x0' "$LOG" | head -n 1 | cut -d: -f1 || true)
+seq_b_start=$(grep -nE 'ninit: started b \(pid' "$LOG" | head -n 1 | cut -d: -f1 || true)
+seq_b_exit=$(grep -nE 'ninit: b \(pid [0-9]+\) exit status=0x0' "$LOG" | head -n 1 | cut -d: -f1 || true)
+seq_a_start=$(grep -nE 'ninit: started a \(pid' "$LOG" | head -n 1 | cut -d: -f1 || true)
+
+if [ -n "$seq_c_exit" ] && [ -n "$seq_b_start" ] && [ "$seq_c_exit" -lt "$seq_b_start" ] && \
+   [ -n "$seq_b_exit" ] && [ -n "$seq_a_start" ] && [ "$seq_b_exit" -lt "$seq_a_start" ]; then
+	ok "layanan once selesai sebelum dependensinya jalan (c exit -> b start -> b exit -> a start)"
+else
+	bad "layanan once tidak menunggu selesai sebelum dependensi jalan (c_exit=$seq_c_exit b_start=$seq_b_start b_exit=$seq_b_exit a_start=$seq_a_start)"
+fi
+
 # -------------------------------------------------------------- skenario 1b
 printf '\n== 1b. konfigurasi padat 64 layanan (regresi stack overflow) ==\n'
 start_root dense

@@ -29,14 +29,22 @@
 #define MAX_LINE        1024
 #define RESPAWN_DELAY   2
 
+typedef enum {
+    SVC_STATE_STOPPED = 0,
+    SVC_STATE_RUNNING,
+    SVC_STATE_DONE,
+    SVC_STATE_FAILED
+} svc_state_t;
+
 typedef struct {
-    char   name[128];
-    char   cmd[512];
-    pid_t  pid;
-    int    respawn;
-    int    need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
-    time_t last_start;
-    char   deps_str[256]; 
+    char        name[128];
+    char        cmd[512];
+    pid_t       pid;
+    int         respawn;
+    int         need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
+    time_t      last_start;
+    char        deps_str[256]; 
+    svc_state_t state;
 } service_t;
 
 static service_t services[MAX_SERVICES];
@@ -228,6 +236,7 @@ static int parse_config(const char *path)
         services[num_services].need_respawn = 0;
         services[num_services].pid          = 0;
         services[num_services].last_start   = 0;
+        services[num_services].state        = SVC_STATE_STOPPED;
         num_services++;
     }
     fclose(f);
@@ -405,6 +414,7 @@ static void spawn_service(service_t *svc)
     }
 
     svc->pid = pid;
+    svc->state = SVC_STATE_RUNNING;
     init_log("started %s (pid %d)", svc->name, pid);
     setup_cgroup(svc->name, pid);
 }
@@ -422,10 +432,76 @@ static void reap_zombies(void)
             if (services[i].pid == pid) {
                 init_log("%s (pid %d) exit status=0x%x", services[i].name, pid, status);
                 services[i].pid = 0;
+                if (!services[i].respawn) {
+                    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+                        services[i].state = SVC_STATE_DONE;
+                    else
+                        services[i].state = SVC_STATE_FAILED;
+                } else {
+                    services[i].state = SVC_STATE_STOPPED;
+                }
                 break;
             }
         }
     }
+}
+
+/* Cek apakah semua dependensi layanan sudah terpenuhi:
+   - Layanan once harus sudah selesai dengan sukses (SVC_STATE_DONE).
+   - Layanan respawn harus sedang berjalan (pid > 0).
+   Mengembalikan:
+     1 = semua dependensi terpenuhi
+     0 = masih menunggu dependensi
+    -1 = ada dependensi once yang gagal
+*/
+static int deps_satisfied(const service_t *svc, const char **failed_dep)
+{
+    int off = 0;
+    char token[256];
+    while (next_dep(svc->deps_str, &off, token, sizeof(token))) {
+        int idx = find_service(token);
+        if (idx < 0) continue;
+        const service_t *dep = &services[idx];
+        if (dep->respawn) {
+            if (dep->pid <= 0) return 0;
+        } else {
+            if (dep->state == SVC_STATE_FAILED) {
+                if (failed_dep) *failed_dep = dep->name;
+                return -1;
+            }
+            if (dep->state != SVC_STATE_DONE) return 0;
+        }
+    }
+    return 1;
+}
+
+/* Menjalankan semua layanan yang dependensinya sudah terpenuhi. */
+static void spawn_eligible_services(void)
+{
+    if (shutting_down) return;
+
+    int progress;
+    do {
+        progress = 0;
+        for (int i = 0; i < num_services; i++) {
+            service_t *svc = &services[i];
+            if (svc->pid > 0 || svc->state == SVC_STATE_DONE || svc->state == SVC_STATE_FAILED)
+                continue;
+            if (svc->need_respawn)
+                continue;
+
+            const char *failed_dep = NULL;
+            int ret = deps_satisfied(svc, &failed_dep);
+            if (ret < 0) {
+                init_log("layanan '%s' dibatalkan: dependensi '%s' gagal", svc->name, failed_dep);
+                svc->state = SVC_STATE_FAILED;
+                progress = 1;
+            } else if (ret == 1) {
+                spawn_service(svc);
+                progress = 1;
+            }
+        }
+    } while (progress);
 }
 
 /* Respawn hanya dijalankan dari loop utama, di luar reap_zombies(). */
@@ -672,7 +748,7 @@ int main(int argc, char **argv)
     int log_fifo_fd = setup_log_fifo();
     g_log_fifo_fd = log_fifo_fd;
 
-    for (int i = 0; i < num_services; i++) spawn_service(&services[i]);
+    spawn_eligible_services();
 
     init_log("main loop siap");
 
@@ -707,7 +783,11 @@ int main(int argc, char **argv)
         if (sigint_flag ) { sigint_flag  = 0; shutdown_all(RB_AUTOBOOT,   0); }
         if (sigusr1_flag) { sigusr1_flag = 0; shutdown_all(RB_POWER_OFF, 1); }
         if (sigusr2_flag) { sigusr2_flag = 0; shutdown_all(RB_AUTOBOOT,   1); }
-        if (sigchld_flag) { sigchld_flag = 0; reap_zombies();                 }
+        if (sigchld_flag) {
+            sigchld_flag = 0;
+            reap_zombies();
+            spawn_eligible_services();
+        }
 
         /* 2. Cek fd yang aktif */
         for (int i = 0; i < nfds; i++) {
@@ -744,6 +824,7 @@ int main(int argc, char **argv)
         /* Akhir loop: proses layanan yang respawn-nya tertunda. Juga terpanggil
            saat ppoll timeout (ret == 0) -> timer merespawn tanpa sleep(). */
         respawn_services();
+        spawn_eligible_services();
     }
     return 0;
 }
