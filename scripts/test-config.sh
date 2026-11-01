@@ -380,6 +380,85 @@ HOLDER=""
 INIT_STDIN=/dev/null
 stop_init
 
+# -------------------------------------------------------------- skenario 5
+printf '\n== 5. peringatan pemotongan string panjang (nama, perintah, dependensi) ==\n'
+start_root trunc
+LOG8="$LOG"
+
+long_name=$(printf 'longname_%.0s' $(seq 1 15))
+long_cmd=$(printf 'echo hello_%.0s' $(seq 1 55))
+long_deps="dep,"$(printf 'd%02d,' $(seq 1 45))
+cat > "$ROOT/etc/init.conf" <<EOCFG
+dep:once:true
+${long_name}:once:${long_cmd}:requires=${long_deps}
+EOCFG
+
+run_init
+if ! wait_for 'terpotong'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencatat peringatan string terpotong dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "peringatan nama terpotong dicatat" 'Peringatan: nama layanan'
+check "peringatan perintah terpotong dicatat" 'Peringatan: perintah layanan'
+check "peringatan dependensi terpotong dicatat" 'Peringatan: dependensi layanan'
+
+# -------------------------------------------------------------- skenario 6
+printf '\n== 6. layanan ke-65 melebihi batas MAX_SERVICES ==\n'
+start_root maxsvc
+LOG9="$LOG"
+
+{
+	i=1
+	while [ "$i" -le 65 ]; do
+		printf 'svc%02d:once::\n' "$i"
+		i=$((i + 1))
+	done
+} > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak selesai boot dalam ${READY_TIMEOUT}s pada uji layanan ke-65"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "peringatan batas 64 layanan tercapai" 'Peringatan: batas 64 layanan tercapai'
+check_absent "layanan ke-65 tidak dijalankan" 'started svc65'
+
+# -------------------------------------------------------------- skenario 7
+printf '\n== 7. urutan dependensi yang dijanjikan README (logd once -> net once) ==\n'
+start_root readmedep
+LOG10="$LOG"
+
+cat > "$ROOT/etc/init.conf" <<'EOCFG'
+logd:once:/bin/sh -c 'sleep 0.3 && echo logd-ready'
+net:once:echo net-started:requires=logd
+EOCFG
+
+run_init
+if ! wait_for 'net-started'; then
+	sed 's/^/  | /' "$LOG"
+	fail "net tidak berjalan dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+seq_logd=$(grep -n '\[service\] logd-ready' "$LOG" | head -n 1 | cut -d: -f1 || true)
+seq_net=$(grep -n 'ninit: started net' "$LOG" | head -n 1 | cut -d: -f1 || true)
+
+if [ -n "$seq_logd" ] && [ -n "$seq_net" ] && [ "$seq_logd" -lt "$seq_net" ]; then
+	ok "net baru berjalan SETELAH logd selesai ('logd-ready' sebelum 'started net')"
+else
+	bad "urutan dependensi README salah (posisi logd_ready=$seq_logd net_started=$seq_net)"
+fi
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -396,6 +475,12 @@ printf '\n== log 4a (config tidak terbaca) ==\n'
 sed 's/^/  | /' "$LOG6"
 printf '\n== log 4b (siklus dependensi) ==\n'
 sed 's/^/  | /' "$LOG7"
+printf '\n== log 5 (pemotongan string) ==\n'
+sed 's/^/  | /' "$LOG8"
+printf '\n== log 6 (layanan ke-65) ==\n'
+sed 's/^/  | /' "$LOG9"
+printf '\n== log 7 (dependensi README: logd -> net) ==\n'
+sed 's/^/  | /' "$LOG10"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
