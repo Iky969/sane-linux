@@ -9,7 +9,7 @@ Satu file sumber ([`ninit.c`](ninit.c), ~600 baris), biner statis, nol warning
 dengan `-Wall -Werror`. Bonus: event loop-nya berbasis `ppoll`, jadi init tetap
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
-[![CI](https://github.com/Iky969/build-distros/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/build-distros/actions/workflows/ci.yml)
+[![CI](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Fitur
