@@ -226,6 +226,12 @@ static int parse_config(const char *path)
         char *c2 = strchr(mode, ':'); if (!c2) { init_log("Parse err: no cmd in %s", name); continue; }
         *c2 = 0;
         char *cmd = c2 + 1;
+
+        /* Validasi Nama Layanan: tidak boleh memuat '/' (dipakai untuk direktori cgroup) */
+        if (strchr(name, '/')) {
+            init_log("Parse err: nama layanan '%s' tidak boleh memuat '/'", name);
+            continue;
+        }
         
         /* Cari :requires= dari kanan (menggunakan strstr) agar cmd dengan ':' aman */
         char *deps = "";

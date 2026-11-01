@@ -459,6 +459,28 @@ else
 	bad "urutan dependensi README salah (posisi logd_ready=$seq_logd net_started=$seq_net)"
 fi
 
+# -------------------------------------------------------------- skenario 8
+printf '\n== 8. validasi nama layanan tidak boleh mengandung / ==\n'
+start_root slashname
+LOG11="$LOG"
+
+cat > "$ROOT/etc/init.conf" <<'EOCFG'
+good_svc:once:true
+bad/svc:once:true
+EOCFG
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak boot dalam ${READY_TIMEOUT}s pada uji nama dengan slash"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "error nama mengandung slash dicatat" 'Parse err: nama layanan'
+check_absent "layanan dengan slash tidak dijalankan" 'started bad/svc'
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
