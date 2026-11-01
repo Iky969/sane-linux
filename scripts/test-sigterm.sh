@@ -41,15 +41,25 @@ for t in unshare chroot timeout ps mktemp; do
 done
 $SUDO true 2>/dev/null || fail "butuh root atau sudo tanpa password (unshare + chroot)"
 
-ROOT=$(mktemp -d /tmp/ninit-sigterm.XXXXXX)
-LOG=$(mktemp /tmp/ninit-sigterm-log.XXXXXX)
+ROOTS=""
+LOGS=""
 init_pid=""
+init_pid2=""
 cleanup() {
 	[ -n "${init_pid:-}" ] && $SUDO kill -KILL "$init_pid" 2>/dev/null || true
-	$SUDO umount "$ROOT/proc" 2>/dev/null || true
-	rm -rf "$ROOT" "$LOG"
+	[ -n "${init_pid2:-}" ] && $SUDO kill -KILL "$init_pid2" 2>/dev/null || true
+	for d in ${ROOTS:-}; do
+		$SUDO umount "$d/proc" 2>/dev/null || true
+		rm -rf "$d"
+	done
+	for f in ${LOGS:-}; do rm -f "$f"; done
 }
 trap cleanup EXIT INT TERM
+
+ROOT=$(mktemp -d /tmp/ninit-sigterm.XXXXXX)
+LOG=$(mktemp /tmp/ninit-sigterm-log.XXXXXX)
+ROOTS="$ROOTS $ROOT"
+LOGS="$LOGS $LOG"
 
 mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp" \
          "$ROOT/etc" "$ROOT/var/log" "$ROOT/bin"
@@ -187,6 +197,79 @@ fi
 
 printf '\n== log ninit ==\n'
 sed 's/^/  | /' "$LOG"
+
+# -------------------------------------------------------------- Skenario 2
+printf '\n== Skenario 2: shutdown pipeline (kill(-pid)) ==\n'
+ROOT2=$(mktemp -d /tmp/ninit-sigterm-pipe.XXXXXX)
+LOG2=$(mktemp /tmp/ninit-sigterm-pipe-log.XXXXXX)
+ROOTS="$ROOTS $ROOT2"
+LOGS="$LOGS $LOG2"
+
+mkdir -p "$ROOT2/proc" "$ROOT2/sys" "$ROOT2/dev" "$ROOT2/run" "$ROOT2/tmp" \
+         "$ROOT2/etc" "$ROOT2/var/log" "$ROOT2/bin"
+cp "$BIN" "$ROOT2/ninit"
+cp "$BUSYBOX" "$ROOT2/bin/sh"
+cp "$BUSYBOX" "$ROOT2/bin/sleep"
+
+printf 'pipe-svc:once:/bin/sh -c "/bin/sleep 50 | /bin/sleep 50"\n' > "$ROOT2/etc/init.conf"
+
+(
+	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
+		--mount --propagation private \
+		sh -c "mount -t proc proc '$ROOT2/proc' && exec chroot '$ROOT2' /ninit" \
+		>"$LOG2" 2>&1
+) &
+job2=$!
+
+i=0
+init_pid2=""
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	init_pid2=$(find_init_pid || true)
+	if [ -n "${init_pid2:-}" ] && grep -q 'main loop siap' "$LOG2" 2>/dev/null \
+	   && grep -q 'started pipe-svc' "$LOG2" 2>/dev/null; then
+		break
+	fi
+	sleep 0.2
+	i=$((i + 1))
+done
+
+if [ -z "${init_pid2:-}" ]; then
+	sed 's/^/  | /' "$LOG2"
+	fail "ninit skenario 2 tidak berjalan dalam ${READY_TIMEOUT}s"
+fi
+
+# Beri jeda agar kedua proses sleep dalam pipeline siap
+sleep 0.5
+
+# Pastikan proses sleep hidup sebelum shutdown
+pipe_procs_before=$(ps -eo args 2>/dev/null | grep '/bin/sleep 50' | grep -v grep | wc -l || true)
+if [ "$pipe_procs_before" -ge 2 ]; then
+	ok "proses pipeline berjalan ($pipe_procs_before proses sleep aktif)"
+else
+	bad "proses pipeline tidak aktif sebelum shutdown (ditemukan $pipe_procs_before proses sleep)"
+fi
+
+# Kirim SIGTERM ke init
+$SUDO kill -TERM "$init_pid2" || true
+
+i=0
+while [ "$i" -lt 60 ]; do
+	kill -0 "$job2" 2>/dev/null || break
+	sleep 0.1
+	i=$((i + 1))
+done
+wait "$job2" 2>/dev/null || true
+
+# Verifikasi tidak ada proses sleep 50 yang tertinggal
+pipe_procs_after=$(ps -eo args 2>/dev/null | grep '/bin/sleep 50' | grep -v grep | wc -l || true)
+if [ "$pipe_procs_after" -eq 0 ]; then
+	ok "seluruh proses dalam pipeline mati setelah shutdown (group kill -pid)"
+else
+	bad "ada $pipe_procs_after proses pipeline tertinggal setelah shutdown"
+fi
+
+printf '\n== log ninit skenario 2 ==\n'
+sed 's/^/  | /' "$LOG2"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
