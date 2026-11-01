@@ -423,7 +423,8 @@ static void spawn_service(service_t *svc)
         int fd = open("/dev/null", O_RDONLY);
         if (fd >= 0) { dup2(fd, 0); close(fd); }
 
-        fd = open("/run/log.fifo", O_WRONLY | O_NONBLOCK); /* Non-block writer */
+        /* Buka FIFO tanpa O_NONBLOCK agar stdout/stderr layanan tidak mengembalikan EAGAIN */
+        fd = open("/run/log.fifo", O_WRONLY);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
         else {
             fd = open("/dev/console", O_WRONLY);
