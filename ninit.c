@@ -198,11 +198,16 @@ static int parse_config(const char *path)
     if (!f) { init_log("buka %s gagal: %s", path, strerror(errno)); return -1; }
 
     char line[MAX_LINE];
-    while (fgets(line, sizeof(line), f) && num_services < MAX_SERVICES) {
+    while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n")] = 0;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == 0) continue;
+
+        if (num_services >= MAX_SERVICES) {
+            init_log("Peringatan: batas %d layanan tercapai, '%s' diabaikan", MAX_SERVICES, p);
+            continue;
+        }
 
         char *name = p;
         char *c1 = strchr(p, ':'); if (!c1) { init_log("Parse err: no mode in %s", name); continue; }
@@ -227,11 +232,27 @@ static int parse_config(const char *path)
             init_log("Warning: mode '%s' tidak dikenal untuk '%s'. Default: once", mode, name);
         }
 
+        /* Peringatan jika string terpotong */
+        if (strlen(name) >= sizeof(services[num_services].name)) {
+            init_log("Peringatan: nama layanan '%s' terpotong (panjang %zu > maks %d)",
+                     name, strlen(name), (int)sizeof(services[num_services].name) - 1);
+        }
+        if (strlen(cmd) >= sizeof(services[num_services].cmd)) {
+            init_log("Peringatan: perintah layanan '%s' terpotong (panjang %zu > maks %d)",
+                     name, strlen(cmd), (int)sizeof(services[num_services].cmd) - 1);
+        }
+        if (strlen(deps) >= sizeof(services[num_services].deps_str)) {
+            init_log("Peringatan: dependensi layanan '%s' terpotong (panjang %zu > maks %d)",
+                     name, strlen(deps), (int)sizeof(services[num_services].deps_str) - 1);
+        }
+
         /* Batasi presisi ke ukuran tujuan: menghilangkan -Wformat-truncation (nama max 127 char) */
         snprintf(services[num_services].name, sizeof(services[num_services].name), "%.*s",
                  (int)sizeof(services[num_services].name) - 1, name);
-        snprintf(services[num_services].cmd,  sizeof(services[num_services].cmd),  "%s", cmd);
-        snprintf(services[num_services].deps_str, sizeof(services[num_services].deps_str), "%s", deps);
+        snprintf(services[num_services].cmd,  sizeof(services[num_services].cmd),  "%.*s",
+                 (int)sizeof(services[num_services].cmd) - 1, cmd);
+        snprintf(services[num_services].deps_str, sizeof(services[num_services].deps_str), "%.*s",
+                 (int)sizeof(services[num_services].deps_str) - 1, deps);
         services[num_services].respawn      = is_respawn;
         services[num_services].need_respawn = 0;
         services[num_services].pid          = 0;

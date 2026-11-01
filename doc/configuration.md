@@ -10,19 +10,19 @@ Format per baris:
 
 | Bagian | Aturan |
 |---|---|
-| `<nama>` | Maks 127 karakter (dipotong otomatis). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
+| `<nama>` | Maks 127 karakter (diperingatkan dan dipotong otomatis). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
 | `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
-| `<perintah>` | Maks 511 karakter, dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari `:requires=` dari kanan). |
-| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
-
+| `<perintah>` | Maks 511 karakter (diperingatkan dan dipotong otomatis), dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari `:requires=` dari kanan). |
+| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter (diperingatkan dan dipotong otomatis). Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
+ 
 Aturan umum:
-
+ 
 - Baris komentar dimulai `#` (spasi/tab di depan diizinkan) dan baris kosong diabaikan.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
 - File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
   `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
   nol layanan.
-- Maksimum **64 layanan** (`MAX_SERVICES`); baris selebihnya tidak dibaca.
+- Maksimum **64 layanan** (`MAX_SERVICES`); layanan ke-65 dan seterusnya dilaporkan dengan peringatan dan diabaikan.
 - Siklus dependensi → `FATAL: CYCLE DETECTED`, init masuk rescue shell.
 - Nama dependensi yang tidak ada di daftar layanan →
   `FATAL: Dependensi '<dep>' untuk '<layanan>' tidak ditemukan`, init masuk
