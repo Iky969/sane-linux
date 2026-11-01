@@ -387,7 +387,7 @@ LOG8="$LOG"
 
 long_name=$(printf 'longname_%.0s' $(seq 1 15))
 long_cmd=$(printf 'echo hello_%.0s' $(seq 1 55))
-long_deps="dep,"$(printf 'd%02d,' $(seq 1 45))
+long_deps="dep,"$(printf 'd%02d,' $(seq 1 70))
 cat > "$ROOT/etc/init.conf" <<EOCFG
 dep:once:true
 ${long_name}:once:${long_cmd}:requires=${long_deps}
