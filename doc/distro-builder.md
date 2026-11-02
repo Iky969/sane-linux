@@ -21,7 +21,7 @@ SECS=5 make qemu     # boot otomatis 5 detik + pemeriksaan penanda + laporan kon
 
 | Path | Isi | Catatan |
 |---|---|---|
-| `/bin/busybox` | BusyBox 1.36.1 statis (`gcc -static`, 402 applet) + symlink applet | `make defconfig` + `CONFIG_STATIC=y` + `make LDFLAGS=-static` + `make install` |
+| `/bin/busybox` | BusyBox 1.36.1 statis (`gcc -static`, 401 applet) + symlink applet | `make defconfig` + `CONFIG_STATIC=y` + `CONFIG_TC` dimatikan + `make LDFLAGS=-static` + `make install` |
 | `/bin/sh` | symlink ke `busybox` | wajib: ninit menjalankan setiap layanan lewat `/bin/sh -c` |
 | `/sbin/init` | biner `ninit` (statis) | PID 1 di dalam guest |
 | `/sbin/{poweroff,reboot,halt}` | skrip wrapper → `/run/initctl` | menimpa applet BusyBox yang memakai sinyal berbeda dari tabel ninit |
@@ -159,8 +159,8 @@ reboot (dipakai uji otomatis).
 |---|---|---|
 | `DISTRO_DIR` | `distro` | direktori kerja |
 | `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / hash resmi | sumber BusyBox (kosongkan `BB_SHA256` untuk melewati verifikasi) |
-| `BUSYBOX_MODE` | `auto` | `auto` \| `source` (wajib kompilasi) \| `prebuilt` (pakai `/bin/busybox` statis) |
-| `BUSYBOX_PREBUILT` | `/bin/busybox` | cadangan bila kompilasi gagal |
+| `BUSYBOX_MODE` | `auto` | `auto` \| `source` (wajib kompilasi) \| `prebuilt` (pakai `/bin/busybox` statis). Pada `auto`, unduh/kompilasi/install yang gagal menjatuhkan build ke busybox cadangan; `source` menuntut berhasil. |
+| `BUSYBOX_PREBUILT` | `/bin/busybox` | cadangan bila build dari sumber gagal; hanya biner ini yang dipakai rootfs (pohon `make install` sisa run lama diabaikan) |
 | `BUSYBOX_FORCE` | `0` | `1` = unduh/kompilasi ulang |
 | `NINIT` | `./ninit` | biner yang dipasang sebagai `/sbin/init` |
 | `JOBS` | `nproc` | jumlah job `make` |
@@ -190,6 +190,9 @@ reboot (dipakai uji otomatis).
 - **Kernel masih pinjam Alpine.** Kernel proyek ini belum dikompilasi sendiri;
   yang dipakai Alpine `vmlinuz-virt` (v3.20) yang diunduh ke `distro/cache/`.
 - Belum ada manajer paket, jaringan, dan modul kernel; BusyBox dibangun dengan
-  `defconfig` (402 applet).
-- Belum ada job CI yang mem-boot QEMU (butuh `qemu-system-x86` + kernel; bisa
-  ditambah sebagai job terpisah).
+  `defconfig` minus applet `tc` (401 applet). `tc` dimatikan karena
+  `networking/tc.c` masih memakai definisi CBQ yang sudah tidak ada di kernel
+  headers terbaru — dengan Ubuntu 24.04 build `defconfig` penuh gagal kompilasi.
+- Job CI `rootfs-distro` membangun rootfs dan mem-boot initramfs di QEMU (TCG,
+  tanpa `/dev/kvm`). Yang masih belum ada: uji interaktif (ketikan ke serial
+  console) dan uji `poweroff`/`reboot` dari dalam guest.
