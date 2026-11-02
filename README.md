@@ -146,7 +146,8 @@ scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
 scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda
 distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
 doc/                     dokumentasi teknis (lihat di bawah)
-.github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror
+.github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror,
+                      rootfs + boot QEMU (job rootfs-distro)
 SECURITY.md              kebijakan keamanan & cara melaporkan kerentanan
 LICENSE                  MIT
 ```
