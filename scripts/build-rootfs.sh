@@ -111,12 +111,12 @@ build_busybox_source() {
 		mkdir -p "$BUILD_DIR"
 		rm -rf "$src"
 		info "ekstrak tarball ke $BUILD_DIR"
-		tar -xjf "$tarball" -C "$BUILD_DIR" || bb_fail "ekstrak tarball gagal"
+		tar -xjf "$tarball" -C "$BUILD_DIR" || { bb_fail "ekstrak tarball gagal"; return 1; }
 	fi
 
 	if [ ! -f "$src/.config" ]; then
 		info "make defconfig"
-		( cd "$src" && make defconfig >/dev/null ) || bb_fail "make defconfig gagal"
+		( cd "$src" && make defconfig >/dev/null ) || { bb_fail "make defconfig gagal"; return 1; }
 	fi
 
 	# Opsi ini dituliskan setiap run, bukan hanya saat .config dibuat, supaya
@@ -126,17 +126,17 @@ build_busybox_source() {
 	#   (TCA_CBQ_*, struct tc_cbq_*) yang sudah tidak ada di kernel headers
 	#   terbaru; di Ubuntu 24.04 build defconfig gagal total karena ini. Applet
 	#   `tc` tidak dipakai rootfs ini.
-	[ -f "$src/.config" ] || bb_fail "make defconfig tidak menghasilkan .config"
+	[ -f "$src/.config" ] || { bb_fail "make defconfig tidak menghasilkan .config"; return 1; }
 	set_bb_config "$src/.config" CONFIG_STATIC y
 	set_bb_config "$src/.config" CONFIG_TC n
 	( cd "$src" && make oldconfig >/dev/null 2>&1 </dev/null ) || true
 	grep -q '^CONFIG_STATIC=y' "$src/.config" \
-		|| bb_fail "CONFIG_STATIC tidak bisa diaktifkan di .config busybox"
+		|| { bb_fail "CONFIG_STATIC tidak bisa diaktifkan di .config busybox"; return 1; }
 
 	info "kompilasi busybox $BB_VERSION statis dengan $JOBS job (1-3 menit)..."
 	( cd "$src" && make -j"$JOBS" LDFLAGS="-static" ) \
-		|| bb_fail "kompilasi busybox gagal (lihat keluaran make di atas)"
-	[ -x "$src/busybox" ] || bb_fail "biner busybox tidak dihasilkan"
+		|| { bb_fail "kompilasi busybox gagal (lihat keluaran make di atas)"; return 1; }
+	[ -x "$src/busybox" ] || { bb_fail "biner busybox tidak dihasilkan"; return 1; }
 
 	if ! is_static "$src/busybox"; then
 		info "PERINGATAN: busybox hasil kompilasi tidak statis"
@@ -146,7 +146,7 @@ build_busybox_source() {
 	info "make install -> $PKG_INSTALL"
 	rm -rf "$PKG_INSTALL"
 	( cd "$src" && make CONFIG_PREFIX="$PKG_INSTALL" install >/dev/null ) \
-		|| bb_fail "make install busybox gagal"
+		|| { bb_fail "make install busybox gagal"; return 1; }
 	BUSYBOX_BIN=$src/busybox
 	return 0
 }
