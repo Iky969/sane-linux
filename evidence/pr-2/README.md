@@ -14,3 +14,15 @@ perintah sungguhan pada head PR `6af0ed3`:
 
 Gambar adalah output mentah dari perintah di atas, hanya difilter agar muat di
 layar terminal; tidak ada yang direkayasa.
+
+## Ronde 2 — commit `94499b8` (perluasan klasifikasi opsi fstab)
+
+| berkas | isi |
+|---|---|
+| `round2/10-head-info.png` | head, md5 biner uji, md5 `/sbin/init` di rootfs, lingkungan |
+| `round2/11-suite-bawaan.png` | smoke-test + test-sigterm (skenario 3 dengan pelacakan PID anak) |
+| `round2/12-config-skenario-10-11.png` | skenario baru: klasifikasi opsi fstab + batas baris di EOF |
+| `round2/13-probe-fstab-10-kasus.png` | probe mandiri 10 kasus opsi fstab, biner pra- vs pasca-`94499b8` |
+| `round2/14-proot-distro.png` | baterai distro di proot (12/12) |
+| `round2/15-qemu-distro-shutdown.png` | boot distro di QEMU: laporan guest + garis waktu shutdown |
+| `round2/16-gap-yang-ditemukan.png` | gap yang masih tersisa (`exec/suid/dev`, implikasi `user`) |
