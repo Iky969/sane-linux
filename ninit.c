@@ -40,6 +40,10 @@ typedef struct {
     char        name[128];
     char        cmd[512];
     pid_t       pid;
+    pid_t       pgid;           /* grup proses layanan: anak memanggil setsid() sehingga
+                                   pgid == pid saat spawn. SENGAJA tidak di-nol-kan saat
+                                   leader mati — grup bisa hidup lebih lama dari
+                                   leadernya (audit SANE-01). */
     int         respawn;
     int         need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
     time_t      last_start;
@@ -202,6 +206,22 @@ static void cleanup_cgroup(const char *svc_name)
 }
 
 /* ---------- config parser (FIXED: Robust) ---------- */
+/* fgets() membelah baris yang lebih panjang dari buffer menjadi beberapa
+   potongan yang tampak seperti baris terpisah; tanpa deteksi, potongan ekor
+   bisa terparsing sebagai entri hantu (audit SANE-03). Baris dianggap terlalu
+   panjang bila buffer terisi penuh tanpa '\n' dan belum EOF. Bila terdeteksi,
+   sisa baris dibuang sampai '\n'/EOF dan pemanggil menolak baris itu. */
+static int line_overlong(FILE *f, const char *line)
+{
+    size_t len = strlen(line);
+    if (len == MAX_LINE - 1 && line[len - 1] != '\n' && !feof(f)) {
+        int c;
+        while ((c = fgetc(f)) != EOF && c != '\n') { }
+        return 1;
+    }
+    return 0;
+}
+
 static int parse_config(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -209,6 +229,10 @@ static int parse_config(const char *path)
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
+        if (line_overlong(f, line)) {
+            init_log("Parse err: baris melebihi MAX_LINE (%d), baris ditolak", MAX_LINE);
+            continue;
+        }
         line[strcspn(line, "\n")] = 0;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -248,19 +272,29 @@ static int parse_config(const char *path)
             init_log("Warning: mode '%s' tidak dikenal untuk '%s'. Default: once", mode, name);
         }
 
-        /* Peringatan jika string terpotong */
+        /* Tolak entri yang bidangnya melebihi buffer (audit SANE-03): versi
+           lama hanya memperingatkan lalu mendaftarkan layanan dalam keadaan
+           TERPOTONG — nama bisa menabrak layanan lain, cmd berubah arti, dan
+           dependensi terpotong bisa menunjuk nama yang salah. Lebih aman
+           entri ditolak keras daripada sistem jalan dengan config yang
+           berbeda dari yang ditulis pengguna. */
+        int too_long = 0;
         if (strlen(name) >= sizeof(services[num_services].name)) {
-            init_log("Peringatan: nama layanan '%s' terpotong (panjang %zu > maks %d)",
-                     name, strlen(name), (int)sizeof(services[num_services].name) - 1);
+            init_log("Parse err: nama layanan terlalu panjang (panjang %zu > maks %d), entri ditolak",
+                     strlen(name), (int)sizeof(services[num_services].name) - 1);
+            too_long = 1;
         }
         if (strlen(cmd) >= sizeof(services[num_services].cmd)) {
-            init_log("Peringatan: perintah layanan '%s' terpotong (panjang %zu > maks %d)",
+            init_log("Parse err: perintah layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
                      name, strlen(cmd), (int)sizeof(services[num_services].cmd) - 1);
+            too_long = 1;
         }
         if (strlen(deps) >= sizeof(services[num_services].deps_str)) {
-            init_log("Peringatan: dependensi layanan '%s' terpotong (panjang %zu > maks %d)",
+            init_log("Parse err: dependensi layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
                      name, strlen(deps), (int)sizeof(services[num_services].deps_str) - 1);
+            too_long = 1;
         }
+        if (too_long) continue;
 
         /* Batasi presisi ke ukuran tujuan: menghilangkan -Wformat-truncation (nama max 127 char) */
         snprintf(services[num_services].name, sizeof(services[num_services].name), "%.*s",
@@ -272,6 +306,7 @@ static int parse_config(const char *path)
         services[num_services].respawn      = is_respawn;
         services[num_services].need_respawn = 0;
         services[num_services].pid          = 0;
+        services[num_services].pgid         = 0;
         services[num_services].last_start   = 0;
         services[num_services].state        = SVC_STATE_STOPPED;
         num_services++;
@@ -302,6 +337,12 @@ static int next_dep(const char *deps_str, int *off, char *out, size_t outsz)
         if (*s == 0) { *off = (int)(s - deps_str); return 0; }
 
         while (*s && *s != ',' && n < outsz - 1) out[n++] = *s++;
+        /* Token lebih panjang dari buffer keluaran: buang sisa token ini
+           supaya ekornya tidak terbaca sebagai token dependensi kedua pada
+           panggilan berikutnya (audit SANE-03). deps_str sendiri sudah
+           divalidasi panjangnya di parse_config(); ini lapis pertahanan
+           kedua agar tokenizer tidak pernah membelah satu nama menjadi dua. */
+        while (*s && *s != ',') s++;
         while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\t')) n--;
         if (n > 0) { out[n] = 0; *off = (int)(s - deps_str); return 1; }
         /* token kosong -> lanjut ke token berikutnya */
@@ -451,7 +492,8 @@ static void spawn_service(service_t *svc)
         _exit(127);
     }
 
-    svc->pid = pid;
+    svc->pid  = pid;
+    svc->pgid = pid;   /* anak memanggil setsid(): dia pemimpin grup prosesnya */
     svc->state = SVC_STATE_RUNNING;
     init_log("started %s (pid %d)", svc->name, pid);
     setup_cgroup(svc->name, pid);
@@ -470,6 +512,9 @@ static void reap_zombies(void)
             if (services[i].pid == pid) {
                 init_log("%s (pid %d) exit status=0x%x", services[i].name, pid, status);
                 services[i].pid = 0;
+                /* pgid SENGAJA tidak ikut di-nol-kan: anggota grup lain bisa
+                   masih hidup setelah leader mati (audit SANE-01).
+                   shutdown_all() memeriksa grup lewat pgid ini. */
                 if (!services[i].respawn) {
                     if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
                         services[i].state = SVC_STATE_DONE;
@@ -587,29 +632,50 @@ static void drain_log_fifo(void)
     }
 }
 
-/* Kirim sinyal ke seluruh grup proses layanan, dan coba cgroup.kill bila SIGKILL */
+/* Picu cgroup.kill layanan (berdasarkan NAMA, bukan pid): membunuh seluruh
+   anggota cgroup, termasuk proses yang grup prosesnya sudah berubah.
+   Dipanggil terpisah dari kill_service_group() supaya tetap terjangkau saat
+   leader sudah lama mati dan pid/pgid tidak lagi bisa diandalkan. */
+static void cgroup_kill_service(const char *name)
+{
+    char kill_path[320];
+    snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, name);
+    int fd = open(kill_path, O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "1\n", 2) < 0) {
+            /* abaikan bila cgroup.kill belum didukung kernel */
+        }
+        close(fd);
+    }
+}
+
+/* Kirim sinyal ke seluruh grup proses layanan (lewat pgid yang disimpan,
+   BUKAN pid leader: leader bisa sudah mati sementara grupnya masih hidup —
+   audit SANE-01), dan coba cgroup.kill bila SIGKILL. */
 static void kill_service_group(const service_t *svc, int sig)
 {
-    if (svc->pid <= 0) return;
-
-    /* 1. Kirim sinyal ke seluruh grup proses (-pid).
-       Jika gagal (misal leader sudah mati), tetap coba ke PID langsung. */
-    if (kill(-svc->pid, sig) < 0 && errno == ESRCH) {
+    if (svc->pgid > 0) {
+        if (kill(-svc->pgid, sig) < 0 && errno == ESRCH && svc->pid > 0)
+            kill(svc->pid, sig);
+    } else if (svc->pid > 0) {
         kill(svc->pid, sig);
     }
 
-    /* 2. Bila SIGKILL dan cgroup v2 aktif, picu cgroup.kill */
-    if (sig == SIGKILL) {
-        char kill_path[320];
-        snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, svc->name);
-        int fd = open(kill_path, O_WRONLY);
-        if (fd >= 0) {
-            if (write(fd, "1\n", 2) < 0) {
-                /* abaikan bila cgroup.kill belum didukung kernel */
-            }
-            close(fd);
-        }
+    if (sig == SIGKILL) cgroup_kill_service(svc->name);
+}
+
+/* Masih adakah yang hidup dari layanan ini? Leader (pid) ATAU siapa pun di
+   grup prosesnya. Grup yang sudah kosong terdeteksi lewat kill(-pgid, 0)
+   yang gagal ESRCH; pgid lalu dibersihkan supaya tidak ada sinyal nyasar ke
+   grup lain bila nomor itu kelak didaur ulang kernel. */
+static int service_still_alive(service_t *svc)
+{
+    if (svc->pid > 0) return 1;
+    if (svc->pgid > 0) {
+        if (kill(-svc->pgid, 0) == 0 || errno == EPERM) return 1;
+        svc->pgid = 0;
     }
+    return 0;
 }
 
 /* ---------- shutdown ---------- */
@@ -620,7 +686,7 @@ static void shutdown_all(int reboot_cmd, int force)
     if (force) {
         init_log("FORCE shutdown (cmd=%d)", reboot_cmd);
         for (int i = 0; i < num_services; i++) {
-            if (services[i].pid > 0) kill_service_group(&services[i], SIGKILL);
+            kill_service_group(&services[i], SIGKILL);
             cleanup_cgroup(services[i].name);
         }
         rmdir(CGROUP_BASE);
@@ -631,12 +697,13 @@ static void shutdown_all(int reboot_cmd, int force)
 
     init_log("graceful shutdown (cmd=%d)", reboot_cmd);
     for (int i = 0; i < num_services; i++) {
-        if (services[i].pid > 0) kill_service_group(&services[i], SIGTERM);
+        if (services[i].pid > 0 || services[i].pgid > 0)
+            kill_service_group(&services[i], SIGTERM);
     }
 
     for (int i = 0; i < 50; i++) {
         int alive = 0;
-        for (int j = 0; j < num_services; j++) if (services[j].pid > 0) { alive = 1; break; }
+        for (int j = 0; j < num_services; j++) if (service_still_alive(&services[j])) { alive = 1; break; }
         if (!alive) break;
         reap_zombies();
         drain_log_fifo();   /* pesan terakhir layanan sebelum mati (mis. "bye!") */
@@ -644,7 +711,7 @@ static void shutdown_all(int reboot_cmd, int force)
     }
 
     for (int i = 0; i < num_services; i++) {
-        if (services[i].pid > 0) kill_service_group(&services[i], SIGKILL);
+        kill_service_group(&services[i], SIGKILL);
         cleanup_cgroup(services[i].name);
     }
     rmdir(CGROUP_BASE);
@@ -662,11 +729,22 @@ static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/r
 #define FSTAB_PATH "/etc/fstab"
 #endif
 
-static unsigned long parse_mount_flags(char *opts)
+/* Pisahkan opsi fstab menjadi DUA kelompok dalam satu lintasan
+   (audit SANE-02):
+     - flag VFS (ro, nosuid, ...) -> nilai balik sebagai MS_* flags untuk
+       argumen ke-4 mount();
+     - selainnya -> opsi khas filesystem, disalin ke `data` untuk argumen
+       ke-5 mount().
+   Versi lama menyalin hampir semua token ke data juga, termasuk yang sudah
+   menjadi flag; parser opsi filesystem yang ketat (ext4, tmpfs) menolak opsi
+   data tak dikenal dengan EINVAL sehingga mount-nya gagal.
+   "defaults"/"rw"/"relatime" tidak menghasilkan flag maupun data. */
+static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz)
 {
     unsigned long flags = 0;
     char *tok;
 
+    if (data && datasz) data[0] = 0;
     if (!opts) return 0;
 
     for (tok = strtok(opts, ","); tok; tok = strtok(NULL, ",")) {
@@ -679,7 +757,13 @@ static unsigned long parse_mount_flags(char *opts)
         else if (!strcmp(tok, "dirsync")) flags |= MS_DIRSYNC;
         else if (!strcmp(tok, "remount")) flags |= MS_REMOUNT;
         else if (!strcmp(tok, "bind"))    flags |= MS_BIND;
-        else init_log("fstab: opsi '%s' bukan flag, diteruskan sebagai data", tok);
+        else {
+            init_log("fstab: opsi '%s' bukan flag, diteruskan sebagai data", tok);
+            if (data && datasz) {
+                if (data[0]) strncat(data, ",", datasz - strlen(data) - 1);
+                strncat(data, tok, datasz - strlen(data) - 1);
+            }
+        }
     }
     return flags;
 }
@@ -695,6 +779,10 @@ static void mount_fstab(void)
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
+        if (line_overlong(f, line)) {
+            init_log("fstab: baris melebihi MAX_LINE (%d), dilewati", MAX_LINE);
+            continue;
+        }
         line[strcspn(line, "\n")] = 0;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -710,27 +798,15 @@ static void mount_fstab(void)
             continue;
         }
 
-        /* Opsi dipakai dua kali: sebagai flag untuk arg ke-4 (dihitung dari salinan,
-           karena parse_mount_flags() memakai strtok yang merusak string) dan sebagai
-           data untuk arg ke-5. Kata kunci "defaults" dibuang dari data: ia hanya
-           dikenal mount(8) dan ditolak kernel dengan EINVAL. */
+        /* Opsi dipisahkan SATU kali oleh parse_mount_flags() dari salinan
+           string (strtok merusak string aslinya): token flag menjadi MS_*
+           flags (arg ke-4) dan token non-flag menjadi data khas filesystem
+           (arg ke-5). Token flag TIDAK boleh ikut terbawa ke data — parser
+           opsi ext4/tmpfs menolaknya dengan EINVAL (audit SANE-02). */
         char flagbuf[MAX_LINE];
         char databuf[MAX_LINE] = "";
-        if (opts) {
-            char tmp[MAX_LINE];
-            char *t;
-            snprintf(tmp, sizeof(tmp), "%s", opts);
-            for (t = strtok(tmp, ","); t; t = strtok(NULL, ",")) {
-                if (!strcmp(t, "defaults")) {
-                    init_log("fstab: kata kunci 'defaults' dibuang dari data");
-                    continue;
-                }
-                if (databuf[0]) strncat(databuf, ",", sizeof(databuf) - strlen(databuf) - 1);
-                strncat(databuf, t, sizeof(databuf) - strlen(databuf) - 1);
-            }
-        }
         snprintf(flagbuf, sizeof(flagbuf), "%s", opts ? opts : "");
-        unsigned long flags = parse_mount_flags(flagbuf);
+        unsigned long flags = parse_mount_flags(flagbuf, databuf, sizeof(databuf));
 
         mkdir(mnt, 0755);
         if (mount(dev, mnt, type, flags, databuf[0] ? databuf : NULL) < 0)
