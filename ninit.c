@@ -691,7 +691,14 @@ static void shutdown_all(int reboot_cmd, int force)
     if (force) {
         init_log("FORCE shutdown (cmd=%d)", reboot_cmd);
         for (int i = 0; i < num_services; i++) {
-            kill_service_group(&services[i], SIGKILL);
+            /* Probe dulu (menutup catatan review PR #2): service_still_alive()
+               membersihkan pgid basi layanan yang sudah lama selesai, supaya
+               SIGKILL tidak nyasar ke grup lain yang nomornya didaur ulang.
+               Layanan yang lolos dari grupnya tetap dijangkau cgroup.kill. */
+            if (service_still_alive(&services[i]))
+                kill_service_group(&services[i], SIGKILL);
+            else
+                cgroup_kill_service(services[i].name);
             cleanup_cgroup(services[i].name);
         }
         rmdir(CGROUP_BASE);
@@ -702,7 +709,10 @@ static void shutdown_all(int reboot_cmd, int force)
 
     init_log("graceful shutdown (cmd=%d)", reboot_cmd);
     for (int i = 0; i < num_services; i++) {
-        if (services[i].pid > 0 || services[i].pgid > 0)
+        /* Probe sebelum memberi sinyal (sama seperti jalur force di atas):
+           pgid basi dibersihkan lebih dulu, baru grup yang benar-benar
+           masih hidup menerima SIGTERM. */
+        if (service_still_alive(&services[i]))
             kill_service_group(&services[i], SIGTERM);
     }
 
@@ -741,9 +751,11 @@ static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/r
 /* Klasifikasikan opsi fstab dalam satu lintasan (audit SANE-02, diperluas
    mengikuti review PR #2):
      1. Flag VFS (ro, noatime, lazytime, ...) -> nilai balik sebagai MS_*
-        flags untuk argumen ke-4 mount(). Pasangan peniadanya (rw, async,
-        atime, diratime) dan "defaults" dikonsumsi tanpa flag.
-     2. Opsi userspace fstab (user, _netdev, nofail, x-*, comment=*, ...) ->
+        flags untuk argumen ke-4 mount(). Pasangan peniadanya (rw, exec,
+        suid, dev, async, atime, diratime) MEMBERSIHKAN bit lawannya, dan
+        "user"/"users"/"owner"/"group" memasang flag implikasi mount(8) —
+        semua diproses kiri-ke-kanan sehingga token belakangan menang.
+     2. Opsi userspace fstab murni (_netdev, nofail, x-*, comment=*, ...) ->
         wewenang mount(8)/systemd, BUKAN kernel: dicatat lalu diabaikan,
         tidak pernah diteruskan sebagai data.
      3. "noauto" -> entri dilewati seluruhnya (*skip_entry = 1), seperti
@@ -761,9 +773,19 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
     if (skip_entry) *skip_entry = 0;
     if (!opts) return 0;
 
+    /* Token diproses KIRI KE KANAN seperti mount(8): token peniada
+       membersihkan bit lawannya (ro lalu rw berakhir rw), dan "user"
+       memasang implikasinya yang bisa dibatalkan token sesudahnya
+       (user,exec berakhir exec) — review PR #2 butir 1 & 2. */
     for (tok = strtok(opts, ","); tok; tok = strtok(NULL, ",")) {
-        if (!strcmp(tok, "defaults") || !strcmp(tok, "rw") ||
-            !strcmp(tok, "async") || !strcmp(tok, "atime") || !strcmp(tok, "diratime")) continue;
+        if (!strcmp(tok, "defaults")) continue;
+        else if (!strcmp(tok, "rw"))          flags &= ~MS_RDONLY;
+        else if (!strcmp(tok, "async"))       flags &= ~MS_SYNCHRONOUS;
+        else if (!strcmp(tok, "atime"))       flags &= ~(MS_NOATIME | MS_RELATIME | MS_STRICTATIME);
+        else if (!strcmp(tok, "diratime"))    flags &= ~MS_NODIRATIME;
+        else if (!strcmp(tok, "exec"))        flags &= ~MS_NOEXEC;
+        else if (!strcmp(tok, "suid"))        flags &= ~MS_NOSUID;
+        else if (!strcmp(tok, "dev"))         flags &= ~MS_NODEV;
         else if (!strcmp(tok, "ro"))          flags |= MS_RDONLY;
         else if (!strcmp(tok, "noexec"))      flags |= MS_NOEXEC;
         else if (!strcmp(tok, "nosuid"))      flags |= MS_NOSUID;
@@ -773,16 +795,26 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
         else if (!strcmp(tok, "remount"))     flags |= MS_REMOUNT;
         else if (!strcmp(tok, "bind"))        flags |= MS_BIND;
         else if (!strcmp(tok, "rbind"))       flags |= MS_BIND | MS_REC;
-        else if (!strcmp(tok, "noatime"))     flags |= MS_NOATIME;
-        else if (!strcmp(tok, "relatime"))    flags |= MS_RELATIME;
-        else if (!strcmp(tok, "strictatime")) flags |= MS_STRICTATIME;
+        else if (!strcmp(tok, "noatime"))     { flags |= MS_NOATIME;     flags &= ~(MS_RELATIME | MS_STRICTATIME); }
+        else if (!strcmp(tok, "relatime"))    { flags |= MS_RELATIME;    flags &= ~(MS_NOATIME | MS_STRICTATIME); }
+        else if (!strcmp(tok, "strictatime")) { flags |= MS_STRICTATIME; flags &= ~(MS_NOATIME | MS_RELATIME); }
         else if (!strcmp(tok, "nodiratime"))  flags |= MS_NODIRATIME;
         else if (!strcmp(tok, "lazytime"))    flags |= MS_LAZYTIME;
+        else if (!strcmp(tok, "user") || !strcmp(tok, "users")) {
+            /* mount(8): user/users mengimplikasikan noexec+nosuid+nodev
+               (bisa dibatalkan token exec/suid/dev sesudahnya). */
+            flags |= MS_NOEXEC | MS_NOSUID | MS_NODEV;
+            init_log("fstab: opsi '%s' menerapkan noexec,nosuid,nodev", tok);
+        }
+        else if (!strcmp(tok, "owner") || !strcmp(tok, "group")) {
+            /* mount(8): owner/group mengimplikasikan nosuid+nodev. */
+            flags |= MS_NOSUID | MS_NODEV;
+            init_log("fstab: opsi '%s' menerapkan nosuid,nodev", tok);
+        }
         else if (!strcmp(tok, "noauto")) {
             if (skip_entry) *skip_entry = 1;
         }
-        else if (!strcmp(tok, "auto") || !strcmp(tok, "user") || !strcmp(tok, "users") ||
-                 !strcmp(tok, "nouser") || !strcmp(tok, "owner") || !strcmp(tok, "group") ||
+        else if (!strcmp(tok, "auto") || !strcmp(tok, "nouser") ||
                  !strcmp(tok, "_netdev") || !strcmp(tok, "nofail") ||
                  !strncmp(tok, "x-", 2) || !strncmp(tok, "comment=", 8)) {
             init_log("fstab: opsi '%s' khusus userspace, diabaikan", tok);
