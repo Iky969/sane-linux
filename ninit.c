@@ -208,15 +208,20 @@ static void cleanup_cgroup(const char *svc_name)
 /* ---------- config parser (FIXED: Robust) ---------- */
 /* fgets() membelah baris yang lebih panjang dari buffer menjadi beberapa
    potongan yang tampak seperti baris terpisah; tanpa deteksi, potongan ekor
-   bisa terparsing sebagai entri hantu (audit SANE-03). Baris dianggap terlalu
-   panjang bila buffer terisi penuh tanpa '\n' dan belum EOF. Bila terdeteksi,
-   sisa baris dibuang sampai '\n'/EOF dan pemanggil menolak baris itu. */
+   bisa terparsing sebagai entri hantu (audit SANE-03). Batasnya eksplisit:
+   baris berisi sampai MAX_LINE-1 karakter DITERIMA (dengan atau tanpa '\n',
+   termasuk baris terakhir yang berakhir tepat di EOF); baris yang masih
+   punya karakter kelanjutan setelah buffer penuh DITOLAK — sisa barisnya
+   dibuang sampai '\n'/EOF di sini supaya tidak terparsing sebagai baris
+   baru. Satu karakter sondir (fgetc) membedakan kedua kasus itu tanpa
+   bergantung pada kapan libc memasang indikator EOF. */
 static int line_overlong(FILE *f, const char *line)
 {
     size_t len = strlen(line);
-    if (len == MAX_LINE - 1 && line[len - 1] != '\n' && !feof(f)) {
-        int c;
-        while ((c = fgetc(f)) != EOF && c != '\n') { }
+    if (len == MAX_LINE - 1 && line[len - 1] != '\n') {
+        int c = fgetc(f);
+        if (c == EOF) return 0;   /* baris terakhir tepat di batas, utuh */
+        while (c != EOF && c != '\n') c = fgetc(f);
         return 1;
     }
     return 0;
@@ -729,34 +734,59 @@ static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/r
 #define FSTAB_PATH "/etc/fstab"
 #endif
 
-/* Pisahkan opsi fstab menjadi DUA kelompok dalam satu lintasan
-   (audit SANE-02):
-     - flag VFS (ro, nosuid, ...) -> nilai balik sebagai MS_* flags untuk
-       argumen ke-4 mount();
-     - selainnya -> opsi khas filesystem, disalin ke `data` untuk argumen
-       ke-5 mount().
-   Versi lama menyalin hampir semua token ke data juga, termasuk yang sudah
-   menjadi flag; parser opsi filesystem yang ketat (ext4, tmpfs) menolak opsi
-   data tak dikenal dengan EINVAL sehingga mount-nya gagal.
-   "defaults"/"rw"/"relatime" tidak menghasilkan flag maupun data. */
-static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz)
+#ifndef MS_LAZYTIME
+#define MS_LAZYTIME (1U << 25)   /* kernel >= 4.0; glibc lama belum tentu punya */
+#endif
+
+/* Klasifikasikan opsi fstab dalam satu lintasan (audit SANE-02, diperluas
+   mengikuti review PR #2):
+     1. Flag VFS (ro, noatime, lazytime, ...) -> nilai balik sebagai MS_*
+        flags untuk argumen ke-4 mount(). Pasangan peniadanya (rw, async,
+        atime, diratime) dan "defaults" dikonsumsi tanpa flag.
+     2. Opsi userspace fstab (user, _netdev, nofail, x-*, comment=*, ...) ->
+        wewenang mount(8)/systemd, BUKAN kernel: dicatat lalu diabaikan,
+        tidak pernah diteruskan sebagai data.
+     3. "noauto" -> entri dilewati seluruhnya (*skip_entry = 1), seperti
+        perilaku `mount -a` saat boot.
+     4. Selainnya -> opsi khas filesystem (size=, mode=, uid=, ...), disalin
+        ke `data` untuk argumen ke-5 mount().
+   Token flag TIDAK boleh ikut terbawa ke data: parser opsi filesystem yang
+   ketat (ext4, tmpfs) menolak opsi data tak dikenal dengan EINVAL. */
+static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, int *skip_entry)
 {
     unsigned long flags = 0;
     char *tok;
 
     if (data && datasz) data[0] = 0;
+    if (skip_entry) *skip_entry = 0;
     if (!opts) return 0;
 
     for (tok = strtok(opts, ","); tok; tok = strtok(NULL, ",")) {
-        if (!strcmp(tok, "defaults") || !strcmp(tok, "rw") || !strcmp(tok, "relatime")) continue;
-        else if (!strcmp(tok, "ro"))      flags |= MS_RDONLY;
-        else if (!strcmp(tok, "noexec"))  flags |= MS_NOEXEC;
-        else if (!strcmp(tok, "nosuid"))  flags |= MS_NOSUID;
-        else if (!strcmp(tok, "nodev"))   flags |= MS_NODEV;
-        else if (!strcmp(tok, "sync"))    flags |= MS_SYNCHRONOUS;
-        else if (!strcmp(tok, "dirsync")) flags |= MS_DIRSYNC;
-        else if (!strcmp(tok, "remount")) flags |= MS_REMOUNT;
-        else if (!strcmp(tok, "bind"))    flags |= MS_BIND;
+        if (!strcmp(tok, "defaults") || !strcmp(tok, "rw") ||
+            !strcmp(tok, "async") || !strcmp(tok, "atime") || !strcmp(tok, "diratime")) continue;
+        else if (!strcmp(tok, "ro"))          flags |= MS_RDONLY;
+        else if (!strcmp(tok, "noexec"))      flags |= MS_NOEXEC;
+        else if (!strcmp(tok, "nosuid"))      flags |= MS_NOSUID;
+        else if (!strcmp(tok, "nodev"))       flags |= MS_NODEV;
+        else if (!strcmp(tok, "sync"))        flags |= MS_SYNCHRONOUS;
+        else if (!strcmp(tok, "dirsync"))     flags |= MS_DIRSYNC;
+        else if (!strcmp(tok, "remount"))     flags |= MS_REMOUNT;
+        else if (!strcmp(tok, "bind"))        flags |= MS_BIND;
+        else if (!strcmp(tok, "rbind"))       flags |= MS_BIND | MS_REC;
+        else if (!strcmp(tok, "noatime"))     flags |= MS_NOATIME;
+        else if (!strcmp(tok, "relatime"))    flags |= MS_RELATIME;
+        else if (!strcmp(tok, "strictatime")) flags |= MS_STRICTATIME;
+        else if (!strcmp(tok, "nodiratime"))  flags |= MS_NODIRATIME;
+        else if (!strcmp(tok, "lazytime"))    flags |= MS_LAZYTIME;
+        else if (!strcmp(tok, "noauto")) {
+            if (skip_entry) *skip_entry = 1;
+        }
+        else if (!strcmp(tok, "auto") || !strcmp(tok, "user") || !strcmp(tok, "users") ||
+                 !strcmp(tok, "nouser") || !strcmp(tok, "owner") || !strcmp(tok, "group") ||
+                 !strcmp(tok, "_netdev") || !strcmp(tok, "nofail") ||
+                 !strncmp(tok, "x-", 2) || !strncmp(tok, "comment=", 8)) {
+            init_log("fstab: opsi '%s' khusus userspace, diabaikan", tok);
+        }
         else {
             init_log("fstab: opsi '%s' bukan flag, diteruskan sebagai data", tok);
             if (data && datasz) {
@@ -806,7 +836,12 @@ static void mount_fstab(void)
         char flagbuf[MAX_LINE];
         char databuf[MAX_LINE] = "";
         snprintf(flagbuf, sizeof(flagbuf), "%s", opts ? opts : "");
-        unsigned long flags = parse_mount_flags(flagbuf, databuf, sizeof(databuf));
+        int skip_entry = 0;
+        unsigned long flags = parse_mount_flags(flagbuf, databuf, sizeof(databuf), &skip_entry);
+        if (skip_entry) {
+            init_log("fstab: %s -> %s dilewati (opsi noauto)", dev, mnt);
+            continue;
+        }
 
         mkdir(mnt, 0755);
         if (mount(dev, mnt, type, flags, databuf[0] ? databuf : NULL) < 0)

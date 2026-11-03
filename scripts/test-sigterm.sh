@@ -303,6 +303,7 @@ cp "$BUSYBOX" "$ROOT3/bin/sleep"
 cat > "$ROOT3/stubborn-service.sh" <<'EOSVC'
 #!/bin/sh
 ( trap '' TERM; exec sleep 47 ) &
+echo $! > /var/stubborn.pid
 echo "stubborn-service: leader jalan (pid $$), anak bandel sleep 47"
 trap 'echo "leader menerima SIGTERM, bye!"; exit 0' TERM
 while true; do sleep 1; done
@@ -337,13 +338,45 @@ fi
 
 sleep 0.5
 
-count_sleep47() { ps -eo args 2>/dev/null | grep 'sleep 47' | grep -v grep | wc -l || true; }
+# Lacak anak bandel lewat PID-nya sendiri, bukan memindai `ps` secara global
+# (hasil pindaian global bergantung pada proses lain di mesin pengujian).
+# Layanan menulis pid namespace-nya ke /var/stubborn.pid (BUKAN /tmp atau
+# /run: keduanya ditimpa tmpfs oleh ninit di dalam namespace, jadi tidak
+# terlihat dari host); petakan ke pid
+# host lewat kolom NSpid di /proc/<pid>/status (bidang terakhir = pid di
+# namespace terdalam; syarat NF >= 3 menyingkirkan proses level host yang
+# nomor pid-nya kebetulan sama).
+child_ns_pid=""
+host_pid_of_ns() {
+	for d in /proc/[0-9]*; do
+		ns=$(awk '/^NSpid:/ { if (NF >= 3) print $NF }' "$d/status" 2>/dev/null || true)
+		if [ -n "${ns:-}" ] && [ "$ns" = "$1" ]; then
+			printf '%s\n' "${d#/proc/}"
+			return 0
+		fi
+	done
+	return 0
+}
+stubborn_alive() {
+	[ -n "${child_ns_pid:-}" ] || return 1
+	hp=$(host_pid_of_ns "$child_ns_pid")
+	[ -n "${hp:-}" ] && kill -0 "$hp" 2>/dev/null
+}
 
-stubborn_before=$(count_sleep47)
-if [ "$stubborn_before" -ge 1 ]; then
-	ok "anak bandel berjalan sebelum shutdown ($stubborn_before proses sleep 47)"
+i=0
+while [ "$i" -lt 25 ]; do
+	if [ -s "$ROOT3/var/stubborn.pid" ]; then
+		child_ns_pid=$(cat "$ROOT3/var/stubborn.pid")
+	fi
+	if stubborn_alive; then break; fi
+	sleep 0.2
+	i=$((i + 1))
+done
+
+if stubborn_alive; then
+	ok "anak bandel berjalan sebelum shutdown (pid namespace $child_ns_pid terpetakan ke host)"
 else
-	bad "anak bandel tidak aktif sebelum shutdown (ditemukan $stubborn_before)"
+	bad "anak bandel tidak aktif sebelum shutdown (pid namespace: '${child_ns_pid:-?}')"
 fi
 
 t0=$(date +%s)
@@ -360,7 +393,7 @@ done
 # 2 detik setelah leader mati, anak bandel harus MASIH hidup: init yang
 # benar masih menunggu grupnya (grace), bukan langsung reboot.
 sleep 2
-stubborn_mid=$(count_sleep47)
+if stubborn_alive; then stubborn_mid=1; else stubborn_mid=0; fi
 
 i=0
 while [ "$i" -lt 150 ]; do
@@ -371,7 +404,7 @@ done
 wait "$job3" 2>/dev/null || true
 shutdown_secs=$(( $(date +%s) - t0 ))
 
-stubborn_after=$(count_sleep47)
+if stubborn_alive; then stubborn_after=1; else stubborn_after=0; fi
 
 if grep -q 'leader menerima SIGTERM, bye!' "$LOG3"; then
 	ok "leader keluar sendiri lewat trap SIGTERM"
@@ -398,9 +431,9 @@ else
 fi
 
 if [ "$stubborn_after" -eq 0 ]; then
-	ok "tidak ada proses sleep 47 tertinggal setelah shutdown"
+	ok "anak bandel sudah mati setelah shutdown (pid namespace $child_ns_pid tidak lagi terpetakan)"
 else
-	bad "ada $stubborn_after proses sleep 47 tertinggal setelah shutdown"
+	bad "anak bandel masih hidup setelah shutdown (pid namespace $child_ns_pid)"
 fi
 
 printf '\n== log ninit skenario 3 ==\n'

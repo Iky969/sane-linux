@@ -507,6 +507,72 @@ check "baris terlalu panjang dicatat sebagai ditolak" 'melebihi MAX_LINE'
 check "layanan sesudah baris panjang tetap terdaftar ('started realsvc')" 'ninit: started realsvc (pid'
 check_absent "tidak ada layanan hantu dari potongan baris ('started ghost')" 'started ghost'
 
+# ------------------------------------------------------------- skenario 10
+printf '\n== 10. klasifikasi opsi fstab: flag VFS vs userspace vs data (audit SANE-02) ==\n'
+start_root fstab
+LOG12="$LOG"
+mkdir -p "$ROOT/mnt"
+cat > "$ROOT/etc/fstab" <<'EOFSTAB'
+tmpfs /mnt/a tmpfs ro,nosuid,noatime,size=4M 0 0
+tmpfs /mnt/b tmpfs noauto,mode=700 0 0
+tmpfs /mnt/c tmpfs _netdev,x-custom,relatime,mode=755 0 0
+EOFSTAB
+printf 'fstabprobe:once:true\n' > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario fstab dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "fstab a: flag VFS dipisah, data hanya opsi filesystem, mount ok" '\[data: size=4M\] ok'
+check "fstab b: entri noauto dilewati" 'dilewati (opsi noauto)'
+check_absent "fstab b: entri noauto TIDAK di-mount" 'mount tmpfs -> /mnt/b'
+check "fstab c: opsi userspace dicatat sebagai diabaikan" 'khusus userspace, diabaikan'
+check "fstab c: mount ok, data hanya mode=755" '\[data: mode=755\] ok'
+check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+
+# ------------------------------------------------------------- skenario 11
+printf '\n== 11. batas baris di EOF: tepat MAX_LINE-1 diterima, MAX_LINE ditolak ==\n'
+start_root eolbound
+LOG13="$LOG"
+
+# Baris komentar dipakai supaya yang diuji murni batas BARIS (MAX_LINE),
+# bukan batas bidang nama/cmd/deps yang punya penolakan sendiri.
+{ printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1022))"; } > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario batas EOF dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "layanan normal tetap jalan pada skenario batas EOF" 'ninit: started first (pid'
+check_absent "baris EOF tepat MAX_LINE-1 (1023) TIDAK ditolak" 'melebihi MAX_LINE'
+
+start_root eolover
+LOG14="$LOG"
+
+{ printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1023))"; } > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario batas EOF+1 dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "baris EOF MAX_LINE (1024) ditolak walau tanpa newline" 'melebihi MAX_LINE'
+check "layanan normal tetap jalan setelah baris EOF ditolak" 'ninit: started first (pid'
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -531,6 +597,12 @@ printf '\n== log 7 (dependensi README: logd -> net) ==\n'
 sed 's/^/  | /' "$LOG10"
 printf '\n== log 9 (baris melebihi MAX_LINE) ==\n'
 sed 's/^/  | /' "$LOG11"
+printf '\n== log 10 (klasifikasi opsi fstab) ==\n'
+sed 's/^/  | /' "$LOG12"
+printf '\n== log 11 (batas EOF MAX_LINE) ==\n'
+sed 's/^/  | /' "$LOG13"
+printf '\n== log 11b (batas EOF MAX_LINE+1) ==\n'
+sed 's/^/  | /' "$LOG14"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
