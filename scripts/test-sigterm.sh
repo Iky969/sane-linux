@@ -9,6 +9,11 @@
 # tidak jalan -> shutdown_all() menunggu 5 detik lalu memakai SIGKILL.
 # Test ini gagal bila regresi tersebut kembali.
 #
+# Skenario 3 mengunci audit SANE-01: leader layanan yang patuh SIGTERM dan
+# keluar lebih dulu TIDAK boleh membuat init mengira seluruh grup sudah mati.
+# Anak dalam grup yang mengabaikan SIGTERM harus tetap ditunggu sampai
+# jendela grace habis, lalu dibunuh SIGKILL lewat pgid yang disimpan init.
+#
 # Pemakaian:
 #   sudo sh ./scripts/test-sigterm.sh      # atau: make test
 #
@@ -45,9 +50,11 @@ ROOTS=""
 LOGS=""
 init_pid=""
 init_pid2=""
+init_pid3=""
 cleanup() {
 	[ -n "${init_pid:-}" ] && $SUDO kill -KILL "$init_pid" 2>/dev/null || true
 	[ -n "${init_pid2:-}" ] && $SUDO kill -KILL "$init_pid2" 2>/dev/null || true
+	[ -n "${init_pid3:-}" ] && $SUDO kill -KILL "$init_pid3" 2>/dev/null || true
 	for d in ${ROOTS:-}; do
 		$SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
@@ -270,6 +277,167 @@ fi
 
 printf '\n== log ninit skenario 2 ==\n'
 sed 's/^/  | /' "$LOG2"
+
+# -------------------------------------------------------------- Skenario 3
+printf '\n== Skenario 3: anak bandel dalam grup proses (audit SANE-01) ==\n'
+ROOT3=$(mktemp -d /tmp/ninit-sigterm-stubborn.XXXXXX)
+LOG3=$(mktemp /tmp/ninit-sigterm-stubborn-log.XXXXXX)
+ROOTS="$ROOTS $ROOT3"
+LOGS="$LOGS $LOG3"
+
+mkdir -p "$ROOT3/proc" "$ROOT3/sys" "$ROOT3/dev" "$ROOT3/run" "$ROOT3/tmp" \
+         "$ROOT3/etc" "$ROOT3/var/log" "$ROOT3/bin"
+cp "$BIN" "$ROOT3/ninit"
+cp "$BUSYBOX" "$ROOT3/bin/sh"
+cp "$BUSYBOX" "$ROOT3/bin/sleep"
+
+# Leader menuruti SIGTERM dan keluar 0, tetapi lebih dulu menelurkan anak
+# dalam grup proses yang sama yang MENGABAIKAN SIGTERM (sleep 47). Init lama
+# terkecoh: leader mati -> pid di-nol-kan -> shutdown mengira layanan sudah
+# mati -> grup lolos dari SIGKILL dan hanya mati oleh teardown namespace.
+# Placeholder /dev/null berupa berkas biasa: ash membuka /dev/null untuk
+# stdin job latar, dan rootfs uji memang tidak punya device node (harness
+# menghindari mknod). Berkas kosong cukup — yang penting open()-nya berhasil;
+# anak bandel tidak pernah membaca stdin.
+: > "$ROOT3/dev/null"
+cat > "$ROOT3/stubborn-service.sh" <<'EOSVC'
+#!/bin/sh
+( trap '' TERM; exec sleep 47 ) &
+echo $! > /var/stubborn.pid
+echo "stubborn-service: leader jalan (pid $$), anak bandel sleep 47"
+trap 'echo "leader menerima SIGTERM, bye!"; exit 0' TERM
+while true; do sleep 1; done
+EOSVC
+chmod 0755 "$ROOT3/stubborn-service.sh"
+printf 'stubborn-svc:once:/stubborn-service.sh\n' > "$ROOT3/etc/init.conf"
+
+(
+	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
+		--mount --propagation private \
+		sh -c "mount -t proc proc '$ROOT3/proc' && exec chroot '$ROOT3' /ninit" \
+		>"$LOG3" 2>&1
+) &
+job3=$!
+
+i=0
+init_pid3=""
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	init_pid3=$(find_init_pid || true)
+	if [ -n "${init_pid3:-}" ] && grep -q 'main loop siap' "$LOG3" 2>/dev/null \
+	   && grep -q 'started stubborn-svc' "$LOG3" 2>/dev/null; then
+		break
+	fi
+	sleep 0.2
+	i=$((i + 1))
+done
+
+if [ -z "${init_pid3:-}" ]; then
+	sed 's/^/  | /' "$LOG3"
+	fail "ninit skenario 3 tidak berjalan dalam ${READY_TIMEOUT}s"
+fi
+
+sleep 0.5
+
+# Lacak anak bandel lewat PID-nya sendiri, bukan memindai `ps` secara global
+# (hasil pindaian global bergantung pada proses lain di mesin pengujian).
+# Layanan menulis pid namespace-nya ke /var/stubborn.pid (BUKAN /tmp atau
+# /run: keduanya ditimpa tmpfs oleh ninit di dalam namespace, jadi tidak
+# terlihat dari host); petakan ke pid
+# host lewat kolom NSpid di /proc/<pid>/status (bidang terakhir = pid di
+# namespace terdalam; syarat NF >= 3 menyingkirkan proses level host yang
+# nomor pid-nya kebetulan sama).
+child_ns_pid=""
+host_pid_of_ns() {
+	for d in /proc/[0-9]*; do
+		ns=$(awk '/^NSpid:/ { if (NF >= 3) print $NF }' "$d/status" 2>/dev/null || true)
+		if [ -n "${ns:-}" ] && [ "$ns" = "$1" ]; then
+			printf '%s\n' "${d#/proc/}"
+			return 0
+		fi
+	done
+	return 0
+}
+stubborn_alive() {
+	[ -n "${child_ns_pid:-}" ] || return 1
+	hp=$(host_pid_of_ns "$child_ns_pid")
+	[ -n "${hp:-}" ] && kill -0 "$hp" 2>/dev/null
+}
+
+i=0
+while [ "$i" -lt 25 ]; do
+	if [ -s "$ROOT3/var/stubborn.pid" ]; then
+		child_ns_pid=$(cat "$ROOT3/var/stubborn.pid")
+	fi
+	if stubborn_alive; then break; fi
+	sleep 0.2
+	i=$((i + 1))
+done
+
+if stubborn_alive; then
+	ok "anak bandel berjalan sebelum shutdown (pid namespace $child_ns_pid terpetakan ke host)"
+else
+	bad "anak bandel tidak aktif sebelum shutdown (pid namespace: '${child_ns_pid:-?}')"
+fi
+
+t0=$(date +%s)
+$SUDO kill -TERM "$init_pid3" || true
+
+# Tunggu leader keluar lewat trap-nya (exit status tercatat di log).
+i=0
+while [ "$i" -lt $((ACK_TIMEOUT * 20)) ]; do
+	grep -q 'stubborn-svc (pid .*) exit status=' "$LOG3" 2>/dev/null && break
+	sleep 0.05
+	i=$((i + 1))
+done
+
+# 2 detik setelah leader mati, anak bandel harus MASIH hidup: init yang
+# benar masih menunggu grupnya (grace), bukan langsung reboot.
+sleep 2
+if stubborn_alive; then stubborn_mid=1; else stubborn_mid=0; fi
+
+i=0
+while [ "$i" -lt 150 ]; do
+	kill -0 "$job3" 2>/dev/null || break
+	sleep 0.1
+	i=$((i + 1))
+done
+wait "$job3" 2>/dev/null || true
+shutdown_secs=$(( $(date +%s) - t0 ))
+
+if stubborn_alive; then stubborn_after=1; else stubborn_after=0; fi
+
+if grep -q 'leader menerima SIGTERM, bye!' "$LOG3"; then
+	ok "leader keluar sendiri lewat trap SIGTERM"
+else
+	bad "leader tidak menjalankan trap SIGTERM"
+fi
+
+if grep -qE 'stubborn-svc \(pid [0-9]+\) exit status=0x0' "$LOG3"; then
+	ok "leader exit status=0x0 (graceful)"
+else
+	bad "leader tidak exit dengan status 0x0"
+fi
+
+if [ "$stubborn_mid" -ge 1 ]; then
+	ok "anak bandel masih hidup 2 detik setelah leader mati (init menunggu grup, tidak terkecoh)"
+else
+	bad "anak bandel sudah hilang 2 detik setelah leader mati (init terkecoh: grup lolos dari grace+SIGKILL)"
+fi
+
+if [ "$shutdown_secs" -ge 4 ]; then
+	ok "shutdown menunggu jendela grace penuh untuk grup bandel: ${shutdown_secs}s (grace = 5s)"
+else
+	bad "shutdown selesai hanya dalam ${shutdown_secs}s (jendela grace tidak dipakai untuk grup bandel)"
+fi
+
+if [ "$stubborn_after" -eq 0 ]; then
+	ok "anak bandel sudah mati setelah shutdown (pid namespace $child_ns_pid tidak lagi terpetakan)"
+else
+	bad "anak bandel masih hidup setelah shutdown (pid namespace $child_ns_pid)"
+fi
+
+printf '\n== log ninit skenario 3 ==\n'
+sed 's/^/  | /' "$LOG3"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
