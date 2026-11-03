@@ -381,30 +381,32 @@ INIT_STDIN=/dev/null
 stop_init
 
 # -------------------------------------------------------------- skenario 5
-printf '\n== 5. peringatan pemotongan string panjang (nama, perintah, dependensi) ==\n'
+printf '\n== 5. penolakan string terlalu panjang (nama, perintah, dependensi) ==\n'
 start_root trunc
 LOG8="$LOG"
 
 long_name=$(printf 'longname_%.0s' $(seq 1 15))
-long_cmd=$(printf 'echo hello_%.0s' $(seq 1 55))
-long_deps="dep,"$(printf 'd%02d,' $(seq 1 70))
+long_cmd=$(printf 'echo hello_%.0s' $(seq 1 48))
+long_deps="dep,"$(printf 'd%02d,' $(seq 1 63))
 cat > "$ROOT/etc/init.conf" <<EOCFG
 dep:once:true
 ${long_name}:once:${long_cmd}:requires=${long_deps}
 EOCFG
 
 run_init
-if ! wait_for 'terpotong'; then
+if ! wait_for 'entri ditolak'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencatat peringatan string terpotong dalam ${READY_TIMEOUT}s"
+	fail "ninit tidak mencatat penolakan string terlalu panjang dalam ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "peringatan nama terpotong dicatat" 'Peringatan: nama layanan'
-check "peringatan perintah terpotong dicatat" 'Peringatan: perintah layanan'
-check "peringatan dependensi terpotong dicatat" 'Peringatan: dependensi layanan'
+check "nama terlalu panjang ditolak" 'Parse err: nama layanan terlalu panjang'
+check "perintah terlalu panjang ditolak" 'Parse err: perintah layanan'
+check "dependensi terlalu panjang ditolak" 'Parse err: dependensi layanan'
+check "layanan sehat tetap jalan ('started dep')" 'ninit: started dep (pid'
+check_absent "layanan terlalu panjang TIDAK dijalankan" 'started longname'
 
 # -------------------------------------------------------------- skenario 6
 printf '\n== 6. layanan ke-65 melebihi batas MAX_SERVICES ==\n'
@@ -481,6 +483,30 @@ stop_init
 check "error nama mengandung slash dicatat" 'Parse err: nama layanan'
 check_absent "layanan dengan slash tidak dijalankan" 'started bad/svc'
 
+# -------------------------------------------------------------- skenario 8
+printf '\n== 9. baris config melebihi MAX_LINE ditolak utuh (audit SANE-03) ==\n'
+start_root longline
+LOG11="$LOG"
+
+pad=$(printf 'x%.0s' $(seq 1 1200))
+cat > "$ROOT/etc/init.conf" <<EOCFG
+ghost:once:echo boo${pad}
+realsvc:once:true
+EOCFG
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario baris panjang dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "baris terlalu panjang dicatat sebagai ditolak" 'melebihi MAX_LINE'
+check "layanan sesudah baris panjang tetap terdaftar ('started realsvc')" 'ninit: started realsvc (pid'
+check_absent "tidak ada layanan hantu dari potongan baris ('started ghost')" 'started ghost'
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -497,12 +523,14 @@ printf '\n== log 4a (config tidak terbaca) ==\n'
 sed 's/^/  | /' "$LOG6"
 printf '\n== log 4b (siklus dependensi) ==\n'
 sed 's/^/  | /' "$LOG7"
-printf '\n== log 5 (pemotongan string) ==\n'
+printf '\n== log 5 (penolakan string panjang) ==\n'
 sed 's/^/  | /' "$LOG8"
 printf '\n== log 6 (layanan ke-65) ==\n'
 sed 's/^/  | /' "$LOG9"
 printf '\n== log 7 (dependensi README: logd -> net) ==\n'
 sed 's/^/  | /' "$LOG10"
+printf '\n== log 9 (baris melebihi MAX_LINE) ==\n'
+sed 's/^/  | /' "$LOG11"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
