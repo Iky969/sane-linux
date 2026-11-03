@@ -23,7 +23,10 @@
 # Catatan: langkah busybox diminta eksplisit (make defconfig, make LDFLAGS=-static,
 # make install). Karena defconfig busybox tidak mengaktifkan CONFIG_STATIC,
 # script juga menyetelnya supaya hasilnya dijamin statis walau LDFLAGS diabaikan
-# oleh tahap link mana pun.
+# oleh tahap link mana pun. CONFIG_TC dimatikan: tc.c memakai definisi CBQ yang
+# tidak ada lagi di kernel headers terbaru, dan applet itu tidak dipakai rootfs.
+# Pada BUSYBOX_MODE=auto, kegagalan build dari sumber (unduh, kompilasi, install)
+# menjatuhkan script ke busybox cadangan; BUSYBOX_MODE=source menuntut berhasil.
 
 set -eu
 
@@ -50,6 +53,10 @@ HOSTNAME_NAME=${HOSTNAME_NAME:-ninit-distro}
 log()  { printf '== %s\n' "$1"; }
 info() { printf '   %s\n' "$1"; }
 die()  { printf 'GAGAL: %s\n' "$1" >&2; exit 1; }
+# Kegagalan di dalam build_busybox_source(): dilaporkan apa adanya lalu mengembalikan
+# 1, supaya BUSYBOX_MODE=auto masih bisa jatuh ke busybox cadangan. BUSYBOX_MODE=source
+# menuntutnya keras (lihat resolve_busybox).
+bb_fail() { printf '   build busybox dari sumber gagal: %s\n' "$1" >&2; return 1; }
 need() {
 	command -v "$1" >/dev/null 2>&1 || die "perkakas '$1' tidak ditemukan${2:+ ($2)}"
 }
@@ -65,9 +72,23 @@ download() { # $1 = url, $2 = tujuan
 		return 0
 	fi
 	info "unduh $1"
-	curl -fL --retry 3 --connect-timeout 15 -o "$2.part" "$1" \
-		|| die "unduhan gagal: $1"
+	if ! curl -fL --retry 3 --connect-timeout 15 -o "$2.part" "$1"; then
+		rm -f "$2.part"
+		info "unduhan gagal: $1"
+		return 1
+	fi
 	mv "$2.part" "$2"
+}
+
+# Tulis satu opsi .config BusyBox: $2 = y menyalakan, n memadamkan. Opsi lain yang
+# bergantung padanya dirapikan `make oldconfig` sesudahnya.
+set_bb_config() { # $1 = berkas .config, $2 = CONFIG_*, $3 = y | n
+	sed -i -e "/^$2=y\$/d" -e "/^# $2 is not set\$/d" "$1"
+	if [ "$3" = y ]; then
+		printf '%s=y\n' "$2" >> "$1"
+	else
+		printf '# %s is not set\n' "$2" >> "$1"
+	fi
 }
 
 # --------------------------------------------------------------- busybox
@@ -75,7 +96,7 @@ build_busybox_source() {
 	src=$BUILD_DIR/busybox-$BB_VERSION
 	tarball=$CACHE_DIR/busybox-$BB_VERSION.tar.bz2
 
-	download "$BB_URL" "$tarball"
+	download "$BB_URL" "$tarball" || return 1
 	if [ -n "$BB_SHA256" ]; then
 		actual=$(sha256sum "$tarball" | cut -d' ' -f1)
 		[ "$actual" = "$BB_SHA256" ] || die "checksum busybox tidak cocok:
@@ -90,22 +111,32 @@ build_busybox_source() {
 		mkdir -p "$BUILD_DIR"
 		rm -rf "$src"
 		info "ekstrak tarball ke $BUILD_DIR"
-		tar -xjf "$tarball" -C "$BUILD_DIR" || die "ekstrak tarball gagal"
+		tar -xjf "$tarball" -C "$BUILD_DIR" || { bb_fail "ekstrak tarball gagal"; return 1; }
 	fi
 
-	if [ ! -f "$src/.config" ] || [ "$BUSYBOX_FORCE" = 1 ]; then
+	if [ ! -f "$src/.config" ]; then
 		info "make defconfig"
-		( cd "$src" && make defconfig >/dev/null )
-		sed -i 's/^# CONFIG_STATIC is not set$/CONFIG_STATIC=y/' "$src/.config"
-		grep -q '^CONFIG_STATIC=y' "$src/.config" \
-			|| die "CONFIG_STATIC tidak bisa diaktifkan di .config busybox"
-		( cd "$src" && make oldconfig >/dev/null 2>&1 </dev/null ) || true
+		( cd "$src" && make defconfig >/dev/null ) || { bb_fail "make defconfig gagal"; return 1; }
 	fi
+
+	# Opsi ini dituliskan setiap run, bukan hanya saat .config dibuat, supaya
+	# build ulang dari pohon hasil run lama ikut diperbaiki.
+	# - CONFIG_STATIC: defconfig tidak menyalakannya; tanpa ini hasilnya dinamis.
+	# - CONFIG_TC dimatikan karena networking/tc.c masih memakai definisi CBQ
+	#   (TCA_CBQ_*, struct tc_cbq_*) yang sudah tidak ada di kernel headers
+	#   terbaru; di Ubuntu 24.04 build defconfig gagal total karena ini. Applet
+	#   `tc` tidak dipakai rootfs ini.
+	[ -f "$src/.config" ] || { bb_fail "make defconfig tidak menghasilkan .config"; return 1; }
+	set_bb_config "$src/.config" CONFIG_STATIC y
+	set_bb_config "$src/.config" CONFIG_TC n
+	( cd "$src" && make oldconfig >/dev/null 2>&1 </dev/null ) || true
+	grep -q '^CONFIG_STATIC=y' "$src/.config" \
+		|| { bb_fail "CONFIG_STATIC tidak bisa diaktifkan di .config busybox"; return 1; }
 
 	info "kompilasi busybox $BB_VERSION statis dengan $JOBS job (1-3 menit)..."
 	( cd "$src" && make -j"$JOBS" LDFLAGS="-static" ) \
-		|| die "kompilasi busybox gagal (lihat keluaran make di atas)"
-	[ -x "$src/busybox" ] || die "biner busybox tidak dihasilkan"
+		|| { bb_fail "kompilasi busybox gagal (lihat keluaran make di atas)"; return 1; }
+	[ -x "$src/busybox" ] || { bb_fail "biner busybox tidak dihasilkan"; return 1; }
 
 	if ! is_static "$src/busybox"; then
 		info "PERINGATAN: busybox hasil kompilasi tidak statis"
@@ -115,7 +146,7 @@ build_busybox_source() {
 	info "make install -> $PKG_INSTALL"
 	rm -rf "$PKG_INSTALL"
 	( cd "$src" && make CONFIG_PREFIX="$PKG_INSTALL" install >/dev/null ) \
-		|| die "make install busybox gagal"
+		|| { bb_fail "make install busybox gagal"; return 1; }
 	BUSYBOX_BIN=$src/busybox
 	return 0
 }
@@ -124,6 +155,10 @@ use_prebuilt_busybox() {
 	[ -x "$BUSYBOX_PREBUILT" ] || die "busybox cadangan '$BUSYBOX_PREBUILT' tidak ada"
 	is_static "$BUSYBOX_PREBUILT" \
 		|| die "busybox cadangan '$BUSYBOX_PREBUILT' tidak statis (pasang paket busybox-static)"
+	# Pohon hasil `make install` run sebelumnya bukan bagian dari busybox cadangan.
+	# Tanpa ini, install_busybox() diam-diam memasang build sumber yang tertinggal
+	# di $BUILD_DIR walau run ini memakai BUSYBOX_PREBUILT.
+	PKG_INSTALL=
 	BUSYBOX_BIN=$BUSYBOX_PREBUILT
 	info "pakai busybox statis yang sudah ada: $BUSYBOX_BIN"
 }
@@ -131,12 +166,13 @@ use_prebuilt_busybox() {
 resolve_busybox() {
 	case $BUSYBOX_MODE in
 	source)
-		build_busybox_source ;;
+		build_busybox_source \
+			|| die "BUSYBOX_MODE=source: build dari sumber gagal dan tidak ada fallback" ;;
 	prebuilt)
 		use_prebuilt_busybox ;;
 	auto)
 		if build_busybox_source; then :; else
-			info "kompilasi sumber tidak menghasilkan biner statis, beralih ke busybox cadangan"
+			info "build dari sumber gagal, beralih ke busybox cadangan"
 			use_prebuilt_busybox
 		fi ;;
 	*)

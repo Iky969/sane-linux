@@ -189,6 +189,12 @@ Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` 
 `sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
 `sudo sh ./scripts/test-config.sh` → `make CFLAGS="-static -O2 -Wall -Werror"`.
 
+Job kedua, `rootfs-distro`, menjaga jalur distro yang tidak dipakai script di atas:
+install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs.sh`
+(kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
+(boot initramfs dengan konsol serial). QEMU di runner memakai TCG karena tidak ada
+`/dev/kvm`; kernel guest diunduh dari Alpine netboot ke `distro/cache/`.
+
 ## Troubleshooting
 
 | Gejala | Penyebab & solusi |

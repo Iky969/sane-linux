@@ -41,3 +41,26 @@ jobs:
 
       - name: Build tanpa warning (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
+
+  rootfs-distro:
+    # scripts/build-rootfs.sh dan scripts/run-qemu.sh tidak dipakai job di atas,
+    # jadi jalur "make rootfs && make qemu" bisa rusak tanpa ada yang melihat:
+    # kompilasi BusyBox defconfig pernah gagal total di kernel headers baru dan
+    # tidak ketahuan karena tidak ada yang membangunnya.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependensi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential busybox-static bzip2 cpio qemu-system-x86
+
+      - name: rootfs + initramfs dari sumber (BUSYBOX_MODE=auto)
+        run: |
+          make
+          sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
+          test -s distro/initramfs.cpio.gz
+
+      - name: Boot initramfs di QEMU (TCG, tanpa /dev/kvm)
+        run: sudo SECS=20 sh ./scripts/run-qemu.sh
