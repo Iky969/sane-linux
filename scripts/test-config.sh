@@ -573,6 +573,71 @@ stop_init
 check "baris EOF MAX_LINE (1024) ditolak walau tanpa newline" 'melebihi MAX_LINE'
 check "layanan normal tetap jalan setelah baris EOF ditolak" 'ninit: started first (pid'
 
+# ------------------------------------------------------------- skenario 12
+printf '\n== 12. fstab: exec/suid/dev, implikasi user, override kiri-ke-kanan (review PR #2) ==\n'
+start_root fstabflags
+LOG15="$LOG"
+mkdir -p "$ROOT/mnt"
+cat > "$ROOT/etc/fstab" <<'EOFSTAB'
+tmpfs /mnt/e1 tmpfs exec,suid,dev,size=1M 0 0
+tmpfs /mnt/e2 tmpfs user,size=1M 0 0
+tmpfs /mnt/e3 tmpfs user,exec,size=1M 0 0
+tmpfs /mnt/e4 tmpfs ro,rw,size=1M 0 0
+EOFSTAB
+printf 'dumpro:once:cat /proc/mounts > /var/mounts.txt\n' > "$ROOT/etc/init.conf"
+
+run_init
+i=0
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	[ -s "$ROOT/var/mounts.txt" ] && break
+	sleep 0.2
+	i=$((i + 1))
+done
+if [ ! -s "$ROOT/var/mounts.txt" ]; then
+	sed 's/^/  | /' "$LOG"
+	fail "dumpro tidak menulis /var/mounts.txt dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "fstab e1: exec/suid/dev terkonsumsi (bukan data), mount ok" 'mount tmpfs -> /mnt/e1 (tmpfs) \[data: size=1M\] ok'
+check "fstab e2: user dicatat menerapkan implikasinya" "opsi 'user' menerapkan noexec,nosuid,nodev"
+check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+
+# Bukti dari /proc/mounts di dalam guest: flag yang BENAR-BENAR terpakai,
+# bukan sekadar mount() yang tidak error.
+mount_opts() { awk -v m="$1" '$2 == m { print $4 }' "$ROOT/var/mounts.txt"; }
+has_opt() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+e1_opts=$(mount_opts /mnt/e1)
+if ! has_opt noexec "$e1_opts" && ! has_opt nosuid "$e1_opts" && ! has_opt nodev "$e1_opts"; then
+	ok "fstab e1: /proc/mounts tanpa noexec/nosuid/nodev ($e1_opts)"
+else
+	bad "fstab e1: opts mengandung peniada yang tidak diminta ($e1_opts)"
+fi
+
+e2_opts=$(mount_opts /mnt/e2)
+if has_opt noexec "$e2_opts" && has_opt nosuid "$e2_opts" && has_opt nodev "$e2_opts"; then
+	ok "fstab e2: /proc/mounts membuktikan user -> noexec,nosuid,nodev ($e2_opts)"
+else
+	bad "fstab e2: implikasi user tidak terpakai (opts: '$e2_opts')"
+fi
+
+e3_opts=$(mount_opts /mnt/e3)
+if has_opt nosuid "$e3_opts" && has_opt nodev "$e3_opts" && ! has_opt noexec "$e3_opts"; then
+	ok "fstab e3: user,exec -> exec membatalkan noexec saja ($e3_opts)"
+else
+	bad "fstab e3: override user,exec salah (opts: '$e3_opts')"
+fi
+
+e4_opts=$(mount_opts /mnt/e4)
+if has_opt rw "$e4_opts" && ! has_opt ro "$e4_opts"; then
+	ok "fstab e4: ro,rw -> berakhir rw ($e4_opts)"
+else
+	bad "fstab e4: override ro,rw salah (opts: '$e4_opts')"
+fi
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -603,6 +668,8 @@ printf '\n== log 11 (batas EOF MAX_LINE) ==\n'
 sed 's/^/  | /' "$LOG13"
 printf '\n== log 11b (batas EOF MAX_LINE+1) ==\n'
 sed 's/^/  | /' "$LOG14"
+printf '\n== log 12 (fstab: exec/suid/dev + implikasi user) ==\n'
+sed 's/^/  | /' "$LOG15"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
