@@ -381,30 +381,32 @@ INIT_STDIN=/dev/null
 stop_init
 
 # -------------------------------------------------------------- skenario 5
-printf '\n== 5. peringatan pemotongan string panjang (nama, perintah, dependensi) ==\n'
+printf '\n== 5. penolakan string terlalu panjang (nama, perintah, dependensi) ==\n'
 start_root trunc
 LOG8="$LOG"
 
 long_name=$(printf 'longname_%.0s' $(seq 1 15))
-long_cmd=$(printf 'echo hello_%.0s' $(seq 1 55))
-long_deps="dep,"$(printf 'd%02d,' $(seq 1 70))
+long_cmd=$(printf 'echo hello_%.0s' $(seq 1 48))
+long_deps="dep,"$(printf 'd%02d,' $(seq 1 63))
 cat > "$ROOT/etc/init.conf" <<EOCFG
 dep:once:true
 ${long_name}:once:${long_cmd}:requires=${long_deps}
 EOCFG
 
 run_init
-if ! wait_for 'terpotong'; then
+if ! wait_for 'entri ditolak'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencatat peringatan string terpotong dalam ${READY_TIMEOUT}s"
+	fail "ninit tidak mencatat penolakan string terlalu panjang dalam ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "peringatan nama terpotong dicatat" 'Peringatan: nama layanan'
-check "peringatan perintah terpotong dicatat" 'Peringatan: perintah layanan'
-check "peringatan dependensi terpotong dicatat" 'Peringatan: dependensi layanan'
+check "nama terlalu panjang ditolak" 'Parse err: nama layanan terlalu panjang'
+check "perintah terlalu panjang ditolak" 'Parse err: perintah layanan'
+check "dependensi terlalu panjang ditolak" 'Parse err: dependensi layanan'
+check "layanan sehat tetap jalan ('started dep')" 'ninit: started dep (pid'
+check_absent "layanan terlalu panjang TIDAK dijalankan" 'started longname'
 
 # -------------------------------------------------------------- skenario 6
 printf '\n== 6. layanan ke-65 melebihi batas MAX_SERVICES ==\n'
@@ -481,6 +483,161 @@ stop_init
 check "error nama mengandung slash dicatat" 'Parse err: nama layanan'
 check_absent "layanan dengan slash tidak dijalankan" 'started bad/svc'
 
+# -------------------------------------------------------------- skenario 8
+printf '\n== 9. baris config melebihi MAX_LINE ditolak utuh (audit SANE-03) ==\n'
+start_root longline
+LOG11="$LOG"
+
+pad=$(printf 'x%.0s' $(seq 1 1200))
+cat > "$ROOT/etc/init.conf" <<EOCFG
+ghost:once:echo boo${pad}
+realsvc:once:true
+EOCFG
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario baris panjang dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "baris terlalu panjang dicatat sebagai ditolak" 'melebihi MAX_LINE'
+check "layanan sesudah baris panjang tetap terdaftar ('started realsvc')" 'ninit: started realsvc (pid'
+check_absent "tidak ada layanan hantu dari potongan baris ('started ghost')" 'started ghost'
+
+# ------------------------------------------------------------- skenario 10
+printf '\n== 10. klasifikasi opsi fstab: flag VFS vs userspace vs data (audit SANE-02) ==\n'
+start_root fstab
+LOG12="$LOG"
+mkdir -p "$ROOT/mnt"
+cat > "$ROOT/etc/fstab" <<'EOFSTAB'
+tmpfs /mnt/a tmpfs ro,nosuid,noatime,size=4M 0 0
+tmpfs /mnt/b tmpfs noauto,mode=700 0 0
+tmpfs /mnt/c tmpfs _netdev,x-custom,relatime,mode=755 0 0
+EOFSTAB
+printf 'fstabprobe:once:true\n' > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario fstab dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "fstab a: flag VFS dipisah, data hanya opsi filesystem, mount ok" '\[data: size=4M\] ok'
+check "fstab b: entri noauto dilewati" 'dilewati (opsi noauto)'
+check_absent "fstab b: entri noauto TIDAK di-mount" 'mount tmpfs -> /mnt/b'
+check "fstab c: opsi userspace dicatat sebagai diabaikan" 'khusus userspace, diabaikan'
+check "fstab c: mount ok, data hanya mode=755" '\[data: mode=755\] ok'
+check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+
+# ------------------------------------------------------------- skenario 11
+printf '\n== 11. batas baris di EOF: tepat MAX_LINE-1 diterima, MAX_LINE ditolak ==\n'
+start_root eolbound
+LOG13="$LOG"
+
+# Baris komentar dipakai supaya yang diuji murni batas BARIS (MAX_LINE),
+# bukan batas bidang nama/cmd/deps yang punya penolakan sendiri.
+{ printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1022))"; } > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario batas EOF dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "layanan normal tetap jalan pada skenario batas EOF" 'ninit: started first (pid'
+check_absent "baris EOF tepat MAX_LINE-1 (1023) TIDAK ditolak" 'melebihi MAX_LINE'
+
+start_root eolover
+LOG14="$LOG"
+
+{ printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1023))"; } > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop siap'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit tidak mencapai main loop pada skenario batas EOF+1 dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "baris EOF MAX_LINE (1024) ditolak walau tanpa newline" 'melebihi MAX_LINE'
+check "layanan normal tetap jalan setelah baris EOF ditolak" 'ninit: started first (pid'
+
+# ------------------------------------------------------------- skenario 12
+printf '\n== 12. fstab: exec/suid/dev, implikasi user, override kiri-ke-kanan (review PR #2) ==\n'
+start_root fstabflags
+LOG15="$LOG"
+mkdir -p "$ROOT/mnt"
+cat > "$ROOT/etc/fstab" <<'EOFSTAB'
+tmpfs /mnt/e1 tmpfs exec,suid,dev,size=1M 0 0
+tmpfs /mnt/e2 tmpfs user,size=1M 0 0
+tmpfs /mnt/e3 tmpfs user,exec,size=1M 0 0
+tmpfs /mnt/e4 tmpfs ro,rw,size=1M 0 0
+EOFSTAB
+printf 'dumpro:once:cat /proc/mounts > /var/mounts.txt\n' > "$ROOT/etc/init.conf"
+
+run_init
+i=0
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	[ -s "$ROOT/var/mounts.txt" ] && break
+	sleep 0.2
+	i=$((i + 1))
+done
+if [ ! -s "$ROOT/var/mounts.txt" ]; then
+	sed 's/^/  | /' "$LOG"
+	fail "dumpro tidak menulis /var/mounts.txt dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "fstab e1: exec/suid/dev terkonsumsi (bukan data), mount ok" 'mount tmpfs -> /mnt/e1 (tmpfs) \[data: size=1M\] ok'
+check "fstab e2: user dicatat menerapkan implikasinya" "opsi 'user' menerapkan noexec,nosuid,nodev"
+check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+
+# Bukti dari /proc/mounts di dalam guest: flag yang BENAR-BENAR terpakai,
+# bukan sekadar mount() yang tidak error.
+mount_opts() { awk -v m="$1" '$2 == m { print $4 }' "$ROOT/var/mounts.txt"; }
+has_opt() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+e1_opts=$(mount_opts /mnt/e1)
+if ! has_opt noexec "$e1_opts" && ! has_opt nosuid "$e1_opts" && ! has_opt nodev "$e1_opts"; then
+	ok "fstab e1: /proc/mounts tanpa noexec/nosuid/nodev ($e1_opts)"
+else
+	bad "fstab e1: opts mengandung peniada yang tidak diminta ($e1_opts)"
+fi
+
+e2_opts=$(mount_opts /mnt/e2)
+if has_opt noexec "$e2_opts" && has_opt nosuid "$e2_opts" && has_opt nodev "$e2_opts"; then
+	ok "fstab e2: /proc/mounts membuktikan user -> noexec,nosuid,nodev ($e2_opts)"
+else
+	bad "fstab e2: implikasi user tidak terpakai (opts: '$e2_opts')"
+fi
+
+e3_opts=$(mount_opts /mnt/e3)
+if has_opt nosuid "$e3_opts" && has_opt nodev "$e3_opts" && ! has_opt noexec "$e3_opts"; then
+	ok "fstab e3: user,exec -> exec membatalkan noexec saja ($e3_opts)"
+else
+	bad "fstab e3: override user,exec salah (opts: '$e3_opts')"
+fi
+
+e4_opts=$(mount_opts /mnt/e4)
+if has_opt rw "$e4_opts" && ! has_opt ro "$e4_opts"; then
+	ok "fstab e4: ro,rw -> berakhir rw ($e4_opts)"
+else
+	bad "fstab e4: override ro,rw salah (opts: '$e4_opts')"
+fi
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -497,12 +654,22 @@ printf '\n== log 4a (config tidak terbaca) ==\n'
 sed 's/^/  | /' "$LOG6"
 printf '\n== log 4b (siklus dependensi) ==\n'
 sed 's/^/  | /' "$LOG7"
-printf '\n== log 5 (pemotongan string) ==\n'
+printf '\n== log 5 (penolakan string panjang) ==\n'
 sed 's/^/  | /' "$LOG8"
 printf '\n== log 6 (layanan ke-65) ==\n'
 sed 's/^/  | /' "$LOG9"
 printf '\n== log 7 (dependensi README: logd -> net) ==\n'
 sed 's/^/  | /' "$LOG10"
+printf '\n== log 9 (baris melebihi MAX_LINE) ==\n'
+sed 's/^/  | /' "$LOG11"
+printf '\n== log 10 (klasifikasi opsi fstab) ==\n'
+sed 's/^/  | /' "$LOG12"
+printf '\n== log 11 (batas EOF MAX_LINE) ==\n'
+sed 's/^/  | /' "$LOG13"
+printf '\n== log 11b (batas EOF MAX_LINE+1) ==\n'
+sed 's/^/  | /' "$LOG14"
+printf '\n== log 12 (fstab: exec/suid/dev + implikasi user) ==\n'
+sed 's/^/  | /' "$LOG15"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
