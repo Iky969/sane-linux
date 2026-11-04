@@ -92,7 +92,7 @@ run_init() {
 	(
 		$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 			--mount --propagation private \
-			sh -c "mount -t proc proc '$ROOT/proc' && exec chroot '$ROOT' /ninit ${INIT_ARGS:-}" \
+			sh -c "umask ${TEST_UMASK:-0022}; mount -t proc proc '$ROOT/proc' && exec chroot '$ROOT' /ninit ${INIT_ARGS:-}" \
 			>"$LOG" 2>&1 <"$INIT_STDIN"
 	) &
 	JOB=$!
@@ -638,6 +638,83 @@ else
 	bad "fstab e4: override ro,rw salah (opts: '$e4_opts')"
 fi
 
+# ------------------------------------------------------------- skenario 13
+printf '\n== 13. fstab: mkdir rekursif, bind ditolak, skip sebelum mkdir (PR lanjutan) ==\n'
+start_root fstabdeep
+LOG16="$LOG"
+# /mnt dibuat sebagai induk kontrol; yang diuji adalah level DI BAWAHNYA
+# yang tidak dibuat dari luar (skenario 10/12 selalu menyiapkan jalurnya).
+mkdir -p "$ROOT/mnt" "$ROOT/var/realdir"
+touch "$ROOT/mnt/blocked" "$ROOT/var/afile"
+ln -s /var/realdir "$ROOT/mnt/linkdir"
+ln -s /var/afile "$ROOT/mnt/filelink"
+ln -s /var/tidak-ada "$ROOT/mnt/dangle"
+cat > "$ROOT/etc/fstab" <<'EOFSTAB'
+tmpfs /mnt/deep/nested tmpfs size=1M 0 0
+tmpfs /mnt/trail/ tmpfs size=1M 0 0
+tmpfs /mnt/noauto-dir tmpfs noauto,size=1M 0 0
+/sumber /mnt/bind-dir none bind 0 0
+/sumber2 /mnt/nobind-dir none bind,noauto 0 0
+tmpfs /mnt/filelink/x tmpfs size=1M 0 0
+tmpfs /mnt/blocked/x tmpfs size=1M 0 0
+tmpfs /mnt/./evil tmpfs size=1M 0 0
+tmpfs /mnt/ghostdir/../evil tmpfs size=1M 0 0
+tmpfs /mnt/dangle/x tmpfs size=1M 0 0
+tmpfs /mnt/linkdir/deep tmpfs size=1M 0 0
+tmpfs /mnt/after tmpfs size=1M 0 0
+EOFSTAB
+printf 'dumpro:once:cat /proc/mounts > /var/mounts.txt\n' > "$ROOT/etc/init.conf"
+
+# umask ketat di guest: mountpoint hasil mkdir_p harus TETAP 0755 berkat
+# chmod eksplisit, bukan 0700 warisan umask.
+TEST_UMASK=077
+run_init
+i=0
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	[ -s "$ROOT/var/mounts.txt" ] && break
+	sleep 0.2
+	i=$((i + 1))
+done
+if [ ! -s "$ROOT/var/mounts.txt" ]; then
+	sed 's/^/  | /' "$LOG"
+	fail "dumpro tidak menulis /var/mounts.txt pada skenario 13 dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+TEST_UMASK=""
+
+check "fstab f1: mountpoint bertingkat dibuat rekursif, mount ok" 'mount tmpfs -> /mnt/deep/nested (tmpfs) \[data: size=1M\] ok'
+check "fstab f2: trailing slash ditangani, mount ok" 'mount tmpfs -> /mnt/trail/ (tmpfs) \[data: size=1M\] ok'
+check "fstab f3: entri noauto dilewati" 'tmpfs -> /mnt/noauto-dir dilewati (opsi noauto)'
+check "fstab f4: entri bind ditolak eksplisit" '/sumber -> /mnt/bind-dir dilewati (bind/rbind tidak didukung)'
+check_absent "fstab f4: bind TIDAK ter-mount" 'mount /sumber -> /mnt/bind-dir'
+check "fstab f4b: bind+noauto -> alasan pertama (noauto) yang dicatat" '/sumber2 -> /mnt/nobind-dir dilewati (opsi noauto)'
+check_absent "fstab f4b: bind+noauto TIDAK dicatat sebagai bind" 'nobind-dir dilewati (bind'
+check "fstab f5: komponen symlink-ke-file ditolak jelas" "komponen '/mnt/filelink' dari mountpoint '/mnt/filelink/x' bukan direktori"
+check "fstab f6: komponen file biasa ditolak jelas" "komponen '/mnt/blocked' dari mountpoint '/mnt/blocked/x' bukan direktori"
+check "fstab f7: komponen '.' ditolak" "memuat komponen '.', ditolak"
+check "fstab f7b: komponen '..' ditolak oleh pra-pindai" "memuat komponen '..', ditolak"
+check "fstab f7c: symlink menggantung ditolak jelas" "stat '/mnt/dangle' gagal"
+check "fstab f8: symlink-ke-direktori diikuti, mount ok" 'mount tmpfs -> /mnt/linkdir/deep (tmpfs) \[data: size=1M\] ok'
+
+# Bukti sisi host: direktori yang benar-benar dibuat / tidak dibuat.
+if [ -d "$ROOT/mnt/deep/nested" ]; then ok "host: /mnt/deep/nested benar-benar dibuat"; else bad "host: /mnt/deep/nested tidak dibuat"; fi
+if [ "$(stat -c %a "$ROOT/mnt/deep")" = "755" ] && [ "$(stat -c %a "$ROOT/mnt/deep/nested")" = "755" ]; then ok "host: mountpoint tetap 0755 walau umask guest 077 (chmod eksplisit)"; else bad "host: mode mountpoint bukan 0755 (deep=$(stat -c %a "$ROOT/mnt/deep" 2>/dev/null), nested=$(stat -c %a "$ROOT/mnt/deep/nested" 2>/dev/null))"; fi
+if [ ! -e "$ROOT/mnt/noauto-dir" ]; then ok "host: entri noauto TIDAK meninggalkan direktori hantu"; else bad "host: entri noauto meninggalkan direktori hantu"; fi
+if [ ! -e "$ROOT/mnt/bind-dir" ]; then ok "host: entri bind TIDAK meninggalkan direktori hantu"; else bad "host: entri bind meninggalkan direktori hantu"; fi
+if [ ! -e "$ROOT/mnt/nobind-dir" ]; then ok "host: entri bind+noauto TIDAK meninggalkan direktori hantu"; else bad "host: entri bind+noauto meninggalkan direktori hantu"; fi
+if [ ! -e "$ROOT/mnt/ghostdir" ]; then ok "host: pra-pindai '..' TIDAK meninggalkan direktori induk hantu"; else bad "host: pra-pindai '..' meninggalkan direktori induk hantu"; fi
+if [ -d "$ROOT/var/realdir/deep" ]; then ok "host: mkdir lewat symlink membuat direktori di target aslinya"; else bad "host: direktori di target symlink tidak dibuat"; fi
+if [ ! -e "$ROOT/mnt/evil" ]; then ok "host: path dengan '.' TIDAK dibuat"; else bad "host: path dengan '.' dibuat"; fi
+
+# Bukti /proc/mounts guest: yang ter-mount dan isolasi kegagalan per entri.
+if [ -n "$(mount_opts /mnt/deep/nested)" ]; then ok "guest: /mnt/deep/nested ter-mount"; else bad "guest: /mnt/deep/nested tidak ter-mount"; fi
+if [ -n "$(mount_opts /mnt/trail)" ]; then ok "guest: /mnt/trail ter-mount (tanpa slash)"; else bad "guest: /mnt/trail tidak ter-mount"; fi
+if [ -n "$(mount_opts /mnt/after)" ]; then ok "guest: entri sesudah yang gagal tetap ter-mount (isolasi per entri)"; else bad "guest: entri sesudah yang gagal TIDAK ter-mount"; fi
+if [ -z "$(mount_opts /mnt/bind-dir)" ]; then ok "guest: /mnt/bind-dir tidak ter-mount"; else bad "guest: /mnt/bind-dir ter-mount"; fi
+if [ -z "$(mount_opts /mnt/blocked/x)" ]; then ok "guest: /mnt/blocked/x tidak ter-mount"; else bad "guest: /mnt/blocked/x ter-mount"; fi
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -670,6 +747,8 @@ printf '\n== log 11b (batas EOF MAX_LINE+1) ==\n'
 sed 's/^/  | /' "$LOG14"
 printf '\n== log 12 (fstab: exec/suid/dev + implikasi user) ==\n'
 sed 's/^/  | /' "$LOG15"
+printf '\n== log 13 (fstab: mkdir rekursif + bind ditolak) ==\n'
+sed 's/^/  | /' "$LOG16"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
