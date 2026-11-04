@@ -715,6 +715,54 @@ if [ -n "$(mount_opts /mnt/after)" ]; then ok "guest: entri sesudah yang gagal t
 if [ -z "$(mount_opts /mnt/bind-dir)" ]; then ok "guest: /mnt/bind-dir tidak ter-mount"; else bad "guest: /mnt/bind-dir ter-mount"; fi
 if [ -z "$(mount_opts /mnt/blocked/x)" ]; then ok "guest: /mnt/blocked/x tidak ter-mount"; else bad "guest: /mnt/blocked/x ter-mount"; fi
 
+# ------------------------------------------------------------- skenario 14
+printf '\n== 14. fstab: escape oktal didekode + mountpoint duplikat dilewati (PR3-C1/C2) ==\n'
+start_root fstabesc
+LOG17="$LOG"
+mkdir -p "$ROOT/mnt"
+cat > "$ROOT/etc/fstab" <<'EOFSTAB'
+tmpfs /mnt/spa\040ce tmpfs size=1M 0 0
+tmpfs /mnt/dup tmpfs nosuid,size=1M 0 0
+tmpfs /mnt/dup tmpfs size=2M 0 0
+tmpfs /mnt/\056\056/evil tmpfs size=1M 0 0
+tmpfs /mnt/plain tmpfs size=1M 0 0
+EOFSTAB
+printf 'dumpro:once:cat /proc/mounts > /var/mounts.txt\n' > "$ROOT/etc/init.conf"
+
+run_init
+i=0
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	[ -s "$ROOT/var/mounts.txt" ] && break
+	sleep 0.2
+	i=$((i + 1))
+done
+if [ ! -s "$ROOT/var/mounts.txt" ]; then
+	sed 's/^/  | /' "$LOG"
+	fail "dumpro tidak menulis /var/mounts.txt pada skenario 14 dalam ${READY_TIMEOUT}s"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "fstab g1: escape oktal didekode, mount ke path berisi spasi ok" 'mount tmpfs -> /mnt/spa ce (tmpfs) \[data: size=1M\] ok'
+check_absent "fstab g1: TIDAK ada mount ke nama harfiah backslash" 'mount tmpfs -> /mnt/spa\\040ce'
+check "fstab g2: entri duplikat dilewati dengan catatan" 'tmpfs -> /mnt/dup dilewati (mountpoint duplikat'
+check "fstab g3: escape terdekode menjadi '..' lalu ditolak pra-pindai" "memuat komponen '..', ditolak"
+check "fstab g4: entri normal sesudahnya tetap diproses" 'mount tmpfs -> /mnt/plain (tmpfs) \[data: size=1M\] ok'
+
+# Bukti sisi host: direktori yang benar-benar dibuat / tidak dibuat.
+if [ -d "$ROOT/mnt/spa ce" ]; then ok "host: direktori 'spa ce' (spasi asli) benar-benar dibuat"; else bad "host: direktori 'spa ce' tidak dibuat"; fi
+if [ ! -e "$ROOT/mnt/spa\040ce" ]; then ok "host: TIDAK ada direktori bernama harfiah 'spa\\040ce'"; else bad "host: ada direktori bernama harfiah backslash"; fi
+if [ ! -e "$ROOT/mnt/evil" ]; then ok "host: escape '..' TIDAK meloloskan path"; else bad "host: escape '..' meloloskan path"; fi
+
+# Bukti /proc/mounts guest: duplikat tidak menumpuk, proteksi entri
+# pertama tidak tertutupi, dan path spasi tercatat (kernel menulis
+# spasi sebagai \040 di /proc/mounts).
+if [ "$(grep -c ' /mnt/dup ' "$ROOT/var/mounts.txt")" = "1" ]; then ok "guest: /mnt/dup ter-mount TEPAT satu kali"; else bad "guest: /mnt/dup ter-mount bukan satu kali"; fi
+dup_opts=$(mount_opts /mnt/dup)
+if has_opt nosuid "$dup_opts"; then ok "guest: proteksi entri pertama (nosuid) TIDAK tertutupi duplikat ($dup_opts)"; else bad "guest: nosuid entri pertama hilang (opts: '$dup_opts')"; fi
+if grep -qF ' /mnt/spa\040ce ' "$ROOT/var/mounts.txt"; then ok "guest: mount path berisi spasi tercatat di /proc/mounts"; else bad "guest: mount path berisi spasi tidak tercatat"; fi
+
 # --------------------------------------------------------------- ringkasan
 printf '\n== log 1a (urut dependensi) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -749,6 +797,8 @@ printf '\n== log 12 (fstab: exec/suid/dev + implikasi user) ==\n'
 sed 's/^/  | /' "$LOG15"
 printf '\n== log 13 (fstab: mkdir rekursif + bind ditolak) ==\n'
 sed 's/^/  | /' "$LOG16"
+printf '\n== log 14 (fstab: escape oktal + duplikat) ==\n'
+sed 's/^/  | /' "$LOG17"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
