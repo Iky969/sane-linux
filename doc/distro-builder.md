@@ -27,7 +27,7 @@ SECS=5 make qemu     # boot otomatis 5 detik + pemeriksaan penanda + laporan kon
 | `/sbin/{poweroff,reboot,halt}` | skrip wrapper → `/run/initctl` | menimpa applet BusyBox yang memakai sinyal berbeda dari tabel ninit |
 | `/etc/init.conf` | `console:respawn:cttyhack /bin/sh -i` | shell interaktif di serial console, nama layanan `console` (lihat “Temuan integrasi”) |
 | `/etc/passwd`, `/etc/group` | `root:x:0:0`, `root:x:0:` | minimal |
-| `/etc/hostname` | `ninit-distro` | dipakai `set_hostname()` ninit |
+| `/etc/hostname` | `S.A.N.E` | dipakai `set_hostname()` ninit |
 | `/etc/fstab` | hanya komentar | menghindari log `fstab: … tidak ada, dilewati` |
 | `/dev/{console,null,tty}` | node awal (`mknod`) | supaya konsol kernel hidup sejak detik pertama; devtmpfs menyusul |
 | `/proc /sys /dev /run /tmp` | direktori kosong | dipasang otomatis oleh `setup_pseudo_fs()` |
@@ -70,7 +70,7 @@ qemu-system-x86_64 -m 256 -no-reboot \
 [    1.256959] Run /sbin/init as init process
 [2026-10-27 23:55:18] ninit: cgroup2: /sys/fs/cgroup ter-mount
 [2026-10-27 23:55:18] ninit: === ninit start (PID 1) v1.0.0 ===
-[2026-10-27 23:55:18] ninit: hostname = ninit-distro
+[2026-10-27 23:55:18] ninit: hostname = S.A.N.E
 [2026-10-27 23:55:18] ninit: started console (pid 403)
 ~ #
 [2026-10-27 23:55:18] ninit: cgroup: 'console' (pid 403) -> /sys/fs/cgroup/ninit/console
@@ -85,7 +85,7 @@ Sesi interaktif (perintah diketik ke serial console, dijalankan di dalam guest):
 ~ # echo HALO-DARI-GUEST
 HALO-DARI-GUEST
 ~ # cat /etc/hostname
-ninit-distro
+S.A.N.E
 ~ # kill -TERM 1
 [2026-10-27 23:56:51] ninit: graceful shutdown (cmd=1126301404)
 [   10.500910] ACPI: PM: Preparing to enter system sleep state S5

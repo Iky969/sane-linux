@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-rootfs.sh -- rootfs minimal distro ninit: busybox statis + ninit sebagai
+# build-rootfs.sh -- rootfs minimal distro S.A.N.E: busybox statis + ninit sebagai
 # /sbin/init, dibungkus menjadi initramfs cpio.gz yang siap di-boot QEMU
 # (lihat scripts/run-qemu.sh).
 #
@@ -48,7 +48,7 @@ BUSYBOX_PREBUILT=${BUSYBOX_PREBUILT:-/bin/busybox}
 BUSYBOX_FORCE=${BUSYBOX_FORCE:-0}
 NINIT=${NINIT:-$REPO_ROOT/ninit}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 1)}
-HOSTNAME_NAME=${HOSTNAME_NAME:-ninit-distro}
+HOSTNAME_NAME=${HOSTNAME_NAME:-S.A.N.E}
 
 log()  { printf '== %s\n' "$1"; }
 info() { printf '   %s\n' "$1"; }
@@ -316,7 +316,7 @@ write_etc() {
 	#   <> /dev/console   buka console read-write sebagai stdin
 	#   >&0 2>&0          stdout & stderr mengikuti stdin (console)
 	cat > "$ROOTFS/etc/init.conf" <<'EOF'
-# /etc/init.conf -- rootfs distro ninit
+# /etc/init.conf -- rootfs distro S.A.N.E
 #
 # Layanan dijalankan lewat `/bin/sh -c` dengan stdin /dev/null dan
 # stdout/stderr /run/log.fifo (bawaan ninit). Versi harfiah
