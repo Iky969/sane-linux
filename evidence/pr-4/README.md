@@ -11,7 +11,7 @@ QEMU 8.2.2 TCG, kernel guest Alpine v3.20 `vmlinuz-virt`).
 | `02-sisa-identitas-lama.png` | `git grep` penyebutan `ninit-distro`/`distro ninit` di seluruh pohon PR (bersih) vs basis (masih ada), plus jumlah kemunculan nama komponen yang sengaja tidak diubah |
 | `03-build-rootfs-dan-initramfs.png` | build rootfs mode prebuilt, isi `/etc/hostname`, ekstrak `initramfs.cpio.gz` dan baca `etc/hostname` dari dalamnya, override `HOSTNAME_NAME=` |
 | `04-qemu-boot-hostname.png` | boot distro di QEMU: log `ninit: hostname = S.A.N.E`, lalu dari serial console `uname -n`, `cat /etc/hostname`, `ls -l /sbin/init`, shutdown rapi |
-| `05-make-test-hijau-104.png` | tiga suite pada head PR #4: 6 + 14 + 84 = 104 pemeriksaan, 0 GAGAL |
+| `05-make-test-hijau.png` | tiga suite pada head PR #4: 6 smoke + 14 sigterm + 58 config = 78 pemeriksaan, 0 GAGAL (skenario 13 milik PR #3, jadi belum ada di pohon ini) |
 | `06-bit-exec-hilang.png` | konsekuensi temuan PR4-C1: `./scripts/build-rootfs.sh` ditolak, sedangkan basis dan Makefile/CI (`sh ./scripts/...`) tidak terpengaruh |
 
 ## Kesimpulan: layak merge setelah satu baris perbaikan
@@ -26,7 +26,7 @@ perubahan tak terduga masuk ke diff dan sebaiknya dipulihkan sebelum merge.
 | ninit memasangnya saat boot (`hostname = S.A.N.E`) | LULUS — baris log itu muncul dari dalam guest, dan `uname -n` di serial console menjawab `S.A.N.E` (`04`) |
 | tidak ada lagi `ninit-distro` / "distro ninit" di repo | LULUS — `git grep` pada pohon PR kosong; pada basis masih ada (`02`) |
 | nama komponen ninit tidak diubah | LULUS — `ninit.c`, `/sbin/init`, `/etc/init.conf`, `/var/log/ninit.log`, cgroup `ninit/` tetap utuh; `/sbin/init` di guest adalah ninit 989152 byte (`02`, `04`) |
-| `make test` hijau penuh (104 pemeriksaan) | LULUS — 104/104, 0 GAGAL (`05`) |
+| `make test` hijau penuh (tiga suite) + `sh -n` kedua skrip | LULUS — 78/78, 0 GAGAL (`05`); `sh -n scripts/build-rootfs.sh scripts/run-qemu.sh` bersih |
 | `doc/distro-builder.md` cocok dengan kenyataan | LULUS — contoh keluaran `hostname = S.A.N.E` dan `cat /etc/hostname` = `S.A.N.E` direproduksi persis (`04`) |
 | "tidak ada perubahan perilaku selain hostname bawaan" | **TIDAK SEPENUHNYA BENAR** — lihat PR4-C1 |
 
