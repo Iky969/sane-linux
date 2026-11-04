@@ -1,5 +1,5 @@
 #!/bin/sh
-# run-qemu.sh -- boot rootfs distro ninit (scripts/build-rootfs.sh) di QEMU
+# run-qemu.sh -- boot rootfs distro S.A.N.E (scripts/build-rootfs.sh) di QEMU
 # dengan konsol serial, lalu periksa penanda boot ninit.
 #
 # Pemakaian:

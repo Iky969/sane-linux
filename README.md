@@ -1,12 +1,15 @@
-# ninit — init system minimal (PID 1) dalam satu file C
+# S.A.N.E — distro Linux minimal dengan init ninit
 
-`ninit` adalah init system kecil tanpa dependensi selain libc, dibuat untuk
-eksperimen membangun distro/OS sendiri: membaca daftar layanan, menjalankan dan
+**S.A.N.E** adalah distro Linux minimal yang dibangun dari nol di repository
+ini. Jantungnya adalah `ninit`, init system kecil (PID 1) dalam satu file C
+tanpa dependensi selain libc: membaca daftar layanan, menjalankan dan
 menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 `/etc/fstab`, lalu mematikan sistem dengan rapi.
 
-Satu file sumber ([`ninit.c`](ninit.c), ~600 baris), biner statis, nol warning
-dengan `-Wall -Werror`. Bonus: event loop-nya berbasis `ppoll`, jadi init tetap
+Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
+initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
+[`ninit.c`](ninit.c) (~600 baris), biner statis, nol warning dengan
+`-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
 [![CI](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml)
