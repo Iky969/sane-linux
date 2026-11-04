@@ -758,19 +758,27 @@ static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/r
      2. Opsi userspace fstab murni (_netdev, nofail, x-*, comment=*, ...) ->
         wewenang mount(8)/systemd, BUKAN kernel: dicatat lalu diabaikan,
         tidak pernah diteruskan sebagai data.
-     3. "noauto" -> entri dilewati seluruhnya (*skip_entry = 1), seperti
-        perilaku `mount -a` saat boot.
-     4. Selainnya -> opsi khas filesystem (size=, mode=, uid=, ...), disalin
+     3. "noauto" -> entri dilewati seluruhnya (*skip_reason = SKIP_NOAUTO),
+        seperti perilaku `mount -a` saat boot.
+     4. "bind"/"rbind" -> TIDAK didukung: entri dilewati dengan alasan
+        (*skip_reason = SKIP_BIND) yang dicatat eksplisit oleh pemanggil.
+        Bind mengubah semantik kolom pertama fstab menjadi path sumber,
+        sedangkan ninit memperlakukannya sebagai label/device filesystem;
+        mendukungnya setengah-setengah hanya menghasilkan kegagalan senyap.
+     5. Selainnya -> opsi khas filesystem (size=, mode=, uid=, ...), disalin
         ke `data` untuk argumen ke-5 mount().
    Token flag TIDAK boleh ikut terbawa ke data: parser opsi filesystem yang
    ketat (ext4, tmpfs) menolak opsi data tak dikenal dengan EINVAL. */
-static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, int *skip_entry)
+#define SKIP_NONE   0
+#define SKIP_NOAUTO 1
+#define SKIP_BIND   2
+static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, int *skip_reason)
 {
     unsigned long flags = 0;
     char *tok;
 
     if (data && datasz) data[0] = 0;
-    if (skip_entry) *skip_entry = 0;
+    if (skip_reason) *skip_reason = SKIP_NONE;
     if (!opts) return 0;
 
     /* Token diproses KIRI KE KANAN seperti mount(8): token peniada
@@ -812,7 +820,7 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
             init_log("fstab: opsi '%s' menerapkan nosuid,nodev", tok);
         }
         else if (!strcmp(tok, "noauto")) {
-            if (skip_entry) *skip_entry = 1;
+            if (skip_reason && *skip_reason == SKIP_NONE) *skip_reason = SKIP_NOAUTO;
         }
         else if (!strcmp(tok, "auto") || !strcmp(tok, "nouser") ||
                  !strcmp(tok, "_netdev") || !strcmp(tok, "nofail") ||
@@ -827,7 +835,89 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
             }
         }
     }
+    /* MS_BIND tidak punya token peniada: sekali bind/rbind (termasuk dalam
+       kombinasi seperti remount,bind) muncul, entri ini tidak didukung dan
+       dilewati — keputusannya di sini, di parser, supaya pemanggil bisa
+       melewatinya SEBELUM mountpoint dibuat (tidak ada direktori hantu
+       untuk entri yang tidak pernah di-mount). */
+    if ((flags & MS_BIND) && skip_reason && *skip_reason == SKIP_NONE)
+        *skip_reason = SKIP_BIND;
     return flags;
+}
+
+/* Buat direktori beserta seluruh induknya (mkdir -p), mode 0755 untuk tiap
+   direktori yang BARU dibuat (di-chmod eksplisit supaya hasilnya tidak
+   bergantung umask warisan PID 1; kegagalan chmod menggagalkan entri).
+   Seluruh path DIPINDAI DI MUKA: komponen "." dan ".." ditolak sebelum
+   direktori apa pun dibuat, supaya penolakan tidak meninggalkan direktori
+   hantu (fstab juga tidak boleh diam-diam menormalisasi path ke tempat
+   lain). Komponen yang sudah ada harus direktori: diperiksa dengan stat()
+   yang MENGIKUTI symlink — symlink ke direktori diterima, symlink ke file
+   / komponen berupa file biasa ditolak dengan log jelas (tanpa cek ini,
+   mkdir EEXIST akan lolos dan mount() gagal ENOTDIR jauh dari
+   penyebabnya). Path harus absolut dan muat di buffer (tidak ada
+   pemotongan diam-diam). Mengembalikan 0 bila mountpoint siap, -1 bila
+   entri harus dilewati. */
+static int mkdir_p(const char *path)
+{
+    char buf[MAX_LINE];
+    size_t len;
+
+    if (!path) return -1;
+    len = strlen(path);
+    if (path[0] != '/' || len >= sizeof(buf)) {
+        init_log("fstab: mountpoint '%s' tidak valid (harus absolut, maks %zu karakter)",
+                 path, sizeof(buf) - 1);
+        return -1;
+    }
+
+    /* Pra-pindai komponen: tolak "." / ".." sebelum mkdir pertama. */
+    for (const char *s = path; *s; ) {
+        while (*s == '/') s++;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t clen = (size_t)(e - s);
+        if ((clen == 1 && s[0] == '.') ||
+            (clen == 2 && s[0] == '.' && s[1] == '.')) {
+            init_log("fstab: mountpoint '%s' memuat komponen '%.*s', ditolak",
+                     path, (int)clen, s);
+            return -1;
+        }
+        s = e;
+    }
+
+    memcpy(buf, path, len + 1);
+
+    /* Berjalan komponen demi komponen; potongan kosong (slash ganda,
+       trailing slash, dan "/" itu sendiri) berakhir sebagai direktori
+       yang sudah ada dan lolos lewat jalur EEXIST + stat di bawah. */
+    for (char *p = buf + 1; ; p++) {
+        if (*p != '/' && *p != '\0') continue;
+        char save = *p;
+        *p = '\0';
+        if (mkdir(buf, 0755) == 0) {
+            if (chmod(buf, 0755) < 0) {
+                init_log("fstab: chmod '%s' gagal: %s", buf, strerror(errno));
+                return -1;
+            }
+        } else if (errno == EEXIST) {
+            struct stat st;
+            if (stat(buf, &st) < 0) {
+                init_log("fstab: stat '%s' gagal: %s", buf, strerror(errno));
+                return -1;
+            }
+            if (!S_ISDIR(st.st_mode)) {
+                init_log("fstab: komponen '%s' dari mountpoint '%s' bukan direktori", buf, path);
+                return -1;
+            }
+        } else {
+            init_log("fstab: mkdir '%s' gagal: %s", buf, strerror(errno));
+            return -1;
+        }
+        *p = save;
+        if (save == '\0') break;
+    }
+    return 0;
 }
 
 /* Format: <device> <mountpoint> <fstype> <options> [dump] [pass]; baris '#' diabaikan */
@@ -868,14 +958,24 @@ static void mount_fstab(void)
         char flagbuf[MAX_LINE];
         char databuf[MAX_LINE] = "";
         snprintf(flagbuf, sizeof(flagbuf), "%s", opts ? opts : "");
-        int skip_entry = 0;
-        unsigned long flags = parse_mount_flags(flagbuf, databuf, sizeof(databuf), &skip_entry);
-        if (skip_entry) {
+        int skip_reason = SKIP_NONE;
+        unsigned long flags = parse_mount_flags(flagbuf, databuf, sizeof(databuf), &skip_reason);
+        /* Keputusan lewati diputuskan parser dan dievaluasi di sini,
+           SEBELUM mountpoint dibuat: entri yang dilewati tidak meninggalkan
+           direktori hantu di rootfs. */
+        if (skip_reason == SKIP_NOAUTO) {
             init_log("fstab: %s -> %s dilewati (opsi noauto)", dev, mnt);
             continue;
         }
+        if (skip_reason == SKIP_BIND) {
+            init_log("fstab: %s -> %s dilewati (bind/rbind tidak didukung)", dev, mnt);
+            continue;
+        }
 
-        mkdir(mnt, 0755);
+        if (mkdir_p(mnt) < 0) {
+            init_log("fstab: %s -> %s dilewati (mountpoint tidak bisa disiapkan)", dev, mnt);
+            continue;
+        }
         if (mount(dev, mnt, type, flags, databuf[0] ? databuf : NULL) < 0)
             init_log("fstab: mount %s -> %s (%s) [data: %s] gagal: %s", dev, mnt, type,
                      databuf[0] ? databuf : "-", strerror(errno));

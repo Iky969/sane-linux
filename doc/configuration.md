@@ -10,14 +10,15 @@ Format per baris:
 
 | Bagian | Aturan |
 |---|---|
-| `<nama>` | Maks 127 karakter (diperingatkan dan dipotong otomatis). Tidak boleh memuat karakter `/` (karena nama dipakai sebagai path direktori cgroup). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
+| `<nama>` | Maks 127 karakter. Lebih dari itu entri **ditolak** (`Parse err: ... entri ditolak`), bukan dipotong. Tidak boleh memuat karakter `/` (karena nama dipakai sebagai path direktori cgroup). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
 | `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
-| `<perintah>` | Maks 511 karakter (diperingatkan dan dipotong otomatis), dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari `:requires=` dari kanan). |
-| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter (diperingatkan dan dipotong otomatis). Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
+| `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari `:requires=` dari kanan). |
+| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
  
 Aturan umum:
  
 - Baris komentar dimulai `#` (spasi/tab di depan diizinkan) dan baris kosong diabaikan.
+- Baris lebih dari 1023 karakter ditolak utuh dan dicatat (`Parse err: baris melebihi MAX_LINE ...`); baris berikutnya tetap diproses. Aturan yang sama berlaku untuk baris `/etc/fstab`.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
 - File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
   `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
@@ -51,23 +52,61 @@ Dipasang sekali saat boot, tepat setelah filesystem pseudo (`proc`, `sysfs`,
 <device> <mountpoint> <fstype> <options> [dump] [pass]
 ```
 
-Sikap ninit terhadap kolom `options`:
+Sikap ninit terhadap kolom `options` — semua token diproses **kiri ke
+kanan** seperti `mount(8)`: token belakangan mengalahkan token sebelumnya.
 
 | Opsi | Perlakuan |
 |---|---|
-| `ro` | flag `MS_RDONLY` |
-| `noexec`, `nosuid`, `nodev` | flag `MS_NOEXEC` / `MS_NOSUID` / `MS_NODEV` |
-| `sync`, `dirsync`, `remount`, `bind` | flag `MS_SYNCHRONOUS` / `MS_DIRSYNC` / `MS_REMOUNT` / `MS_BIND` |
+| `ro`, `noexec`, `nosuid`, `nodev`, `sync`, `dirsync`, `remount` | flag `MS_RDONLY` / `MS_NOEXEC` / `MS_NOSUID` / `MS_NODEV` / `MS_SYNCHRONOUS` / `MS_DIRSYNC` / `MS_REMOUNT` |
+| `noatime`, `relatime`, `strictatime` | flag mode atime yang bersangkutan; ketiganya saling meniadakan (yang terakhir menang) |
+| `nodiratime`, `lazytime` | flag `MS_NODIRATIME` / `MS_LAZYTIME` |
+| `rw`, `async`, `atime`, `diratime`, `exec`, `suid`, `dev` | token peniada: membersihkan bit lawannya (mis. `ro,rw` berakhir `rw`; `user,exec` berakhir tetap bisa dieksekusi) |
+| `user`, `users` | menerapkan implikasi `mount(8)`: `noexec,nosuid,nodev` (bisa dibatalkan token `exec`/`suid`/`dev` sesudahnya) |
+| `owner`, `group` | menerapkan implikasi `mount(8)`: `nosuid,nodev` |
 | `defaults` | dibuang seluruhnya (kata kunci `mount(8)`; bila dikirim ke kernel ditolak `EINVAL`) |
-| `rw`, `relatime` | diabaikan (perilaku default kernel) |
+| `auto`, `nouser`, `_netdev`, `nofail`, `x-*`, `comment=*` | opsi khusus userspace: dicatat sebagai diabaikan, tidak diteruskan ke kernel |
+| `noauto` | entri dilewati seluruhnya (seperti `mount -a`); mountpoint **tidak** dibuat |
+| `bind`, `rbind` (termasuk kombinasi `remount,bind`) | **tidak didukung**: entri dilewati dengan catatan eksplisit; mountpoint **tidak** dibuat — lihat *Batasan yang diketahui* |
 | opsi lain (`size=`, `uid=`, `mode=`, `compress=`, …) | **diteruskan sebagai argumen ke-5 `mount()`** (parameter `data`) |
+
+Token flag tidak pernah ikut diteruskan sebagai `data`: parser opsi
+filesystem yang ketat (ext4, tmpfs) menolak opsi data tak dikenal dengan
+`EINVAL`.
+
+Mountpoint:
+
+- Dibuat **rekursif** (seperti `mkdir -p`) dengan mode `0755` untuk tiap
+  direktori yang baru dibuat; mode dipasang eksplisit sehingga tidak
+  bergantung pada umask warisan PID 1.
+- Mountpoint harus path absolut. Komponen yang sudah ada harus direktori:
+  symlink diikuti — symlink ke direktori diterima, sedangkan komponen
+  berupa file biasa, symlink ke file, atau symlink menggantung (targetnya
+  tidak ada) ditolak dengan catatan jelas dan entri itu dilewati (entri
+  lain tetap diproses).
+- Komponen `.` dan `..` ditolak: fstab tidak dinormalisasi diam-diam ke
+  path lain.
+- Entri yang dilewati (`noauto`, `bind`) tidak dibuatkan direktori.
+- Bila `mount()` gagal setelah direktori dibuat, direktori kosongnya
+  tertinggal di rootfs.
 
 - Komentar `#` dan baris kosong diabaikan; baris dengan kolom kurang dari tiga
   dilaporkan `fstab: baris tidak lengkap`.
-- Mountpoint dibuat otomatis dengan mode `0755`.
 - Hasil tiap baris dicatat: `fstab: mount <dev> -> <mnt> (<fstype>) [data: <opsi>] ok|gagal: <errno>`.
 - Path default `/etc/fstab`, dapat diubah saat build untuk pengujian:
   `make CFLAGS="-static -O2 -Wall -DFSTAB_PATH=\"/path/uji/fstab\""`.
+
+### Batasan yang diketahui
+
+- **Bind mount tidak didukung.** Untuk entri bind, kolom pertama fstab
+  bermakna path sumber, sedangkan ninit memperlakukan kolom pertama
+  sebagai device/label filesystem; mendukung bind berarti mengubah
+  semantik kolom itu dan menangani kasus sumber file vs direktori.
+  Daripada gagal diam-diam, entri `bind`/`rbind` ditolak eksplisit di
+  log. Kebutuhan boot dasar (`/proc`, `/sys`, `/dev`, `/run`, `/tmp`)
+  semuanya mount bertipe dan tidak membutuhkan bind.
+- `/etc/fstab` dan `/etc/init.conf` diasumsikan milik root dan tepercaya;
+  ninit tidak mempertahankan diri dari file konfigurasi yang sudah bisa
+  ditulis penyerang (penyerang itu sudah setara root).
 
 Contoh:
 
