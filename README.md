@@ -44,15 +44,15 @@ Butuh `build-essential` dan (untuk uji) `busybox-static`:
 sudo apt-get install build-essential busybox-static
 
 make          # hasilkan biner statis ./ninit
-make test     # smoke test + test SIGTERM (butuh root/sudo)
+make test     # smoke test + SIGTERM + config + fixture harness QEMU (tiga pertama butuh root/sudo)
 make rootfs   # rootfs distro minimal + initramfs (busybox statis, ninit PID 1)
 make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
 make clean
 ```
 
-`make test` menjalankan tiga uji otomatis. Semuanya menyiapkan rootfs sementara
-(busybox sebagai `/bin/sh`) lalu menjalankan ninit sebagai PID 1 di PID + mount
-namespace baru:
+`make test` menjalankan empat uji otomatis. Tiga pertama menyiapkan rootfs
+sementara (busybox sebagai `/bin/sh`) lalu menjalankan ninit sebagai PID 1 di
+PID + mount namespace baru:
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
   (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
@@ -66,6 +66,11 @@ namespace baru:
   rescue shell (signal mask-nya kosong, jadi Ctrl+C berfungsi), dan
   `/run/initctl` dibaca per baris (`poweroff\nreboot` → hanya `poweroff` yang
   dieksekusi).
+- **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — menjaga
+  pemeriksaan otomatis `run-qemu.sh` tidak longgar: log konsol tempat layanan
+  console mati dan di-respawn ulang (`exit status`, `respawn ditunda`, lebih
+  dari satu PID unik) harus GAGAL, bukan LULUS. Dijalankan terhadap fixture
+  log lewat `REPORT_ONLY=1` — tanpa root dan tanpa QEMU.
 
 Contoh output dan penjelasan tiap pemeriksaan ada di
 [doc/build-and-test.md](doc/build-and-test.md).
@@ -78,7 +83,7 @@ dengan konsol serial:
 
 ```bash
 make rootfs               # unduh + kompilasi busybox statis, susun distro/rootfs, bungkus initramfs
-SECS=5 make qemu          # boot 5 detik, cetak konsol serial + pemeriksaan penanda boot
+SECS=5 make qemu          # boot 5 detik, cetak konsol serial + pemeriksaan penanda boot & liveness console
 make qemu                 # mode interaktif (keluar: Ctrl-A X)
 ```
 
@@ -145,8 +150,10 @@ Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
+scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
 scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
 scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda
+                        boot + cek liveness layanan console
 distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
 doc/                     dokumentasi teknis (lihat di bawah)
 .github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror,
