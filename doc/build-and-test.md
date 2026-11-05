@@ -223,6 +223,13 @@ Pemakaian: `sudo sh ./scripts/test-integration.sh` (CI: step terakhir job
 `rootfs-distro`). Variabel: `SECS=40` (jendela boot TCG), `BUSYBOX_MODE`
 diteruskan ke build-rootfs.
 
+Catatan `BUSYBOX_MODE`: suite default memakai `prebuilt` (cepat, cocok CI).
+Hook `EXTRA_FSTAB`/`EXTRA_INIT_CONF` tidak bergantung mode, tetapi **isi
+rootfs bisa berbeda** antar mode — mis. set applet dari sumber (`defconfig`)
+tidak selalu sama dengan `busybox-static` cadangan. Sesekali jalankan juga
+dengan `BUSYBOX_MODE=auto|source` untuk memastikan fixture tetap lulus pada
+rootfs hasil kompilasi sumber, bukan hanya binary cadangan.
+
 ## Uji manual di chroot (tanpa script)
 
 ```bash
