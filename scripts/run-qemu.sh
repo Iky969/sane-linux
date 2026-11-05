@@ -141,6 +141,13 @@ run_qemu() { # $1 = auto | interactive
 	if [ -w /dev/kvm ] 2>/dev/null; then
 		info "KVM tersedia: -enable-kvm -cpu host"
 		set -- "$@" -enable-kvm -cpu host
+	elif [ "$mode" = auto ]; then
+		# TCG tanpa -cpu memakai qemu64 yang tidak punya AVX dst: toolchain
+		# host modern (mis. Ubuntu x86-64-v3) menghasilkan SIGILL di dalam
+		# guest dan panic-nya jauh dari penyebab sebenarnya. -cpu max =
+		# semua yang bisa di-emulasi TCG.
+		info "TCG: -cpu max (qemu64 default terlalu tua untuk toolchain host)"
+		set -- "$@" -cpu max
 	fi
 	if [ "$NO_REBOOT" = 1 ]; then
 		set -- "$@" -no-reboot

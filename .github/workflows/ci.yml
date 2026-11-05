@@ -67,3 +67,6 @@ jobs:
 
       - name: Boot initramfs di QEMU (TCG, tanpa /dev/kvm)
         run: sudo SECS=20 sh ./scripts/run-qemu.sh
+
+      - name: Uji integrasi lintas lapisan fstab <-> kernel <-> layanan (boot QEMU kedua)
+        run: sudo SECS=40 sh ./scripts/test-integration.sh

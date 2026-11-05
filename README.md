@@ -71,6 +71,11 @@ PID + mount namespace baru:
   console mati dan di-respawn ulang (`exit status`, `respawn ditunda`, lebih
   dari satu PID unik) harus GAGAL, bukan LULUS. Dijalankan terhadap fixture
   log lewat `REPORT_ONLY=1` — tanpa root dan tanpa QEMU.
+- **[`scripts/test-integration.sh`](scripts/test-integration.sh)** — uji
+  silang-lapisan dengan SATU boot QEMU sungguhan: fstab uji (opsi data, escape
+  oktal, duplikat mountpoint) harus benar-benar ter-mount di kernel dan
+  terlihat dari `/proc/mounts` milik layanan, SEMUA mount selesai sebelum
+  service pertama start, dan harness standar tetap LULUS (`make integration`).
 
 Contoh output dan penjelasan tiap pemeriksaan ada di
 [doc/build-and-test.md](doc/build-and-test.md).
@@ -151,13 +156,14 @@ scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
+scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
 scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
 scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda
                         boot + cek liveness layanan console
 distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
 doc/                     dokumentasi teknis (lihat di bawah)
 .github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror,
-                      rootfs + boot QEMU (job rootfs-distro)
+                      rootfs + boot QEMU + uji integrasi (job rootfs-distro)
 SECURITY.md              kebijakan keamanan & cara melaporkan kerentanan
 LICENSE                  MIT
 ```
