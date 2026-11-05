@@ -94,7 +94,11 @@ check "escape oktal didekode lalu di-mount kernel apa adanya ('/mnt/a b')" \
 	'fstab: mount tmpfs -> /mnt/a b (tmpfs)'
 check "entri duplikat DILEWATI, bukan mount ganda" \
 	'fstab: tmpfs -> /mnt/intg dilewati (mountpoint duplikat'
-absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+# Scope kegagalan mount ke HANYA path fixture: kalau nanti suite ini dipakai
+# sebagai host untuk uji negatif (entri yang sengaja gagal), mount gagal di
+# path lain tidak boleh membuat pemeriksaan ini ikut merah.
+absent "entri fixture /mnt/intg tidak gagal mount" 'fstab: mount .* /mnt/intg .* gagal'
+absent "entri fixture /mnt/a b tidak gagal mount"  'fstab: mount .* /mnt/a b .* gagal'
 check "layanan mountproof start"            'started mountproof'
 check "mount fstab terlihat dari /proc/mounts guest" 'INTEGRATION-MOUNT-VISIBLE'
 absent "tidak ada mount yang hilang dari sudut pandang layanan" 'INTEGRATION-MOUNT-MISSING'
