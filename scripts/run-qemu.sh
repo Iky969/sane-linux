@@ -197,7 +197,10 @@ report() {
 		fail_count=$((fail_count + 1))
 	fi
 	absent "console tidak pernah keluar ('console (pid N) exit status')" 'console (pid [0-9]*) exit status'
-	absent "tidak ada respawn tertunda ('respawn ditunda')"               'respawn ditunda'
+	# Di-scope ke console: service respawn LAIN yang pernah tertunda window-nya
+	# adalah perilaku normal (catatan review PR #6); yang dilarang adalah
+	# console-nya sendiri yang di-respawn.
+	absent "console tidak di-respawn tertunda ('console: respawn ditunda')" 'console: respawn ditunda'
 
 	absent "tidak ada kernel panic"                      'Kernel panic'
 	if [ -n "${ready_ms:-}" ]; then
