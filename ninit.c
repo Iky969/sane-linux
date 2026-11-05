@@ -920,6 +920,46 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
+/* Dekode escape oktal fstab di tempat, mengikuti getmntent(3)/mount(8):
+   backslash diikuti TEPAT tiga digit oktal (\040 spasi, \011 tab, \012
+   newline, \134 backslash, dan \ooo lain) menjadi satu byte; urutan selain
+   itu dibiarkan apa adanya. Hasil dekode tidak pernah lebih panjang dari
+   sumbernya, jadi aman dilakukan in-place. Diterapkan pada field device
+   dan mountpoint SEBELUM validasi lain (pra-pindai mkdir_p, cek duplikat),
+   supaya semua pemeriksaan bekerja pada path yang sebenarnya — mis.
+   \056\056 yang terdekode menjadi ".." tetap ditolak pra-pindai mkdir_p.
+   Tanpa dekode ini (temuan PR3-C1), path berisi spasi dibuat sebagai
+   direktori bernama harfiah "spa\040ce" dan di-mount di sana: berhasil,
+   tapi diam-diam menyimpang dari mount -a. Field opsi TIDAK didekode:
+   tokennya dipisah koma oleh parse_mount_flags(), dan koma hasil dekode
+   (\054) akan mengubah makna pemisahan itu; path berisi spasi — kasus
+   nyata temuan ini — hidup di device/mountpoint. */
+static void unescape_fstab_field(char *s)
+{
+    char *r = s, *w = s;
+    while (*r) {
+        if (r[0] == '\\' && r[1] >= '0' && r[1] <= '7' &&
+            r[2] >= '0' && r[2] <= '7' && r[3] >= '0' && r[3] <= '7') {
+            *w++ = (char)((r[1] - '0') * 64 + (r[2] - '0') * 8 + (r[3] - '0'));
+            r += 4;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+/* Dua mountpoint dianggap sama bila identik setelah slash di ujung
+   diabaikan ("/mnt/x/" dan "/mnt/x" adalah direktori yang sama; "/"
+   tetap "/"). Dipakai cek duplikat mount_fstab. */
+static int same_mountpoint(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    while (la > 1 && a[la - 1] == '/') la--;
+    while (lb > 1 && b[lb - 1] == '/') lb--;
+    return la == lb && strncmp(a, b, la) == 0;
+}
+
 /* Format: <device> <mountpoint> <fstype> <options> [dump] [pass]; baris '#' diabaikan */
 static void mount_fstab(void)
 {
@@ -928,6 +968,17 @@ static void mount_fstab(void)
         init_log("fstab: %s tidak ada, dilewati", FSTAB_PATH);
         return;
     }
+
+    /* Mountpoint yang SUDAH berhasil di-mount entri sebelumnya pada
+       lintasan ini (temuan PR3-C2): mount(2) menumpuk mount duplikat
+       diam-diam, dan opsi mount teratas menutupi proteksi mount di
+       bawahnya (nosuid bisa hilang tanpa jejak). Entri duplikat kini
+       dilewati dan dicatat. Hanya mount yang BERHASIL yang dicatat, jadi
+       kegagalan entri pertama tidak menghalangi mountpoint yang sama
+       dicoba lagi oleh entri berikutnya. */
+    enum { MAX_SEEN_MNT = 64 };
+    static char seen_mnt[MAX_SEEN_MNT][MAX_LINE];
+    int seen_cnt = 0;
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
@@ -949,6 +1000,12 @@ static void mount_fstab(void)
             init_log("fstab: baris tidak lengkap: '%s'", p);
             continue;
         }
+
+        /* Escape oktal didekode sebelum pemrosesan lain apa pun (lihat
+           unescape_fstab_field): log, mkdir, cek duplikat, dan mount()
+           semuanya melihat path yang sebenarnya. */
+        unescape_fstab_field(dev);
+        unescape_fstab_field(mnt);
 
         /* Opsi dipisahkan SATU kali oleh parse_mount_flags() dari salinan
            string (strtok merusak string aslinya): token flag menjadi MS_*
@@ -972,6 +1029,17 @@ static void mount_fstab(void)
             continue;
         }
 
+        /* Duplikat diperiksa setelah keputusan parser, sebelum mkdir:
+           entri yang dilewati tidak meninggalkan direktori hantu, sama
+           seperti noauto/bind. */
+        int is_dup = 0;
+        for (int i = 0; i < seen_cnt; i++)
+            if (same_mountpoint(seen_mnt[i], mnt)) { is_dup = 1; break; }
+        if (is_dup) {
+            init_log("fstab: %s -> %s dilewati (mountpoint duplikat, sudah di-mount entri sebelumnya)", dev, mnt);
+            continue;
+        }
+
         if (mkdir_p(mnt) < 0) {
             init_log("fstab: %s -> %s dilewati (mountpoint tidak bisa disiapkan)", dev, mnt);
             continue;
@@ -979,9 +1047,12 @@ static void mount_fstab(void)
         if (mount(dev, mnt, type, flags, databuf[0] ? databuf : NULL) < 0)
             init_log("fstab: mount %s -> %s (%s) [data: %s] gagal: %s", dev, mnt, type,
                      databuf[0] ? databuf : "-", strerror(errno));
-        else
+        else {
             init_log("fstab: mount %s -> %s (%s) [data: %s] ok", dev, mnt, type,
                      databuf[0] ? databuf : "-");
+            if (seen_cnt < MAX_SEEN_MNT)
+                snprintf(seen_mnt[seen_cnt++], MAX_LINE, "%s", mnt);
+        }
     }
     fclose(f);
 }

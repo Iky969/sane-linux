@@ -75,6 +75,21 @@ filesystem yang ketat (ext4, tmpfs) menolak opsi data tak dikenal dengan
 
 Mountpoint:
 
+- Escape oktal gaya `getmntent(3)`/`mount(8)` pada kolom *device* dan
+  *mountpoint* **didekode** sebelum pemrosesan lain: `\040` spasi, `\011`
+  tab, `\012` newline, `\134` backslash, dan `\ooo` oktal lain. Path
+  hasil dekode-lah yang divalidasi, dibuat, dan di-mount — jadi
+  `\056\056` yang terdekode menjadi `..` tetap ditolak seperti `..`
+  harfiah. (Kolom *options* tidak didekode — lihat *Batasan yang
+  diketahui*.)
+- Mountpoint yang **sudah berhasil di-mount** oleh entri sebelumnya
+  dalam lintasan yang sama tidak di-mount ulang: entri duplikat
+  dilewati dan dicatat (`mountpoint duplikat`), supaya opsi entri
+  pertama (mis. `nosuid`) tidak tertutupi diam-diam oleh tumpukan
+  mount entri berikutnya. Perbandingan mengabaikan slash di ujung
+  (`/mnt/x/` sama dengan `/mnt/x`). Hanya mount yang berhasil yang
+  dicatat, jadi kegagalan entri pertama tidak menghalangi entri
+  berikutnya untuk mountpoint yang sama.
 - Dibuat **rekursif** (seperti `mkdir -p`) dengan mode `0755` untuk tiap
   direktori yang baru dibuat; mode dipasang eksplisit sehingga tidak
   bergantung pada umask warisan PID 1.
@@ -104,6 +119,11 @@ Mountpoint:
   Daripada gagal diam-diam, entri `bind`/`rbind` ditolak eksplisit di
   log. Kebutuhan boot dasar (`/proc`, `/sys`, `/dev`, `/run`, `/tmp`)
   semuanya mount bertipe dan tidak membutuhkan bind.
+- **Escape oktal di kolom *options* tidak didekode.** Token opsi
+  dipisah koma, dan koma hasil dekode (`\054`) akan mengubah makna
+  pemisahan itu; nilai opsi fstab nyata praktis tidak pernah memuat
+  karakter yang perlu di-escape. Escape pada *device* dan *mountpoint*
+  (kasus nyata: path berisi spasi) didukung penuh.
 - `/etc/fstab` dan `/etc/init.conf` diasumsikan milik root dan tepercaya;
   ninit tidak mempertahankan diri dari file konfigurasi yang sudah bisa
   ditulis penyerang (penyerang itu sudah setara root).
