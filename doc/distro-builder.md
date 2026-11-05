@@ -60,7 +60,22 @@ qemu-system-x86_64 -m 256 -no-reboot \
 - Mode **interaktif**: `-nographic` (serial + monitor di stdio).
 - Mode **otomatis** (`SECS=<detik>`): `-display none -serial file:distro/qemu-console.log`
   supaya konsol guest terekam utuh tanpa bergantung pada TTY, dan proses QEMU
-  dibatasi `timeout`.
+  dibatasi `timeout`. Setelah boot, `report()` memeriksa:
+
+  | Pemeriksaan | Alasan |
+  |---|---|
+  | `ninit start (PID 1)` muncul | init benar-benar jalan sebagai PID 1 |
+  | `main loop siap` muncul (dengan latensi) | parsing config + spawn awal sukses |
+  | `started console` muncul | layanan `init.conf` di-spawn |
+  | **tepat satu PID unik** di `started console (pid N)` | console tidak di-respawn ulang; tiap baris ninit muncul dua kali (`/dev/kmsg` + stderr), jadi dihitung PID uniknya |
+  | **tidak ada `console (pid N) exit status`** | console tidak pernah mati selama jendela boot |
+  | **tidak ada `respawn ditunda`** | tidak ada layanan respawn yang gagal terus |
+  | tidak ada `Kernel panic` | guest tidak mati keras |
+
+  Empat pemeriksaan terakhir ada karena `started console` ditulis saat *fork*,
+  bukan setelah `exec` berhasil: tanpa itu,
+  `console:respawn:/bin/does-not-exist` tetap LULUS (buktinya di
+  `scripts/test-qemu-report.sh` skenario 2).
 - `-enable-kvm -cpu host` ditambahkan otomatis bila `/dev/kvm` bisa ditulis
   (di sandbox ini tidak ada, jadi emulasi TCG murni).
 
@@ -176,6 +191,7 @@ reboot (dipakai uji otomatis).
 | `NO_REBOOT` | `1` | `0` = tanpa `-no-reboot`, sehingga reboot guest benar-benar me-reset mesin |
 | `REBUILD` | `0` | `1` = bangun ulang rootfs dulu |
 | `CONSOLE_LOG` | `distro/qemu-console.log` | rekaman konsol serial |
+| `REPORT_ONLY` | `0` | `1` = jangan boot; jalankan `report()` terhadap `CONSOLE_LOG` yang sudah ada (dipakai `scripts/test-qemu-report.sh`; tanpa QEMU/root) |
 
 ## Known Limitations
 
