@@ -7,6 +7,8 @@
 #   make rootfs     bangun rootfs distro minimal + initramfs (busybox statis,
 #                   ninit sebagai /sbin/init; lihat doc/distro-builder.md)
 #   make qemu       boot rootfs itu di QEMU (butuh qemu-system-x86)
+#   make integration  uji integrasi lintas lapisan fstab<->kernel<->layanan
+#                   lewat satu boot QEMU sungguhan (butuh root + qemu-system-x86)
 #   make clean      hapus biner hasil build
 #
 # Butuh: build-essential + busybox-static (busybox dipakai sebagai /bin/sh di rootfs uji).
@@ -34,6 +36,9 @@ rootfs:
 qemu: rootfs
 	sh ./scripts/run-qemu.sh
 
+integration: $(BIN)
+	sh ./scripts/test-integration.sh
+
 clean:
 	rm -f $(BIN)
 
@@ -41,4 +46,4 @@ clean-distro:
 	rm -rf distro/rootfs distro/build distro/cache distro/initramfs.cpio.gz \
 	       distro/qemu-console.log distro/qemu.log
 
-.PHONY: all test rootfs qemu clean clean-distro
+.PHONY: all test rootfs qemu integration clean clean-distro

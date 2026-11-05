@@ -18,11 +18,12 @@ make            # -> ./ninit  (gcc -static -O2 -Wall)
 ## Uji otomatis
 
 ```bash
-make test                              # menjalankan keempat script di bawah ini
+make test                              # menjalankan empat script pertama (5 butuh QEMU: make integration)
 sudo sh ./scripts/smoke-test.sh        # 1) smoke test PID 1
 sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM sampai ke layanan
 sudo sh ./scripts/test-config.sh       # 3) urut dependensi + rescue mode + initctl
 sh ./scripts/test-qemu-report.sh       # 4) pemeriksaan harness run-qemu.sh (tanpa root)
+sudo sh ./scripts/test-integration.sh  # 5) integrasi lintas lapisan via boot QEMU (make integration)
 ```
 
 ### 1. Smoke test PID 1 (`scripts/smoke-test.sh`)
@@ -187,6 +188,48 @@ jumlah PID unik pada `started console (pid N)` harus tepat satu; baris
 Pemakaian: `sh ./scripts/test-qemu-report.sh` (sudah termasuk `make test`
 dan CI).
 
+### 5. Uji integrasi lintas lapisan (`scripts/test-integration.sh`)
+
+Kenapa ada: suite 1–4 menguji satu lapisan pada satu waktu (parser di chroot,
+report() lewat fixture). Inkonsistensi ANTAR lapisan lolos dari semuanya —
+misalnya escape oktal fstab yang benar di unit test tapi `mount()` gagal di
+kernel asli, atau opsi data yang terbaca parser namun hilang saat rootfs
+di-pack ke initramfs.
+
+Cara kerja (butuh root + QEMU; `sudo make integration`):
+
+1. Menulis fixture `fstab` (entri normal `size=1m`, mountpoint ber-escape
+   oktal `/mnt/a\040b`, dan duplikat mountpoint) + `init.conf` berisi layanan
+   `mountproof:once:` yang membaca `/proc/mounts` dari DALAM guest.
+2. Membangun rootfs lewat hook `EXTRA_FSTAB`/`EXTRA_INIT_CONF`
+   `scripts/build-rootfs.sh`, lalu SATU boot QEMU via `run-qemu.sh`.
+3. Menuntut hasil lintas lapisan:
+
+| Pemeriksaan | Arti |
+|---|---|
+| `fstab: mount ... [data: size=1m] ok` | opsi data fstab benar-benar diteruskan ke `mount()` kernel |
+| `fstab: mount tmpfs -> /mnt/a b ... ok` | dekode escape oktal bekerja terhadap kernel nyata (regresi PR #3-C1) |
+| `dilewati (mountpoint duplikat` | entri duplikat tidak di-mount dua kali (regresi PR #3-C2) |
+| `INTEGRATION-MOUNT-VISIBLE` | mount fstab terlihat dari `/proc/mounts` sudut pandang layanan |
+| urutan baris konsol | semua aktivitas `fstab:` mendahului service pertama dan `main loop siap` |
+| `report()` LULUS | boot ber-fstab uji tetap memenuhi harness standar (bagian 4) |
+
+Catatan TCG: mode otomatis kini memakai `-cpu max` bila `/dev/kvm` tidak ada.
+Tanpa itu, CPU default `qemu64` tidak punya AVX dan toolchain host modern
+(x86-64-v3, mis. Ubuntu 26.04) langsung SIGILL — kernel panic jauh sebelum
+banner ninit, tanpa petunjuk penyebabnya.
+
+Pemakaian: `sudo sh ./scripts/test-integration.sh` (CI: step terakhir job
+`rootfs-distro`). Variabel: `SECS=40` (jendela boot TCG), `BUSYBOX_MODE`
+diteruskan ke build-rootfs.
+
+Catatan `BUSYBOX_MODE`: suite default memakai `prebuilt` (cepat, cocok CI).
+Hook `EXTRA_FSTAB`/`EXTRA_INIT_CONF` tidak bergantung mode, tetapi **isi
+rootfs bisa berbeda** antar mode — mis. set applet dari sumber (`defconfig`)
+tidak selalu sama dengan `busybox-static` cadangan. Sesekali jalankan juga
+dengan `BUSYBOX_MODE=auto|source` untuk memastikan fixture tetap lulus pada
+rootfs hasil kompilasi sumber, bukan hanya binary cadangan.
+
 ## Uji manual di chroot (tanpa script)
 
 ```bash
@@ -225,7 +268,8 @@ Job kedua, `rootfs-distro`, menjaga jalur distro yang tidak dipakai script di at
 install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs.sh`
 (kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
 (boot initramfs dengan konsol serial; selain penanda boot, harness juga menuntut
-console tetap hidup — lihat bagian 4). QEMU di runner memakai TCG karena tidak ada
+console tetap hidup — lihat bagian 4) → `sudo SECS=40 sh ./scripts/test-integration.sh`
+(satu boot kedua dengan fstab + init.conf uji — lihat bagian 5). QEMU di runner memakai TCG karena tidak ada
 `/dev/kvm`; kernel guest diunduh dari Alpine netboot ke `distro/cache/`.
 
 ## Troubleshooting
