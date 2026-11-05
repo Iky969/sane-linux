@@ -39,6 +39,9 @@ jobs:
       - name: Dependensi, rescue mode, dan initctl per baris
         run: sudo sh ./scripts/test-config.sh
 
+      - name: Pemeriksaan harness run-qemu.sh (fixture log, tanpa QEMU)
+        run: sh ./scripts/test-qemu-report.sh
+
       - name: Build tanpa warning (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
 
