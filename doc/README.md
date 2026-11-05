@@ -47,8 +47,9 @@ Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), initctl per baris
+scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
 doc/                     dokumentasi ini
-.github/workflows/ci.yml CI: build statis, cek statis, ketiga uji, -Werror
+.github/workflows/ci.yml CI: build statis, cek statis, keempat uji, -Werror
 SECURITY.md              kebijakan keamanan
 LICENSE                  MIT
 ```
@@ -57,7 +58,7 @@ LICENSE                  MIT
 
 ```bash
 make          # hasilkan biner statis ./ninit
-make test     # uji sebagai PID 1: smoke test + test SIGTERM + test konfigurasi
+make test     # uji sebagai PID 1: smoke test + test SIGTERM + test konfigurasi (+ pemeriksaan harness run-qemu.sh)
               # (butuh root/sudo)
 ```
 

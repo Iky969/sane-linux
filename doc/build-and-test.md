@@ -18,10 +18,11 @@ make            # -> ./ninit  (gcc -static -O2 -Wall)
 ## Uji otomatis
 
 ```bash
-make test                            # menjalankan ketiga script di bawah ini
-sudo sh ./scripts/smoke-test.sh      # 1) smoke test PID 1
-sudo sh ./scripts/test-sigterm.sh    # 2) SIGTERM sampai ke layanan
-sudo sh ./scripts/test-config.sh     # 3) urut dependensi + rescue mode + initctl
+make test                              # menjalankan keempat script di bawah ini
+sudo sh ./scripts/smoke-test.sh        # 1) smoke test PID 1
+sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM sampai ke layanan
+sudo sh ./scripts/test-config.sh       # 3) urut dependensi + rescue mode + initctl
+sh ./scripts/test-qemu-report.sh       # 4) pemeriksaan harness run-qemu.sh (tanpa root)
 ```
 
 ### 1. Smoke test PID 1 (`scripts/smoke-test.sh`)
@@ -156,6 +157,36 @@ portabel. Perintah manual asli tetap bisa dipakai di mesin yang mendukungnya:
 sudo timeout 5 unshare --pid --fork --mount-proc=/tmp/myrootfs/proc chroot /tmp/myrootfs /ninit
 ```
 
+### 4. Pemeriksaan harness run-qemu.sh (`scripts/test-qemu-report.sh`)
+
+Kenapa ada: catatan PR #1 ("Temuan berikutnya") — `run-qemu.sh` mode otomatis
+bisa melaporkan LULUS padahal layanan console mati. Baris `started console`
+ditulis `spawn_service()` saat *fork*, bukan setelah `exec` berhasil, sehingga
+`console:respawn:/bin/does-not-exist` menghasilkan `started console` berulang
+(diselingi `exit status=0x7f00` dan `respawn ditunda`) sementara tiga pemeriksaan
+lama tetap cocok semua.
+
+Cara kerja: `scripts/run-qemu.sh` dijalankan dengan `REPORT_ONLY=1` terhadap
+fixture log konsol — tidak ada QEMU yang di-boot, tidak butuh root. Setiap
+skenario menuntut kode keluar DAN baris pemeriksaan spesifik yang diharapkan,
+sehingga kegagalan tidak boleh datang dari pemeriksaan yang salah sasaran:
+
+| Skenario | Fixture | Hasil diharapkan |
+|---|---|---|
+| 1 | boot sehat (tiap baris ninit dobel: `/dev/kmsg` + stderr) | LULUS; `console start tepat satu PID` membuktikan deduplikasi baris |
+| 2 | console mati + respawn loop (pembuktian regresi PR #1) | GAGAL oleh 3 pemeriksaan liveness baru (PID unik, `exit status`, `respawn ditunda`) — sementara pemeriksaan lama tetap `[ OK ]`, bukti lama harness akan LULUS |
+| 3 | console keluar sekali, satu PID | GAGAL oleh pemeriksaan `exit status` saja |
+| 4 | kernel panic | GAGAL oleh `absent Kernel panic` |
+| 5 | `started console` tidak pernah muncul | GAGAL; hitungan PID unik = 0 |
+| 6 | `main loop siap` tidak pernah muncul | GAGAL; `ready_ms` kosong |
+
+Pemeriksaan liveness yang dijaga (ada di `report()` `scripts/run-qemu.sh`):
+jumlah PID unik pada `started console (pid N)` harus tepat satu; baris
+`console (pid N) exit status` dan `respawn ditunda` tidak boleh muncul.
+
+Pemakaian: `sh ./scripts/test-qemu-report.sh` (sudah termasuk `make test`
+dan CI).
+
 ## Uji manual di chroot (tanpa script)
 
 ```bash
@@ -187,12 +218,14 @@ minimal (BusyBox statis) + initramfs di-boot QEMU dengan konsol serial; lihat
 Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` →
 `make` → cek biner statis lewat `readelf` (tidak boleh ada `INTERP`) →
 `sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
-`sudo sh ./scripts/test-config.sh` → `make CFLAGS="-static -O2 -Wall -Werror"`.
+`sudo sh ./scripts/test-config.sh` → `sh ./scripts/test-qemu-report.sh` →
+`make CFLAGS="-static -O2 -Wall -Werror"`.
 
 Job kedua, `rootfs-distro`, menjaga jalur distro yang tidak dipakai script di atas:
 install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs.sh`
 (kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
-(boot initramfs dengan konsol serial). QEMU di runner memakai TCG karena tidak ada
+(boot initramfs dengan konsol serial; selain penanda boot, harness juga menuntut
+console tetap hidup — lihat bagian 4). QEMU di runner memakai TCG karena tidak ada
 `/dev/kvm`; kernel guest diunduh dari Alpine netboot ke `distro/cache/`.
 
 ## Troubleshooting
