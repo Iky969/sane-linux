@@ -17,6 +17,9 @@
 #   BUSYBOX_PREBUILT=/bin/busybox   busybox statis cadangan (busybox-static)
 #   NINIT=./ninit            biner yang dipasang sebagai /sbin/init
 #   JOBS=$(nproc)            jumlah job make
+#   EXTRA_INIT_CONF=<file>   isi berkas di-append ke /etc/init.conf hasil
+#   EXTRA_FSTAB=<file>       isi berkas di-append ke /etc/fstab hasil
+#                            (keduanya untuk scripts/test-integration.sh)
 #
 # Butuh: gcc + libc statis, curl, tar, bzip2, cpio; root untuk mknod /dev.
 #
@@ -348,6 +351,19 @@ EOF
 # proc /proc proc defaults
 # sysfs /sys sysfs defaults
 EOF
+
+	# Hook uji integrasi (scripts/test-integration.sh): berkas tambahan
+	# di-append apa adanya. Default kosong = perilaku build tidak berubah.
+	if [ -n "${EXTRA_INIT_CONF:-}" ]; then
+		[ -r "$EXTRA_INIT_CONF" ] || die "EXTRA_INIT_CONF '$EXTRA_INIT_CONF' tidak bisa dibaca"
+		printf '# --- EXTRA_INIT_CONF ---\n' >> "$ROOTFS/etc/init.conf"
+		cat "$EXTRA_INIT_CONF" >> "$ROOTFS/etc/init.conf"
+	fi
+	if [ -n "${EXTRA_FSTAB:-}" ]; then
+		[ -r "$EXTRA_FSTAB" ] || die "EXTRA_FSTAB '$EXTRA_FSTAB' tidak bisa dibaca"
+		printf '# --- EXTRA_FSTAB ---\n' >> "$ROOTFS/etc/fstab"
+		cat "$EXTRA_FSTAB" >> "$ROOTFS/etc/fstab"
+	fi
 }
 
 pack_initramfs() {
