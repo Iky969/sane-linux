@@ -179,6 +179,8 @@ reboot (dipakai uji otomatis).
 | `BUSYBOX_FORCE` | `0` | `1` = unduh/kompilasi ulang |
 | `NINIT` | `./ninit` | biner yang dipasang sebagai `/sbin/init` |
 | `JOBS` | `nproc` | jumlah job `make` |
+| `EXTRA_INIT_CONF` | (kosong) | berkas yang isinya di-append ke `/etc/init.conf` hasil (dipakai `scripts/test-integration.sh`) |
+| `EXTRA_FSTAB` | (kosong) | berkas yang isinya di-append ke `/etc/fstab` hasil (dipakai `scripts/test-integration.sh`) |
 
 `scripts/run-qemu.sh`
 

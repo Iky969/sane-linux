@@ -49,7 +49,8 @@ scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), initctl per baris
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
 doc/                     dokumentasi ini
-.github/workflows/ci.yml CI: build statis, cek statis, keempat uji, -Werror
+.github/workflows/ci.yml CI: build statis, cek statis, keempat uji, -Werror,
+                      rootfs + boot QEMU + uji integrasi (job rootfs-distro)
 SECURITY.md              kebijakan keamanan
 LICENSE                  MIT
 ```
