@@ -18,6 +18,9 @@
 #                          0 = QEMU me-reset mesin sehingga restart ninit terlihat
 #   REBUILD=1              bangun ulang rootfs + initramfs sebelum boot
 #   CONSOLE_LOG=$DISTRO_DIR/qemu-console.log   keluaran konsol serial guest
+#   REPORT_ONLY=1          jangan boot; jalankan pemeriksaan report() terhadap
+#                          CONSOLE_LOG yang sudah ada (untuk uji fixture log,
+#                          lihat scripts/test-qemu-report.sh)
 #
 # Butuh: qemu-system-x86_64 (apt-get install -y qemu-system-x86), curl, gzip.
 #
@@ -57,11 +60,16 @@ info() { printf '   %s\n' "$1"; }
 die()  { printf 'GAGAL: %s\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "perkakas '$1' tidak ditemukan${2:+ ($2)}"; }
 
-need qemu-system-x86_64 "apt-get install -y qemu-system-x86"
-need timeout
-need gzip
-need sha256sum "coreutils"
-need sleep "coreutils"
+if [ "${REPORT_ONLY:-0}" = 1 ]; then
+	# Pemeriksaan saja tidak butuh QEMU/timeout/gzip — cukup grep, sed, date.
+	:
+else
+	need qemu-system-x86_64 "apt-get install -y qemu-system-x86"
+	need timeout
+	need gzip
+	need sha256sum "coreutils"
+	need sleep "coreutils"
+fi
 
 # --------------------------------------------------------------- kernel
 host_kernel() {
@@ -165,6 +173,25 @@ report() {
 	check "banner 'ninit start (PID 1)' dari dalam guest" 'ninit start (PID 1)'
 	check "event loop masuk ('main loop siap')"          'main loop siap'
 	check "layanan /etc/init.conf dijalankan ('started console')" 'started console'
+
+	# Liveness console. 'started console' ditulis spawn_service() SAAT FORK,
+	# bukan setelah exec berhasil; layanan yang langsung mati (mis. binary
+	# tidak ada -> exit status=0x7f00) tetap menuliskannya berulang kali lewat
+	# jalur respawn. Catatan: tiap baris ninit muncul DUA kali di konsol
+	# (/dev/kmsg dan stderr), jadi yang dihitung adalah PID unik, bukan jumlah
+	# baris.
+	console_pids=$(grep -o 'started console (pid [0-9]\{1,\}' "$CONSOLE_LOG" 2>/dev/null | sed 's/.*pid //' | sort -u || true)
+	console_pid_count=$(printf '%s\n' "$console_pids" | grep -c '[0-9]' || true)
+	if [ "$console_pid_count" = 1 ]; then
+		printf '  [ OK ]   console start tepat satu PID (%s) - tanpa respawn loop\n' "$console_pids"
+	else
+		printf '  [GAGAL] console punya %s PID unik (start ulang): %s\n' \
+			"$console_pid_count" "$(printf '%s ' $console_pids)"
+		fail_count=$((fail_count + 1))
+	fi
+	absent "console tidak pernah keluar ('console (pid N) exit status')" 'console (pid [0-9]*) exit status'
+	absent "tidak ada respawn tertunda ('respawn ditunda')"               'respawn ditunda'
+
 	absent "tidak ada kernel panic"                      'Kernel panic'
 	if [ -n "${ready_ms:-}" ]; then
 		printf '  [ OK ]   boot sampai "main loop siap" dalam %s ms (mode TCG/emulasi)\n' "$ready_ms"
@@ -183,6 +210,16 @@ report() {
 }
 
 # --------------------------------------------------------------- main
+if [ "${REPORT_ONLY:-0}" = 1 ]; then
+	[ -r "$CONSOLE_LOG" ] || die "REPORT_ONLY=1 butuh CONSOLE_LOG '$CONSOLE_LOG' yang bisa dibaca"
+	log "REPORT_ONLY=1: memeriksa $CONSOLE_LOG tanpa boot QEMU"
+	T0=$(date +%s%N)
+	ready_ms=$(mark_ms 'main loop siap')
+	report
+	[ "${fail_count:-1}" -eq 0 ] || exit 1
+	exit 0
+fi
+
 resolve_kernel
 ensure_initramfs
 
