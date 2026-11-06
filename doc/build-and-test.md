@@ -54,7 +54,7 @@ Pemeriksaan yang dijalankan:
 | `started shell` | layanan dari `init.conf` dijalankan |
 | `graceful shutdown` | `SIGTERM` diproses dan jalur shutdown dieksekusi |
 | tidak ada respawn setelah shutdown | regresi "respawn saat shutdown" tidak kembali |
-| latensi `SIGTERM → berhenti < 2000 ms` | loop tidak terblokir `sleep()`/respawn |
+| latensi `SIGTERM → berhenti < 5000 ms` | loop tidak terblokir `sleep()`/respawn; diukur lewat `sync()` yang fluktuatif di VPS/CI, ambang bisa dioverride lewat `LATENCY_LIMIT_MS` |
 
 Script memakai `sudo` sendiri bila bukan root, membersihkan rootfs + proc lewat
 `trap`, dan mencetak seluruh log ninit agar kegagalan bisa dibaca langsung.
