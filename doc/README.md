@@ -48,8 +48,14 @@ scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), initctl per baris
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
+scripts/test-spawn-failure.sh uji dependensi jalur respawn + fork retry limit
+scripts/test-cgroup-limits.sh uji cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
+scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
+scripts/run-qemu.sh     boot rootfs itu di QEMU (konsol serial & verifikasi boot)
+distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
 doc/                     dokumentasi ini
-.github/workflows/ci.yml CI: build statis, cek statis, keempat uji, -Werror,
+.github/workflows/ci.yml CI: build statis, cek statis, seluruh suite uji, -Werror,
                       rootfs + boot QEMU + uji integrasi (job rootfs-distro)
 SECURITY.md              kebijakan keamanan
 LICENSE                  MIT
@@ -59,8 +65,8 @@ LICENSE                  MIT
 
 ```bash
 make          # hasilkan biner statis ./ninit
-make test     # uji sebagai PID 1: smoke test + test SIGTERM + test konfigurasi (+ pemeriksaan harness run-qemu.sh)
-              # (butuh root/sudo)
+make test     # uji PID 1: smoke test + test SIGTERM + test konfigurasi + test spawn failure + test cgroup limits (+ pemeriksaan harness run-qemu.sh)
+              # (lima pertama butuh root/sudo)
 ```
 
 Menjalankannya di sistem nyata berarti memasang biner ini sebagai `/sbin/init`
