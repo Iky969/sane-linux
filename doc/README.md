@@ -89,8 +89,9 @@ dijaga `scripts/test-config.sh`.
   fstab hanya muncul di console/`/dev/kmsg`, tidak di file log init.
 - Opsi fstab non-flag hanya diteruskan apa adanya; `defaults` dibuang (kata kunci
   `mount(8)`, ditolak kernel bila dikirim sebagai data).
-- Belum ada limit resource cgroup (hanya pemindahan PID), tidak ada `PIDFile`,
-  `Restart=on-failure`, dependency berbasis event, atau mount namespace per layanan.
+- Belum ada `PIDFile`, `Restart=on-failure`, dependency berbasis event, atau mount
+  namespace per layanan (namun pembatasan resource cgroup v2 untuk memory, cpu,
+  dan pids sudah didukung penuh per layanan).
 - Tidak ada pengerasan (seccomp, MAC, user berbeda per layanan): tiap layanan
   berjalan sebagai root, sama seperti init.
 - Shutdown masih memakai jendela grace tetap 5 detik; layanan yang mengabaikan
@@ -102,7 +103,7 @@ dijaga `scripts/test-config.sh`.
 
 Catatan arah pengembangan, bukan janji:
 
-- Limit cgroup v2 (`memory.max`, `pids.max`, `cpu.weight`) per layanan.
+- Hak akses & user privilege dropping (`:user=`/`:uid=`) per layanan.
 - Timeout/kill policy dan mode `restart=on-failure` yang eksplisit.
 - Dukungan mount namespace per layanan + `chroot` rootfs layanan.
 - Parser konfigurasi bergaya inittab SysV (`id:runlevels:action:proses`) atau

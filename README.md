@@ -8,7 +8,7 @@ menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 
 Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
 initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
-[`ninit.c`](ninit.c) (1051 baris), biner statis, nol warning dengan
+[`ninit.c`](ninit.c) (~1580 baris), biner statis, nol warning dengan
 `-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
@@ -26,7 +26,10 @@ responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
   bukan `sleep()`, sehingga init tidak pernah buta terhadap sinyal.
 - **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
   `sync()` → `reboot()`; ada varian force untuk mem-bypass grace.
-- **Cgroups v2**: tiap layanan dipindahkan ke `/sys/fs/cgroup/ninit/<nama>`.
+- **Cgroups v2**: tiap layanan dipindahkan ke leaf `/sys/fs/cgroup/ninit/<nama>`
+  dengan penegakan batas resource (`:memory_max=`, `:cpu_max=`, `:pids_max=`),
+  pencegahan lolos swap (`memory.swap.max=0`), dan pembersihan orphan otomatis
+  (`cgroup.kill`).
 - **`/etc/fstab`**: memasang filesystem dengan flag *dan* opsi data (`size=`,
   `mode=`, `uid=`, …) diteruskan ke `mount()`; `defaults` dibuang seperti `mount(8)`.
 - **Logging ganda**: `/dev/kmsg`, console, `/var/log/ninit.log`, plus jalur
@@ -131,14 +134,17 @@ Varian `--mount --propagation private` + `mount -t proc` manual dipakai karena
 
 ## Konfigurasi
 
-`/etc/init.conf` — satu layanan per baris, `nama:mode:perintah[:requires=a,b]`:
+`/etc/init.conf` — satu layanan per baris, `nama:mode:perintah[:requires=a,b][:memory_max=16M][:cpu_max=50000 100000][:pids_max=50]`:
 
 ```
 # layanan wajib: jalankan sekali, jangan respawn
 logd:once:/bin/sh -c 'exec >/var/log/logd.log 2>&1; ...'
 
-# jaringan: respawn terus, dan jalan setelah logd siap
-net:respawn:/sbin/dhcpcd -B eth0:requires=logd
+# jaringan: respawn terus, jalan setelah logd siap, dibatasi memori 32M
+net:respawn:/sbin/dhcpcd -B eth0:requires=logd:memory_max=32M
+
+# daemon aplikasi: kuota CPU 50% dan maks 20 proses
+app:respawn:/usr/bin/myapp:cpu_max=50000 100000:pids_max=20
 
 # shell darurat
 tty1:respawn:/bin/sh
@@ -197,8 +203,8 @@ topologis, validasi dependensi, initctl per baris, dan rescue mode sungguhan
 lewat `enter_rescue_mode()` dengan signal mask yang dikosongkan). Ini proyek
 eksperimental untuk belajar cara kerja init di level OS — belum siap dipakai di
 mesin produksi. Batasan yang diketahui:
-semua layanan berjalan sebagai root (belum ada seccomp/user per layanan), belum
-ada limit resource cgroup (hanya pemindahan PID), dan ini bukan pengganti
+semua layanan berjalan sebagai root (belum ada seccomp/user per layanan; pembatasan
+resource ditangani cgroup v2: memory, cpu, pids), dan ini bukan pengganti
 systemd. Uji selalu di VM/container, dan siapkan jalur pemulihan lebih dulu.
 
 ## Lisensi
