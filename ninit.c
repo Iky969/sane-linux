@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <time.h>
 #include <poll.h>
+#include <ctype.h>
 
 #define MAX_SERVICES    64
 #define MAX_LINE        1024
@@ -130,7 +131,7 @@ static void enable_cgroup_subtree(const char *path)
 {
     int fd = open(path, O_WRONLY);
     if (fd < 0) {
-        init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+        init_log("cgroup: buka %s gagal: %s (toleransi nested/container)", path, strerror(errno));
         return;
     }
 
@@ -142,7 +143,8 @@ static void enable_cgroup_subtree(const char *path)
             char buf[32];
             snprintf(buf, sizeof(buf), "%s\n", controllers[i]);
             if (write(fd, buf, strlen(buf)) < 0) {
-                init_log("cgroup: tulis '%s' ke %s gagal: %s", controllers[i], path, strerror(errno));
+                init_log("cgroup: controller '%s' pada %s gagal: %s (toleransi partial)",
+                         controllers[i], path, strerror(errno));
             }
         }
     }
@@ -327,10 +329,24 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
 /* Hapus direktori cgroup layanan saat layanan berhenti */
 static void cleanup_cgroup(const char *svc_name)
 {
+    cgroup_kill_service(svc_name);
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
-    if (rmdir(dir) == 0) {
-        init_log("cgroup: dibersihkan '%s'", svc_name);
+    for (int i = 0; i < 20; i++) {
+        if (rmdir(dir) == 0) {
+            init_log("cgroup: dibersihkan '%s'", svc_name);
+            return;
+        }
+        if (errno != EBUSY) {
+            if (errno != ENOENT) {
+                init_log("cgroup: rmdir %s gagal: %s", dir, strerror(errno));
+            }
+            return;
+        }
+        usleep(5000);
+    }
+    if (errno != ENOENT) {
+        init_log("cgroup: rmdir %s gagal: %s", dir, strerror(errno));
     }
 }
 
@@ -354,6 +370,78 @@ static int line_overlong(FILE *f, const char *line)
         return 1;
     }
     return 0;
+}
+
+/* Validasi format cpu_max: <kuota> <period> (angka positif dipisah spasi tunggal) */
+static int validate_cpu_max(const char *s)
+{
+    if (!s || !*s) return 0;
+    const char *sp = strchr(s, ' ');
+    if (!sp) return 0;
+    if (strchr(sp + 1, ' ')) return 0; /* tolak bila ada lebih dari satu spasi */
+    if (sp == s || *(sp + 1) == '\0') return 0; /* kuota atau period kosong */
+
+    for (const char *p = s; p < sp; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+    for (const char *p = sp + 1; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+
+    errno = 0;
+    unsigned long long quota = strtoull(s, NULL, 10);
+    if (errno == ERANGE || quota == 0) return 0;
+
+    errno = 0;
+    unsigned long long period = strtoull(sp + 1, NULL, 10);
+    if (errno == ERANGE || period == 0) return 0;
+
+    return 1;
+}
+
+/* Validasi format memory_max: 'max' atau angka dengan satuan K, M, G (atau byte murni) */
+static int validate_memory_max(const char *s)
+{
+    if (!s || !*s) return 0;
+    if (strcmp(s, "max") == 0) return 1;
+
+    size_t len = strlen(s);
+    size_t num_len = len;
+    char last = s[len - 1];
+
+    if (last == 'k' || last == 'K' ||
+        last == 'm' || last == 'M' ||
+        last == 'g' || last == 'G') {
+        if (len < 2) return 0;
+        num_len = len - 1;
+    }
+
+    for (size_t i = 0; i < num_len; i++) {
+        if (!isdigit((unsigned char)s[i])) return 0;
+    }
+
+    errno = 0;
+    unsigned long long val = strtoull(s, NULL, 10);
+    if (errno == ERANGE || val == 0) return 0;
+
+    return 1;
+}
+
+/* Validasi format pids_max: 'max' atau angka positif */
+static int validate_pids_max(const char *s)
+{
+    if (!s || !*s) return 0;
+    if (strcmp(s, "max") == 0) return 1;
+
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+
+    errno = 0;
+    unsigned long long val = strtoull(s, NULL, 10);
+    if (errno == ERANGE || val == 0) return 0;
+
+    return 1;
 }
 
 static int parse_config(const char *path)
@@ -429,6 +517,29 @@ static int parse_config(const char *path)
                 }
 
                 scan = next_tag ? next_tag + 1 : NULL;
+            }
+        }
+
+        /* Validasi Semantik Limit Resource Cgroup v2 */
+        if (mem_max[0] != '\0') {
+            if (!validate_memory_max(mem_max)) {
+                init_log("Parse err: memory_max '%s' tidak valid pada layanan '%s', batas diabaikan",
+                         mem_max, name);
+                mem_max = "";
+            }
+        }
+        if (cpu_limit[0] != '\0') {
+            if (!validate_cpu_max(cpu_limit)) {
+                init_log("Parse err: cpu_max '%s' tidak valid pada layanan '%s', batas diabaikan",
+                         cpu_limit, name);
+                cpu_limit = "";
+            }
+        }
+        if (pids_limit[0] != '\0') {
+            if (!validate_pids_max(pids_limit)) {
+                init_log("Parse err: pids_max '%s' tidak valid pada layanan '%s', batas diabaikan",
+                         pids_limit, name);
+                pids_limit = "";
             }
         }
 
@@ -737,10 +848,15 @@ static void reap_zombies(void)
                         services[i].state = SVC_STATE_DONE;
                     else
                         services[i].state = SVC_STATE_FAILED;
-                    cleanup_cgroup(services[i].name);
+                    if (!shutting_down) {
+                        cgroup_kill_service(services[i].name);
+                        cleanup_cgroup(services[i].name);
+                    }
                 } else {
                     services[i].state = SVC_STATE_STOPPED;
-                    cgroup_kill_service(services[i].name);
+                    if (!shutting_down) {
+                        cgroup_kill_service(services[i].name);
+                    }
                 }
                 break;
             }
