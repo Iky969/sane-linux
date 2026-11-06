@@ -304,14 +304,15 @@ minimal (BusyBox statis) + initramfs di-boot QEMU dengan konsol serial; lihat
 
 ## CI (`.github/workflows/ci.yml`)
 
-Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` →
+Workflow terdiri dari tiga job di runner `ubuntu-latest` (dengan action SHA-pinned):
+- `security-scan`: pemindaian riwayat komit untuk mencegah kebocoran secret atau kredensial via Gitleaks (`gitleaks-action`).
+- `build-and-smoke-test`: install `build-essential` + `busybox-static` →
 `make` → cek biner statis lewat `readelf` (tidak boleh ada `INTERP`) →
 `sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
 `sudo sh ./scripts/test-config.sh` → `sh ./scripts/test-qemu-report.sh` →
 `sudo sh ./scripts/test-spawn-failure.sh` →
 `make CFLAGS="-static -O2 -Wall -Werror"`.
-
-Job kedua, `rootfs-distro`, menjaga jalur distro yang tidak dipakai script di atas:
+- `rootfs-distro`: menjaga jalur distro yang tidak dipakai script di atas:
 install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs.sh`
 (kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
 (boot initramfs dengan konsol serial; selain penanda boot, harness juga menuntut
