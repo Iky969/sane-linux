@@ -56,7 +56,8 @@ PID + mount namespace baru:
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
   (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
-  setelah shutdown, latensi shutdown < 2000 ms (mengirim `SIGTERM`).
+  setelah shutdown, latensi shutdown < 5000 ms (mengirim `SIGTERM`; diukur lewat
+  `sync()` sehingga ambangnya longgar, override lewat `LATENCY_LIMIT_MS`).
 - **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — `SIGTERM` benar-benar
   *sampai* ke proses layanan: trap-nya jalan, `exit status=0x0` (bukan `0x9`),
   mask sinyal anak bersih, penutupan terjadi sebelum jendela grace 5 detik.
