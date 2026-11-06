@@ -12,6 +12,15 @@
 #      oleh pemimpin layanan respawn sebelum generasi baru dihidupkan.
 #   4. Konfigurasi leaf cgroup (memory.max, cpu.max, pids.max) tertulis dengan
 #      benar ke hierarki cgroup v2 layanan dan mendukung urutan opsi bebas.
+#   5. Validasi parser menerima format limit valid dan menolak format rusak
+#      (malformed) dengan log peringatan informatif tanpa crash PID 1.
+#   6. Penulisan subtree control mentoleransi environment nested/container
+#      dan partial subtree control tanpa menggagalkan boot.
+#   7. Interaksi PR #9: layanan once dengan pids_max=1 yang mengalami fork EAGAIN
+#      mencoba ulang hingga batas MAX_SPAWN_RETRY (3x), transisi ke FAILED,
+#      dan membatalkan layanan dependen deterministik.
+#   8. Pembersihan siklus hidup orphan pada layanan once (cgroup_kill_service
+#      sebelum rmdir) menyapu bersih proses anak orphan sebelum rmdir leaf cgroup.
 #
 # Pemakaian:
 #   sudo sh ./scripts/test-cgroup-limits.sh      # atau: make test
@@ -19,7 +28,7 @@
 # Variabel lingkungan:
 #   BIN=./ninit              biner yang diuji
 #   BUSYBOX=/bin/busybox     busybox statis (apt-get install busybox-static)
-#   WAIT1/WAIT2/WAIT3/WAIT4  jendela waktu observasi tiap skenario (detik)
+#   WAIT1..WAIT8             jendela waktu observasi tiap skenario (detik)
 #
 # Catatan: suite ini menggunakan unshare dengan `--mount --propagation private`
 # dan `mount -t proc` manual (bukan `--mount-proc`), konsisten dengan konvensi
@@ -33,6 +42,10 @@ WAIT1=${WAIT1:-6}
 WAIT2=${WAIT2:-6}
 WAIT3=${WAIT3:-8}
 WAIT4=${WAIT4:-6}
+WAIT5=${WAIT5:-6}
+WAIT6=${WAIT6:-6}
+WAIT7=${WAIT7:-8}
+WAIT8=${WAIT8:-6}
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
@@ -60,15 +73,44 @@ fi
 ROOTS=""
 LOGS=""
 HELPERS=""
+CG_DYNAMIC=""
 INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
 cleanup() {
 	for d in ${ROOTS:-}; do
-		$SUDO umount "$d/proc" 2>/dev/null || true
+		$SUDO umount -R "$d" 2>/dev/null || $SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
 	done
 	for f in ${LOGS:-}; do rm -f "$f"; done
 	for h in ${HELPERS:-}; do rm -f "$h"; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
+
+	# Bersihkan cgroup ninit dan leaf cgroups yang tertinggal pada host
+	if [ -d "/sys/fs/cgroup/ninit" ]; then
+		for leaf in /sys/fs/cgroup/ninit/*; do
+			[ -d "$leaf" ] || continue
+			if [ -f "$leaf/cgroup.kill" ]; then
+				echo 1 | $SUDO tee "$leaf/cgroup.kill" >/dev/null 2>&1 || true
+			fi
+			$SUDO rmdir "$leaf" 2>/dev/null || {
+				sleep 0.1
+				$SUDO rmdir "$leaf" 2>/dev/null || true
+			}
+		done
+		$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
+	fi
+
+	# Bersihkan cgroup dinamis/ephemeral yang dibuat selama pengujian
+	for cg in ${CG_DYNAMIC:-}; do
+		if [ -d "$cg" ]; then
+			if [ -f "$cg/cgroup.kill" ]; then
+				echo 1 | $SUDO tee "$cg/cgroup.kill" >/dev/null 2>&1 || true
+			fi
+			$SUDO rmdir "$cg" 2>/dev/null || {
+				sleep 0.1
+				$SUDO rmdir "$cg" 2>/dev/null || true
+			}
+		fi
+	done
 }
 trap cleanup EXIT INT TERM
 
@@ -95,10 +137,17 @@ new_log() {
 }
 
 boot_guest() {
-	root=$1; secs=$2
+	root=$1; secs=$2; cg=${3:-}; extra_setup=${4:-}
+	if [ -n "$cg" ]; then
+		move="echo \$\$ > $cg/cgroup.procs;"
+	else
+		move=""
+	fi
 	cat > "$INNER" <<EOI
 #!/bin/sh
 mount -t proc proc $root/proc
+$move
+$extra_setup
 exec chroot $root /ninit
 EOI
 	$SUDO chmod 755 "$INNER"
@@ -322,6 +371,168 @@ else
 	fi
 	check_in "leaf cgroup dibersihkan setelah selesai" "$L4" \
 		"cgroup: dibersihkan 'limits_audit'"
+fi
+
+# ------------------------------------------------------------- Skenario 5
+# Validasi Parser Limit Resource (Valid vs Invalid/Malformed)
+# Memverifikasi bahwa parser menerima format limit yang valid (memory_max,
+# cpu_max, pids_max) dan menolak nilai rusak/malformed dengan log peringatan
+# tanpa menyebabkan crash pada PID 1.
+printf '\n== Skenario 5: Validasi parser batas resource (valid vs malformed) ==\n'
+R5=$(new_root sleep true)
+L5=$(new_log)
+ROOTS="$ROOTS $R5"
+LOGS="$LOGS $L5"
+
+cat > "$R5/etc/init.conf" << 'EOF'
+# Layanan dengan opsi valid
+valid_svc:once:/bin/sh -c "echo VALID_OK > /var/valid.txt":memory_max=64M:cpu_max=50000 100000:pids_max=25
+# Layanan dengan opsi memory_max rusak (suffix invalid, huruf acak, angka negatif)
+bad_mem1:once:/bin/true:memory_max=64MB
+bad_mem2:once:/bin/true:memory_max=-100M
+bad_mem3:once:/bin/true:memory_max=corrupted!@#
+# Layanan dengan opsi cpu_max rusak (non-numerik, spasi berlebih, format token salah)
+bad_cpu1:once:/bin/true:cpu_max=invalid 100000
+bad_cpu2:once:/bin/true:cpu_max=50000  100000
+bad_cpu3:once:/bin/true:cpu_max=50000
+# Layanan dengan opsi pids_max rusak (angka negatif, karakter non-numerik, nol)
+bad_pid1:once:/bin/true:pids_max=-5
+bad_pid2:once:/bin/true:pids_max=invalid
+bad_pid3:once:/bin/true:pids_max=0
+# Stopper
+stopper:once:/bin/sh -c "/bin/sleep 2 && echo poweroff > /run/initctl":requires=valid_svc
+EOF
+
+boot_guest "$R5" "$WAIT5" >"$L5" 2>&1
+
+check_in  "peringatan memory_max invalid dicatat di log" "$L5" \
+	"memory_max '64MB' tidak valid"
+check_in  "peringatan cpu_max invalid dicatat di log" "$L5" \
+	"cpu_max 'invalid 100000' tidak valid"
+check_in  "peringatan pids_max invalid dicatat di log" "$L5" \
+	"pids_max '-5' tidak valid"
+check_in  "layanan dengan limit valid tetap berjalan normal" "$R5/var/valid.txt" \
+	'VALID_OK'
+check_in  "limit valid diterapkan ke leaf cgroup" "$L5" \
+	"cgroup: 'valid_svc' memory.max = 64M"
+absent_in "limit memory_max rusak TIDAK pernah diterapkan" "$L5" \
+	"memory.max = 64MB"
+absent_in "limit cpu_max rusak TIDAK pernah diterapkan" "$L5" \
+	"cpu.max = invalid"
+absent_in "limit pids_max rusak TIDAK pernah diterapkan" "$L5" \
+	"pids.max = -5"
+check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L5" \
+	'graceful shutdown'
+
+# ------------------------------------------------------------- Skenario 6
+# Toleransi Environment Subtree Cgroup (Nested / Partial Subtree Control)
+# Memverifikasi bahwa penulisan subtree control yang gagal atau berstatus
+# partial di environment nested/container tidak menggagalkan booting ninit.
+printf '\n== Skenario 6: Toleransi environment root cgroup (nested / partial) ==\n'
+R6=$(new_root sleep)
+L6=$(new_log)
+ROOTS="$ROOTS $R6"
+LOGS="$LOGS $L6"
+
+cat > "$R6/etc/init.conf" << 'EOF'
+svc_nested:once:/bin/sh -c "echo NESTED_OK > /var/nested.txt && echo poweroff > /run/initctl":pids_max=10
+EOF
+
+# Siapkan lingkungan nested cgroup tiruan dengan subtree_control read-only pada tmpfs
+setup_r6="mount -t sysfs sysfs $R6/sys; mkdir -p $R6/sys/fs/cgroup; mount -t tmpfs tmpfs $R6/sys/fs/cgroup; touch $R6/sys/fs/cgroup/cgroup.controllers; echo pids > $R6/sys/fs/cgroup/cgroup.controllers; touch $R6/sys/fs/cgroup/cgroup.subtree_control; mount -o remount,ro $R6/sys/fs/cgroup;"
+
+boot_guest "$R6" "$WAIT6" "" "$setup_r6" >"$L6" 2>&1
+
+check_in  "kegagalan buka/tulis subtree_control ditoleransi dengan log" "$L6" \
+	'cgroup:'
+check_in  "toleransi nested/container tercatat di log" "$L6" \
+	'toleransi nested/container'
+check_in  "layanan berhasil di-spawn meskipun subtree_control terhambat" "$R6/var/nested.txt" \
+	'NESTED_OK'
+check_in  "sistem masuk ke main loop dan shutdown bersih" "$L6" \
+	'graceful shutdown'
+
+# ------------------------------------------------------------- Skenario 7
+# Interaksi PR #9: Layanan 'once' dengan pids_max=1 fork EAGAIN -> FAILED -> Batalkan Dependen
+# Memverifikasi bahwa cgroup resource exhaustion pada proses init memicu fork EAGAIN
+# deterministik, layanan tipe 'once' mencoba ulang hingga MAX_SPAWN_RETRY (3x),
+# lalu bertransisi ke state FAILED, dan membatalkan layanan dependen deterministik.
+printf '\n== Skenario 7: Interaksi PR #9 (once + pids.max=1 fork EAGAIN -> FAILED) ==\n'
+CG_PR9=""
+pids_available=0
+if [ "$has_cg2" -eq 1 ] && [ "$has_pids" -eq 1 ]; then
+	CG_PR9=$($SUDO mktemp -d /sys/fs/cgroup/ninit-cg-pr9.XXXXXX)
+	CG_DYNAMIC="$CG_DYNAMIC $CG_PR9"
+	if [ -e "$CG_PR9/pids.max" ] && printf '1\n' | $SUDO tee "$CG_PR9/pids.max" >/dev/null 2>&1; then
+		pids_available=1
+	fi
+fi
+
+if [ "$pids_available" -ne 1 ]; then
+	skip "skenario 7 dilewati: cgroup v2 + controller pids tidak tersedia atau gagal disiapkan"
+else
+	R7=$(new_root)
+	L7=$(new_log)
+	ROOTS="$ROOTS $R7"
+	LOGS="$LOGS $L7"
+
+	printf 'boot_pr9:once:exit 0\napp_dep:respawn:exit 0:requires=boot_pr9\n' > "$R7/etc/init.conf"
+	boot_guest "$R7" "$WAIT7" "$CG_PR9" >"$L7" 2>&1
+
+	check_in  "event loop tetap masuk dan responsif" "$L7" 'main loop siap'
+	check_in  "kegagalan fork() terdeteksi karena cgroup pids habis" "$L7" \
+		'fork boot_pr9: Resource temporarily unavailable'
+	check_in  "layanan once mencoba ulang hingga batas lalu dinyatakan gagal" "$L7" \
+		'percobaan, layanan dinyatakan gagal'
+	check_in  "layanan dependen dibatalkan deterministik" "$L7" \
+		"layanan 'app_dep' dibatalkan: dependensi 'boot_pr9' gagal"
+	absent_in "boot_pr9 tidak pernah berhasil di-spawn" "$L7" 'started boot_pr9'
+	absent_in "app_dep tidak pernah di-spawn saat dependensi gagal" "$L7" 'fork app_dep'
+	nfork=$(grep -c 'fork boot_pr9' "$L7" 2>/dev/null || true)
+	if [ "${nfork:-0}" -le 3 ]; then
+		ok "jumlah percobaan fork() boot_pr9 terbatas: $nfork (maks 3, tanpa busy-loop)"
+	else
+		bad "percobaan fork() boot_pr9 tidak terbatas: $nfork baris (dugaan busy-loop)"
+	fi
+fi
+
+# ------------------------------------------------------------- Skenario 8
+# Pembersihan Siklus Hidup Orphan pada Layanan 'once' (cgroup_kill_service sebelum rmdir)
+# Memverifikasi bahwa proses anak/orphan yang ditinggalkan layanan 'once' disapu bersih
+# via cgroup.kill sebelum pemanggilan rmdir leaf cgroup.
+printf '\n== Skenario 8: Pembersihan orphan pada layanan once sebelum rmdir ==\n'
+if [ "$has_cg2" -ne 1 ]; then
+	skip "skenario 8 dilewati: cgroup v2 tidak tersedia"
+else
+	R8=$(new_root sleep)
+	L8=$(new_log)
+	ROOTS="$ROOTS $R8"
+	LOGS="$LOGS $L8"
+
+	cat > "$R8/bin/once_fork.sh" << 'EOF'
+#!/bin/sh
+/bin/sleep 300 &
+/bin/sleep 300 &
+/bin/sleep 0.2
+exit 0
+EOF
+	chmod 0755 "$R8/bin/once_fork.sh"
+
+	cat > "$R8/etc/init.conf" << 'EOF'
+orphan_maker:once:/bin/sh /bin/once_fork.sh
+checker:once:/bin/sh -c "/bin/sleep 1 && echo poweroff > /run/initctl":requires=orphan_maker
+EOF
+
+	boot_guest "$R8" "$WAIT8" >"$L8" 2>&1
+
+	check_in  "layanan orphan_maker dijalankan" "$L8" \
+		'started orphan_maker'
+	check_in  "leaf cgroup orphan_maker berhasil dibersihkan tanpa EBUSY" "$L8" \
+		"cgroup: dibersihkan 'orphan_maker'"
+	absent_in "tidak ada kegagalan rmdir leaf cgroup" "$L8" \
+		"Device or resource busy"
+	check_in  "event loop tetap jalan dan shutdown bersih" "$L8" \
+		'graceful shutdown'
 fi
 
 # ------------------------------------------------------------- Ringkasan
