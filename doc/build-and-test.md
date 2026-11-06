@@ -24,7 +24,7 @@ sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM sampai ke layanan
 sudo sh ./scripts/test-config.sh       # 3) urut dependensi + rescue mode + initctl
 sh ./scripts/test-qemu-report.sh       # 4) pemeriksaan harness run-qemu.sh (tanpa root)
 sudo sh ./scripts/test-spawn-failure.sh # 5) jalur kegagalan spawn (fork EAGAIN + deps di respawn)
-sudo sh ./scripts/test-cgroup-limits.sh # 6) batasan cgroup v2 & pembersihan orphan respawn
+sudo sh ./scripts/test-cgroup-limits.sh # 6) batasan cgroup v2, validasi & siklus hidup orphan (8 skenario)
 sudo sh ./scripts/test-integration.sh  # 7) integrasi lintas lapisan via boot QEMU (make integration)
 ```
 
@@ -235,25 +235,29 @@ Pemakaian: `sudo sh ./scripts/test-spawn-failure.sh` (sudah termasuk
 `make test` dan CI). Variabel: `WAIT1`/`WAIT2`/`WAIT3` jendela observasi tiap
 skenario.
 
-### 6. Batasan resource cgroup v2 & pembersihan orphan respawn (`scripts/test-cgroup-limits.sh`)
+### 6. Batasan resource cgroup v2, validasi parser & siklus hidup orphan (`scripts/test-cgroup-limits.sh`)
 
-Kenapa ada: Requirement R4 menuntut suite pengujian otomatis untuk memverifikasi
-penegakan batas memori (OOM), batas PID (fork limit EAGAIN), audit siklus hidup
-pembersihan proses orphan saat respawn layanan (`cgroup_kill_service`), serta
-verifikasi penulisan konfigurasi batas resource ke cgroup leaf node (`memory.max`,
-`cpu.max`, `pids.max`).
+Kenapa ada: Suite pengujian otomatis untuk memverifikasi penegakan batas memori (OOM), batas PID (fork limit EAGAIN), batas CPU, verifikasi nilai leaf cgroup v2 (`memory.max`, `cpu.max`, `pids.max`), urutan opsi bebas, validasi semantik parser (format valid vs malformed dengan penanganan graceful), toleransi environment nested/container pada subtree control, interaksi PR #9 (layanan `once` + `pids_max=1` fork EAGAIN -> retry habis -> FAILED -> pembatalan dependen), serta pembersihan siklus hidup orphan via `cgroup_kill_service` pada jalur exit layanan `respawn` maupun `once` sebelum `rmdir`.
+
+Mode file git & kebersihan host (host hygiene):
+- File `scripts/test-cgroup-limits.sh` memiliki mode berkas git **`100755`** (`chmod +x`). Mode izin eksekusi ini dipertahankan secara ketat pada tree repositori agar script dapat langsung dieksekusi oleh CI dan proses pengujian lokal tanpa memerlukan `chmod` manual.
+- Suite dilengkapi fungsi trap `cleanup()` komprehensif yang secara otomatis melepas unshare mount (`umount -R`), menghapus direktori kerja rootfs sementara, menyapu bersih seluruh leaf cgroup `/sys/fs/cgroup/ninit/*` menggunakan `cgroup.kill` dan `rmdir`, serta membersihkan ephemeral cgroup yang terdaftar dalam `CG_DYNAMIC` sehingga sistem host terbebas dari artefak cgroup yang menggantung setelah pengujian selesai.
 
 Cara kerja (butuh root; `sudo make test`):
 
 | Skenario | Konfigurasi | Yang dituntut |
 |---|---|---|
-| 1 | `mem_test:once:/bin/mem_hog:memory_max=16M` | Workload alokasi melebihi 16MB deterministik memicu OOM killer kernel (`SIGKILL`, exit status `0x9`); ninit mencatat batas `memory.max = 16M`, menangani exit status tanpa crash, dan membersihkan leaf cgroup |
-| 2 | `pids_test:once:/bin/fork_test:pids_max=5` | Proses induk melakukan fork anak loop; setelah 5 proses dalam cgroup tercapai, fork berikutnya deterministik ditolak dengan `EAGAIN` (`EAGAIN_CONFIRMED count=4`); leaf cgroup dibersihkan setelah selesai |
-| 3 | `leak:respawn:/bin/sh /bin/leak.sh` | Pemimpin layanan keluar setelah membuat proses anak background (`sleep 300 &`); `cgroup_kill_service` menyapu bersih seluruh proses orphan pada jeda `RESPAWN_DELAY` sebelum generasi baru dihidupkan (`LINGERING_ORPHANS=0`) |
-| 4 | `limits_audit:once:...:pids_max=20:cpu_max=50000 100000:memory_max=32M` | Nilai batas terbaca langsung dari filesystem leaf cgroup (`33554432` byte, `50000 100000`, `20`), membuktikan controller terdelegasi dan parser mendukung urutan tag bebas |
+| 1 | `mem_test:once:/bin/mem_hog:memory_max=16M` | Workload alokasi melebihi 16MB deterministik memicu OOM killer kernel (`SIGKILL`, exit status `0x9`); ninit mencatat batas `memory.max = 16M`, menangani exit status tanpa crash, dan membersihkan leaf cgroup. |
+| 2 | `pids_test:once:/bin/fork_test:pids_max=5` | Proses induk melakukan fork anak loop; setelah 5 proses dalam cgroup tercapai, fork berikutnya deterministik ditolak dengan `EAGAIN` (`EAGAIN_CONFIRMED count=4`); leaf cgroup dibersihkan setelah selesai. |
+| 3 | `leak:respawn:/bin/sh /bin/leak.sh` | Pemimpin layanan keluar setelah membuat proses anak background (`sleep 300 &`); `cgroup_kill_service` menyapu bersih seluruh proses orphan pada jeda `RESPAWN_DELAY` sebelum generasi baru dihidupkan (`LINGERING_ORPHANS=0`); leaf cgroup dibersihkan saat shutdown. |
+| 4 | `limits_audit:once:...:pids_max=20:cpu_max=50000 100000:memory_max=32M` | Nilai batas terbaca langsung dari filesystem leaf cgroup (`33554432` byte pada `memory.max`, `50000 100000` pada `cpu.max`, `20` pada `pids.max`), membuktikan controller terdelegasi dan parser mendukung urutan tag bebas. |
+| 5 | `valid_svc:once:...:memory_max=64M:cpu_max=50000 100000:pids_max=25` + opsi rusak (`64MB`, `-100M`, `corrupted!@#`, `invalid 100000`, `50000  100000`, `50000`, `-5`, `invalid`, `0`) | Parser menolak nilai rusak dengan log peringatan informatif (`tidak valid ..., batas diabaikan`), batas rusak TIDAK pernah diterapkan ke leaf cgroup, limit valid tetap diterapkan ke `valid_svc` (`VALID_OK`), event loop berjalan stabil, dan shutdown bersih. |
+| 6 | `svc_nested:once:...:pids_max=10` pada subtree control read-only (tiruan nested/container) | Kegagalan penulisan subtree control ditoleransi dengan log informatif `(toleransi nested/container)` tanpa menghentikan boot; layanan berhasil di-spawn (`NESTED_OK`), event loop tetap responsif, dan shutdown bersih. |
+| 7 | `boot_pr9:once:exit 0` + `app_dep:respawn:exit 0:requires=boot_pr9` dalam cgroup berbatas `pids.max=1` | Cgroup exhaustion memicu kegagalan `fork()` dengan `EAGAIN`; layanan `once` mencoba ulang hingga batas `MAX_SPAWN_RETRY` (3x) tanpa busy-loop, lalu bertransisi ke status `FAILED`; layanan dependen `app_dep` dibatalkan secara deterministik (`layanan 'app_dep' dibatalkan: dependensi 'boot_pr9' gagal`). |
+| 8 | `orphan_maker:once:/bin/sh /bin/once_fork.sh` (menelurkan `sleep 300 &`) + `checker:once:...:requires=orphan_maker` | Saat layanan `once` keluar (`exit 0`), `cgroup_kill_service` menyapu bersih proses anak/orphan sebelum `rmdir`; leaf cgroup `orphan_maker` berhasil dihapus tanpa kegagalan `EBUSY` (`Device or resource busy`); layanan dependen `checker` memverifikasi tidak ada proses orphan yang bertahan (`LINGERING_ONCE_ORPHANS=0`), pembersihan leaf cgroup terjadi sebelum `graceful shutdown`, dan sistem shutdown bersih. |
 
 Pemakaian: `sudo sh ./scripts/test-cgroup-limits.sh` (sudah termasuk `make test`
-dan CI). Variabel: `WAIT1`/`WAIT2`/`WAIT3`/`WAIT4` jendela observasi tiap skenario.
+dan CI). Variabel: `WAIT1` sampai `WAIT8` jendela observasi tiap skenario.
 
 ### 7. Uji integrasi lintas lapisan (`scripts/test-integration.sh`)
 
