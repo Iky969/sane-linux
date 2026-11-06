@@ -202,29 +202,29 @@ static void cgroup_kill_service(const char *name)
     char kill_path[320];
     snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, name);
     int fd = open(kill_path, O_WRONLY);
+    int written = -1;
     if (fd >= 0) {
-        if (write(fd, "1\n", 2) < 0) {
+        written = write(fd, "1\n", 2);
+        if (written < 0) {
             init_log("cgroup: tulis 1 ke %s gagal: %s", kill_path, strerror(errno));
         }
         close(fd);
-        return;
+        if (written >= 0) return;
     }
 
-    /* Fallback pra-Linux 5.14: bila cgroup.kill tidak ada (ENOENT),
+    /* Fallback pra-Linux 5.14 atau bila penulisan cgroup.kill gagal:
        baca cgroup.procs dan kirim SIGKILL ke setiap PID yang terdaftar */
-    if (errno == ENOENT) {
-        char procs_path[320];
-        snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
-        FILE *fp = fopen(procs_path, "r");
-        if (fp) {
-            int p;
-            while (fscanf(fp, "%d", &p) == 1) {
-                if (p > 1) {
-                    kill((pid_t)p, SIGKILL);
-                }
+    char procs_path[320];
+    snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
+    FILE *fp = fopen(procs_path, "r");
+    if (fp) {
+        int p;
+        while (fscanf(fp, "%d", &p) == 1) {
+            if (p > 1) {
+                kill((pid_t)p, SIGKILL);
             }
-            fclose(fp);
         }
+        fclose(fp);
     }
 }
 
@@ -267,6 +267,16 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
                 close(lim_fd);
             } else {
                 init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+            }
+
+            /* Batasi memory.swap.max=0 jika didukung, agar batas memory_max tidak bocor ke swap */
+            snprintf(path, sizeof(path), "%s/memory.swap.max", dir);
+            int swap_fd = open(path, O_WRONLY);
+            if (swap_fd >= 0) {
+                if (write(swap_fd, "0\n", 2) < 0) {
+                    /* abaikan jika controller swap tidak aktif atau menolak */
+                }
+                close(swap_fd);
             }
         }
         if (svc->cpu_max[0]) {
