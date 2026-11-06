@@ -14,9 +14,9 @@ Format per baris:
 | `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
 | `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari tag opsi paling awal). |
 | `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
-| `:memory_max=` | Opsional. Batas alokasi memori layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/memory.max` (contoh: `16M`, `256M`, `1G`, `max`). Pelanggaran batas memori memicu OOM killer kernel secara deterministik (`SIGKILL`, status `0x9`). Lebih dari 63 karakter entri **ditolak**. |
-| `:cpu_max=` | Opsional. Batas kuota bandwidth CPU CFS (maks 63 karakter). Ditulis ke leaf cgroup v2 `cpu.max` dalam format `<quota> <period>` (contoh: `50000 100000` untuk 50% CPU, atau `max 100000`). Lebih dari 63 karakter entri **ditolak**. |
-| `:pids_max=` | Opsional. Batas jumlah proses maksimum dalam cgroup layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `pids.max` (contoh: `5`, `50`, `max`). Upaya `fork()` melebihi batas ini deterministik ditolak dengan `EAGAIN` (`Resource temporarily unavailable`). Lebih dari 63 karakter entri **ditolak**. |
+| `:memory_max=` | Opsional. Batas alokasi memori layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/memory.max`. Nilai valid: `max` atau angka desimal positif dengan akhiran satuan tunggal opsional (`K`/`k`, `M`/`m`, `G`/`g`, atau byte murni; contoh: `16M`, `256M`, `1G`, `max`). Pelanggaran batas memori memicu OOM killer kernel secara deterministik (`SIGKILL`, status `0x9`). Format rusak (huruf acak, angka negatif, satuan ganda seperti `64MB`, atau nol) ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Lebih dari 63 karakter entri **ditolak**. |
+| `:cpu_max=` | Opsional. Batas kuota bandwidth CPU CFS (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/cpu.max`. Format valid: `<kuota> <periode>` yaitu dua angka desimal positif yang dipisahkan tepat satu spasi tunggal (contoh: `50000 100000` untuk 50% kuota per periode 100ms). Format rusak (non-numerik, spasi ganda/berlebih, nilai kuota/periode nol atau negatif, tanpa spasi pemisah) ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Lebih dari 63 karakter entri **ditolak**. |
+| `:pids_max=` | Opsional. Batas jumlah proses maksimum dalam cgroup layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/pids.max`. Format valid: `max` atau angka desimal positif (contoh: `5`, `50`, `max`). Nilai negatif, nol, atau karakter non-numerik ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Upaya `fork()` melebihi batas ini deterministik ditolak oleh kernel dengan `EAGAIN` (`Resource temporarily unavailable`). Lebih dari 63 karakter entri **ditolak**. |
  
 Aturan umum:
  
@@ -24,8 +24,11 @@ Aturan umum:
 - Baris lebih dari 1023 karakter ditolak utuh dan dicatat (`Parse err: baris melebihi MAX_LINE ...`); baris berikutnya tetap diproses. Aturan yang sama berlaku untuk baris `/etc/fstab`.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
 - Tag opsi (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`) dapat ditulis dalam urutan bebas setelah `<perintah>`. Parser memisahkan perintah pada kemunculan tag opsi paling awal, sehingga perintah yang memuat karakter titik dua (misal URL `http://...`) tetap utuh.
-- Batasan resource cgroup v2 diterapkan pada leaf node `/sys/fs/cgroup/ninit/<nama>/` sebelum PID layanan dimasukkan ke `cgroup.procs`. Bila kernel tidak mengaktifkan controller tertentu, kegagalan penulisan dicatat di log tanpa menggagalkan PID 1.
-- Pembersihan siklus hidup (lifecycle orphan cleanup): saat proses pemimpin layanan `respawn` mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (atau fallback scanning PIDs pada kernel pra-5.14) untuk menyapu bersih sisa proses anak/orphan selama jeda `RESPAWN_DELAY` (2 detik). Pembersihan juga dipanggil kembali sebelum PID baru dimasukkan ke leaf cgroup.
+- Batasan resource cgroup v2 diterapkan pada leaf node `/sys/fs/cgroup/ninit/<nama>/` sebelum PID layanan dimasukkan ke `cgroup.procs`. Penulisan controller (`+memory +cpu +pids`) ke root cgroup `/sys/fs/cgroup/cgroup.subtree_control` mentoleransi kegagalan atau status partial pada lingkungan nested/container tanpa menggagalkan booting. Bila kernel tidak mengaktifkan controller tertentu, kegagalan penulisan dicatat di log tanpa menggagalkan PID 1.
+- Validasi semantik & penanganan kesalahan graceful: parser memeriksa format nilai `memory_max`, `cpu_max`, dan `pids_max` sebelum diterapkan. Bila format tidak valid/rusak (malformed), ninit mencatat pesan log peringatan informatif (`Parse err: ... tidak valid pada layanan '...', batas diabaikan`) dan mengosongkan batas tersebut. Layanan tetap dijalankan tanpa limit bersangkutan (unconstrained) tanpa membuat PID 1 crash atau masuk rescue shell.
+- Pembersihan siklus hidup orphan (lifecycle orphan cleanup):
+  - Layanan `respawn`: saat proses pemimpin mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (atau fallback scanning PIDs pada kernel pra-5.14) untuk menyapu bersih sisa proses anak/orphan selama jeda `RESPAWN_DELAY` (2 detik). Pembersihan juga dipanggil kembali sebelum PID baru dimasukkan ke leaf cgroup.
+  - Layanan `once`: saat proses pemimpin selesai/exit (`SVC_STATE_DONE` atau `SVC_STATE_FAILED`), `cgroup_kill_service` menyapu bersih seluruh proses anak/orphan sebelum pemanggilan penghapusan direktori cgroup leaf (`rmdir`). Fungsi `cleanup_cgroup` juga melakukan polling `rmdir` dengan toleransi `EBUSY` (hingga 20 kali percobaan / 100ms) untuk mengantisipasi latensi pelepasan referensi proses oleh kernel, mencegah kegagalan penghapusan leaf cgroup.
 - File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
   `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
   nol layanan.
@@ -49,6 +52,48 @@ net:once:/bin/sh -c 'ip link set lo up':requires=logger
 web:respawn:/bin/httpd -p 8080:requires=net,logger:memory_max=256M:cpu_max=50000 100000:pids_max=50
 worker:respawn:/usr/bin/worker:memory_max=128M:pids_max=20
 ```
+
+### Batasan Resource Cgroup v2 & Validasi Semantik
+
+ninit mengelola pembatasan resource proses menggunakan Cgroup v2 (*unified hierarchy*) pada leaf node `/sys/fs/cgroup/ninit/<nama>/`.
+
+#### 1. Aturan Validasi Semantik
+
+Parser `/etc/init.conf` menerapkan validasi semantik yang ketat sebelum nilai batas ditulis ke sysfs cgroup:
+
+- **`cpu_max=<kuota> <periode>`**:
+  - **Format valid**: Dua bilangan desimal positif yang dipisahkan oleh tepat satu spasi tunggal (`' '`), contoh: `50000 100000` (50% CPU pada periode 100.000 µs).
+  - **Aturan**: Kuota > 0, periode > 0, hanya berisi karakter digit (`0-9`) dan satu spasi pemisah, serta tidak melampaui batas representasi numerik (`ERANGE`).
+  - **Nilai tidak valid / ditolak**: Karakter non-numerik (`invalid 100000`), spasi ganda (`50000  100000`), tanpa periode (`50000`), nilai nol atau negatif (`-50000 100000`, `0 100000`).
+
+- **`memory_max=<nilai>`**:
+  - **Format valid**: String literal `"max"` atau bilangan bulat positif dengan akhiran satuan opsional huruf tunggal: `K`/`k` (kibibita), `M`/`m` (mebibita), `G`/`g` (gibibita), atau angka byte murni tanpa satuan. Contoh: `16M`, `256M`, `1G`, `max`.
+  - **Aturan**: Karakter angka sebelum satuan harus berupa digit murni (`0-9`) bernilai > 0 dan tidak melampaui rentang (`ERANGE`). Akhiran hanya boleh satu huruf satuan.
+  - **Nilai tidak valid / ditolak**: Satuan ganda atau multi-karakter (`64MB`, `256MiB`), teks acak (`corrupted!@#`), bilangan bertanda negatif (`-100M`), atau angka nol (`0`).
+
+- **`pids_max=<nilai>`**:
+  - **Format valid**: String literal `"max"` atau bilangan desimal positif murni, contoh: `5`, `25`, `50`, `max`.
+  - **Aturan**: Hanya digit murni (`0-9`) bernilai > 0 tanpa tanda plus/minus dan tidak overflow (`ERANGE`).
+  - **Nilai tidak valid / ditolak**: Bilangan negatif (`-5`), nilai nol (`0`), teks non-numerik (`invalid`).
+
+#### 2. Penanganan Kesalahan Graceful (Graceful Error Handling)
+
+Bila suatu opsi limit resource mengandung format yang rusak atau tidak valid:
+1. ninit **tidak** membatalkan parsing file konfigurasi secara keseluruhan.
+2. ninit **tidak** mengalami crash ataupun memasuki rescue shell darurat.
+3. Pesan kesalahan dicatat secara transparan ke log:
+   ```
+   [YYYY-MM-DD HH:MM:SS] ninit: Parse err: <tag> '<nilai>' tidak valid pada layanan '<nama>', batas diabaikan
+   ```
+4. Nilai batas yang rusak dibuang (dikosongkan), dan layanan yang bersangkutan tetap diinisialisasi serta dijalankan tanpa batas resource tersebut (*unconstrained*). Dengan demikian, kesalahan pengetikan opsi limit tidak melumpuhkan ketersediaan layanan sistem utama.
+
+#### 3. Siklus Hidup Cgroup & Pembersihan Orphan (Lifecycle Cleanup)
+
+Untuk mencegah kebocoran proses zombie/orphan di latar belakang saat proses utama layanan berhenti:
+- **Toleransi Subtree Root & Hierarki**: Saat inisialisasi boot, ninit mengaktifkan controller `+memory +cpu +pids` pada `/sys/fs/cgroup/cgroup.subtree_control` dan `/sys/fs/cgroup/ninit/cgroup.subtree_control`. Jika penulisan multi-token gagal (misalnya salah satu controller tidak didukung kernel atau berjalan di dalam container dengan delegasi terbatas), ninit mencoba menulis setiap token satu per satu dan mencatat kegagalan dengan penanda `(toleransi nested/container)` atau `(toleransi partial)` tanpa menghentikan proses boot.
+- **Pembersihan Layanan Respawn**: Ketika proses pemimpin layanan bertipe `respawn` mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (dengan fallback pemindaian PID melalui `/proc` untuk kernel pra-5.14) guna menghentikan semua proses turunan selama jendela `RESPAWN_DELAY` (2 detik). Pembersihan juga diulang sesaat sebelum PID generasi baru dipindahkan ke dalam cgroup leaf.
+- **Pembersihan Layanan Once**: Ketika layanan bertipe `once` selesai (`exit 0` maupun keluar dengan error/sinyal), `cgroup_kill_service` menyapu bersih seluruh proses anak/orphan yang ditinggalkan sebelum memanggil `cleanup_cgroup`.
+- **Polling `rmdir` pada Leaf Cgroup**: Fungsi `cleanup_cgroup` memanggil `cgroup_kill_service` dan mencoba menghapus direktori leaf cgroup `/sys/fs/cgroup/ninit/<nama>`. Bila kernel masih dalam proses merealisasikan terminasi task sehingga `rmdir` mengembalikan `EBUSY`, ninit melakukan polling hingga 20 kali dengan jeda 5 ms (`usleep(5000)`, total maksimal 100 ms). Saat berhasil, ninit mencatat `cgroup: dibersihkan '<nama>'`.
 
 ## `/etc/fstab`
 
