@@ -58,6 +58,9 @@ jobs:
       - name: Jalur kegagalan spawn (dependensi di jalur respawn + fork EAGAIN)
         run: sudo sh ./scripts/test-spawn-failure.sh
 
+      - name: Batasan resource cgroup v2 & pembersihan orphan respawn
+        run: sudo sh ./scripts/test-cgroup-limits.sh
+
       - name: Build tanpa warning (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
 
