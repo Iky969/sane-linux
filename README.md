@@ -50,7 +50,7 @@ make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
 make clean
 ```
 
-`make test` menjalankan empat uji otomatis. Tiga pertama menyiapkan rootfs
+`make test` menjalankan enam uji otomatis. Lima pertama menyiapkan rootfs
 sementara (busybox sebagai `/bin/sh`) lalu menjalankan ninit sebagai PID 1 di
 PID + mount namespace baru:
 
@@ -72,6 +72,14 @@ PID + mount namespace baru:
   console mati dan di-respawn ulang (`exit status`, `respawn ditunda`, lebih
   dari satu PID unik) harus GAGAL, bukan LULUS. Dijalankan terhadap fixture
   log lewat `REPORT_ONLY=1` — tanpa root dan tanpa QEMU.
+- **[`scripts/test-spawn-failure.sh`](scripts/test-spawn-failure.sh)** — jalur
+  kegagalan spawn: penegakan dependensi di jalur respawn, pencegahan loop fork
+  gagal tak terbatas pada layanan `once`, dan probe keaktifan proses grup
+  sebelum pengiriman `SIGKILL` final.
+- **[`scripts/test-cgroup-limits.sh`](scripts/test-cgroup-limits.sh)** — penegakan
+  batas resource cgroup v2: batasan memori & OOM deterministik (`memory_max`),
+  pembatasan fork (`pids_max`), pembersihan proses orphan saat respawn
+  (`cgroup.kill`), serta verifikasi hierarki leaf cgroup.
 - **[`scripts/test-integration.sh`](scripts/test-integration.sh)** — uji
   silang-lapisan dengan SATU boot QEMU sungguhan: fstab uji (opsi data, escape
   oktal, duplikat mountpoint) harus benar-benar ter-mount di kernel dan
@@ -157,6 +165,8 @@ scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
+scripts/test-spawn-failure.sh uji dependensi jalur respawn + fork retry limit
+scripts/test-cgroup-limits.sh uji cgroup v2 limits (memory, cpu, pids) & lifecycle
 scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
 scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
 scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda

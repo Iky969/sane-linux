@@ -33,7 +33,6 @@ test: $(BIN)
 	sh ./scripts/test-spawn-failure.sh
 	sh ./scripts/test-cgroup-limits.sh
 
-
 rootfs:
 	sh ./scripts/build-rootfs.sh
 
