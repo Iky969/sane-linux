@@ -37,7 +37,7 @@
 # Variabel lingkungan:
 #   BIN=./ninit              biner yang diuji
 #   BUSYBOX=/bin/busybox     busybox statis (apt-get install busybox-static)
-#   WAIT1..WAIT10B           jendela waktu observasi tiap skenario (detik)
+#   WAIT1..WAIT11            jendela waktu observasi tiap skenario (detik)
 #
 # Catatan: suite ini menggunakan unshare dengan `--mount --propagation private`
 # dan `mount -t proc` manual (bukan `--mount-proc`), konsisten dengan konvensi
@@ -58,6 +58,8 @@ WAIT8=${WAIT8:-6}
 WAIT9=${WAIT9:-8}
 WAIT10A=${WAIT10A:-6}
 WAIT10B=${WAIT10B:-8}
+WAIT11=${WAIT11:-6}
+
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
@@ -87,16 +89,7 @@ LOGS=""
 HELPERS=""
 CG_DYNAMIC=""
 INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
-cleanup() {
-	for d in ${ROOTS:-}; do
-		$SUDO umount -R "$d" 2>/dev/null || $SUDO umount "$d/proc" 2>/dev/null || true
-		rm -rf "$d"
-	done
-	for f in ${LOGS:-}; do rm -f "$f"; done
-	for h in ${HELPERS:-}; do rm -f "$h"; done
-	$SUDO rm -f "$INNER" 2>/dev/null || true
-
-	# Bersihkan cgroup ninit dan leaf cgroups yang tertinggal pada host
+clean_host_ninit() {
 	if [ -d "/sys/fs/cgroup/ninit" ]; then
 		for leaf in /sys/fs/cgroup/ninit/*; do
 			[ -d "$leaf" ] || continue
@@ -110,6 +103,19 @@ cleanup() {
 		done
 		$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
 	fi
+}
+
+cleanup() {
+	for d in ${ROOTS:-}; do
+		$SUDO umount -R "$d" 2>/dev/null || $SUDO umount "$d/proc" 2>/dev/null || true
+		rm -rf "$d"
+	done
+	for f in ${LOGS:-}; do rm -f "$f"; done
+	for h in ${HELPERS:-}; do rm -f "$h"; done
+	$SUDO rm -f "$INNER" 2>/dev/null || true
+
+	# Bersihkan cgroup ninit dan leaf cgroups yang tertinggal pada host
+	clean_host_ninit
 
 	# Bersihkan cgroup dinamis/ephemeral yang dibuat selama pengujian
 	for cg in ${CG_DYNAMIC:-}; do
@@ -125,6 +131,9 @@ cleanup() {
 	done
 }
 trap cleanup EXIT INT TERM
+
+# Bersihkan sisa cgroup dari pengujian sebelumnya agar pengujian mulai dari state bersih
+clean_host_ninit
 
 fail_count=0
 ok()   { printf '  [ OK ]   %s\n' "$1"; }
@@ -251,6 +260,37 @@ EOF
 #include <string.h>
 
 int main(void) {
+    /* =========================================================================
+     * INSTRUKSI PERTAMA (SEBELUM FORK):
+     * Baca /proc/self/cgroup dan verifikasi bahwa proses SUDAH berada di leaf
+     * cgroup (/ninit/... atau escape_svc).
+     * Biner tanpa handshake melihat cgroup root (0::/) -> GAGAL deterministik.
+     * Biner dengan handshake T1 dijamin sudah berada di leaf -> LULUS.
+     * ========================================================================= */
+    int in_leaf = 0;
+    char cgroup_line[256] = {0};
+    FILE *fcg = fopen("/proc/self/cgroup", "r");
+    if (fcg) {
+        while (fgets(cgroup_line, sizeof(cgroup_line), fcg)) {
+            if (strstr(cgroup_line, "/ninit/") || strstr(cgroup_line, "escape_svc")) {
+                in_leaf = 1;
+                break;
+            }
+        }
+        fclose(fcg);
+    }
+
+    if (!in_leaf) {
+        /* Biner tanpa handshake: cgroup root / belum di leaf cgroup -> GAGAL */
+        FILE *fa = fopen("/var/escape_audit.txt", "w");
+        if (fa) {
+            fprintf(fa, "PRE_FORK_LEAF_CGROUP=0\nFAILED_REASON=not_in_leaf_cgroup\n");
+            fflush(fa);
+            fclose(fa);
+        }
+        return 1; /* Keluar segera, tidak ada fork anak atau cucu */
+    }
+
     pid_t leader_pid = getpid();
 
     /* Generation 2: Child */
@@ -282,13 +322,16 @@ int main(void) {
     setsid();
     pid_t gc_pid = getpid();
 
-    /* Verify cgroup membership via /proc/self/cgroup */
-    int in_leaf = 0;
-    FILE *fcg = fopen("/proc/self/cgroup", "r");
+    /* Verify grandchild cgroup membership via /proc/self/cgroup */
+    int gc_in_leaf = 0;
+    fcg = fopen("/proc/self/cgroup", "r");
     if (fcg) {
         char buf[256];
         while (fgets(buf, sizeof(buf), fcg)) {
-            if (strstr(buf, "escape_svc")) { in_leaf = 1; break; }
+            if (strstr(buf, "/ninit/") || strstr(buf, "escape_svc")) {
+                gc_in_leaf = 1;
+                break;
+            }
         }
         fclose(fcg);
     }
@@ -309,8 +352,8 @@ int main(void) {
 
     FILE *fa = fopen("/var/escape_audit.txt", "w");
     if (fa) {
-        fprintf(fa, "LEADER=%d\nCHILD=%d\nGRANDCHILD=%d\nIN_LEAF_CGROUP=%d\nIN_CGROUP_PROCS=%d\nGRANDCHILD_ACTIVE=1\n",
-                leader_pid, getppid(), gc_pid, in_leaf, in_procs);
+        fprintf(fa, "LEADER=%d\nCHILD=%d\nGRANDCHILD=%d\nPRE_FORK_LEAF_CGROUP=1\nIN_LEAF_CGROUP=%d\nIN_CGROUP_PROCS=%d\nGRANDCHILD_ACTIVE=1\n",
+                leader_pid, getppid(), gc_pid, gc_in_leaf, in_procs);
         fflush(fa);
         fclose(fa);
     }
@@ -841,6 +884,29 @@ else
 
 	cp "$ESCAPE_BIN" "$R9/bin/escape_workload"
 
+	# -----------------------------------------------------------------
+	# Phase 1: Negative Control Test (Biner Tanpa Handshake -> GAGAL)
+	# -----------------------------------------------------------------
+	# Jalankan biner secara langsung di lingkungan root cgroup tanpa handshake T1.
+	# Biner harus mendeteksi ketiadaan leaf cgroup pada instruksi pertama dan exit 1.
+	neg_ret=0
+	$SUDO timeout -s KILL 5 unshare --pid --fork --kill-child=SIGKILL \
+		--mount --propagation private /bin/sh -c \
+		"mount -t proc proc '$R9/proc' && chroot '$R9' /bin/escape_workload" >/dev/null 2>&1 || neg_ret=$?
+
+	if [ "$neg_ret" -ne 0 ] && [ -f "$R9/var/escape_audit.txt" ]; then
+		check_in  "uji anti-hampa negatif: biner tanpa handshake melihat cgroup root dan GAGAL deterministik" \
+			"$R9/var/escape_audit.txt" 'PRE_FORK_LEAF_CGROUP=0'
+		absent_in "uji anti-hampa negatif: biner tanpa handshake tidak pernah spawn cucu" \
+			"$R9/var/escape_audit.txt" 'GRANDCHILD_ACTIVE=1'
+	else
+		bad "uji anti-hampa negatif: biner tanpa handshake seharusnya gagal, namun lolos (exit=$neg_ret)"
+	fi
+	rm -f "$R9/var/escape_audit.txt"
+
+	# -----------------------------------------------------------------
+	# Phase 2: Positive Test (Dengan T1 Handshake di Bawah ninit -> LULUS)
+	# -----------------------------------------------------------------
 	cat > "$R9/bin/check_escape.sh" << 'EOF'
 #!/bin/sh
 /bin/sleep 0.5
@@ -874,7 +940,9 @@ EOF
 
 	boot_guest "$R9" "$WAIT9" >"$L9" 2>&1
 
-	check_in  "adversary berhasil spawn cucu orphan (anti-hampa)" \
+	check_in  "instruksi pertama proses anak memvalidasi keberadaan di leaf cgroup (/ninit/...)" \
+		"$R9/var/escape_audit.txt" 'PRE_FORK_LEAF_CGROUP=1'
+	check_in  "adversary berhasil spawn cucu orphan berkat handshake T1 (anti-hampa positif)" \
 		"$R9/var/escape_audit.txt" 'GRANDCHILD_ACTIVE=1'
 	check_in  "cucu orphan berada di leaf cgroup.procs berkat handshake T1" \
 		"$R9/var/escape_audit.txt" 'IN_CGROUP_PROCS=1'
@@ -955,6 +1023,49 @@ EOF
 		"cgroup: dibersihkan 'mem_cumul'"
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L10B" \
 		'graceful shutdown'
+fi
+
+# ------------------------------------------------------------- Skenario 11
+# Fallback Fail-Open saat Cgroup v2 Tidak Tersedia (Mount Cgroup Gagal)
+# Memverifikasi bahwa ketika hierarki cgroup v2 tidak dapat di-mount atau disiapkan:
+# 1. Init mencatat baris fail-open aktif: "cgroup: fail-open aktif untuk ..."
+# 2. Init mencatat warning pengabaian limit: "Warning: batas resource diabaikan pada layanan '...' karena cgroup tidak tersedia"
+# 3. Layanan tetap dieksekusi dengan normal melalui handshake T1
+# 4. Init PID 1 melakukan shutdown bersih (graceful shutdown) tanpa crash atau orphan hang
+printf '\n== Skenario 11: Fallback fail-open saat cgroup v2 tidak tersedia ==\n'
+R11=$(new_root sleep)
+L11=$(new_log)
+ROOTS="$ROOTS $R11"
+LOGS="$LOGS $L11"
+
+cat > "$R11/etc/init.conf" << 'EOF'
+failopen_svc:once:/bin/sh -c "echo FAILOPEN_EXECUTED > /var/failopen_audit.txt":memory_max=32M:pids_max=10
+stopper:once:/bin/sh -c "/bin/sleep 2 && echo poweroff > /run/initctl":requires=failopen_svc
+EOF
+
+# Siapkan lingkungan tiruan di mana /sys/fs/cgroup berupa berkas biasa pada tmpfs,
+# sehingga pemanggilan mount("cgroup2", "/sys/fs/cgroup", ...) gagal deterministik dengan ENOTDIR
+setup_r11="mount -t sysfs sysfs $R11/sys; mkdir -p $R11/sys/fs; mount -t tmpfs tmpfs $R11/sys/fs; touch $R11/sys/fs/cgroup;"
+
+boot_guest "$R11" "$WAIT11" "" "$setup_r11" >"$L11" 2>&1
+
+check_in  "kegagalan mount cgroup v2 tercatat di log" "$L11" \
+	'cgroup2: mount /sys/fs/cgroup gagal'
+check_in  "fallback fail-open aktif tercatat di log" "$L11" \
+	"cgroup: fail-open aktif untuk 'failopen_svc'"
+check_in  "warning batas resource diabaikan tercatat di log" "$L11" \
+	"Warning: batas resource diabaikan pada layanan 'failopen_svc' karena cgroup tidak tersedia"
+check_in  "layanan tetap berhasil dieksekusi normal saat cgroup tidak tersedia" \
+	"$R11/var/failopen_audit.txt" 'FAILOPEN_EXECUTED'
+check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L11" \
+	'graceful shutdown'
+
+# ------------------------------------------------------------- Verifikasi Teardown Cgroup Host
+printf '\n== Verifikasi Teardown Cgroup Host ==\n'
+if [ -d "/sys/fs/cgroup/ninit" ]; then
+	bad "kebocoran direktori cgroup: /sys/fs/cgroup/ninit masih tertinggal pada host"
+else
+	ok "hierarki cgroup bersih: tidak ada kebocoran direktori di /sys/fs/cgroup/ninit"
 fi
 
 # ------------------------------------------------------------- Ringkasan
