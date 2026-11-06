@@ -28,6 +28,7 @@
 #define MAX_SERVICES    64
 #define MAX_LINE        1024
 #define RESPAWN_DELAY   2
+#define MAX_SPAWN_RETRY 3   /* percobaan fork() ulang untuk layanan once */
 
 typedef enum {
     SVC_STATE_STOPPED = 0,
@@ -46,6 +47,7 @@ typedef struct {
                                    leadernya (audit SANE-01). */
     int         respawn;
     int         need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
+    int         spawn_tries;    /* jumlah berturut-turut fork() gagal; dinolkan saat spawn sukses */
     time_t      last_start;
     char        deps_str[256]; 
     svc_state_t state;
@@ -310,6 +312,7 @@ static int parse_config(const char *path)
                  (int)sizeof(services[num_services].deps_str) - 1, deps);
         services[num_services].respawn      = is_respawn;
         services[num_services].need_respawn = 0;
+        services[num_services].spawn_tries  = 0;
         services[num_services].pid          = 0;
         services[num_services].pgid         = 0;
         services[num_services].last_start   = 0;
@@ -442,9 +445,18 @@ static int sort_services(void)
 }
 
 /* ---------- process management ---------- */
-static void spawn_service(service_t *svc)
+/* Kembalikan:
+     1 = ada kemajuan nyata (proses berjalan, ATAU kegagalan final yang
+         menjadikan state terminal) -> pemanggil boleh menandai progress
+     0 = tidak ada kemajuan (ditunda jendela RESPAWN_DELAY, atau fork() gagal
+         tapi masih punya jatah percobaan)
+   Dulu fungsi ini void dan spawn_eligible_services() menandai progress tanpa
+   melihat hasilnya, sehingga kegagalan fork() tidak punya keadaan akhir:
+   layanan once tertinggal di STOPPED selamanya dan dependensinya menunggu
+   tanpa pesan apa pun. */
+static int spawn_service(service_t *svc)
 {
-    if (shutting_down) return;   /* saat shutdown: jangan sleep, jangan fork */
+    if (shutting_down) return 0;   /* saat shutdown: jangan sleep, jangan fork */
 
     time_t now = time(NULL);
 
@@ -456,14 +468,31 @@ static void spawn_service(service_t *svc)
             init_log("%s: respawn ditunda (timer %d detik, loop tidak diblokir)",
                      svc->name, RESPAWN_DELAY);
         svc->need_respawn = 1;
-        return;
+        return 0;
     }
 
     svc->need_respawn = 0;
     svc->last_start   = time(NULL);
     pid_t pid = fork();
     
-    if (pid < 0) { init_log("fork %s: %s", svc->name, strerror(errno)); return; }
+    if (pid < 0) {
+        int err = errno;   /* dibaca sebelum init_log(): open/dprintf mengubah errno */
+        svc->spawn_tries++;
+        /* Layanan once tidak di respawn, jadi tanpa batas percobaan kegagalan
+           fork() tidak akan pernah berakhir di keadaan terminal. Setelah
+           MAX_SPAWN_RETRY: nyatakan gagal supaya deps_satisfied() melaporkan
+           dependensi sebagai batal, bukan menggantung selamanya. */
+        if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
+            init_log("fork %s: %s (%d percobaan, layanan dinyatakan gagal)",
+                     svc->name, strerror(err), svc->spawn_tries);
+            svc->state = SVC_STATE_FAILED;
+            svc->spawn_tries = 0;
+            return 1;
+        }
+        init_log("fork %s: %s", svc->name, strerror(err));
+        svc->need_respawn = 1;   /* retry lewat timer ppoll, bukan busy-loop */
+        return 0;
+    }
 
     if (pid == 0) {
         setsid();
@@ -500,8 +529,10 @@ static void spawn_service(service_t *svc)
     svc->pid  = pid;
     svc->pgid = pid;   /* anak memanggil setsid(): dia pemimpin grup prosesnya */
     svc->state = SVC_STATE_RUNNING;
+    svc->spawn_tries = 0;
     init_log("started %s (pid %d)", svc->name, pid);
     setup_cgroup(svc->name, pid);
+    return 1;
 }
 
 static void reap_zombies(void)
@@ -586,21 +617,54 @@ static void spawn_eligible_services(void)
                 svc->state = SVC_STATE_FAILED;
                 progress = 1;
             } else if (ret == 1) {
-                spawn_service(svc);
-                progress = 1;
+                /* Hanya tandai kemajuan bila spawn_service benar-benar mengubah
+                   keadaan layanan. Tanpa ini, kegagalan fork() (yang hanya
+                   menandai need_respawn) akan membuat do-while berputar lagi
+                   dan lagi tanpa ada yang berubah. */
+                if (spawn_service(svc)) progress = 1;
             }
         }
     } while (progress);
 }
 
-/* Respawn hanya dijalankan dari loop utama, di luar reap_zombies(). */
+/* Respawn hanya dijalankan dari loop utama, di luar reap_zombies().
+   Dependensi WAJIB diperiksa di sini. Versi lama hanya melihat
+   `respawn && pid == 0` lalu langsung spawn, sehingga layanan yang sudah
+   "dibatalkan" karena dependensi once-nya gagal (state FAILED) tetap
+   dihidupkan ulang selamanya — janji urutan `requires=` dilanggar lewat
+   jalur respawn ini, dan pembatalannya menjadi pesan tanpa efek.
+   Sekaligus menjadi jalur retry bagi layanan once yang fork()-nya gagal
+   (need_respawn): layanan jenis ini tidak pernah di-respawn, jadi tanpa
+   jalur itu ia berhenti sebagai STOPPED selamanya. */
 static void respawn_services(void)
 {
     if (shutting_down) return;
 
     for (int i = 0; i < num_services; i++) {
-        if (services[i].respawn && services[i].pid == 0)
-            spawn_service(&services[i]);
+        service_t *svc = &services[i];
+        if (svc->pid > 0 || svc->state == SVC_STATE_DONE || svc->state == SVC_STATE_FAILED)
+            continue;
+        if (!svc->respawn && !svc->need_respawn)
+            continue;   /* belum pernah dicoba: itu tugas spawn_eligible_services() */
+
+        const char *failed_dep = NULL;
+        int ret = deps_satisfied(svc, &failed_dep);
+        if (ret < 0) {
+            init_log("layanan '%s' dibatalkan: dependensi '%s' gagal", svc->name, failed_dep);
+            svc->state = SVC_STATE_FAILED;
+            svc->need_respawn = 0;
+            continue;
+        }
+        if (ret == 0) {
+            /* Dependensi belum terpenuhi: tidak ada yang perlu dicoba lagi,
+               jadi need_respawn di-clear. Kalau dibiarkan, respawn_pending()
+               membuat ppoll bangun 10x/detik selamanya tanpa pernah ada
+               kemajuan — dan layanan ini toh akan dinilai ulang oleh
+               spawn_eligible_services() pada iterasi berikutnya. */
+            svc->need_respawn = 0;
+            continue;
+        }
+        spawn_service(svc);
     }
 }
 
@@ -718,7 +782,14 @@ static void shutdown_all(int reboot_cmd, int force)
 
     for (int i = 0; i < 50; i++) {
         int alive = 0;
-        for (int j = 0; j < num_services; j++) if (service_still_alive(&services[j])) { alive = 1; break; }
+        /* Probe SETIAP layanan, jangan berhenti di yang pertama hidup: hanya
+           service_still_alive() yang membersihkan pgid basi (:681). Dengan
+           break dini, layanan yang indeksnya setelah layanan hidup tidak
+           pernah ter-probe pada pass terakhir, jadi pgid kadaluarsanya
+           bertahan sampai SIGKILL di bawah dan bisa mengenai grup proses lain
+           yang nomornya sudah didaur ulang kernel. */
+        for (int j = 0; j < num_services; j++)
+            if (service_still_alive(&services[j])) alive = 1;
         if (!alive) break;
         reap_zombies();
         drain_log_fifo();   /* pesan terakhir layanan sebelum mati (mis. "bye!") */
@@ -726,7 +797,16 @@ static void shutdown_all(int reboot_cmd, int force)
     }
 
     for (int i = 0; i < num_services; i++) {
-        kill_service_group(&services[i], SIGKILL);
+        /* Probe sekali lagi sebelum SIGKILL, sama seperti jalur force dan
+           jalur SIGTERM di atas: grup bisa saja baru mati setelah pass
+           terakhir. Layanan yang grupnya sudah kosong hanya perlu
+           cgroup.kill — SIGKILL lewat pgid basi justru berbahaya. */
+        if (service_still_alive(&services[i])) {
+            kill_service_group(&services[i], SIGKILL);
+        } else {
+            init_log("%s: grup sudah mati, SIGKILL dilewati", services[i].name);
+            cgroup_kill_service(services[i].name);
+        }
         cleanup_cgroup(services[i].name);
     }
     rmdir(CGROUP_BASE);

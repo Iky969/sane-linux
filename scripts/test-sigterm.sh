@@ -14,6 +14,12 @@
 # Anak dalam grup yang mengabaikan SIGTERM harus tetap ditunggu sampai
 # jendela grace habis, lalu dibunuh SIGKILL lewat pgid yang disimpan init.
 #
+# Skenario 4 mengunci perbaikan jalur SIGKILL final: grace loop yang berhenti
+# probe di layanan hidup pertama meninggalkan pgid basi pada layanan setelahnya,
+# dan SIGKILL tanpa pemeriksaan bisa mendarat di grup proses yang nomornya sudah
+# didaur ulang kernel. Layanan yang grupnya terbukti kosong kini dilewati
+# (hanya cgroup.kill), layanan yang grupnya hidup tetap dibunuh.
+#
 # Pemakaian:
 #   sudo sh ./scripts/test-sigterm.sh      # atau: make test
 #
@@ -438,6 +444,105 @@ fi
 
 printf '\n== log ninit skenario 3 ==\n'
 sed 's/^/  | /' "$LOG3"
+
+# -------------------------------------------------------------- Skenario 4
+printf '\n== Skenario 4: probe ulang sebelum SIGKILL final (grup basi) ==\n'
+ROOT4=$(mktemp -d /tmp/ninit-sigterm-stalepgid.XXXXXX)
+LOG4=$(mktemp /tmp/ninit-sigterm-stalepgid-log.XXXXXX)
+ROOTS="$ROOTS $ROOT4"
+LOGS="$LOGS $LOG4"
+
+mkdir -p "$ROOT4/proc" "$ROOT4/sys" "$ROOT4/dev" "$ROOT4/run" "$ROOT4/tmp" \
+         "$ROOT4/etc" "$ROOT4/var/log" "$ROOT4/bin"
+cp "$BIN" "$ROOT4/ninit"
+cp "$BUSYBOX" "$ROOT4/bin/sh"
+cp "$BUSYBOX" "$ROOT4/bin/sleep"
+: > "$ROOT4/dev/null"
+
+# Dua layanan, urutannya penting:
+#   astall (indeks 0) = respawn yang MENGABAIKAN SIGTERM -> jendela grace pasti
+#           habis dengan satu layanan masih hidup.
+#   zdead  (indeks 1) = once yang selesai sendiri jauh sebelum shutdown ->
+#           pid sudah 0 tapi pgid masih tersimpan (sengaja, audit SANE-01),
+#           dan grupnya sudah kosong.
+# Grace loop lama memakai `break` begitu menemukan layanan hidup pertama, jadi
+# zdead tidak pernah ter-probe pada pass terakhir: pgid basi itu lalu dipakai
+# kill(-pgid, SIGKILL) tanpa pemeriksaan. Nomor grup proses bisa didaur ulang
+# kernel, dan sinyal itu justru bisa mendarat di grup proses milik orang lain.
+# Sekarang setiap layanan ter-probe dan tiap SIGKILL didahului
+# service_still_alive(), sehingga zdead tercatat sebagai
+# "grup sudah mati, SIGKILL dilewati".
+printf 'astall:respawn:trap "" TERM; exec /bin/sleep 60\nzdead:once:/bin/sleep 1\n' \
+	> "$ROOT4/etc/init.conf"
+
+(
+	$SUDO timeout -k 5 40 unshare --pid --fork --kill-child=SIGKILL \
+		--mount --propagation private \
+		sh -c "mount -t proc proc '$ROOT4/proc' && exec chroot '$ROOT4' /ninit" \
+		>"$LOG4" 2>&1
+) &
+job4=$!
+
+i=0
+init_pid4=""
+while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
+	init_pid4=$(find_init_pid || true)
+	if [ -n "${init_pid4:-}" ] && grep -q 'main loop siap' "$LOG4" 2>/dev/null \
+	   && grep -q 'started astall' "$LOG4" 2>/dev/null \
+	   && grep -q 'started zdead' "$LOG4" 2>/dev/null; then
+		break
+	fi
+	sleep 0.2
+	i=$((i + 1))
+done
+
+if [ -z "${init_pid4:-}" ]; then
+	sed 's/^/  | /' "$LOG4"
+	fail "ninit skenario 4 tidak berjalan dalam ${READY_TIMEOUT}s"
+fi
+
+# Beri zdead waktu selesai dan reap menormalkan pid-nya (pgid sengaja tertinggal).
+sleep 2
+if ! grep -qE 'zdead \(pid [0-9]+\) exit status=0x0' "$LOG4"; then
+	sed 's/^/  | /' "$LOG4"
+	fail "zdead tidak selesai lebih dulu seperti yang test ini asumsikan"
+fi
+
+t0=$(date +%s)
+$SUDO kill -TERM "$init_pid4" || true
+
+i=0
+while [ "$i" -lt 200 ]; do
+	kill -0 "$job4" 2>/dev/null || break
+	sleep 0.1
+	i=$((i + 1))
+done
+wait "$job4" 2>/dev/null || true
+shutdown4_secs=$(( $(date +%s) - t0 ))
+
+check4() { if grep -q "$2" "$LOG4"; then ok "$1"; else bad "$1"; fi; }
+absent4() { if grep -q "$2" "$LOG4"; then bad "$1"; else ok "$1"; fi; }
+
+check4  "zdead ter-probe dan SIGKILL dilewati (pgid basi tidak dipakai)" \
+	'zdead: grup sudah mati, SIGKILL dilewati'
+absent4 "astall TIDAK dianggap grup mati (grupnya masih hidup)" \
+	'astall: grup sudah mati'
+# Tidak ada asersi ketiga di sini. Baris "astall (pid N) exit status=0x9"
+# tidak dicetak karena shutdown_all() langsung reboot() begitu SIGKILL
+# terkirim — namespace mati sebelum ninit sempat reaping. Menandai cgroup
+# terbebas juga tidak bisa dipakai: cleanup_cgroup() hanya mencetak bila
+# rmdir() sukses, dan rmdir grup yang anggotanya baru saja dibunuh kembali
+# EBUSY bergantung penjadwalan. Dua pemeriksaan di atas sudah memisahkan
+# kedua cabang (grup hidup -> SIGKILL, grup kosong -> dilewati) dan itu
+# bagian yang diregresi.
+if [ "$shutdown4_secs" -ge 4 ]; then
+	ok "grace window tetap dipakai penuh untuk layanan bandel: ${shutdown4_secs}s"
+else
+	bad "shutdown selesai dalam ${shutdown4_secs}s (grace window tidak dihormati)"
+fi
+
+printf '\n== log ninit skenario 4 ==\n'
+sed 's/^/  | /' "$LOG4"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'

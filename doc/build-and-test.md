@@ -18,12 +18,13 @@ make            # -> ./ninit  (gcc -static -O2 -Wall)
 ## Uji otomatis
 
 ```bash
-make test                              # menjalankan empat script pertama (5 butuh QEMU: make integration)
+make test                              # menjalankan lima script pertama (6 butuh QEMU: make integration)
 sudo sh ./scripts/smoke-test.sh        # 1) smoke test PID 1
 sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM sampai ke layanan
 sudo sh ./scripts/test-config.sh       # 3) urut dependensi + rescue mode + initctl
 sh ./scripts/test-qemu-report.sh       # 4) pemeriksaan harness run-qemu.sh (tanpa root)
-sudo sh ./scripts/test-integration.sh  # 5) integrasi lintas lapisan via boot QEMU (make integration)
+sudo sh ./scripts/test-spawn-failure.sh # 5) jalur kegagalan spawn (fork EAGAIN + deps di respawn)
+sudo sh ./scripts/test-integration.sh  # 6) integrasi lintas lapisan via boot QEMU (make integration)
 ```
 
 ### 1. Smoke test PID 1 (`scripts/smoke-test.sh`)
@@ -193,9 +194,49 @@ review PR #6).
 Pemakaian: `sh ./scripts/test-qemu-report.sh` (sudah termasuk `make test`
 dan CI).
 
-### 5. Uji integrasi lintas lapisan (`scripts/test-integration.sh`)
+### 5. Jalur kegagalan spawn (`scripts/test-spawn-failure.sh`)
 
-Kenapa ada: suite 1–4 menguji satu lapisan pada satu waktu (parser di chroot,
+Kenapa ada: audit eksternal atas `main` (af3388f) menuduh kegagalan `fork()`
+mengunci PID 1 dalam `do ... while (progress)` sehingga tidak pernah kembali ke
+`ppoll()`. Dugaan itu tidak terbukti saat direproduksi — `spawn_service()`
+sudah men-set `last_start` SEBELUM `fork()`, jadi jendela `RESPAWN_DELAY`
+memaksa loop keluar. Pengujian ulang jalur yang sama menemukan dua cacat nyata
+yang justru tidak tercakup suite mana pun:
+
+1. `respawn_services()` tidak membaca dependensi sama sekali, sehingga layanan
+   yang sudah "dibatalkan" karena dependensi `once`-nya gagal tetap
+   dihidupkan ulang selamanya — urutan `requires=` dilanggar lewat jalur respawn.
+2. Layanan `once` yang `fork()`-nya gagal tidak punya jalur retry (`respawn_services()`
+   hanya menangani `svc->respawn`) dan tidak pernah mencapai state terminal: ia
+   tertinggal di `SVC_STATE_STOPPED` selamanya sementara dependennya menunggu
+   tanpa pesan.
+
+Cara kerja (butuh root; `sudo make test`):
+
+| Skenario | Konfigurasi | Yang dituntut |
+|---|---|---|
+| 1 | `boot:once` keluar 3 + `app:respawn:requires=boot` | `app` dibatalkan dan `started app` TIDAK pernah muncul |
+| 2 | `ping:once` (pemicu SIGCHLD) + `slow:once` tidur 4 s + `app:respawn:requires=slow` | baris `SLOW-DONE` mendahului `APP-START` di `/var/order` |
+| 3 | `boot:once` + `app:respawn:requires=boot`, `fork()` dipaksa EAGAIN | `boot` berakhir `FAILED` setelah maks. 3 percobaan, `app` dibatalkan, `main loop siap` tetap tercetak |
+
+Skenario 2 butuh layanan `ping`: tanpa peristiwa SIGCHLD, event loop lama
+memblokir di `ppoll()` tanpa timeout sampai `slow` selesai, sehingga jalur
+respawn yang salah tidak pernah dieksekusi dan testnya jadi hampa.
+
+Skenario 3 memaksa `fork()` gagal secara deterministik lewat controller
+`pids` di cgroup v2: proses yang akan menjadi ninit memindahkan dirinya ke
+cgroup dengan `pids.max=1` sebelum `exec`, jadi setiap `fork()` berikutnya
+mengembalikan `EAGAIN`. `RLIMIT_NPROC` (`ulimit -u`) tidak bisa dipakai karena
+kernel mengecualikan uid 0 darinya. Bila cgroup v2 atau delegasi `pids` tidak
+tersedia, skenario ini dicetak `[ -- ]` (dilewati) tanpa membuat suite gagal.
+
+Pemakaian: `sudo sh ./scripts/test-spawn-failure.sh` (sudah termasuk
+`make test` dan CI). Variabel: `WAIT1`/`WAIT2`/`WAIT3` jendela observasi tiap
+skenario.
+
+### 6. Uji integrasi lintas lapisan (`scripts/test-integration.sh`)
+
+Kenapa ada: suite 1–5 menguji satu lapisan pada satu waktu (parser di chroot,
 report() lewat fixture). Inkonsistensi ANTAR lapisan lolos dari semuanya —
 misalnya escape oktal fstab yang benar di unit test tapi `mount()` gagal di
 kernel asli, atau opsi data yang terbaca parser namun hilang saat rootfs
@@ -267,6 +308,7 @@ Runner `ubuntu-latest`, urutannya: install `build-essential` + `busybox-static` 
 `make` → cek biner statis lewat `readelf` (tidak boleh ada `INTERP`) →
 `sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
 `sudo sh ./scripts/test-config.sh` → `sh ./scripts/test-qemu-report.sh` →
+`sudo sh ./scripts/test-spawn-failure.sh` →
 `make CFLAGS="-static -O2 -Wall -Werror"`.
 
 Job kedua, `rootfs-distro`, menjaga jalur distro yang tidak dipakai script di atas:
@@ -274,7 +316,7 @@ install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs
 (kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
 (boot initramfs dengan konsol serial; selain penanda boot, harness juga menuntut
 console tetap hidup — lihat bagian 4) → `sudo SECS=40 sh ./scripts/test-integration.sh`
-(satu boot kedua dengan fstab + init.conf uji — lihat bagian 5). QEMU di runner memakai TCG karena tidak ada
+(satu boot kedua dengan fstab + init.conf uji — lihat bagian 6). QEMU di runner memakai TCG karena tidak ada
 `/dev/kvm`; kernel guest diunduh dari Alpine netboot ke `distro/cache/`.
 
 ## Troubleshooting
