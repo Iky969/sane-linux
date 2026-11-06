@@ -18,13 +18,14 @@ make            # -> ./ninit  (gcc -static -O2 -Wall)
 ## Uji otomatis
 
 ```bash
-make test                              # menjalankan lima script pertama (6 butuh QEMU: make integration)
+make test                              # menjalankan enam script pertama (7 butuh QEMU: make integration)
 sudo sh ./scripts/smoke-test.sh        # 1) smoke test PID 1
 sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM sampai ke layanan
 sudo sh ./scripts/test-config.sh       # 3) urut dependensi + rescue mode + initctl
 sh ./scripts/test-qemu-report.sh       # 4) pemeriksaan harness run-qemu.sh (tanpa root)
 sudo sh ./scripts/test-spawn-failure.sh # 5) jalur kegagalan spawn (fork EAGAIN + deps di respawn)
-sudo sh ./scripts/test-integration.sh  # 6) integrasi lintas lapisan via boot QEMU (make integration)
+sudo sh ./scripts/test-cgroup-limits.sh # 6) batasan cgroup v2 & pembersihan orphan respawn
+sudo sh ./scripts/test-integration.sh  # 7) integrasi lintas lapisan via boot QEMU (make integration)
 ```
 
 ### 1. Smoke test PID 1 (`scripts/smoke-test.sh`)
@@ -234,7 +235,27 @@ Pemakaian: `sudo sh ./scripts/test-spawn-failure.sh` (sudah termasuk
 `make test` dan CI). Variabel: `WAIT1`/`WAIT2`/`WAIT3` jendela observasi tiap
 skenario.
 
-### 6. Uji integrasi lintas lapisan (`scripts/test-integration.sh`)
+### 6. Batasan resource cgroup v2 & pembersihan orphan respawn (`scripts/test-cgroup-limits.sh`)
+
+Kenapa ada: Requirement R4 menuntut suite pengujian otomatis untuk memverifikasi
+penegakan batas memori (OOM), batas PID (fork limit EAGAIN), audit siklus hidup
+pembersihan proses orphan saat respawn layanan (`cgroup_kill_service`), serta
+verifikasi penulisan konfigurasi batas resource ke cgroup leaf node (`memory.max`,
+`cpu.max`, `pids.max`).
+
+Cara kerja (butuh root; `sudo make test`):
+
+| Skenario | Konfigurasi | Yang dituntut |
+|---|---|---|
+| 1 | `mem_test:once:/bin/mem_hog:memory_max=16M` | Workload alokasi melebihi 16MB deterministik memicu OOM killer kernel (`SIGKILL`, exit status `0x9`); ninit mencatat batas `memory.max = 16M`, menangani exit status tanpa crash, dan membersihkan leaf cgroup |
+| 2 | `pids_test:once:/bin/fork_test:pids_max=5` | Proses induk melakukan fork anak loop; setelah 5 proses dalam cgroup tercapai, fork berikutnya deterministik ditolak dengan `EAGAIN` (`EAGAIN_CONFIRMED count=4`); leaf cgroup dibersihkan setelah selesai |
+| 3 | `leak:respawn:/bin/sh /bin/leak.sh` | Pemimpin layanan keluar setelah membuat proses anak background (`sleep 300 &`); `cgroup_kill_service` menyapu bersih seluruh proses orphan pada jeda `RESPAWN_DELAY` sebelum generasi baru dihidupkan (`LINGERING_ORPHANS=0`) |
+| 4 | `limits_audit:once:...:pids_max=20:cpu_max=50000 100000:memory_max=32M` | Nilai batas terbaca langsung dari filesystem leaf cgroup (`33554432` byte, `50000 100000`, `20`), membuktikan controller terdelegasi dan parser mendukung urutan tag bebas |
+
+Pemakaian: `sudo sh ./scripts/test-cgroup-limits.sh` (sudah termasuk `make test`
+dan CI). Variabel: `WAIT1`/`WAIT2`/`WAIT3`/`WAIT4` jendela observasi tiap skenario.
+
+### 7. Uji integrasi lintas lapisan (`scripts/test-integration.sh`)
 
 Kenapa ada: suite 1–5 menguji satu lapisan pada satu waktu (parser di chroot,
 report() lewat fixture). Inkonsistensi ANTAR lapisan lolos dari semuanya —
@@ -311,13 +332,14 @@ Workflow terdiri dari tiga job di runner `ubuntu-latest` (dengan action SHA-pinn
 `sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
 `sudo sh ./scripts/test-config.sh` → `sh ./scripts/test-qemu-report.sh` →
 `sudo sh ./scripts/test-spawn-failure.sh` →
+`sudo sh ./scripts/test-cgroup-limits.sh` →
 `make CFLAGS="-static -O2 -Wall -Werror"`.
 - `rootfs-distro`: menjaga jalur distro yang tidak dipakai script di atas:
 install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs.sh`
 (kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
 (boot initramfs dengan konsol serial; selain penanda boot, harness juga menuntut
 console tetap hidup — lihat bagian 4) → `sudo SECS=40 sh ./scripts/test-integration.sh`
-(satu boot kedua dengan fstab + init.conf uji — lihat bagian 6). QEMU di runner memakai TCG karena tidak ada
+(satu boot kedua dengan fstab + init.conf uji — lihat bagian 7). QEMU di runner memakai TCG karena tidak ada
 `/dev/kvm`; kernel guest diunduh dari Alpine netboot ke `distro/cache/`.
 
 ## Troubleshooting
