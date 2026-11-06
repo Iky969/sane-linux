@@ -180,10 +180,15 @@ sehingga kegagalan tidak boleh datang dari pemeriksaan yang salah sasaran:
 | 4 | kernel panic | GAGAL oleh `absent Kernel panic` |
 | 5 | `started console` tidak pernah muncul | GAGAL; hitungan PID unik = 0 |
 | 6 | `main loop siap` tidak pernah muncul | GAGAL; `ready_ms` kosong |
+| 7 | console sehat, service respawn LAIN (`web`) tertunda | LULUS; `web: respawn ditunda` tidak menyeret harness (check ter-scope ke console) |
 
 Pemeriksaan liveness yang dijaga (ada di `report()` `scripts/run-qemu.sh`):
 jumlah PID unik pada `started console (pid N)` harus tepat satu; baris
-`console (pid N) exit status` dan `respawn ditunda` tidak boleh muncul.
+`console (pid N) exit status` dan `console: respawn ditunda` tidak boleh muncul.
+Pemeriksaan respawn **di-scope ke console** (bukan `respawn ditunda` generik):
+service respawn lain yang menunda jendela respawn adalah perilaku normal pada
+`init.conf` multi-layanan — pola global akan memberi GAGAL palsu (catatan
+review PR #6).
 
 Pemakaian: `sh ./scripts/test-qemu-report.sh` (sudah termasuk `make test`
 dan CI).
