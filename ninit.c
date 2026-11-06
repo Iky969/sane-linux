@@ -230,6 +230,19 @@ static void cgroup_kill_service(const char *name)
     }
 }
 
+/* Fallback fail-open eksplisit saat cgroup tidak dapat disiapkan */
+static void cgroup_fail_open(const char *svc_name)
+{
+    init_log("cgroup: fail-open aktif untuk '%s' (cgroup tidak tersedia)", svc_name);
+    int idx = find_service(svc_name);
+    if (idx >= 0) {
+        const service_t *svc = &services[idx];
+        if (svc->memory_max[0] || svc->cpu_max[0] || svc->pids_max[0]) {
+            init_log("Warning: batas resource diabaikan pada layanan '%s' karena cgroup tidak tersedia", svc_name);
+        }
+    }
+}
+
 /* Pindahkan pid layanan ke /sys/fs/cgroup/ninit/<nama>. Dipanggil dari parent
    setelah fork() berhasil; kegagalan hanya di-log dan init tetap jalan. */
 static void setup_cgroup(const char *svc_name, pid_t pid)
@@ -240,6 +253,7 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     /* cgroup v2 tidak membuat parent otomatis */
     if (mkdir(CGROUP_BASE, 0755) < 0 && errno != EEXIST) {
         init_log("cgroup: mkdir %s gagal: %s", CGROUP_BASE, strerror(errno));
+        cgroup_fail_open(svc_name);
         return;
     }
     enable_cgroup_subtree(CGROUP_BASE "/cgroup.subtree_control");
@@ -247,6 +261,7 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
     if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
         init_log("cgroup: mkdir %s gagal: %s", dir, strerror(errno));
+        cgroup_fail_open(svc_name);
         return;
     }
 
@@ -315,13 +330,16 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     fd = open(procs, O_WRONLY);
     if (fd < 0) {
         init_log("cgroup: buka %s gagal: %s", procs, strerror(errno));
+        cgroup_fail_open(svc_name);
         return;
     }
 
-    if (dprintf(fd, "%d\n", (int)pid) < 0)
+    if (dprintf(fd, "%d\n", (int)pid) < 0) {
         init_log("cgroup: tulis pid %d ke %s gagal: %s", (int)pid, procs, strerror(errno));
-    else
+        cgroup_fail_open(svc_name);
+    } else {
         init_log("cgroup: '%s' (pid %d) -> %s", svc_name, (int)pid, dir);
+    }
 
     close(fd);
 }
@@ -763,12 +781,31 @@ static int spawn_service(service_t *svc)
         return 0;
     }
 
+    int sync_pipe[2] = { -1, -1 };
+    int has_sync = 1;
+    if (pipe2(sync_pipe, O_CLOEXEC) < 0) {
+        if (pipe(sync_pipe) < 0) {
+            init_log("pipe2 %s: %s (sinkronisasi handshake dilewati)",
+                     svc->name, strerror(errno));
+            has_sync = 0;
+            sync_pipe[0] = -1;
+            sync_pipe[1] = -1;
+        } else {
+            fcntl(sync_pipe[0], F_SETFD, FD_CLOEXEC);
+            fcntl(sync_pipe[1], F_SETFD, FD_CLOEXEC);
+        }
+    }
+
     svc->need_respawn = 0;
     svc->last_start   = time(NULL);
     pid_t pid = fork();
     
     if (pid < 0) {
         int err = errno;   /* dibaca sebelum init_log(): open/dprintf mengubah errno */
+        if (has_sync) {
+            if (sync_pipe[0] >= 0) close(sync_pipe[0]);
+            if (sync_pipe[1] >= 0) close(sync_pipe[1]);
+        }
         svc->spawn_tries++;
         /* Layanan once tidak di respawn, jadi tanpa batas percobaan kegagalan
            fork() tidak akan pernah berakhir di keadaan terminal. Setelah
@@ -787,6 +824,10 @@ static int spawn_service(service_t *svc)
     }
 
     if (pid == 0) {
+        if (has_sync && sync_pipe[1] >= 0) {
+            close(sync_pipe[1]);
+        }
+
         setsid();
 
         /* Anak mewarisi signal mask PID 1 (SIGCHLD/SIGTERM/SIGINT/SIGUSR1/
@@ -797,11 +838,13 @@ static int spawn_service(service_t *svc)
         sigset_t empty;
         sigemptyset(&empty);
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) {
+            if (has_sync && sync_pipe[0] >= 0) close(sync_pipe[0]);
             _exit(126);
         }
 
         signal(SIGCHLD, SIG_DFL); signal(SIGTERM, SIG_DFL);
         signal(SIGINT,  SIG_DFL); signal(SIGUSR1, SIG_DFL); signal(SIGUSR2, SIG_DFL);
+        signal(SIGPIPE, SIG_DFL);
 
         int fd = open("/dev/null", O_RDONLY);
         if (fd >= 0) { dup2(fd, 0); close(fd); }
@@ -814,8 +857,24 @@ static int spawn_service(service_t *svc)
             if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
         }
 
+        /* Handshake sinkronisasi: tunggu konfirmasi dari parent setelah setup cgroup selesai */
+        if (has_sync && sync_pipe[0] >= 0) {
+            char sync_byte;
+            ssize_t nr;
+            while ((nr = read(sync_pipe[0], &sync_byte, 1)) < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            (void)nr;
+            close(sync_pipe[0]);
+        }
+
         execl("/bin/sh", "sh", "-c", svc->cmd, (char *)NULL);
         _exit(127);
+    }
+
+    if (has_sync && sync_pipe[0] >= 0) {
+        close(sync_pipe[0]);
     }
 
     svc->pid  = pid;
@@ -824,6 +883,16 @@ static int spawn_service(service_t *svc)
     svc->spawn_tries = 0;
     init_log("started %s (pid %d)", svc->name, pid);
     setup_cgroup(svc->name, pid);
+
+    if (has_sync && sync_pipe[1] >= 0) {
+        ssize_t nw;
+        do {
+            nw = write(sync_pipe[1], "1", 1);
+        } while (nw < 0 && errno == EINTR);
+        (void)nw;
+        close(sync_pipe[1]);
+    }
+
     return 1;
 }
 
@@ -1470,6 +1539,7 @@ int main(int argc, char **argv)
     sa.sa_handler = on_sigint;  sigaction(SIGINT,  &sa, NULL);
     sa.sa_handler = on_sigusr1; sigaction(SIGUSR1, &sa, NULL);
     sa.sa_handler = on_sigusr2; sigaction(SIGUSR2, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
 
     setup_pseudo_fs();
     mount_fstab();

@@ -17,7 +17,7 @@ versi terakhir di `main`.
 
 ```
 cek getpid()==1  ->  umask(022)  ->  blokir sinyal + sigemptyset(&orig)
-   ->  pasang handler sigaction (SIGCHLD/SIGTERM/SIGINT/SIGUSR1/SIGUSR2)
+   ->  pasang handler sigaction (SIGCHLD/SIGTERM/SIGINT/SIGUSR1/SIGUSR2) + abaikan SIGPIPE
    ->  setup_pseudo_fs()            proc, sysfs, devtmpfs, tmpfs /run & /tmp, cgroup2
    ->  mount_fstab()                pasang filesystem dari /etc/fstab
    ->  buka /var/log/ninit.log, cetak banner
@@ -99,12 +99,44 @@ Poin penting:
 2. Kalau `now - last_start < RESPAWN_DELAY` (2 detik): set `need_respawn = 1`,
    catat "respawn ditunda" sekali, lalu `return` — **tanpa `sleep()`**; timer
    `ppoll` di loop utama yang akan memanggilnya lagi.
-3. `fork()`; di anak: `setsid()`, **kosongkan signal mask yang diwarisi dari
-   PID 1** (`sigprocmask(SIG_SETMASK, &empty, NULL)` — tanpa ini layanan tidak
-   pernah menerima `SIGTERM` dan mati lewat `SIGKILL`), reset semua handler ke
-   `SIG_DFL`, stdin ← `/dev/null`, stdout/stderr ← `/run/log.fifo`
-   (`O_NONBLOCK`, fallback `/dev/console`), lalu `execl("/bin/sh", "sh", "-c", cmd)`.
-4. Di induk: simpan pid, log `started <nama> (pid N)`, pindahkan ke cgroup v2.
+3. Siapkan pipe sinkronisasi searah (`int sync_pipe[2]`) sebelum `fork()` menggunakan
+   `pipe2(sync_pipe, O_CLOEXEC)` (dengan fallback ke `pipe()` + `fcntl(FD_CLOEXEC)`).
+   Bila pembuatan pipe gagal, ninit mencatat peringatan dan melanjutkan spawn
+   langsung tanpa handshake sinkronisasi.
+4. `fork()`; di proses anak:
+   - Tutup ujung tulis pipe sinkronisasi (`sync_pipe[1]`).
+   - `setsid()` untuk membentuk session baru.
+   - **Kosongkan signal mask yang diwarisi dari PID 1** (`sigprocmask(SIG_SETMASK, &empty, NULL)`
+     — tanpa ini layanan tidak pernah menerima `SIGTERM` dan mati lewat `SIGKILL`),
+     reset semua handler ke `SIG_DFL` (termasuk `SIGPIPE`).
+   - Pasang file descriptor standar: stdin ← `/dev/null`, stdout/stderr ← `/run/log.fifo`
+     (buka tanpa `O_NONBLOCK` agar tidak memicu `EAGAIN`, fallback ke `/dev/console`).
+   - **Handshake Sinkronisasi Pre-Exec**: Anak memblokir pembacaan pada `sync_pipe[0]`
+     (`read(sync_pipe[0], &sync_byte, 1)`) menunggu konfirmasi bahwa parent telah
+     selesai menyiapkan hierarki cgroup dan memasukkan PID anak ke `cgroup.procs`.
+     Setelah menerima byte sinkronisasi atau mendeteksi EOF (pipe ditutup), anak menutup
+     `sync_pipe[0]` dan mengeksekusi `execl("/bin/sh", "sh", "-c", cmd)`. Bila exec gagal, `_exit(127)`.
+5. Di proses induk:
+   - Tutup ujung baca pipe sinkronisasi (`sync_pipe[0]`).
+   - Simpan `svc->pid = pid`, `svc->pgid = pid`, `svc->state = SVC_STATE_RUNNING`, reset `svc->spawn_tries = 0`.
+   - Catat log `started <nama> (pid N)`.
+   - Jalankan `setup_cgroup(svc->name, pid)`:
+     - Buat direktori leaf `/sys/fs/cgroup/ninit/<nama>`.
+     - Bersihkan proses orphan turunan lama via `cgroup_kill_service(svc->name)`.
+     - Terapkan batasan resource yang dikonfigurasi (`memory.max`, `memory.swap.max=0`, `cpu.max`, `pids.max`).
+     - Tuliskan PID ke leaf `cgroup.procs`.
+     - **Kontrak Fail-Open Fallback**: Bila hierarki cgroup v2 tidak tersedia (mount cgroup gagal,
+       direktori cgroup tidak dapat dibuat, atau penulisan `cgroup.procs` gagal), ninit mengaktifkan
+       fallback fail-open:
+       - Mencatat log eksplisit: `cgroup: fail-open aktif untuk '<nama>' (cgroup tidak tersedia)`.
+       - Bila layanan mendefinisikan batas resource (`memory_max`, `cpu_max`, `pids_max`), mencatat log
+         peringatan: `Warning: batas resource diabaikan pada layanan '<nama>' karena cgroup tidak tersedia`.
+       - Layanan tetap dibiarkan berjalan tanpa pembatasan resource (*unconstrained*).
+   - **Pelepasan Blokir Sinkronisasi**: Induk menuliskan byte sinyal `"1"` ke `sync_pipe[1]` lalu menutupnya,
+     membuka blokir proses anak. Penulisan dan penutupan pipe ini dijamin selalu dipanggil setelah `setup_cgroup()`
+     (termasuk pada cabang fail-open), menjamin eksekusi bebas deadlock (*deadlock-free*).
+   - Induk mengabaikan `SIGPIPE` (`signal(SIGPIPE, SIG_IGN)` di `main()`) agar tidak mengalami crash jika proses
+     anak mati sebelum penulisan sinyal sinkronisasi.
 
 Kegagalan `fork()`/`mount()`/cgroup hanya di-log; init tidak berhenti.
 
@@ -186,6 +218,23 @@ berhenti di `pause()`.
   diterapkan pada leaf node sebelum PID dimasukkan ke `cgroup.procs`.
 - Pembersihan orphan (`cgroup.kill` + fallback scanning `cgroup.procs`) dijalankan
   saat respawn maupun saat layanan `once` exit sebelum penghapusan (`rmdir`) leaf cgroup.
+
+### Kontrak Fallback Fail-Open Cgroup
+
+Cgroup v2 merupakan lapisan isolasi dan pembatasan resource opsional. Ketiadaan hierarki cgroup v2 di sistem (misalnya pada kernel tanpa `CONFIG_CGROUPS`, lingkungan container/chroot tanpa hak akses mount cgroupfs, atau kegagalan filesystem sysfs) **tidak boleh menggagalkan proses booting PID 1 atau membatalkan eksekusi layanan**.
+
+1. **Default Fail-Open**: Bila inisialisasi direktori base `/sys/fs/cgroup/ninit`, leaf cgroup `/sys/fs/cgroup/ninit/<nama>`, atau penulisan PID ke `cgroup.procs` gagal, layanan tetap diizinkan berjalan tanpa cgroup (*fail-open*). Sistem tidak panik, init tidak berhenti, dan status layanan tetap bertransisi ke `SVC_STATE_RUNNING` secara bebas batasan (*unconstrained*).
+2. **Log Eksplisit Fail-Open**: ninit mencatat aktivasi fallback fail-open secara eksplisit dan transparan:
+   ```
+   cgroup: fail-open aktif untuk '<nama>' (cgroup tidak tersedia)
+   ```
+3. **Peringatan Batas Resource Tidak Ditegakkan**: Bila layanan mendefinisikan salah satu dari `:memory_max=`, `:cpu_max=`, atau `:pids_max=`, tetapi cgroup v2 tidak tersedia sehingga batas kernel tidak dapat ditegakkan, ninit mencatat log peringatan eksplisit:
+   ```
+   Warning: batas resource diabaikan pada layanan '<nama>' karena cgroup tidak tersedia
+   ```
+   Bila layanan tidak mendefinisikan batas resource apa pun (misal shell atau daemon standar), pesan peringatan ini tidak dicetak (hanya pesan aktivasi fail-open).
+4. **Pelepasan Blokir Sinkronisasi Bebas Deadlock**: Parent menjamin penulisan sinyal unblock (`"1"`) dan penutupan write-end pipe sinkronisasi sesaat setelah `setup_cgroup()` selesai atau keluar lebih awal akibat kegagalan cgroup. Dengan demikian, proses anak yang sedang memblokir pada `read()` di tahap pre-exec terjamin segera melanjutkan eksekusi tanpa pernah mengalami kebuntuan (*deadlock*).
+5. **Fallback Penghentian via Sinyal Grup Proses**: Bila cgroup tidak tersedia di sistem, mekanisme pembersihan berbasis `cgroup.kill` dilewati secara aman. Penghentian layanan pada graceful/force shutdown maupun cleanup lifecycle mengandalkan fallback pengiriman sinyal grup proses standar (`kill(-pgid, SIGTERM)` / `kill(-pgid, SIGKILL)` atau `kill(pid, ...)`), serta pembersihan zombie melalui loop `reap_zombies()` PID 1.
 
 ## Logging
 

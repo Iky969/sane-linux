@@ -21,6 +21,15 @@
 #      dan membatalkan layanan dependen deterministik.
 #   8. Pembersihan siklus hidup orphan pada layanan once (cgroup_kill_service
 #      sebelum rmdir) menyapu bersih proses anak orphan sebelum rmdir leaf cgroup.
+#   9. Descendant escape test dengan fast double-fork + setsid daemonize
+#      workload, memastikan seluruh proses turunan berada di leaf cgroup.procs
+#      via T1 handshake dan cgroup_kill_service menyapu bersih seluruh pohon
+#      proses tanpa sisa (LINGERING_ESCAPE_ORPHANS=0).
+#  10. Batas resource bertingkat (multi-tier hierarchical limits):
+#      - 10A: Hierarchical pids.max nested fork rejection with EAGAIN
+#             (NESTED_EAGAIN_CONFIRMED depth=3).
+#      - 10B: Cumulative parallel memory.max deterministic OOM
+#             (SIGKILL, exit 0x9 / 137).
 #
 # Pemakaian:
 #   sudo sh ./scripts/test-cgroup-limits.sh      # atau: make test
@@ -28,7 +37,7 @@
 # Variabel lingkungan:
 #   BIN=./ninit              biner yang diuji
 #   BUSYBOX=/bin/busybox     busybox statis (apt-get install busybox-static)
-#   WAIT1..WAIT8             jendela waktu observasi tiap skenario (detik)
+#   WAIT1..WAIT10B           jendela waktu observasi tiap skenario (detik)
 #
 # Catatan: suite ini menggunakan unshare dengan `--mount --propagation private`
 # dan `mount -t proc` manual (bukan `--mount-proc`), konsisten dengan konvensi
@@ -46,6 +55,9 @@ WAIT5=${WAIT5:-6}
 WAIT6=${WAIT6:-6}
 WAIT7=${WAIT7:-12}
 WAIT8=${WAIT8:-6}
+WAIT9=${WAIT9:-8}
+WAIT10A=${WAIT10A:-6}
+WAIT10B=${WAIT10B:-8}
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
@@ -166,12 +178,21 @@ EOI
 # Siapkan biner bantuan statis untuk alokasi memori berlebih dan pengujian fork
 HOG_BIN=""
 FORK_BIN=""
+ESCAPE_BIN=""
+FORK_TREE_BIN=""
+CUMUL_MEM_BIN=""
 if command -v gcc >/dev/null 2>&1; then
 	HOG_SRC=$(mktemp /tmp/ninit-hog.XXXXXX.c)
 	HOG_BIN=$(mktemp /tmp/ninit-hog-bin.XXXXXX)
 	FORK_SRC=$(mktemp /tmp/ninit-fork.XXXXXX.c)
 	FORK_BIN=$(mktemp /tmp/ninit-fork-bin.XXXXXX)
-	HELPERS="$HELPERS $HOG_SRC $HOG_BIN $FORK_SRC $FORK_BIN"
+	ESCAPE_SRC=$(mktemp /tmp/ninit-escape.XXXXXX.c)
+	ESCAPE_BIN=$(mktemp /tmp/ninit-escape-bin.XXXXXX)
+	FORK_TREE_SRC=$(mktemp /tmp/ninit-forktree.XXXXXX.c)
+	FORK_TREE_BIN=$(mktemp /tmp/ninit-forktree-bin.XXXXXX)
+	CUMUL_MEM_SRC=$(mktemp /tmp/ninit-cumulmem.XXXXXX.c)
+	CUMUL_MEM_BIN=$(mktemp /tmp/ninit-cumulmem-bin.XXXXXX)
+	HELPERS="$HELPERS $HOG_SRC $HOG_BIN $FORK_SRC $FORK_BIN $ESCAPE_SRC $ESCAPE_BIN $FORK_TREE_SRC $FORK_TREE_BIN $CUMUL_MEM_SRC $CUMUL_MEM_BIN"
 
 	cat > "$HOG_SRC" << 'EOF'
 #include <stdlib.h>
@@ -222,6 +243,245 @@ int main(void) {
 }
 EOF
 	gcc -static -O2 "$FORK_SRC" -o "$FORK_BIN" 2>/dev/null || FORK_BIN=""
+
+	cat > "$ESCAPE_SRC" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main(void) {
+    pid_t leader_pid = getpid();
+
+    /* Generation 2: Child */
+    pid_t child = fork();
+    if (child < 0) return 1;
+    if (child > 0) {
+        /* Leader: tunggu hingga cucu selesai menulis bukti audit, lalu exit 0 */
+        int waited = 0;
+        while (access("/var/escape_audit.txt", F_OK) != 0 && waited < 40) {
+            usleep(50000);
+            waited++;
+        }
+        usleep(50000);
+        return 0;
+    }
+
+    /* Child creates new session */
+    setsid();
+
+    /* Generation 3: Grandchild daemon */
+    pid_t grandchild = fork();
+    if (grandchild < 0) return 1;
+    if (grandchild > 0) {
+        /* Child exits immediately, reparenting grandchild as orphan */
+        return 0;
+    }
+
+    /* Grandchild establishes its own session */
+    setsid();
+    pid_t gc_pid = getpid();
+
+    /* Verify cgroup membership via /proc/self/cgroup */
+    int in_leaf = 0;
+    FILE *fcg = fopen("/proc/self/cgroup", "r");
+    if (fcg) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fcg)) {
+            if (strstr(buf, "escape_svc")) { in_leaf = 1; break; }
+        }
+        fclose(fcg);
+    }
+
+    /* Verify grandchild PID is present in /sys/fs/cgroup/ninit/escape_svc/cgroup.procs */
+    int in_procs = 0;
+    for (int retry = 0; retry < 10 && !in_procs; retry++) {
+        FILE *fp = fopen("/sys/fs/cgroup/ninit/escape_svc/cgroup.procs", "r");
+        if (fp) {
+            int p;
+            while (fscanf(fp, "%d", &p) == 1) {
+                if (p == gc_pid) { in_procs = 1; break; }
+            }
+            fclose(fp);
+        }
+        if (!in_procs) usleep(10000);
+    }
+
+    FILE *fa = fopen("/var/escape_audit.txt", "w");
+    if (fa) {
+        fprintf(fa, "LEADER=%d\nCHILD=%d\nGRANDCHILD=%d\nIN_LEAF_CGROUP=%d\nIN_CGROUP_PROCS=%d\nGRANDCHILD_ACTIVE=1\n",
+                leader_pid, getppid(), gc_pid, in_leaf, in_procs);
+        fflush(fa);
+        fclose(fa);
+    }
+
+    /* Grandchild daemon stays alive until killed by cgroup_kill_service */
+    while (1) {
+        sleep(60);
+    }
+    return 0;
+}
+EOF
+	gcc -static -O2 "$ESCAPE_SRC" -o "$ESCAPE_BIN" 2>/dev/null || ESCAPE_BIN=""
+
+	cat > "$FORK_TREE_SRC" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/wait.h>
+
+int main(void) {
+    pid_t p1 = getpid();
+    FILE *f = fopen("/var/pids_tree_audit.txt", "w");
+    if (f) { fprintf(f, "GEN1_PID=%d\n", p1); fflush(f); fclose(f); }
+
+    /* Leader forks Child (Gen 2) */
+    pid_t p2 = fork();
+    if (p2 < 0) return 1;
+    if (p2 == 0) {
+        FILE *f2 = fopen("/var/pids_tree_audit.txt", "a");
+        if (f2) { fprintf(f2, "GEN2_PID=%d\n", getpid()); fflush(f2); fclose(f2); }
+
+        /* Child forks Grandchild (Gen 3) */
+        pid_t p3 = fork();
+        if (p3 < 0) return 1;
+        if (p3 == 0) {
+            FILE *f3 = fopen("/var/pids_tree_audit.txt", "a");
+            if (f3) { fprintf(f3, "GEN3_PID=%d\n", getpid()); fflush(f3); fclose(f3); }
+
+            /* Kuota cgroup pids_max=3.
+               Saat ini ada 3 proses: p1 (leader), p2 (child), p3 (grandchild).
+               Grandchild (depth 3) mencoba fork Great-grandchild (Gen 4). */
+            errno = 0;
+            pid_t p4 = fork();
+            FILE *f4 = fopen("/var/pids_tree_audit.txt", "a");
+            if (p4 < 0) {
+                if (errno == EAGAIN) {
+                    if (f4) fprintf(f4, "NESTED_EAGAIN_CONFIRMED depth=3 errno=%d\n", errno);
+                } else {
+                    if (f4) fprintf(f4, "NESTED_FORK_FAILED_OTHER errno=%d\n", errno);
+                }
+            } else if (p4 == 0) {
+                _exit(0);
+            } else {
+                if (f4) fprintf(f4, "UNEXPECTED_FORK_SUCCESS pid=%d\n", p4);
+                waitpid(p4, NULL, 0);
+            }
+            if (f4) { fflush(f4); fclose(f4); }
+            _exit(0);
+        }
+        waitpid(p3, NULL, 0);
+        _exit(0);
+    }
+    waitpid(p2, NULL, 0);
+    return 0;
+}
+EOF
+	gcc -static -O2 "$FORK_TREE_SRC" -o "$FORK_TREE_BIN" 2>/dev/null || FORK_TREE_BIN=""
+
+	cat > "$CUMUL_MEM_SRC" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+
+static void on_sigchld(int sig) {
+    (void)sig;
+    int st;
+    pid_t p = waitpid(-1, &st, WNOHANG);
+    if (p > 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) {
+        raise(SIGKILL);
+    }
+}
+
+int main(void) {
+    signal(SIGCHLD, on_sigchld);
+
+    /* Worker 1: alokasikan 12MB */
+    pid_t w1 = fork();
+    if (w1 < 0) return 1;
+    if (w1 == 0) {
+        void *p = malloc(12 * 1024 * 1024);
+        if (p) memset(p, 0xAA, 12 * 1024 * 1024);
+        FILE *f = fopen("/var/cumul_mem_audit.txt", "a");
+        if (f) {
+            fprintf(f, "WORKER1_ALLOCATED_12M\n");
+            fflush(f);
+            fclose(f);
+        }
+        while (1) sleep(60);
+        _exit(0);
+    }
+
+    /* Tunggu worker 1 siap */
+    int waited = 0;
+    while (waited < 40) {
+        FILE *f = fopen("/var/cumul_mem_audit.txt", "r");
+        if (f) {
+            char buf[64];
+            while (fgets(buf, sizeof(buf), f)) {
+                if (strstr(buf, "WORKER1_ALLOCATED_12M")) { fclose(f); goto w1_done; }
+            }
+            fclose(f);
+        }
+        usleep(50000);
+        waited++;
+    }
+w1_done:;
+
+    /* Worker 2: alokasikan 12MB */
+    pid_t w2 = fork();
+    if (w2 < 0) return 1;
+    if (w2 == 0) {
+        void *p = malloc(12 * 1024 * 1024);
+        if (p) memset(p, 0xBB, 12 * 1024 * 1024);
+        FILE *f = fopen("/var/cumul_mem_audit.txt", "a");
+        if (f) {
+            fprintf(f, "WORKER2_ALLOCATED_12M\n");
+            fflush(f);
+            fclose(f);
+        }
+        while (1) sleep(60);
+        _exit(0);
+    }
+
+    /* Tunggu worker 2 siap */
+    waited = 0;
+    while (waited < 40) {
+        FILE *f = fopen("/var/cumul_mem_audit.txt", "r");
+        if (f) {
+            char buf[64];
+            while (fgets(buf, sizeof(buf), f)) {
+                if (strstr(buf, "WORKER2_ALLOCATED_12M")) { fclose(f); goto w2_done; }
+            }
+            fclose(f);
+        }
+        usleep(50000);
+        waited++;
+    }
+w2_done:;
+
+    /* Alokasi agresif oleh leader hingga 256MB untuk mendorong akumulasi total
+       melampaui batas memory.max (32M) + swap dan memicu OOM killer secara deterministik */
+    for (int i = 0; i < 256; i++) {
+        void *p = malloc(1024 * 1024);
+        if (p) memset(p, 0xCC, 1024 * 1024);
+    }
+
+    /* Tunggu sinyal dari kernel atau kematian anak */
+    int st = 0;
+    while (waitpid(-1, &st, 0) > 0) {
+        if (WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) {
+            raise(SIGKILL);
+        }
+    }
+    return 0;
+}
+EOF
+	gcc -static -O2 "$CUMUL_MEM_SRC" -o "$CUMUL_MEM_BIN" 2>/dev/null || CUMUL_MEM_BIN=""
 fi
 
 printf '== biner uji : %s\n' "$BIN"
@@ -560,6 +820,140 @@ EOF
 	before_in "leaf cgroup orphan_maker dibersihkan sebelum graceful shutdown" "$L8" \
 		"cgroup: dibersihkan 'orphan_maker'" 'graceful shutdown'
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L8" \
+		'graceful shutdown'
+fi
+
+# ------------------------------------------------------------- Skenario 9
+# Descendant Escape Test (Pre-exec Pipe Handshake Synchronization)
+# Workload adversarial melakukan fast double-fork dan setsid untuk mencoba
+# melepaskan diri dari leaf cgroup.
+# Verifikasi bahwa handshake sinkronisasi parent-child T1 menjamin seluruh
+# proses turunan (anak, cucu, orphan) berada di leaf cgroup.procs yang tepat,
+# dan cgroup_kill_service menyapu bersih seluruh pohon proses (LINGERING_ESCAPE_ORPHANS=0).
+printf '\n== Skenario 9: Descendant escape test & handshake sinkronisasi ==\n'
+if [ "$has_cg2" -ne 1 ] || [ -z "$ESCAPE_BIN" ]; then
+	skip "skenario 9 dilewati: cgroup v2 tidak tersedia atau gcc tidak ada"
+else
+	R9=$(new_root sleep grep cut cat)
+	L9=$(new_log)
+	ROOTS="$ROOTS $R9"
+	LOGS="$LOGS $L9"
+
+	cp "$ESCAPE_BIN" "$R9/bin/escape_workload"
+
+	cat > "$R9/bin/check_escape.sh" << 'EOF'
+#!/bin/sh
+/bin/sleep 0.5
+gc_pid=""
+if [ -f /var/escape_audit.txt ]; then
+    gc_pid=$(grep '^GRANDCHILD=' /var/escape_audit.txt 2>/dev/null | cut -d= -f2)
+fi
+
+lingering=0
+if [ -n "$gc_pid" ] && [ -d "/proc/$gc_pid" ]; then
+    lingering=$((lingering + 1))
+fi
+
+for cmd in /proc/[0-9]*/cmdline; do
+    [ -f "$cmd" ] || continue
+    if grep -q "escape_workload" "$cmd" 2>/dev/null; then
+        lingering=$((lingering + 1))
+    fi
+done
+
+echo "LINGERING_ESCAPE_ORPHANS=$lingering" > /var/escape_clean_audit.txt
+echo poweroff > /run/initctl
+exit 0
+EOF
+	chmod 0755 "$R9/bin/check_escape.sh"
+
+	cat > "$R9/etc/init.conf" << 'EOF'
+escape_svc:once:/bin/escape_workload
+checker:once:/bin/sh /bin/check_escape.sh:requires=escape_svc
+EOF
+
+	boot_guest "$R9" "$WAIT9" >"$L9" 2>&1
+
+	check_in  "adversary berhasil spawn cucu orphan (anti-hampa)" \
+		"$R9/var/escape_audit.txt" 'GRANDCHILD_ACTIVE=1'
+	check_in  "cucu orphan berada di leaf cgroup.procs berkat handshake T1" \
+		"$R9/var/escape_audit.txt" 'IN_CGROUP_PROCS=1'
+	check_in  "cgroup membership cucu berada di leaf escape_svc" \
+		"$R9/var/escape_audit.txt" 'IN_LEAF_CGROUP=1'
+	check_in  "cgroup_kill_service menyapu bersih seluruh pohon proses turunan (LINGERING_ESCAPE_ORPHANS=0)" \
+		"$R9/var/escape_clean_audit.txt" 'LINGERING_ESCAPE_ORPHANS=0'
+	check_in  "leaf cgroup escape_svc dibersihkan setelah sweep" "$L9" \
+		"cgroup: dibersihkan 'escape_svc'"
+	absent_in "tidak ada kegagalan rmdir leaf cgroup (EBUSY)" "$L9" \
+		"Device or resource busy"
+	check_in  "event loop tetap jalan dan shutdown bersih" "$L9" \
+		'graceful shutdown'
+fi
+
+# ------------------------------------------------------------- Skenario 10
+# Batas Resource Workload Bertingkat (Multi-tier Hierarchical Limits)
+# Memverifikasi bahwa batas hierarkis cgroup v2 mengikat seluruh subtree:
+# Part 10A: Hierarchical pids.max (leader -> child -> grandchild -> fork ke-4 ditolak EAGAIN)
+# Part 10B: Cumulative parallel memory.max (alokasi simultan beberapa worker memicu OOM killer)
+printf '\n== Skenario 10: Batas resource workload bertingkat (hierarki cgroup v2) ==\n'
+
+# 10A: Hierarchical PIDs
+if [ "$has_cg2" -ne 1 ] || [ "$has_pids" -ne 1 ] || [ -z "$FORK_TREE_BIN" ]; then
+	skip "skenario 10A dilewati: cgroup v2 + controller pids tidak tersedia atau gcc tidak ada"
+else
+	R10A=$(new_root sleep)
+	L10A=$(new_log)
+	ROOTS="$ROOTS $R10A"
+	LOGS="$LOGS $L10A"
+
+	cp "$FORK_TREE_BIN" "$R10A/bin/fork_tree"
+	cat > "$R10A/etc/init.conf" << 'EOF'
+pids_tree:once:/bin/fork_tree:pids_max=3
+stopper:once:/bin/sh -c "/bin/sleep 2 && echo poweroff > /run/initctl":requires=pids_tree
+EOF
+
+	boot_guest "$R10A" "$WAIT10A" >"$L10A" 2>&1
+
+	check_in  "konfigurasi limit pids.max diterapkan pada hierarki" "$L10A" \
+		"cgroup: 'pids_tree' pids.max = 3"
+	check_in  "fork cucu ditolak deterministik dengan EAGAIN saat kuota hierarki habis" \
+		"$R10A/var/pids_tree_audit.txt" 'NESTED_EAGAIN_CONFIRMED depth=3'
+	absent_in "tidak ada fork yang lolos melebihi batas pids.max" \
+		"$R10A/var/pids_tree_audit.txt" 'UNEXPECTED_FORK_SUCCESS'
+	check_in  "leaf cgroup dibersihkan setelah selesai" "$L10A" \
+		"cgroup: dibersihkan 'pids_tree'"
+	check_in  "event loop tetap jalan dan shutdown bersih" "$L10A" \
+		'graceful shutdown'
+fi
+
+# 10B: Cumulative Parallel Memory OOM
+if [ "$has_cg2" -ne 1 ] || [ "$has_mem" -ne 1 ] || [ -z "$CUMUL_MEM_BIN" ]; then
+	skip "skenario 10B dilewati: cgroup v2 + controller memory tidak tersedia atau gcc tidak ada"
+else
+	R10B=$(new_root sleep)
+	L10B=$(new_log)
+	ROOTS="$ROOTS $R10B"
+	LOGS="$LOGS $L10B"
+
+	cp "$CUMUL_MEM_BIN" "$R10B/bin/cumul_mem"
+	cat > "$R10B/etc/init.conf" << 'EOF'
+mem_cumul:once:/bin/cumul_mem:memory_max=32M
+stopper:once:/bin/sh -c "/bin/sleep 3 && echo poweroff > /run/initctl"
+EOF
+
+	boot_guest "$R10B" "$WAIT10B" >"$L10B" 2>&1
+
+	check_in  "konfigurasi limit memory.max kumulatif diterapkan" "$L10B" \
+		"cgroup: 'mem_cumul' memory.max = 32M"
+	check_in  "worker 1 berhasil alokasi 12M di bawah limit individu" \
+		"$R10B/var/cumul_mem_audit.txt" 'WORKER1_ALLOCATED_12M'
+	check_in  "worker 2 berhasil alokasi 12M di bawah limit individu" \
+		"$R10B/var/cumul_mem_audit.txt" 'WORKER2_ALLOCATED_12M'
+	check_in  "akumulasi memori paralel memicu OOM killer deterministik (exit status=0x9)" "$L10B" \
+		'mem_cumul (pid .* exit status=0x9'
+	check_in  "leaf cgroup dibersihkan setelah OOM kumulatif" "$L10B" \
+		"cgroup: dibersihkan 'mem_cumul'"
+	check_in  "event loop tetap jalan dan shutdown bersih" "$L10B" \
 		'graceful shutdown'
 fi
 
