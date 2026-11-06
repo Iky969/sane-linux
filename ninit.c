@@ -782,7 +782,14 @@ static void shutdown_all(int reboot_cmd, int force)
 
     for (int i = 0; i < 50; i++) {
         int alive = 0;
-        for (int j = 0; j < num_services; j++) if (service_still_alive(&services[j])) { alive = 1; break; }
+        /* Probe SETIAP layanan, jangan berhenti di yang pertama hidup: hanya
+           service_still_alive() yang membersihkan pgid basi (:681). Dengan
+           break dini, layanan yang indeksnya setelah layanan hidup tidak
+           pernah ter-probe pada pass terakhir, jadi pgid kadaluarsanya
+           bertahan sampai SIGKILL di bawah dan bisa mengenai grup proses lain
+           yang nomornya sudah didaur ulang kernel. */
+        for (int j = 0; j < num_services; j++)
+            if (service_still_alive(&services[j])) alive = 1;
         if (!alive) break;
         reap_zombies();
         drain_log_fifo();   /* pesan terakhir layanan sebelum mati (mis. "bye!") */
@@ -790,7 +797,16 @@ static void shutdown_all(int reboot_cmd, int force)
     }
 
     for (int i = 0; i < num_services; i++) {
-        kill_service_group(&services[i], SIGKILL);
+        /* Probe sekali lagi sebelum SIGKILL, sama seperti jalur force dan
+           jalur SIGTERM di atas: grup bisa saja baru mati setelah pass
+           terakhir. Layanan yang grupnya sudah kosong hanya perlu
+           cgroup.kill — SIGKILL lewat pgid basi justru berbahaya. */
+        if (service_still_alive(&services[i])) {
+            kill_service_group(&services[i], SIGKILL);
+        } else {
+            init_log("%s: grup sudah mati, SIGKILL dilewati", services[i].name);
+            cgroup_kill_service(services[i].name);
+        }
         cleanup_cgroup(services[i].name);
     }
     rmdir(CGROUP_BASE);
