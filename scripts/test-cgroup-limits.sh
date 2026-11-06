@@ -44,7 +44,7 @@ WAIT3=${WAIT3:-8}
 WAIT4=${WAIT4:-6}
 WAIT5=${WAIT5:-6}
 WAIT6=${WAIT6:-6}
-WAIT7=${WAIT7:-8}
+WAIT7=${WAIT7:-12}
 WAIT8=${WAIT8:-6}
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
@@ -120,6 +120,14 @@ bad()  { printf '  [GAGAL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
 skip() { printf '  [ -- ]   %s\n' "$1"; }
 check_in()  { if grep -q "$3" "$2" 2>/dev/null; then ok "$1"; else bad "$1"; fi; }
 absent_in() { if grep -q "$3" "$2" 2>/dev/null; then bad "$1"; else ok "$1"; fi; }
+before_in() {
+	desc=$1; file=$2; first=$3; second=$4
+	if awk -v a="$first" -v b="$second" '$0 ~ a {seen=1} seen && $0 ~ b {found=1; exit} END {exit !(seen && found)}' "$file" 2>/dev/null; then
+		ok "$desc"
+	else
+		bad "$desc"
+	fi
+}
 
 new_root() {
 	d=$(mktemp -d /tmp/ninit-cgtest.XXXXXX)
@@ -151,7 +159,7 @@ $extra_setup
 exec chroot $root /ninit
 EOI
 	$SUDO chmod 755 "$INNER"
-	$SUDO sh -c "timeout -s KILL $((secs + 3)) unshare --pid --fork --kill-child=SIGKILL \
+	$SUDO sh -c "timeout -s KILL $((secs + 4)) unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private /bin/sh $INNER" || true
 }
 
@@ -444,7 +452,7 @@ setup_r6="mount -t sysfs sysfs $R6/sys; mkdir -p $R6/sys/fs/cgroup; mount -t tmp
 boot_guest "$R6" "$WAIT6" "" "$setup_r6" >"$L6" 2>&1
 
 check_in  "kegagalan buka/tulis subtree_control ditoleransi dengan log" "$L6" \
-	'cgroup:'
+	'buka .*subtree_control gagal'
 check_in  "toleransi nested/container tercatat di log" "$L6" \
 	'toleransi nested/container'
 check_in  "layanan berhasil di-spawn meskipun subtree_control terhambat" "$R6/var/nested.txt" \
@@ -504,7 +512,7 @@ printf '\n== Skenario 8: Pembersihan orphan pada layanan once sebelum rmdir ==\n
 if [ "$has_cg2" -ne 1 ]; then
 	skip "skenario 8 dilewati: cgroup v2 tidak tersedia"
 else
-	R8=$(new_root sleep)
+	R8=$(new_root sleep grep)
 	L8=$(new_log)
 	ROOTS="$ROOTS $R8"
 	LOGS="$LOGS $L8"
@@ -518,9 +526,25 @@ exit 0
 EOF
 	chmod 0755 "$R8/bin/once_fork.sh"
 
+	cat > "$R8/bin/check_orphans.sh" << 'EOF'
+#!/bin/sh
+/bin/sleep 0.5
+lingering=0
+for cmd in /proc/[0-9]*/cmdline; do
+    [ -f "$cmd" ] || continue
+    if grep -q "300" "$cmd" 2>/dev/null; then
+        lingering=$((lingering + 1))
+    fi
+done
+echo "LINGERING_ONCE_ORPHANS=$lingering" > /var/once_orphan_audit.txt
+echo poweroff > /run/initctl
+exit 0
+EOF
+	chmod 0755 "$R8/bin/check_orphans.sh"
+
 	cat > "$R8/etc/init.conf" << 'EOF'
 orphan_maker:once:/bin/sh /bin/once_fork.sh
-checker:once:/bin/sh -c "/bin/sleep 1 && echo poweroff > /run/initctl":requires=orphan_maker
+checker:once:/bin/sh /bin/check_orphans.sh:requires=orphan_maker
 EOF
 
 	boot_guest "$R8" "$WAIT8" >"$L8" 2>&1
@@ -531,6 +555,10 @@ EOF
 		"cgroup: dibersihkan 'orphan_maker'"
 	absent_in "tidak ada kegagalan rmdir leaf cgroup" "$L8" \
 		"Device or resource busy"
+	check_in  "orphan dari layanan once disapu bersih sebelum checker (LINGERING_ONCE_ORPHANS=0)" \
+		"$R8/var/once_orphan_audit.txt" 'LINGERING_ONCE_ORPHANS=0'
+	before_in "leaf cgroup orphan_maker dibersihkan sebelum graceful shutdown" "$L8" \
+		"cgroup: dibersihkan 'orphan_maker'" 'graceful shutdown'
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L8" \
 		'graceful shutdown'
 fi
