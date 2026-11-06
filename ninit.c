@@ -277,13 +277,18 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
             snprintf(path, sizeof(path), "%s/memory.max", dir);
             int lim_fd = open(path, O_WRONLY);
             if (lim_fd >= 0) {
-                if (dprintf(lim_fd, "%s\n", svc->memory_max) < 0)
-                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->memory_max, path, strerror(errno));
-                else
+                if (dprintf(lim_fd, "%s\n", svc->memory_max) < 0) {
+                    int err = errno;
+                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->memory_max, path, strerror(err));
+                    init_log("Warning: batas resource memory.max diabaikan pada layanan '%s'", svc_name);
+                } else {
                     init_log("cgroup: '%s' memory.max = %s", svc_name, svc->memory_max);
+                }
                 close(lim_fd);
             } else {
-                init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+                int err = errno;
+                init_log("cgroup: buka %s gagal: %s", path, strerror(err));
+                init_log("Warning: batas resource memory.max diabaikan pada layanan '%s'", svc_name);
             }
 
             /* Batasi memory.swap.max=0 jika didukung, agar batas memory_max tidak bocor ke swap */
@@ -301,13 +306,18 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
             snprintf(path, sizeof(path), "%s/cpu.max", dir);
             int lim_fd = open(path, O_WRONLY);
             if (lim_fd >= 0) {
-                if (dprintf(lim_fd, "%s\n", svc->cpu_max) < 0)
-                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->cpu_max, path, strerror(errno));
-                else
+                if (dprintf(lim_fd, "%s\n", svc->cpu_max) < 0) {
+                    int err = errno;
+                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->cpu_max, path, strerror(err));
+                    init_log("Warning: batas resource cpu.max diabaikan pada layanan '%s'", svc_name);
+                } else {
                     init_log("cgroup: '%s' cpu.max = %s", svc_name, svc->cpu_max);
+                }
                 close(lim_fd);
             } else {
-                init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+                int err = errno;
+                init_log("cgroup: buka %s gagal: %s", path, strerror(err));
+                init_log("Warning: batas resource cpu.max diabaikan pada layanan '%s'", svc_name);
             }
         }
         if (svc->pids_max[0]) {
@@ -315,13 +325,18 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
             snprintf(path, sizeof(path), "%s/pids.max", dir);
             int lim_fd = open(path, O_WRONLY);
             if (lim_fd >= 0) {
-                if (dprintf(lim_fd, "%s\n", svc->pids_max) < 0)
-                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->pids_max, path, strerror(errno));
-                else
+                if (dprintf(lim_fd, "%s\n", svc->pids_max) < 0) {
+                    int err = errno;
+                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->pids_max, path, strerror(err));
+                    init_log("Warning: batas resource pids.max diabaikan pada layanan '%s'", svc_name);
+                } else {
                     init_log("cgroup: '%s' pids.max = %s", svc_name, svc->pids_max);
+                }
                 close(lim_fd);
             } else {
-                init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+                int err = errno;
+                init_log("cgroup: buka %s gagal: %s", path, strerror(err));
+                init_log("Warning: batas resource pids.max diabaikan pada layanan '%s'", svc_name);
             }
         }
     }
@@ -791,8 +806,8 @@ static int spawn_service(service_t *svc)
             sync_pipe[0] = -1;
             sync_pipe[1] = -1;
         } else {
-            fcntl(sync_pipe[0], F_SETFD, FD_CLOEXEC);
-            fcntl(sync_pipe[1], F_SETFD, FD_CLOEXEC);
+            fcntl(sync_pipe[0], F_SETFD, fcntl(sync_pipe[0], F_GETFD) | FD_CLOEXEC);
+            fcntl(sync_pipe[1], F_SETFD, fcntl(sync_pipe[1], F_GETFD) | FD_CLOEXEC);
         }
     }
 

@@ -16,7 +16,7 @@
 # Di distro tanpa libc statis glibc (mis. Alpine):  make CC=musl-gcc
 
 CC     = gcc
-CFLAGS ?= -static -O2 -Wall
+CFLAGS ?= -static -O2 -Wall -Werror
 BIN    ?= ninit
 SRC    ?= ninit.c
 
