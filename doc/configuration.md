@@ -5,21 +5,27 @@
 Format per baris:
 
 ```
-<nama>:<mode>:<perintah>[:requires=<nama1>,<nama2>,...]
+<nama>:<mode>:<perintah>[:requires=<nama1>,<nama2>,...][:memory_max=<nilai>][:cpu_max=<nilai>][:pids_max=<nilai>]
 ```
 
 | Bagian | Aturan |
 |---|---|
 | `<nama>` | Maks 127 karakter. Lebih dari itu entri **ditolak** (`Parse err: ... entri ditolak`), bukan dipotong. Tidak boleh memuat karakter `/` (karena nama dipakai sebagai path direktori cgroup). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
 | `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
-| `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari `:requires=` dari kanan). |
+| `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari tag opsi paling awal). |
 | `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
+| `:memory_max=` | Opsional. Batas alokasi memori layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/memory.max` (contoh: `16M`, `256M`, `1G`, `max`). Pelanggaran batas memori memicu OOM killer kernel secara deterministik (`SIGKILL`, status `0x9`). Lebih dari 63 karakter entri **ditolak**. |
+| `:cpu_max=` | Opsional. Batas kuota bandwidth CPU CFS (maks 63 karakter). Ditulis ke leaf cgroup v2 `cpu.max` dalam format `<quota> <period>` (contoh: `50000 100000` untuk 50% CPU, atau `max 100000`). Lebih dari 63 karakter entri **ditolak**. |
+| `:pids_max=` | Opsional. Batas jumlah proses maksimum dalam cgroup layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `pids.max` (contoh: `5`, `50`, `max`). Upaya `fork()` melebihi batas ini deterministik ditolak dengan `EAGAIN` (`Resource temporarily unavailable`). Lebih dari 63 karakter entri **ditolak**. |
  
 Aturan umum:
  
 - Baris komentar dimulai `#` (spasi/tab di depan diizinkan) dan baris kosong diabaikan.
 - Baris lebih dari 1023 karakter ditolak utuh dan dicatat (`Parse err: baris melebihi MAX_LINE ...`); baris berikutnya tetap diproses. Aturan yang sama berlaku untuk baris `/etc/fstab`.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
+- Tag opsi (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`) dapat ditulis dalam urutan bebas setelah `<perintah>`. Parser memisahkan perintah pada kemunculan tag opsi paling awal, sehingga perintah yang memuat karakter titik dua (misal URL `http://...`) tetap utuh.
+- Batasan resource cgroup v2 diterapkan pada leaf node `/sys/fs/cgroup/ninit/<nama>/` sebelum PID layanan dimasukkan ke `cgroup.procs`. Bila kernel tidak mengaktifkan controller tertentu, kegagalan penulisan dicatat di log tanpa menggagalkan PID 1.
+- Pembersihan siklus hidup (lifecycle orphan cleanup): saat proses pemimpin layanan `respawn` mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (atau fallback scanning PIDs pada kernel pra-5.14) untuk menyapu bersih sisa proses anak/orphan selama jeda `RESPAWN_DELAY` (2 detik). Pembersihan juga dipanggil kembali sebelum PID baru dimasukkan ke leaf cgroup.
 - File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
   `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
   nol layanan.
@@ -40,7 +46,8 @@ Contoh:
 shell:respawn:/bin/sh
 logger:once:/bin/sh -c 'echo boot ok > /dev/console'
 net:once:/bin/sh -c 'ip link set lo up':requires=logger
-web:respawn:/bin/httpd -p 8080:requires=net,logger
+web:respawn:/bin/httpd -p 8080:requires=net,logger:memory_max=256M:cpu_max=50000 100000:pids_max=50
+worker:respawn:/usr/bin/worker:memory_max=128M:pids_max=20
 ```
 
 ## `/etc/fstab`
