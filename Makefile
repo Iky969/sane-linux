@@ -2,9 +2,9 @@
 #
 #   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall)
 #   make test       uji PID 1 di chroot sementara: smoke test + test SIGTERM
-#                   + test konfigurasi + jalur kegagalan spawn (butuh
-#                   root/sudo), lalu pemeriksaan harness run-qemu.sh lewat
-#                   fixture log (tanpa root/QEMU)
+#                   + test konfigurasi + jalur kegagalan spawn + batasan cgroup v2
+#                   dan lifecycle respawn (butuh root/sudo), lalu pemeriksaan
+#                   harness run-qemu.sh lewat fixture log (tanpa root/QEMU)
 #   make rootfs     bangun rootfs distro minimal + initramfs (busybox statis,
 #                   ninit sebagai /sbin/init; lihat doc/distro-builder.md)
 #   make qemu       boot rootfs itu di QEMU (butuh qemu-system-x86)
@@ -31,6 +31,8 @@ test: $(BIN)
 	sh ./scripts/test-config.sh
 	sh ./scripts/test-qemu-report.sh
 	sh ./scripts/test-spawn-failure.sh
+	sh ./scripts/test-cgroup-limits.sh
+
 
 rootfs:
 	sh ./scripts/build-rootfs.sh
