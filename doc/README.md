@@ -48,8 +48,14 @@ scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
 scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), initctl per baris
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
+scripts/test-spawn-failure.sh uji dependensi jalur respawn + fork retry limit
+scripts/test-cgroup-limits.sh uji cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
+scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
+scripts/run-qemu.sh     boot rootfs itu di QEMU (konsol serial & verifikasi boot)
+distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
 doc/                     dokumentasi ini
-.github/workflows/ci.yml CI: build statis, cek statis, keempat uji, -Werror,
+.github/workflows/ci.yml CI: build statis, cek statis, seluruh suite uji, -Werror,
                       rootfs + boot QEMU + uji integrasi (job rootfs-distro)
 SECURITY.md              kebijakan keamanan
 LICENSE                  MIT
@@ -59,8 +65,8 @@ LICENSE                  MIT
 
 ```bash
 make          # hasilkan biner statis ./ninit
-make test     # uji sebagai PID 1: smoke test + test SIGTERM + test konfigurasi (+ pemeriksaan harness run-qemu.sh)
-              # (butuh root/sudo)
+make test     # uji PID 1: smoke test + test SIGTERM + test konfigurasi + test spawn failure + test cgroup limits (+ pemeriksaan harness run-qemu.sh)
+              # (lima pertama butuh root/sudo)
 ```
 
 Menjalankannya di sistem nyata berarti memasang biner ini sebagai `/sbin/init`
@@ -89,8 +95,9 @@ dijaga `scripts/test-config.sh`.
   fstab hanya muncul di console/`/dev/kmsg`, tidak di file log init.
 - Opsi fstab non-flag hanya diteruskan apa adanya; `defaults` dibuang (kata kunci
   `mount(8)`, ditolak kernel bila dikirim sebagai data).
-- Belum ada limit resource cgroup (hanya pemindahan PID), tidak ada `PIDFile`,
-  `Restart=on-failure`, dependency berbasis event, atau mount namespace per layanan.
+- Belum ada `PIDFile`, `Restart=on-failure`, dependency berbasis event, atau mount
+  namespace per layanan (namun pembatasan resource cgroup v2 untuk memory, cpu,
+  dan pids sudah didukung penuh per layanan).
 - Tidak ada pengerasan (seccomp, MAC, user berbeda per layanan): tiap layanan
   berjalan sebagai root, sama seperti init.
 - Shutdown masih memakai jendela grace tetap 5 detik; layanan yang mengabaikan
@@ -102,7 +109,7 @@ dijaga `scripts/test-config.sh`.
 
 Catatan arah pengembangan, bukan janji:
 
-- Limit cgroup v2 (`memory.max`, `pids.max`, `cpu.weight`) per layanan.
+- Hak akses & user privilege dropping (`:user=`/`:uid=`) per layanan.
 - Timeout/kill policy dan mode `restart=on-failure` yang eksplisit.
 - Dukungan mount namespace per layanan + `chroot` rootfs layanan.
 - Parser konfigurasi bergaya inittab SysV (`id:runlevels:action:proses`) atau

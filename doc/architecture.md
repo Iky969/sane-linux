@@ -182,7 +182,10 @@ berhenti di `pause()`.
   menulis PID ke `cgroup.procs`.
 - Saat namespace/container mati, isi `cgroup.procs` kembali kosong; direktori
   `ninit` bisa di-`rmdir` agar uji berikutnya bersih.
-- Belum ada pengaturan limit (hanya pemindahan).
+- Batasan resource cgroup v2 (`memory.max`, `memory.swap.max=0`, `cpu.max`, `pids.max`)
+  diterapkan pada leaf node sebelum PID dimasukkan ke `cgroup.procs`.
+- Pembersihan orphan (`cgroup.kill` + fallback scanning `cgroup.procs`) dijalankan
+  saat respawn maupun saat layanan `once` exit sebelum penghapusan (`rmdir`) leaf cgroup.
 
 ## Logging
 
