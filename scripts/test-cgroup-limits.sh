@@ -121,11 +121,12 @@ if command -v gcc >/dev/null 2>&1; then
 #include <string.h>
 #include <unistd.h>
 int main(void) {
-    for (int i = 0; i < 64; i++) {
+    /* Alokasikan secara agresif tanpa jeda agar melampaui batas memory.max
+       (16M) dan langsung memicu OOM killer secara deterministik */
+    for (int i = 0; i < 256; i++) {
         void *p = malloc(1024 * 1024);
         if (!p) return 1;
         memset(p, 0x55, 1024 * 1024);
-        usleep(10000);
     }
     return 0;
 }
@@ -247,6 +248,7 @@ if [ ! -f /var/gen1_started ]; then
     exit 0
 else
     # Generasi 2: periksa apakah ada proses sleep orphan dari Gen 1 yang bertahan
+    touch /var/gen2_started
     lingering=0
     for d in /proc/[0-9]*; do
         if [ -f "$d/comm" ] && [ "$(cat "$d/comm" 2>/dev/null)" = "sleep" ]; then
@@ -266,8 +268,11 @@ EOF
 		"started leak (pid "
 	check_in  "respawn generasi 1 ditunda timer" "$L3" \
 		'leak: respawn ditunda'
-	check_in  "layanan leak generasi 2 berhasil dijalankan kembali" "$L3" \
-		"started leak (pid "
+	if [ -f "$R3/var/gen2_started" ]; then
+		ok "layanan leak generasi 2 berhasil dijalankan kembali"
+	else
+		bad "layanan leak generasi 2 berhasil dijalankan kembali"
+	fi
 	check_in  "orphan generasi 1 disapu bersih tanpa sisa (LINGERING_ORPHANS=0)" "$R3/var/leak_audit.txt" \
 		'LINGERING_ORPHANS=0'
 	check_in  "leaf cgroup dibersihkan saat shutdown" "$L3" \
