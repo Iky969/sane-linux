@@ -29,6 +29,7 @@ Aturan umum:
 - Pembersihan siklus hidup orphan (lifecycle orphan cleanup):
   - Layanan `respawn`: saat proses pemimpin mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (atau fallback scanning PIDs pada kernel pra-5.14) untuk menyapu bersih sisa proses anak/orphan selama jeda `RESPAWN_DELAY` (2 detik). Pembersihan juga dipanggil kembali sebelum PID baru dimasukkan ke leaf cgroup.
   - Layanan `once`: saat proses pemimpin selesai/exit (`SVC_STATE_DONE` atau `SVC_STATE_FAILED`), `cgroup_kill_service` menyapu bersih seluruh proses anak/orphan sebelum pemanggilan penghapusan direktori cgroup leaf (`rmdir`). Fungsi `cleanup_cgroup` juga melakukan polling `rmdir` dengan toleransi `EBUSY` (hingga 20 kali percobaan / 100ms) untuk mengantisipasi latensi pelepasan referensi proses oleh kernel, mencegah kegagalan penghapusan leaf cgroup.
+- **Perilaku Fail-Open Cgroup**: Bila sistem host tidak menyediakan hierarki cgroup v2 atau inisialisasi cgroup gagal, ninit beroperasi secara fail-open — seluruh layanan tetap dijalankan secara normal tanpa batasan (*unconstrained*). Jika suatu layanan mendefinisikan batas resource (`:memory_max=`, `:cpu_max=`, atau `:pids_max=`), ninit mencatat peringatan bahwa batas resource diabaikan karena cgroup tidak tersedia (`Warning: batas resource diabaikan pada layanan '<nama>' karena cgroup tidak tersedia`) dan melanjutkan eksekusi layanan.
 - File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
   `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
   nol layanan.
@@ -94,6 +95,26 @@ Untuk mencegah kebocoran proses zombie/orphan di latar belakang saat proses utam
 - **Pembersihan Layanan Respawn**: Ketika proses pemimpin layanan bertipe `respawn` mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (dengan fallback pemindaian PID melalui `/proc` untuk kernel pra-5.14) guna menghentikan semua proses turunan selama jendela `RESPAWN_DELAY` (2 detik). Pembersihan juga diulang sesaat sebelum PID generasi baru dipindahkan ke dalam cgroup leaf.
 - **Pembersihan Layanan Once**: Ketika layanan bertipe `once` selesai (`exit 0` maupun keluar dengan error/sinyal), `cgroup_kill_service` menyapu bersih seluruh proses anak/orphan yang ditinggalkan sebelum memanggil `cleanup_cgroup`.
 - **Polling `rmdir` pada Leaf Cgroup**: Fungsi `cleanup_cgroup` memanggil `cgroup_kill_service` dan mencoba menghapus direktori leaf cgroup `/sys/fs/cgroup/ninit/<nama>`. Bila kernel masih dalam proses merealisasikan terminasi task sehingga `rmdir` mengembalikan `EBUSY`, ninit melakukan polling hingga 20 kali dengan jeda 5 ms (`usleep(5000)`, total maksimal 100 ms). Saat berhasil, ninit mencatat `cgroup: dibersihkan '<nama>'`.
+
+#### 4. Kontrak Fallback Fail-Open Saat Cgroup Unavailable
+
+Bila ninit dijalankan di lingkungan di mana hierarki cgroup v2 tidak tersedia (misalnya container tanpa delegasi cgroupfs, chroot minimal tanpa mount cgroup, atau kernel legacy tanpa cgroups):
+
+1. **Ketersediaan Layanan Terjamin (Fail-Open)**:
+   Kegagalan inisialisasi cgroup tidak menggagalkan proses boot PID 1 dan tidak membatalkan eksekusi layanan. Layanan tetap di-spawn dan bertransisi ke state `SVC_STATE_RUNNING`.
+2. **Pencatatan Log Fail-Open Eksplisit**:
+   ninit secara transparan mencatat bahwa mekanisme fallback fail-open sedang aktif untuk layanan tersebut:
+   ```
+   [YYYY-MM-DD HH:MM:SS] ninit: cgroup: fail-open aktif untuk '<nama>' (cgroup tidak tersedia)
+   ```
+3. **Peringatan Penegakan Batas Resource**:
+   Jika konfigurasi layanan menyertakan batas resource (`:memory_max=`, `:cpu_max=`, atau `:pids_max=`), batas tersebut tidak dapat ditegakkan oleh kernel. ninit mencatat peringatan eksplisit:
+   ```
+   [YYYY-MM-DD HH:MM:SS] ninit: Warning: batas resource diabaikan pada layanan '<nama>' karena cgroup tidak tersedia
+   ```
+   Layanan tetap dieksekusi tanpa pembatasan resource (*unconstrained*). Bila layanan tidak mengonfigurasi batas resource apa pun, pesan peringatan ini tidak dicetak (hanya log fail-open aktif).
+4. **Jaminan Bebas Deadlock pada Handshake Pre-Exec**:
+   Pada mekanisme sinkronisasi parent-child sebelum `execl()`, kegagalan cgroup langsung memicu pelepasan blokir proses anak via penulisan sinyal dan penutupan pipe sinkronisasi (`O_CLOEXEC`), memastikan proses anak tidak pernah tertahan (*hang*) atau mengalami kebuntuan (*deadlock*).
 
 ## `/etc/fstab`
 
