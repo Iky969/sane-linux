@@ -120,6 +120,27 @@ cat > "$FIX/tanpa-main-loop.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 EOF
 
+# Console sehat, tapi service respawn LAIN ('web') pernah menunda jendela
+# respawn-nya — perilaku normal pada init.conf multi-layanan. Pemeriksaan
+# 'respawn ditunda' yang di-scope ke console TIDAK boleh membuat ini GAGAL
+# (regresi balik dari catatan review PR #6: pola global terlalu ketat).
+cat > "$FIX/respawn-service-lain.log" <<'EOF'
+[    1.100000] ninit: ninit start (PID 1)
+[2026-11-05 09:00:01] ninit: ninit start (PID 1)
+[    1.250000] ninit: main loop siap
+[2026-11-05 09:00:01] ninit: main loop siap
+[    1.300000] ninit: started console (pid 42)
+[2026-11-05 09:00:01] ninit: started console (pid 42)
+[    1.310000] ninit: started web (pid 43)
+[2026-11-05 09:00:01] ninit: started web (pid 43)
+[    4.000000] ninit: web (pid 43) exit status=0x0
+[2026-11-05 09:00:04] ninit: web (pid 43) exit status=0x0
+[    4.100000] ninit: web: respawn ditunda (timer 2 detik, loop tidak diblokir)
+[2026-11-05 09:00:04] ninit: web: respawn ditunda (timer 2 detik, loop tidak diblokir)
+[    6.200000] ninit: started web (pid 55)
+[2026-11-05 09:00:06] ninit: started web (pid 55)
+EOF
+
 # ------------------------------------------------------------------ skenario
 printf '\n== skenario 1: boot sehat -> LULUS ==\n'
 run_report sehat
@@ -135,8 +156,8 @@ expect_line "$OUT" 'console punya 2 PID unik' \
 	"skenario 2: respawn loop tertangkap lewat PID unik"
 expect_line "$OUT" '[GAGAL] console tidak pernah keluar' \
 	"skenario 2: exit status console tertangkap"
-expect_line "$OUT" '[GAGAL] tidak ada respawn tertunda' \
-	"skenario 2: 'respawn ditunda' tertangkap"
+expect_line "$OUT" '[GAGAL] console tidak di-respawn tertunda' \
+	"skenario 2: 'console: respawn ditunda' tertangkap"
 expect_line "$OUT" "[ OK ]   layanan /etc/init.conf dijalankan ('started console')" \
 	"skenario 2: pemeriksaan lama lolos (bukti lama: harness lama LULUS di log ini)"
 
@@ -163,6 +184,14 @@ printf '\n== skenario 6: main loop tidak muncul -> GAGAL ==\n'
 run_report tanpa-main-loop
 expect_rc "skenario 6: kode keluar" "$RC" 1
 expect_line "$OUT" 'tidak muncul dalam' "skenario 6: ketiadaan 'main loop siap' tertangkap"
+
+printf '\n== skenario 7: service lain di-respawn, console sehat -> LULUS ==\n'
+run_report respawn-service-lain
+expect_rc "skenario 7: kode keluar" "$RC" 0
+expect_line "$OUT" 'HASIL: LULUS' \
+	"skenario 7: 'web: respawn ditunda' tidak menyeret harness (check ter-scope)"
+expect_line "$OUT" "[ OK ]   console tidak di-respawn tertunda" \
+	"skenario 7: pemeriksaan respawn console tetap dieksekusi dan lolos"
 
 printf '\n== konsol: REPORT_ONLY tanpa CONSOLE_LOG -> berhenti dengan pesan jelas ==\n'
 RC=0
