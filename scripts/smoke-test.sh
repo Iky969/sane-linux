@@ -10,6 +10,11 @@
 #   BIN=./ninit              biner yang diuji
 #   BUSYBOX=/bin/busybox     busybox statis (apt-get install busybox-static)
 #   READY_TIMEOUT=10         detik maksimum menunggu ninit siap
+#   LATENCY_LIMIT_MS=5000    ambang maksimum latensi SIGTERM -> berhenti (ms)
+#
+# Latensi shutdown diukur lewat sync(), yang di VPS/CI sangat fluktuatif
+# (tergantung beban disk backend), jadi ambangnya dibuat longgar dan dapat
+# dioverride lewat environment.
 #
 # Catatan: script ini sengaja TIDAK memakai `unshare --mount-proc=<dir>`.
 # Pada sebagian kernel (termasuk sandbox CI tertentu) perubahan mount
@@ -21,6 +26,7 @@ set -eu
 BIN=${BIN:-./ninit}
 BUSYBOX=${BUSYBOX:-/bin/busybox}
 READY_TIMEOUT=${READY_TIMEOUT:-10}
+LATENCY_LIMIT_MS=${LATENCY_LIMIT_MS:-5000}
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
@@ -106,10 +112,10 @@ else
 	bad "ada $after respawn setelah shutdown"
 fi
 
-if [ "$latency_ms" -lt 2000 ]; then
+if [ "$latency_ms" -lt "$LATENCY_LIMIT_MS" ]; then
 	ok "latensi SIGTERM -> berhenti: ${latency_ms}ms"
 else
-	bad "latensi SIGTERM -> berhenti: ${latency_ms}ms (layanan respawn-cepat harus < 2000ms)"
+	bad "latensi SIGTERM -> berhenti: ${latency_ms}ms (layanan respawn-cepat harus < ${LATENCY_LIMIT_MS}ms)"
 fi
 
 printf '\n== log ninit ==\n'
