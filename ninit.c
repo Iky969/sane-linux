@@ -51,10 +51,17 @@ typedef struct {
     time_t      last_start;
     char        deps_str[256]; 
     svc_state_t state;
+    char        memory_max[64];
+    char        cpu_max[64];
+    char        pids_max[64];
 } service_t;
 
 static service_t services[MAX_SERVICES];
 static int num_services = 0;
+
+static int find_service(const char *name);
+static void enable_cgroup_subtree(const char *path);
+static void cgroup_kill_service(const char *name);
 
 static volatile sig_atomic_t sigchld_flag  = 0;
 static volatile sig_atomic_t sigterm_flag  = 0;
@@ -119,6 +126,29 @@ static void try_mount(const char *src, const char *tgt, const char *fstype, unsi
         init_log("mount %s -> %s gagal: %s", src, tgt, strerror(errno));
 }
 
+static void enable_cgroup_subtree(const char *path)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+        return;
+    }
+
+    if (write(fd, "+memory +cpu +pids\n", 19) < 0) {
+        /* Bila penulisan multi-token gagal (misal salah satu controller tidak didukung kernel),
+           coba tulis setiap token secara individual */
+        const char *controllers[] = {"+memory", "+cpu", "+pids"};
+        for (size_t i = 0; i < sizeof(controllers) / sizeof(controllers[0]); i++) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%s\n", controllers[i]);
+            if (write(fd, buf, strlen(buf)) < 0) {
+                init_log("cgroup: tulis '%s' ke %s gagal: %s", controllers[i], path, strerror(errno));
+            }
+        }
+    }
+    close(fd);
+}
+
 static void setup_pseudo_fs(void)
 {
     try_mount("proc",     "/proc", "proc",     0);
@@ -142,6 +172,7 @@ static void setup_pseudo_fs(void)
             else
                 init_log("cgroup2: /sys/fs/cgroup ter-mount");
         }
+        enable_cgroup_subtree("/sys/fs/cgroup/cgroup.subtree_control");
     }
 }
 
@@ -163,6 +194,40 @@ static void set_hostname(void)
 /* ---------- cgroups v2 ---------- */
 #define CGROUP_BASE "/sys/fs/cgroup/ninit"
 
+/* Picu cgroup.kill layanan (berdasarkan NAMA, bukan pid): membunuh seluruh
+   anggota cgroup, termasuk proses yang grup prosesnya sudah berubah.
+   Dipanggil saat respawn, leader exit, dan saat shutdown. */
+static void cgroup_kill_service(const char *name)
+{
+    char kill_path[320];
+    snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, name);
+    int fd = open(kill_path, O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "1\n", 2) < 0) {
+            init_log("cgroup: tulis 1 ke %s gagal: %s", kill_path, strerror(errno));
+        }
+        close(fd);
+        return;
+    }
+
+    /* Fallback pra-Linux 5.14: bila cgroup.kill tidak ada (ENOENT),
+       baca cgroup.procs dan kirim SIGKILL ke setiap PID yang terdaftar */
+    if (errno == ENOENT) {
+        char procs_path[320];
+        snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
+        FILE *fp = fopen(procs_path, "r");
+        if (fp) {
+            int p;
+            while (fscanf(fp, "%d", &p) == 1) {
+                if (p > 1) {
+                    kill((pid_t)p, SIGKILL);
+                }
+            }
+            fclose(fp);
+        }
+    }
+}
+
 /* Pindahkan pid layanan ke /sys/fs/cgroup/ninit/<nama>. Dipanggil dari parent
    setelah fork() berhasil; kegagalan hanya di-log dan init tetap jalan. */
 static void setup_cgroup(const char *svc_name, pid_t pid)
@@ -175,11 +240,63 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
         init_log("cgroup: mkdir %s gagal: %s", CGROUP_BASE, strerror(errno));
         return;
     }
+    enable_cgroup_subtree(CGROUP_BASE "/cgroup.subtree_control");
 
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
     if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
         init_log("cgroup: mkdir %s gagal: %s", dir, strerror(errno));
         return;
+    }
+
+    /* R3: Sapu bersih proses anak / orphan lama sebelum memindahkan PID baru */
+    cgroup_kill_service(svc_name);
+
+    /* R2: Terapkan batas resource jika ditentukan */
+    int idx = find_service(svc_name);
+    if (idx >= 0) {
+        const service_t *svc = &services[idx];
+        if (svc->memory_max[0]) {
+            char path[320];
+            snprintf(path, sizeof(path), "%s/memory.max", dir);
+            int lim_fd = open(path, O_WRONLY);
+            if (lim_fd >= 0) {
+                if (dprintf(lim_fd, "%s\n", svc->memory_max) < 0)
+                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->memory_max, path, strerror(errno));
+                else
+                    init_log("cgroup: '%s' memory.max = %s", svc_name, svc->memory_max);
+                close(lim_fd);
+            } else {
+                init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+            }
+        }
+        if (svc->cpu_max[0]) {
+            char path[320];
+            snprintf(path, sizeof(path), "%s/cpu.max", dir);
+            int lim_fd = open(path, O_WRONLY);
+            if (lim_fd >= 0) {
+                if (dprintf(lim_fd, "%s\n", svc->cpu_max) < 0)
+                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->cpu_max, path, strerror(errno));
+                else
+                    init_log("cgroup: '%s' cpu.max = %s", svc_name, svc->cpu_max);
+                close(lim_fd);
+            } else {
+                init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+            }
+        }
+        if (svc->pids_max[0]) {
+            char path[320];
+            snprintf(path, sizeof(path), "%s/pids.max", dir);
+            int lim_fd = open(path, O_WRONLY);
+            if (lim_fd >= 0) {
+                if (dprintf(lim_fd, "%s\n", svc->pids_max) < 0)
+                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->pids_max, path, strerror(errno));
+                else
+                    init_log("cgroup: '%s' pids.max = %s", svc_name, svc->pids_max);
+                close(lim_fd);
+            } else {
+                init_log("cgroup: buka %s gagal: %s", path, strerror(errno));
+            }
+        }
     }
 
     snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
@@ -264,12 +381,45 @@ static int parse_config(const char *path)
             continue;
         }
         
-        /* Cari :requires= dari kanan (menggunakan strstr) agar cmd dengan ':' aman */
+        /* Cari tag opsi (:requires=, :memory_max=, :cpu_max=, :pids_max=) */
         char *deps = "";
-        char *req_tag = strstr(cmd, ":requires=");
-        if (req_tag) {
-            *req_tag = 0; /* Potong string di sini */
-            deps = req_tag + 10; /* Panjang ":requires=" adalah 10 */
+        char *mem_max = "";
+        char *cpu_limit = "";
+        char *pids_limit = "";
+
+        char *t_req = strstr(cmd, ":requires=");
+        char *t_mem = strstr(cmd, ":memory_max=");
+        char *t_cpu = strstr(cmd, ":cpu_max=");
+        char *t_pid = strstr(cmd, ":pids_max=");
+
+        /* Cari tag yang muncul paling awal agar cmd dengan ':' tetap aman */
+        char *first_tag = NULL;
+        if (t_req && (!first_tag || t_req < first_tag)) first_tag = t_req;
+        if (t_mem && (!first_tag || t_mem < first_tag)) first_tag = t_mem;
+        if (t_cpu && (!first_tag || t_cpu < first_tag)) first_tag = t_cpu;
+        if (t_pid && (!first_tag || t_pid < first_tag)) first_tag = t_pid;
+
+        if (first_tag) {
+            *first_tag = 0; /* Potong cmd tepat sebelum opsi pertama */
+            char *scan = first_tag + 1;
+            while (scan && *scan) {
+                char *next_tag = strchr(scan, ':');
+                if (next_tag) *next_tag = 0;
+
+                if (strncmp(scan, "requires=", 9) == 0) {
+                    deps = trim(scan + 9);
+                } else if (strncmp(scan, "memory_max=", 11) == 0) {
+                    mem_max = trim(scan + 11);
+                } else if (strncmp(scan, "cpu_max=", 8) == 0) {
+                    cpu_limit = trim(scan + 8);
+                } else if (strncmp(scan, "pids_max=", 9) == 0) {
+                    pids_limit = trim(scan + 9);
+                } else {
+                    init_log("Warning: opsi '%s' tidak dikenal pada layanan '%s'", scan, name);
+                }
+
+                scan = next_tag ? next_tag + 1 : NULL;
+            }
         }
 
         /* Validasi Mode */
@@ -301,6 +451,21 @@ static int parse_config(const char *path)
                      name, strlen(deps), (int)sizeof(services[num_services].deps_str) - 1);
             too_long = 1;
         }
+        if (strlen(mem_max) >= sizeof(services[num_services].memory_max)) {
+            init_log("Parse err: memory_max layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+                     name, strlen(mem_max), (int)sizeof(services[num_services].memory_max) - 1);
+            too_long = 1;
+        }
+        if (strlen(cpu_limit) >= sizeof(services[num_services].cpu_max)) {
+            init_log("Parse err: cpu_max layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+                     name, strlen(cpu_limit), (int)sizeof(services[num_services].cpu_max) - 1);
+            too_long = 1;
+        }
+        if (strlen(pids_limit) >= sizeof(services[num_services].pids_max)) {
+            init_log("Parse err: pids_max layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+                     name, strlen(pids_limit), (int)sizeof(services[num_services].pids_max) - 1);
+            too_long = 1;
+        }
         if (too_long) continue;
 
         /* Batasi presisi ke ukuran tujuan: menghilangkan -Wformat-truncation (nama max 127 char) */
@@ -310,6 +475,12 @@ static int parse_config(const char *path)
                  (int)sizeof(services[num_services].cmd) - 1, cmd);
         snprintf(services[num_services].deps_str, sizeof(services[num_services].deps_str), "%.*s",
                  (int)sizeof(services[num_services].deps_str) - 1, deps);
+        snprintf(services[num_services].memory_max, sizeof(services[num_services].memory_max), "%.*s",
+                 (int)sizeof(services[num_services].memory_max) - 1, mem_max);
+        snprintf(services[num_services].cpu_max, sizeof(services[num_services].cpu_max), "%.*s",
+                 (int)sizeof(services[num_services].cpu_max) - 1, cpu_limit);
+        snprintf(services[num_services].pids_max, sizeof(services[num_services].pids_max), "%.*s",
+                 (int)sizeof(services[num_services].pids_max) - 1, pids_limit);
         services[num_services].respawn      = is_respawn;
         services[num_services].need_respawn = 0;
         services[num_services].spawn_tries  = 0;
@@ -559,6 +730,7 @@ static void reap_zombies(void)
                     cleanup_cgroup(services[i].name);
                 } else {
                     services[i].state = SVC_STATE_STOPPED;
+                    cgroup_kill_service(services[i].name);
                 }
                 break;
             }
@@ -701,22 +873,6 @@ static void drain_log_fifo(void)
     }
 }
 
-/* Picu cgroup.kill layanan (berdasarkan NAMA, bukan pid): membunuh seluruh
-   anggota cgroup, termasuk proses yang grup prosesnya sudah berubah.
-   Dipanggil terpisah dari kill_service_group() supaya tetap terjangkau saat
-   leader sudah lama mati dan pid/pgid tidak lagi bisa diandalkan. */
-static void cgroup_kill_service(const char *name)
-{
-    char kill_path[320];
-    snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, name);
-    int fd = open(kill_path, O_WRONLY);
-    if (fd >= 0) {
-        if (write(fd, "1\n", 2) < 0) {
-            /* abaikan bila cgroup.kill belum didukung kernel */
-        }
-        close(fd);
-    }
-}
 
 /* Kirim sinyal ke seluruh grup proses layanan (lewat pgid yang disimpan,
    BUKAN pid leader: leader bisa sudah mati sementara grupnya masih hidup —
