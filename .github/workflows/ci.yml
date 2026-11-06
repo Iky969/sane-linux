@@ -42,6 +42,9 @@ jobs:
       - name: Pemeriksaan harness run-qemu.sh (fixture log, tanpa QEMU)
         run: sh ./scripts/test-qemu-report.sh
 
+      - name: Jalur kegagalan spawn (dependensi di jalur respawn + fork EAGAIN)
+        run: sudo sh ./scripts/test-spawn-failure.sh
+
       - name: Build tanpa warning (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
 
