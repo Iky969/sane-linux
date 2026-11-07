@@ -72,15 +72,6 @@ cleanup() {
 		rm -rf "$d"
 	done
 	for f in ${LOGS:-}; do rm -f "$f"; done
-	for leaf in sender shell a b c d dep topo root s63 astall; do
-		d="/sys/fs/cgroup/ninit/$leaf"
-		[ -d "$d" ] || continue
-		if [ -f "$d/cgroup.kill" ]; then
-			echo 1 | $SUDO tee "$d/cgroup.kill" >/dev/null 2>&1 || true
-		fi
-		$SUDO rmdir "$d" 2>/dev/null || true
-	done
-	$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

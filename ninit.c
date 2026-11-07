@@ -346,6 +346,8 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     fd = open(procs, O_WRONLY);
     if (fd < 0) {
         init_log("cgroup: buka %s gagal: %s", procs, strerror(errno));
+        /* Bersihkan direktori leaf parsial supaya tidak bocor di host */
+        rmdir(dir);
         cgroup_fail_open(svc_name);
         return 1;
     }
@@ -820,8 +822,25 @@ static int spawn_service(service_t *svc)
             svc->need_respawn = 1;
             return 0;
         } else {
-            fcntl(sync_pipe[0], F_SETFD, fcntl(sync_pipe[0], F_GETFD) | FD_CLOEXEC);
-            fcntl(sync_pipe[1], F_SETFD, fcntl(sync_pipe[1], F_GETFD) | FD_CLOEXEC);
+            /* Fallback pipe() berhasil: pasang FD_CLOEXEC secara eksplisit.
+               Fail-closed: kalau fcntl gagal, pipe TIDAK boleh dipakai
+               (anak bisa mewarisi FD sync melewati exec), jadi tutup kedua
+               ujung dan retry lewat ppoll. */
+            int fl0 = fcntl(sync_pipe[0], F_GETFD);
+            int fl1 = fcntl(sync_pipe[1], F_GETFD);
+            if (fl0 < 0 || fl1 < 0 ||
+                fcntl(sync_pipe[0], F_SETFD, fl0 | FD_CLOEXEC) < 0 ||
+                fcntl(sync_pipe[1], F_SETFD, fl1 | FD_CLOEXEC) < 0) {
+                int err = errno;
+                init_log("fcntl CLOEXEC %s: %s (spawn digagalkan, retry)",
+                         svc->name, strerror(err));
+                close(sync_pipe[0]);
+                close(sync_pipe[1]);
+                sync_pipe[0] = sync_pipe[1] = -1;
+                svc->spawn_tries++;
+                svc->need_respawn = 1;
+                return 0;
+            }
         }
     }
 

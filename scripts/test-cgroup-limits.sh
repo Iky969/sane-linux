@@ -1187,10 +1187,24 @@ check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L11" \
 
 # ------------------------------------------------------------- Verifikasi Teardown Cgroup Host
 printf '\n== Verifikasi Teardown Cgroup Host ==\n'
-if [ -d "/sys/fs/cgroup/ninit" ]; then
-	bad "kebocoran direktori cgroup: /sys/fs/cgroup/ninit masih tertinggal pada host"
+# Jangan menyalahkan keberadaan /sys/fs/cgroup/ninit secara langsung: host
+# boleh saja memuat leaf cgroup milik workload lain. Yang diperiksa adalah
+# leaf milik suite ini (TEST_LEAVES) yang tertinggal.
+leaked=""
+for leaf in $TEST_LEAVES; do
+	if [ -d "/sys/fs/cgroup/ninit/$leaf" ]; then
+		leaked="$leaked $leaf"
+	fi
+done
+if [ -n "$leaked" ]; then
+	bad "kebocoran leaf cgroup milik test:$leaked"
 else
-	ok "hierarki cgroup bersih: tidak ada kebocoran direktori di /sys/fs/cgroup/ninit"
+	$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
+	if [ -d /sys/fs/cgroup/ninit ]; then
+		ok "hierarki cgroup test bersih (resource eksternal host tidak disentuh)"
+	else
+		ok "hierarki cgroup bersih: /sys/fs/cgroup/ninit dihapus"
+	fi
 fi
 
 # ------------------------------------------------------------- Ringkasan
