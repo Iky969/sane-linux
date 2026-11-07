@@ -558,12 +558,16 @@ int main(void) {
     if (c2 > 0) { kill(c2, SIGKILL); waitpid(c2, NULL, 0); }
 
     /* ---- Fase uji: 3 worker x 12MB = 36MB > 32MB.
-       OOM killer kernel harus mematikan salah satu WORKER; leader TIDAK
-       mengalokasi memori besar dan TIDAK memanggil raise(SIGKILL). ---- */
+       Spawn worker 1 & 2 secara bertahap untuk memastikan keduanya memegang
+       24MB secara paralel tanpa OOM sebelum worker 3 mendorong akumulasi
+       melampaui kuota 32MB. OOM killer kernel harus mematikan worker;
+       leader TIDAK mengalokasi memori besar dan TIDAK memanggil raise(SIGKILL). ---- */
     audit_msg("TEST_WORKERS_FORKED=3\n");
     pid_t w[3];
     w[0] = spawn_worker(1, "TEST", 1000);
+    wait_for_marker("TEST_WORKER1_ALLOCATED_12M", 3000);
     w[1] = spawn_worker(2, "TEST", 1000);
+    wait_for_marker("TEST_WORKER2_ALLOCATED_12M", 3000);
     w[2] = spawn_worker(3, "TEST", 0);
 
     char buf[4096];
