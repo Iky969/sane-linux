@@ -49,6 +49,7 @@ typedef struct {
     int         respawn;
     int         need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
     int         spawn_tries;    /* jumlah berturut-turut fork() gagal; dinolkan saat spawn sukses */
+    int         cgroup_fail_open; /* 1 = cgroup setup gagal, orphan cleanup via kill(-pgid) */
     time_t      last_start;
     char        deps_str[256]; 
     svc_state_t state;
@@ -244,8 +245,8 @@ static void cgroup_fail_open(const char *svc_name)
 }
 
 /* Pindahkan pid layanan ke /sys/fs/cgroup/ninit/<nama>. Dipanggil dari parent
-   setelah fork() berhasil; kegagalan hanya di-log dan init tetap jalan. */
-static void setup_cgroup(const char *svc_name, pid_t pid)
+   setelah fork() berhasil. Mengembalikan 0=ok, 1=fail-open. */
+static int setup_cgroup(const char *svc_name, pid_t pid)
 {
     char dir[256], procs[320];   /* procs = dir (maks 255) + "/cgroup.procs" */
     int fd;
@@ -254,7 +255,7 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     if (mkdir(CGROUP_BASE, 0755) < 0 && errno != EEXIST) {
         init_log("cgroup: mkdir %s gagal: %s", CGROUP_BASE, strerror(errno));
         cgroup_fail_open(svc_name);
-        return;
+        return 1;
     }
     enable_cgroup_subtree(CGROUP_BASE "/cgroup.subtree_control");
 
@@ -262,7 +263,7 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
         init_log("cgroup: mkdir %s gagal: %s", dir, strerror(errno));
         cgroup_fail_open(svc_name);
-        return;
+        return 1;
     }
 
     /* R3: Sapu bersih proses anak / orphan lama sebelum memindahkan PID baru */
@@ -346,17 +347,21 @@ static void setup_cgroup(const char *svc_name, pid_t pid)
     if (fd < 0) {
         init_log("cgroup: buka %s gagal: %s", procs, strerror(errno));
         cgroup_fail_open(svc_name);
-        return;
+        return 1;
     }
 
     if (dprintf(fd, "%d\n", (int)pid) < 0) {
         init_log("cgroup: tulis pid %d ke %s gagal: %s", (int)pid, procs, strerror(errno));
+        close(fd);
+        /* Bersihkan direktori leaf parsial */
+        rmdir(dir);
         cgroup_fail_open(svc_name);
-    } else {
-        init_log("cgroup: '%s' (pid %d) -> %s", svc_name, (int)pid, dir);
+        return 1;
     }
 
     close(fd);
+    init_log("cgroup: '%s' (pid %d) -> %s", svc_name, (int)pid, dir);
+    return 0;
 }
 
 /* Hapus direktori cgroup layanan saat layanan berhenti */
@@ -638,6 +643,7 @@ static int parse_config(const char *path)
         services[num_services].respawn      = is_respawn;
         services[num_services].need_respawn = 0;
         services[num_services].spawn_tries  = 0;
+        services[num_services].cgroup_fail_open = 0;
         services[num_services].pid          = 0;
         services[num_services].pgid         = 0;
         services[num_services].last_start   = 0;
@@ -800,11 +806,19 @@ static int spawn_service(service_t *svc)
     int has_sync = 1;
     if (pipe2(sync_pipe, O_CLOEXEC) < 0) {
         if (pipe(sync_pipe) < 0) {
-            init_log("pipe2 %s: %s (sinkronisasi handshake dilewati)",
+            /* Pembuatan pipe gagal: jangan fork tanpa sync, retry nanti */
+            init_log("pipe2 %s: %s (spawn digagalkan, retry)",
                      svc->name, strerror(errno));
-            has_sync = 0;
-            sync_pipe[0] = -1;
-            sync_pipe[1] = -1;
+            svc->spawn_tries++;
+            if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
+                init_log("%s: gagal buat pipe %d kali, layanan dinyatakan gagal",
+                         svc->name, svc->spawn_tries);
+                svc->state = SVC_STATE_FAILED;
+                svc->spawn_tries = 0;
+                return 1;
+            }
+            svc->need_respawn = 1;
+            return 0;
         } else {
             fcntl(sync_pipe[0], F_SETFD, fcntl(sync_pipe[0], F_GETFD) | FD_CLOEXEC);
             fcntl(sync_pipe[1], F_SETFD, fcntl(sync_pipe[1], F_GETFD) | FD_CLOEXEC);
@@ -880,7 +894,11 @@ static int spawn_service(service_t *svc)
                 if (errno == EINTR) continue;
                 break;
             }
-            (void)nr;
+            /* Validasi strict: harus tepat 1 byte bernilai '1' */
+            if (nr != 1 || sync_byte != '1') {
+                close(sync_pipe[0]);
+                _exit(127);
+            }
             close(sync_pipe[0]);
         }
 
@@ -897,7 +915,7 @@ static int spawn_service(service_t *svc)
     svc->state = SVC_STATE_RUNNING;
     svc->spawn_tries = 0;
     init_log("started %s (pid %d)", svc->name, pid);
-    setup_cgroup(svc->name, pid);
+    svc->cgroup_fail_open = setup_cgroup(svc->name, pid);
 
     if (has_sync && sync_pipe[1] >= 0) {
         ssize_t nw;
@@ -940,6 +958,10 @@ static void reap_zombies(void)
                     services[i].state = SVC_STATE_STOPPED;
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
+                        /* Fallback kill saat cgroup fail-open: leader mati tapi orphan
+                           runtime mungkin masih hidup di grup */
+                        if (services[i].pgid > 0)
+                            kill(-services[i].pgid, SIGKILL);
                     }
                 }
                 break;
@@ -1063,12 +1085,14 @@ static int respawn_pending(void)
 /* Baca SEMUA output layanan yang tertunda di /run/log.fifo dan teruskan ke
    stderr + log init. Dipakai event loop DAN shutdown_all(): tanpa itu, pesan
    terakhir dari layanan yang menuruti SIGTERM (mis. "bye!") tidak akan pernah
-   terbaca, karena loop utama sudah tidak men-drain FIFO selama shutdown. */
+   terbaca, karena loop utama sudah tidak men-drain FIFO selama shutdown.
+   Dibatasi maksimal 64 iterasi per panggilan agar tidak memonopoli CPU dan
+   menahan penanganan sinyal di ppoll. */
 static void drain_log_fifo(void)
 {
     if (g_log_fifo_fd < 0) return;
 
-    for (;;) {
+    for (int i = 0; i < 64; i++) {
         char log_buf[1024];
         ssize_t n = read(g_log_fifo_fd, log_buf, sizeof(log_buf) - 1);
         if (n <= 0) return;   /* EAGAIN (kosong) atau EOF */
@@ -1505,13 +1529,16 @@ static void mount_fstab(void)
 
 /* ---------- rescue mode ----------
    Satu-satunya jalan keluar bila init tidak bisa memulai boot dengan benar.
-   Dua hal yang wajib terjadi di sini:
+   Tiga hal yang wajib terjadi di sini:
 
      1. Signal mask PID 1 dikosongkan. main() memblokir SIGINT/SIGTERM/SIGCHLD/
         SIGUSR1/SIGUSR2 untuk ppoll; tanpa reset, rescue shell mewarisi mask itu
         dan Ctrl+C di shell darurat tidak akan pernah sampai (SIGINT tertahan).
         spawn_service() melakukan hal yang sama untuk anak layanan.
-     2. execl() menggantikan proses PID 1 ini dengan /bin/sh. Kalau gagal (mis.
+     2. Disposisi SIGPIPE di-reset ke SIG_DFL. main() memasang signal(SIGPIPE, SIG_IGN)
+        untuk PID 1; tanpa reset, shell darurat mewarisi SIG_IGN sehingga utilitas
+        pipeline shell (yes | head -n 1) gagal rusak.
+     3. execl() menggantikan proses PID 1 ini dengan /bin/sh. Kalau gagal (mis.
         /bin/sh tidak ada di rootfs), proses keluar dengan status 1 -- JANGAN
         kembali ke alur boot dengan state yang sudah tidak valid.
 
