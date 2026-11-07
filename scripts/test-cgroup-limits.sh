@@ -24,12 +24,17 @@
 #   9. Descendant escape test dengan fast double-fork + setsid daemonize
 #      workload, memastikan seluruh proses turunan berada di leaf cgroup.procs
 #      via T1 handshake dan cgroup_kill_service menyapu bersih seluruh pohon
-#      proses tanpa sisa (LINGERING_ESCAPE_ORPHANS=0).
+#      proses tanpa sisa (LINGERING_ESCAPE_ORPHANS=0). Pembersihan juga
+#      diverifikasi dari sisi cgroup: cgroup.events (populated 0) dan
+#      cgroup.procs kosong SEBELUM rmdir leaf.
 #  10. Batas resource bertingkat (multi-tier hierarchical limits):
 #      - 10A: Hierarchical pids.max nested fork rejection with EAGAIN
 #             (NESTED_EAGAIN_CONFIRMED depth=3).
-#      - 10B: Cumulative parallel memory.max deterministic OOM
-#             (SIGKILL, exit 0x9 / 137).
+#      - 10B: Cumulative parallel memory.max deterministic OOM: leader
+#             mengorkestrasi 3 worker x 12MB (36MB > limit 32MB) sehingga
+#             OOM killer mematikan worker; kontrol 2 worker x 12MB (24MB)
+#             lolos tanpa OOM. Leader tidak mengalokasi besar dan tidak
+#             memanggil raise(SIGKILL).
 #
 # Pemakaian:
 #   sudo sh ./scripts/test-cgroup-limits.sh      # atau: make test
@@ -72,6 +77,14 @@ for t in unshare chroot timeout grep mktemp; do
 done
 $SUDO true 2>/dev/null || fail "butuh root atau sudo tanpa password (unshare + chroot)"
 
+# Safety guard: suite ini menulis cgroup.kill dan rmdir di /sys/fs/cgroup/ninit.
+# Jika PID 1 host adalah ninit, suite ini akan membunuh inisialisasi host
+# (kernel panic). Abort sebelum menyentuh cgroup host apa pun.
+pid1_comm=$(cat /proc/1/comm 2>/dev/null || true)
+if [ "$pid1_comm" = "ninit" ]; then
+	fail "PID 1 host adalah 'ninit' -- suite dilarang dijalankan pada host hidup (guard isolasi host)"
+fi
+
 CG_CONTROLLERS="/sys/fs/cgroup/cgroup.controllers"
 has_cg2=0
 has_mem=0
@@ -88,20 +101,38 @@ ROOTS=""
 LOGS=""
 HELPERS=""
 CG_DYNAMIC=""
+# Leaf cgroup yang SAH dibuat suite ini (nama layanan di init.conf skenario).
+# Pembersihan host hanya menyentuh leaf ini -- bukan menyapu global
+# /sys/fs/cgroup/ninit/*, yang bisa membunuh layanan asli host.
+TEST_LEAVES="mem_test pids_test leak limits_audit valid_svc bad_mem1 bad_mem2 bad_mem3
+bad_cpu1 bad_cpu2 bad_cpu3 bad_pid1 bad_pid2 bad_pid3 stopper svc_nested boot_pr9 app_dep
+orphan_maker checker escape_svc pids_tree mem_cumul failopen_svc app ping slow boot
+sender shell sigterm-test pipe-svc stubborn-svc a b c d dep topo root s63 astall"
 INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
 clean_host_ninit() {
-	if [ -d "/sys/fs/cgroup/ninit" ]; then
-		for leaf in /sys/fs/cgroup/ninit/*; do
-			[ -d "$leaf" ] || continue
-			if [ -f "$leaf/cgroup.kill" ]; then
-				echo 1 | $SUDO tee "$leaf/cgroup.kill" >/dev/null 2>&1 || true
-			fi
-			$SUDO rmdir "$leaf" 2>/dev/null || {
-				sleep 0.1
-				$SUDO rmdir "$leaf" 2>/dev/null || true
-			}
+	# Bersihkan HANYA leaf milik suite ini (TEST_LEAVES). Jangan pernah
+	# menyapu /sys/fs/cgroup/ninit/* secara global.
+	for leaf in $TEST_LEAVES; do
+		d="/sys/fs/cgroup/ninit/$leaf"
+		[ -d "$d" ] || continue
+		if [ -f "$d/cgroup.kill" ]; then
+			echo 1 | $SUDO tee "$d/cgroup.kill" >/dev/null 2>&1 || true
+		fi
+		$SUDO rmdir "$d" 2>/dev/null || {
+			sleep 0.1
+			$SUDO rmdir "$d" 2>/dev/null || true
+		}
+	done
+	# Hapus direktori dasar hanya bila benar-benar kosong (tidak ada sub-cgroup
+	# asing tersisa); jangan sentuh leaf di luar TEST_LEAVES.
+	if [ -d /sys/fs/cgroup/ninit ]; then
+		has_subdir=0
+		for e in /sys/fs/cgroup/ninit/*; do
+			if [ -d "$e" ]; then has_subdir=1; break; fi
 		done
-		$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
+		if [ "$has_subdir" -eq 0 ]; then
+			$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
+		fi
 	fi
 }
 
@@ -429,98 +460,139 @@ EOF
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 
-static void on_sigchld(int sig) {
-    (void)sig;
-    int st;
-    pid_t p = waitpid(-1, &st, WNOHANG);
-    if (p > 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) {
-        raise(SIGKILL);
+#define WORKER_MB   12
+#define AUDIT_PATH  "/var/cumul_mem_audit.txt"
+
+static void audit_msg(const char *msg) {
+    int fd = open(AUDIT_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    ssize_t unused = write(fd, msg, strlen(msg));
+    (void)unused;
+    close(fd);
+}
+
+static void auditf(const char *fmt, ...) {
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    audit_msg(buf);
+}
+
+/* Fork seorang worker yang mengalokasi dan MENYENTUH WORKER_MB MB.
+   Penulisan volatile per halaman wajib: tanpa itu gcc -O2 mengubah
+   malloc+memset menjadi alokasi lazim (calloc) yang tidak pernah menagih
+   halaman, sehingga batas kumulatif tidak pernah terlampaui.
+   adj menaikkan oom_score_adj worker supaya kernel memilih worker
+   (bukan leader) sebagai korban OOM saat kuota terlampaui. */
+static pid_t spawn_worker(int id, const char *tag, int adj) {
+    pid_t p = fork();
+    if (p < 0) return -1;
+    if (p == 0) {
+        int fd = open("/proc/self/oom_score_adj", O_WRONLY);
+        if (fd >= 0) {
+            dprintf(fd, "%d\n", adj);
+            close(fd);
+        }
+        size_t sz = (size_t)WORKER_MB * 1024 * 1024;
+        volatile unsigned char *m = malloc(sz);
+        if (m) {
+            for (size_t i = 0; i < sz; i += 4096) m[i] = 0x5A;
+            m[sz - 1] = 0x5A;
+        }
+        auditf("%s_WORKER%d_ALLOCATED_12M\n", tag, id);
+        /* Tahan memori sampai OOM killer atau leader menghentikan worker. */
+        for (;;) sleep(60);
+        _exit(0);
     }
+    return p;
+}
+
+static int read_audit(char *buf, size_t sz) {
+    int fd = open(AUDIT_PATH, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sz - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    return 1;
+}
+
+static int wait_for_marker(const char *marker, int timeout_ms) {
+    char buf[4096];
+    for (int i = 0; i < timeout_ms / 20; i++) {
+        if (read_audit(buf, sizeof(buf)) && strstr(buf, marker)) return 1;
+        usleep(20000);
+    }
+    return 0;
+}
+
+static int child_alive(pid_t pid) {
+    if (pid <= 0) return 0;
+    int st;
+    return waitpid(pid, &st, WNOHANG) == 0;
 }
 
 int main(void) {
-    signal(SIGCHLD, on_sigchld);
+    /* ---- Fase kontrol (anti-hampa): 2 worker x 12MB = 24MB < 32MB.
+       Keduanya harus bertahan tanpa OOM killer. ---- */
+    pid_t c1 = spawn_worker(1, "CONTROL", 1000);
+    pid_t c2 = spawn_worker(2, "CONTROL", 1000);
+    int c1_ok = wait_for_marker("CONTROL_WORKER1_ALLOCATED_12M", 2000);
+    int c2_ok = wait_for_marker("CONTROL_WORKER2_ALLOCATED_12M", 2000);
+    usleep(500000); /* jendela pengamatan: OOM killer tidak boleh menembak */
+    int c1_alive = child_alive(c1);
+    int c2_alive = child_alive(c2);
+    if (c1_ok && c2_ok && c1_alive && c2_alive)
+        audit_msg("CONTROL_2_WORKERS_NO_OOM=1\n");
+    else
+        audit_msg("CONTROL_2_WORKERS_NO_OOM=0\n");
 
-    /* Worker 1: alokasikan 12MB */
-    pid_t w1 = fork();
-    if (w1 < 0) return 1;
-    if (w1 == 0) {
-        void *p = malloc(12 * 1024 * 1024);
-        if (p) memset(p, 0xAA, 12 * 1024 * 1024);
-        FILE *f = fopen("/var/cumul_mem_audit.txt", "a");
-        if (f) {
-            fprintf(f, "WORKER1_ALLOCATED_12M\n");
-            fflush(f);
-            fclose(f);
+    /* Bersihkan worker kontrol sebelum fase uji. */
+    if (c1 > 0) { kill(c1, SIGKILL); waitpid(c1, NULL, 0); }
+    if (c2 > 0) { kill(c2, SIGKILL); waitpid(c2, NULL, 0); }
+
+    /* ---- Fase uji: 3 worker x 12MB = 36MB > 32MB.
+       OOM killer kernel harus mematikan salah satu WORKER; leader TIDAK
+       mengalokasi memori besar dan TIDAK memanggil raise(SIGKILL). ---- */
+    audit_msg("TEST_WORKERS_FORKED=3\n");
+    pid_t w[3];
+    w[0] = spawn_worker(1, "TEST", 1000);
+    w[1] = spawn_worker(2, "TEST", 1000);
+    w[2] = spawn_worker(3, "TEST", 0);
+
+    char buf[4096];
+    int seen1 = 0, seen2 = 0, seen3 = 0, oom_kills = 0, st;
+    for (int i = 0; i < 300; i++) {
+        if (read_audit(buf, sizeof(buf))) {
+            if (strstr(buf, "TEST_WORKER1_ALLOCATED_12M")) seen1 = 1;
+            if (strstr(buf, "TEST_WORKER2_ALLOCATED_12M")) seen2 = 1;
+            if (strstr(buf, "TEST_WORKER3_ALLOCATED_12M")) seen3 = 1;
         }
-        while (1) sleep(60);
-        _exit(0);
+        pid_t p = waitpid(-1, &st, WNOHANG);
+        if (p > 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL)
+            oom_kills++;
+        if (oom_kills > 0) break;
+        usleep(20000);
     }
+    auditf("TEST_WORKERS_ALLOCATED=%d\n", seen1 + seen2 + seen3);
+    auditf("WORKER_KILLED_BY_OOM=%d\n", oom_kills > 0);
+    auditf("OOM_KILLED_WORKERS=%d\n", oom_kills);
 
-    /* Tunggu worker 1 siap */
-    int waited = 0;
-    while (waited < 40) {
-        FILE *f = fopen("/var/cumul_mem_audit.txt", "r");
-        if (f) {
-            char buf[64];
-            while (fgets(buf, sizeof(buf), f)) {
-                if (strstr(buf, "WORKER1_ALLOCATED_12M")) { fclose(f); goto w1_done; }
-            }
-            fclose(f);
-        }
-        usleep(50000);
-        waited++;
-    }
-w1_done:;
-
-    /* Worker 2: alokasikan 12MB */
-    pid_t w2 = fork();
-    if (w2 < 0) return 1;
-    if (w2 == 0) {
-        void *p = malloc(12 * 1024 * 1024);
-        if (p) memset(p, 0xBB, 12 * 1024 * 1024);
-        FILE *f = fopen("/var/cumul_mem_audit.txt", "a");
-        if (f) {
-            fprintf(f, "WORKER2_ALLOCATED_12M\n");
-            fflush(f);
-            fclose(f);
-        }
-        while (1) sleep(60);
-        _exit(0);
-    }
-
-    /* Tunggu worker 2 siap */
-    waited = 0;
-    while (waited < 40) {
-        FILE *f = fopen("/var/cumul_mem_audit.txt", "r");
-        if (f) {
-            char buf[64];
-            while (fgets(buf, sizeof(buf), f)) {
-                if (strstr(buf, "WORKER2_ALLOCATED_12M")) { fclose(f); goto w2_done; }
-            }
-            fclose(f);
-        }
-        usleep(50000);
-        waited++;
-    }
-w2_done:;
-
-    /* Alokasi agresif oleh leader hingga 256MB untuk mendorong akumulasi total
-       melampaui batas memory.max (32M) + swap dan memicu OOM killer secara deterministik */
-    for (int i = 0; i < 256; i++) {
-        void *p = malloc(1024 * 1024);
-        if (p) memset(p, 0xCC, 1024 * 1024);
-    }
-
-    /* Tunggu sinyal dari kernel atau kematian anak */
-    int st = 0;
-    while (waitpid(-1, &st, 0) > 0) {
-        if (WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) {
-            raise(SIGKILL);
+    /* Sapu bersih sisa worker sebelum leader keluar (leader bertahan hidup). */
+    for (int i = 0; i < 3; i++) {
+        if (w[i] > 0) {
+            if (waitpid(w[i], &st, WNOHANG) == 0)
+                kill(w[i], SIGKILL);
+            waitpid(w[i], NULL, 0);
         }
     }
+    audit_msg("LEADER_SURVIVED=1\n");
     return 0;
 }
 EOF
@@ -873,11 +945,13 @@ fi
 # Verifikasi bahwa handshake sinkronisasi parent-child T1 menjamin seluruh
 # proses turunan (anak, cucu, orphan) berada di leaf cgroup.procs yang tepat,
 # dan cgroup_kill_service menyapu bersih seluruh pohon proses (LINGERING_ESCAPE_ORPHANS=0).
+# Pembersihan diverifikasi dua sisi: (a) cgroup.events populated 0 dan
+# cgroup.procs kosong SEBELUM rmdir leaf, (b) scan /proc cmdline tanpa sisa.
 printf '\n== Skenario 9: Descendant escape test & handshake sinkronisasi ==\n'
 if [ "$has_cg2" -ne 1 ] || [ -z "$ESCAPE_BIN" ]; then
 	skip "skenario 9 dilewati: cgroup v2 tidak tersedia atau gcc tidak ada"
 else
-	R9=$(new_root sleep grep cut cat)
+	R9=$(new_root sleep grep cut cat awk wc)
 	L9=$(new_log)
 	ROOTS="$ROOTS $R9"
 	LOGS="$LOGS $L9"
@@ -909,12 +983,45 @@ else
 	# -----------------------------------------------------------------
 	cat > "$R9/bin/check_escape.sh" << 'EOF'
 #!/bin/sh
-/bin/sleep 0.5
+# Verifikasi pembersihan dari dua sisi:
+#   (a) cgroup: cgroup.events (populated 0) dan cgroup.procs kosong SEBELUM
+#       rmdir leaf. Leaf sengaja dibiarkan hidup (escape_svc respawn) supaya
+#       state pasca-cgroup_kill_service bisa diamati sebelum ninit menghapusnya
+#       saat shutdown.
+#   (b) /proc: tidak ada proses escape_workload yang masih berjalan.
+CG="/sys/fs/cgroup/ninit/escape_svc"
+
+# Tunggu workload adversarial menulis bukti audit (cucu sudah aktif).
+waited=0
+while [ ! -f /var/escape_audit.txt ] && [ "$waited" -lt 100 ]; do
+    /bin/sleep 0.05
+    waited=$((waited + 1))
+done
+
 gc_pid=""
 if [ -f /var/escape_audit.txt ]; then
     gc_pid=$(grep '^GRANDCHILD=' /var/escape_audit.txt 2>/dev/null | cut -d= -f2)
 fi
 
+# Tunggu cgroup_kill_service menyapu leaf: populated 0 DAN cgroup.procs kosong.
+populated="unknown"
+nprocs="unknown"
+waited=0
+while [ "$waited" -lt 100 ]; do
+    if [ -d "$CG" ] && [ -f "$CG/cgroup.events" ]; then
+        p=$(awk '/^populated /{print $2}' "$CG/cgroup.events" 2>/dev/null)
+        n=$(wc -l < "$CG/cgroup.procs" 2>/dev/null || echo unknown)
+        if [ "$p" = "0" ] && [ "$n" = "0" ]; then
+            populated=0
+            nprocs=0
+            break
+        fi
+    fi
+    /bin/sleep 0.05
+    waited=$((waited + 1))
+done
+
+# Scan /proc: pastikan tidak ada sisa proses turunan yang lolos.
 lingering=0
 if [ -n "$gc_pid" ] && [ -d "/proc/$gc_pid" ]; then
     lingering=$((lingering + 1))
@@ -927,15 +1034,21 @@ for cmd in /proc/[0-9]*/cmdline; do
     fi
 done
 
-echo "LINGERING_ESCAPE_ORPHANS=$lingering" > /var/escape_clean_audit.txt
+echo "POPULATED=$populated" > /var/escape_clean_audit.txt
+echo "CGROUP_PROCS=$nprocs" >> /var/escape_clean_audit.txt
+echo "LINGERING_ESCAPE_ORPHANS=$lingering" >> /var/escape_clean_audit.txt
 echo poweroff > /run/initctl
 exit 0
 EOF
 	chmod 0755 "$R9/bin/check_escape.sh"
 
 	cat > "$R9/etc/init.conf" << 'EOF'
-escape_svc:once:/bin/escape_workload
-checker:once:/bin/sh /bin/check_escape.sh:requires=escape_svc
+# escape_svc sengaja 'respawn': saat leader exit, ninit memanggil
+# cgroup_kill_service tetapi BELUM rmdir leaf, sehingga checker bisa
+# memverifikasi cgroup.events (populated 0) dan cgroup.procs kosong
+# SEBELUM rmdir (rmdir leaf terjadi saat shutdown).
+escape_svc:respawn:/bin/escape_workload
+checker:once:/bin/sh /bin/check_escape.sh
 EOF
 
 	boot_guest "$R9" "$WAIT9" >"$L9" 2>&1
@@ -950,6 +1063,10 @@ EOF
 		"$R9/var/escape_audit.txt" 'IN_LEAF_CGROUP=1'
 	check_in  "cgroup_kill_service menyapu bersih seluruh pohon proses turunan (LINGERING_ESCAPE_ORPHANS=0)" \
 		"$R9/var/escape_clean_audit.txt" 'LINGERING_ESCAPE_ORPHANS=0'
+	check_in  "cgroup.events leaf escape_svc populated 0 sebelum rmdir" \
+		"$R9/var/escape_clean_audit.txt" 'POPULATED=0'
+	check_in  "cgroup.procs leaf escape_svc kosong sebelum rmdir" \
+		"$R9/var/escape_clean_audit.txt" 'CGROUP_PROCS=0'
 	check_in  "leaf cgroup escape_svc dibersihkan setelah sweep" "$L9" \
 		"cgroup: dibersihkan 'escape_svc'"
 	absent_in "tidak ada kegagalan rmdir leaf cgroup (EBUSY)" "$L9" \
@@ -962,7 +1079,9 @@ fi
 # Batas Resource Workload Bertingkat (Multi-tier Hierarchical Limits)
 # Memverifikasi bahwa batas hierarkis cgroup v2 mengikat seluruh subtree:
 # Part 10A: Hierarchical pids.max (leader -> child -> grandchild -> fork ke-4 ditolak EAGAIN)
-# Part 10B: Cumulative parallel memory.max (alokasi simultan beberapa worker memicu OOM killer)
+# Part 10B: Cumulative parallel memory.max -- leader mengorkestrasi 3 worker x 12MB
+#           (total 36MB > limit 32MB) sehingga OOM killer mematikan worker, plus
+#           kontrol anti-hampa 2 worker x 12MB (24MB) yang lolos tanpa OOM.
 printf '\n== Skenario 10: Batas resource workload bertingkat (hierarki cgroup v2) ==\n'
 
 # 10A: Hierarchical PIDs
@@ -1013,11 +1132,17 @@ EOF
 
 	check_in  "konfigurasi limit memory.max kumulatif diterapkan" "$L10B" \
 		"cgroup: 'mem_cumul' memory.max = 32M"
-	check_in  "worker 1 berhasil alokasi 12M di bawah limit individu" \
-		"$R10B/var/cumul_mem_audit.txt" 'WORKER1_ALLOCATED_12M'
-	check_in  "worker 2 berhasil alokasi 12M di bawah limit individu" \
-		"$R10B/var/cumul_mem_audit.txt" 'WORKER2_ALLOCATED_12M'
-	check_in  "akumulasi memori paralel memicu OOM killer deterministik (exit status=0x9)" "$L10B" \
+	check_in  "kontrol anti-hampa: 2 worker x 12M (24M) lolos tanpa OOM" \
+		"$R10B/var/cumul_mem_audit.txt" 'CONTROL_2_WORKERS_NO_OOM=1'
+	check_in  "leader mengorkestrasi 3 worker pada fase uji (total 36M > 32M)" \
+		"$R10B/var/cumul_mem_audit.txt" 'TEST_WORKERS_FORKED=3'
+	check_in  "minimal 2 worker mengalokasi 12M (akumulasi paralel nyata)" \
+		"$R10B/var/cumul_mem_audit.txt" 'TEST_WORKERS_ALLOCATED=[23]'
+	check_in  "OOM killer mematikan worker (bukti waitpid SIGKILL, bukan self-kill)" \
+		"$R10B/var/cumul_mem_audit.txt" 'WORKER_KILLED_BY_OOM=1'
+	check_in  "leader bertahan hidup dan melaporkan (tidak ada raise(SIGKILL))" \
+		"$R10B/var/cumul_mem_audit.txt" 'LEADER_SURVIVED=1'
+	absent_in "tidak ada exit status=0x9 palsu pada leader mem_cumul" "$L10B" \
 		'mem_cumul (pid .* exit status=0x9'
 	check_in  "leaf cgroup dibersihkan setelah OOM kumulatif" "$L10B" \
 		"cgroup: dibersihkan 'mem_cumul'"

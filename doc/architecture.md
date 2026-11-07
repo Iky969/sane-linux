@@ -43,7 +43,10 @@ siklus dependensi. Semuanya lewat satu helper `enter_rescue_mode(reason)` yang:
 2. mengosongkan signal mask PID 1 (`sigprocmask(SIG_SETMASK, &empty, NULL)`) —
    `main()` memblokir `SIGINT`/`SIGTERM`/`SIGCHLD`/`SIGUSR1`/`SIGUSR2` untuk
    `ppoll`, dan tanpa reset ini rescue shell tidak akan pernah menerima Ctrl+C;
-3. `execl("/bin/sh", "sh", NULL)` menggantikan PID 1; bila gagal, `_exit(1)`.
+3. mereset disposisi `SIGPIPE` ke `SIG_DFL` — `main()` memasang `signal(SIGPIPE, SIG_IGN)`
+   untuk PID 1, dan tanpa reset ini rescue shell mewarisi `SIG_IGN` sehingga utilitas
+   pipeline shell (`yes | head -n 1`) gagal rusak;
+4. `execl("/bin/sh", "sh", NULL)` menggantikan PID 1; bila gagal, `_exit(1)`.
 
 Helper ini tidak pernah kembali, jadi tidak ada jalur boot yang berlanjut dengan
 state setengah jadi (dulu `parse_config()` gagal hanya di-log dan boot lanjut
