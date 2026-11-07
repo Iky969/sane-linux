@@ -1527,6 +1527,7 @@ static void enter_rescue_mode(const char *reason)
         init_log("Peringatan: gagal mengosongkan signal mask: %s", strerror(errno));
 
     init_log("Masuk rescue mode (shell).");
+    signal(SIGPIPE, SIG_DFL);
     execl("/bin/sh", "sh", (char *)NULL);
     init_log("FATAL: execl /bin/sh gagal: %s", strerror(errno));
     _exit(1);

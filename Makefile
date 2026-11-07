@@ -1,6 +1,6 @@
 # ninit -- init system minimal (PID 1)
 #
-#   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall)
+#   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall -Werror)
 #   make test       uji PID 1 di chroot sementara: smoke test + test SIGTERM
 #                   + test konfigurasi + jalur kegagalan spawn + batasan cgroup v2
 #                   dan lifecycle respawn (butuh root/sudo), lalu pemeriksaan
