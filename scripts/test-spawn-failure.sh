@@ -55,7 +55,7 @@ for t in unshare chroot timeout grep mktemp; do
 done
 $SUDO true 2>/dev/null || fail "butuh root atau sudo tanpa password (unshare + chroot)"
 
-CG=/sys/fs/cgroup/ninit-spawn-failure
+CG=/sys/fs/cgroup/ninit-spawnfail-$$
 ROOTS=""
 LOGS=""
 INNER=$(mktemp /tmp/ninit-spawnfail-inner.XXXXXX)
@@ -66,16 +66,11 @@ cleanup() {
 	done
 	for f in ${LOGS:-}; do rm -f "$f"; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
-	$SUDO rmdir "$CG" 2>/dev/null || true
-	for leaf in app ping slow boot; do
-		d="/sys/fs/cgroup/ninit/$leaf"
-		[ -d "$d" ] || continue
-		if [ -f "$d/cgroup.kill" ]; then
-			echo 1 | $SUDO tee "$d/cgroup.kill" >/dev/null 2>&1 || true
-		fi
-		$SUDO rmdir "$d" 2>/dev/null || true
-	done
-	$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
+	# Bersihkan HANYA cgroup khusus skenario 3 (nama unik per-PID). Jangan
+	# pernah menyentuh /sys/fs/cgroup/ninit milik workload lain di host.
+	if [ -d "$CG" ]; then
+		$SUDO rmdir "$CG" 2>/dev/null || true
+	fi
 }
 trap cleanup EXIT INT TERM
 
