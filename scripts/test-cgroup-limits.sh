@@ -539,6 +539,14 @@ static int child_alive(pid_t pid) {
 }
 
 int main(void) {
+    /* Lindungi leader agar tidak menjadi korban OOM killer kernel.
+       Hanya proses worker anak yang boleh dipilih sebagai target OOM. */
+    int oom_fd = open("/proc/self/oom_score_adj", O_WRONLY);
+    if (oom_fd >= 0) {
+        dprintf(oom_fd, "-1000\n");
+        close(oom_fd);
+    }
+
     /* ---- Fase kontrol (anti-hampa): 2 worker x 12MB = 24MB < 32MB.
        Keduanya harus bertahan tanpa OOM killer. ---- */
     pid_t c1 = spawn_worker(1, "CONTROL", 1000);
@@ -556,6 +564,7 @@ int main(void) {
     /* Bersihkan worker kontrol sebelum fase uji. */
     if (c1 > 0) { kill(c1, SIGKILL); waitpid(c1, NULL, 0); }
     if (c2 > 0) { kill(c2, SIGKILL); waitpid(c2, NULL, 0); }
+    usleep(100000); /* beri jeda waktu kernel me-reclaim halaman cgroup */
 
     /* ---- Fase uji: 3 worker x 12MB = 36MB > 32MB.
        Spawn worker 1 & 2 secara bertahap untuk memastikan keduanya memegang
@@ -568,7 +577,7 @@ int main(void) {
     wait_for_marker("TEST_WORKER1_ALLOCATED_12M", 3000);
     w[1] = spawn_worker(2, "TEST", 1000);
     wait_for_marker("TEST_WORKER2_ALLOCATED_12M", 3000);
-    w[2] = spawn_worker(3, "TEST", 0);
+    w[2] = spawn_worker(3, "TEST", 1000);
 
     char buf[4096];
     int seen1 = 0, seen2 = 0, seen3 = 0, oom_kills = 0, st;
