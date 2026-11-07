@@ -838,6 +838,13 @@ static int spawn_service(service_t *svc)
                 close(sync_pipe[1]);
                 sync_pipe[0] = sync_pipe[1] = -1;
                 svc->spawn_tries++;
+                if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
+                    init_log("%s: gagal pasang CLOEXEC %d kali, layanan dinyatakan gagal",
+                             svc->name, svc->spawn_tries);
+                    svc->state = SVC_STATE_FAILED;
+                    svc->spawn_tries = 0;
+                    return 1;
+                }
                 svc->need_respawn = 1;
                 return 0;
             }
