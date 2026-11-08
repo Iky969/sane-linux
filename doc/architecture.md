@@ -56,8 +56,8 @@ dengan nol layanan). Diuji oleh bagian 4 `scripts/test-config.sh`.
 
 ```c
 for (;;) {
-    struct timespec ts = { 0, 100 * 1000 * 1000 };
-    struct timespec *pto = respawn_pending() ? &ts : NULL;   /* timer hanya bila perlu */
+    struct timespec ts;
+    struct timespec *pto = compute_poll_timeout(&ts);   /* timer housekeeping */
     int ret = ppoll(fds, nfds, pto, &orig);
     int perr = errno;                     /* simpan segera: errno mudah tertimpa */
     if (ret < 0 && perr != EINTR) { log(...); continue; }
@@ -72,19 +72,31 @@ for (;;) {
     /* 2. fd siap dibaca: /run/initctl (perintah, diproses PER BARIS) dan
        /run/log.fifo (log layanan) */
 
-    /* 3. selalu terakhir: respawn_services() — juga terpanggil saat ppoll timeout */
+    /* 3. selalu terakhir: housekeeping timeout once, lalu respawn_services()
+       — juga terpanggil saat ppoll timeout */
+    enforce_once_timeout();
     respawn_services();
 }
 ```
+
+`compute_poll_timeout()` memilih timeout ppoll:
+
+- **100 ms** bila ada layanan yang menunggu jeda `respawn_delay` (termasuk
+  backoff crash-loop) — respawn dievaluasi ulang 10× per detik;
+- **1 detik** bila ada layanan `once` yang sedang berjalan, supaya
+  `enforce_once_timeout()` tetap dijalankan walau ppoll akan selamanya
+  blokir (tanpa sinyal/fd baru);
+- **`NULL`** (blokir penuh) bila tidak ada housekeeping yang tertunda.
 
 Poin penting:
 
 - `ppoll` memakai `orig` hasil `sigemptyset()`, bukan mask warisan. Ini memastikan
   **semua** sinyal (termasuk `SIGTERM`) benar-benar di-unblock saat menunggu,
   tanpa tergantung mask yang diwarisi dari proses induk/kernel.
-- Kalau tidak ada respawn yang tertunda, `ppoll` dipanggil dengan timeout `NULL`
-  (tidur sampai ada sinyal/fd). Tidak ada busy-loop, dan saat ada timer hanya
-  terbangun 10× per detik.
+- Kalau tidak ada housekeeping yang tertunda, `ppoll` dipanggil dengan timeout
+  `NULL` (tidur sampai ada sinyal/fd). Tidak ada busy-loop; saat ada timer
+  respawn hanya terbangun 10× per detik, dan saat ada layanan `once` yang
+  berjalan paling banyak 1× per detik (untuk timeout `once`).
 - `errno` disimpan tepat setelah `ppoll` (`perr`) supaya cabang error tidak salah
   terpicu oleh `errno` yang berubah karena panggilan log.
 - Perintah `/run/initctl` dibaca sekali lalu dipecah **per baris**
@@ -141,6 +153,34 @@ Poin penting:
    - Induk mengabaikan `SIGPIPE` (`signal(SIGPIPE, SIG_IGN)` di `main()`) agar tidak mengalami crash jika proses
      anak mati sebelum penulisan sinyal sinkronisasi.
 
+### Handshake pre-exec T1
+
+Anak menunggu konfirmasi induk sebelum `execl()`, sehingga induk sempat
+menyiapkan leaf cgroup dan memindahkan PID anak ke `cgroup.procs` **sebelum**
+instruksi pertama layanan dijalankan:
+
+```
+parent                                   child
+------                                   -----
+pipe2(O_CLOEXEC) ---------------------->  sync_pipe[0/1]
+fork()
+                                         close(sync_pipe[1])
+                                         setsid(); kosongkan signal mask
+                                         stdin </dev/null; stdout/stderr >/run/log.fifo
+                                         tutup fd kontrol PID 1 (T8B)
+                                         read(sync_pipe[0]) --blokir--
+setup_cgroup(name, pid)
+  mkdir leaf; tulis limit; tulis cgroup.procs
+write(sync_pipe[1], "1")  ------------->   (baca selesai)
+close(sync_pipe[1])                      close(sync_pipe[0])
+                                         execl("/bin/sh","sh","-c",cmd)
+```
+
+Baca yang gagal (`nr != 1` atau byte bukan `'1'`) membuat anak `_exit(127)`
+(*fail-closed*), bukan melanjutkan eksekusi di cgroup yang salah. Induk
+menjamin `write()`/penutupan pipe selalu dipanggil setelah `setup_cgroup()`
+(termasuk pada jalur fail-open), sehingga anak tidak pernah deadlock.
+
 Kegagalan `fork()`/`mount()`/cgroup hanya di-log; init tidak berhenti.
 
 ### Reaping zombie (`reap_zombies`)
@@ -162,6 +202,22 @@ respawn dipisahkan ke `respawn_services()` yang dipanggil dari loop utama.
 Dipanggil di akhir tiap iterasi loop: untuk tiap layanan dengan `respawn = 1` dan
 `pid == 0`, panggil `spawn_service()`. Guard `shutting_down` di dalamnya memastikan
 tidak ada respawn setelah shutdown dimulai.
+
+### Timeout `once` & backoff `respawn`
+
+- **`ONCE_START_TIMEOUT` (30 detik)**: `enforce_once_timeout()` dijalankan di
+  akhir tiap iterasi loop. Layanan `once` yang `SVC_STATE_RUNNING` lebih dari
+  30 detik dinyatakan `SVC_STATE_FAILED`, prosesnya dihentikan
+  (`kill_service_group` SIGKILL), dan semua dependen transitif dibatalkan
+  (`cancel_dependents()`). Housekeeping ini dijamin berjalan karena
+  `compute_poll_timeout()` memasang timeout ppoll 1 detik selama ada layanan
+  `once` yang berjalan.
+- **Backoff eksponensial + start-limit `respawn`**: saat layanan `respawn`
+  mati kurang dari `RESPAWN_DELAY` (2 detik) setelah start, `crash_count`
+  naik dan `respawn_delay` menjadi `min(BACKOFF_MAX=32, 2 << crash_count)`
+  (4, 8, 16, 32, 32, …). Setelah `CRASH_LIMIT` (5) kegagalan berturut-turut,
+  layanan dinyatakan `SVC_STATE_FAILED` dan respawn dihentikan. Hidup lebih
+  dari `STABLE_RUNTIME` (10 detik) me-reset `crash_count` dan `respawn_delay`.
 
 ### Dependensi (`validate_dependencies` + `sort_services`)
 
@@ -201,6 +257,7 @@ Detail yang penting untuk yang menyentuh fungsi ini:
 | Kirim `SIGTERM` ke semua layanan | ✅ | — |
 | Tunggu sampai 50 × 100 ms (maks 5 detik): `reap_zombies()` + `drain_log_fifo()` tiap iterasi | ✅ | — |
 | `SIGKILL` ke sisa layanan | ✅ | langsung |
+| Remount `/` read-only + `umount2(MNT_DETACH)` entri fstab yang dicatat | ✅ | ✅ |
 | `sync()` → `reboot(cmd)` → `while(1) pause()` | ✅ | ✅ |
 
 `cmd` adalah `RB_POWER_OFF` (SIGTERM/USR1) atau `RB_AUTOBOOT` (SIGINT/USR2).
@@ -208,6 +265,12 @@ Bila `reboot()` gagal (umum di container/sandbox), kegagalan di-log dan init tet
 berhenti di `pause()`.
 
 ## Cgroups v2
+
+Status: **implementasi penuh** (bukan rencana). Penegakan batas `memory.max`,
+`memory.swap.max=0`, `cpu.max`, dan `pids.max` dijaga oleh
+`scripts/test-cgroup-limits.sh` (skenario 1, 4, 7, 9, 10). Cgroup v2 adalah
+pembatasan resource, bukan sandbox isolasi proses — lihat
+[SECURITY.md](../SECURITY.md).
 
 - Mount dicek lebih dulu di `setup_pseudo_fs()` via
   `/sys/fs/cgroup/cgroup.controllers`; kalau belum ada, `cgroup2` di-mount ke

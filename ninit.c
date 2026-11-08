@@ -30,6 +30,10 @@
 #define MAX_LINE        1024
 #define RESPAWN_DELAY   2
 #define MAX_SPAWN_RETRY 3   /* percobaan fork() ulang untuk layanan once */
+#define ONCE_START_TIMEOUT 30  /* detik maksimum layanan once boleh berjalan */
+#define CRASH_LIMIT        5   /* crash berturut-turut sebelum respawn dihentikan */
+#define BACKOFF_MAX        32  /* batas atas jeda respawn eksponensial (detik) */
+#define STABLE_RUNTIME     10  /* detik hidup stabil sebelum backoff direset */
 
 typedef enum {
     SVC_STATE_STOPPED = 0,
@@ -50,7 +54,9 @@ typedef struct {
     int         need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
     int         spawn_tries;    /* jumlah berturut-turut fork() gagal; dinolkan saat spawn sukses */
     int         cgroup_fail_open; /* 1 = cgroup setup gagal, orphan cleanup via kill(-pgid) */
-    time_t      last_start;
+    time_t      last_start;     /* waktu spawn terakhir (timeout once & jeda respawn) */
+    int         crash_count;    /* crash berturut-turut saat respawn (start-limit) */
+    int         respawn_delay;  /* jeda respawn saat ini (detik, backoff eksponensial) */
     char        deps_str[256]; 
     svc_state_t state;
     char        memory_max[64];
@@ -64,6 +70,7 @@ static int num_services = 0;
 static int find_service(const char *name);
 static void enable_cgroup_subtree(const char *path);
 static void cgroup_kill_service(const char *name);
+static void kill_service_group(const service_t *svc, int sig);
 
 static volatile sig_atomic_t sigchld_flag  = 0;
 static volatile sig_atomic_t sigterm_flag  = 0;
@@ -73,7 +80,14 @@ static volatile sig_atomic_t sigusr2_flag  = 0;
 
 static int log_file_fd = -1;
 static int g_log_fifo_fd = -1;  /* ujung baca /run/log.fifo; dipakai juga saat shutdown */
+static int initctl_fd = -1;     /* ujung /run/initctl; ditutup sebelum exec */
 static int shutting_down = 0;   /* 1 = shutdown sedang berjalan: jangan respawn layanan */
+
+/* Mountpoint fstab yang berhasil di-mount mount_fstab(); dipakai
+   shutdown_all() untuk unmount sebelum reboot (T8E). */
+#define MAX_SEEN_MNT 64
+static char g_seen_mnt[MAX_SEEN_MNT][MAX_LINE];
+static int  g_seen_cnt = 0;
 
 /* ---------- logging ---------- */
 static void init_log(const char *fmt, ...)
@@ -197,6 +211,22 @@ static void set_hostname(void)
 /* ---------- cgroups v2 ---------- */
 #define CGROUP_BASE "/sys/fs/cgroup/ninit"
 
+/* Lapis pertahanan kedua untuk path cgroup (SANE-06-02): parse_config sudah
+   menolak nama kosong/"."/".."/mengandung "..", tapi setup_cgroup(),
+   cgroup_kill_service(), dan cleanup_cgroup() membangun path
+   CGROUP_BASE/<nama> — pastikan tidak ada nama bermasalah yang lolos dari
+   state internal. Mengembalikan 1 bila nama aman, 0 bila harus ditolak. */
+static int cgroup_name_safe(const char *name)
+{
+    if (!name || name[0] == '\0' || strcmp(name, ".") == 0 ||
+        strcmp(name, "..") == 0 || strstr(name, "..") != NULL) {
+        init_log("cgroup: nama layanan '%s' tidak valid, operasi cgroup dibatalkan",
+                 name ? name : "(null)");
+        return 0;
+    }
+    return 1;
+}
+
 /* Picu cgroup.kill layanan (berdasarkan NAMA, bukan pid): membunuh seluruh
    anggota cgroup, termasuk proses yang grup prosesnya sudah berubah.
    Dipanggil saat respawn, leader exit, dan saat shutdown. */
@@ -250,6 +280,8 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
 {
     char dir[256], procs[320];   /* procs = dir (maks 255) + "/cgroup.procs" */
     int fd;
+
+    if (!cgroup_name_safe(svc_name)) return 1;   /* fail-open: jangan sentuh path */
 
     /* cgroup v2 tidak membuat parent otomatis */
     if (mkdir(CGROUP_BASE, 0755) < 0 && errno != EEXIST) {
@@ -369,6 +401,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
 /* Hapus direktori cgroup layanan saat layanan berhenti */
 static void cleanup_cgroup(const char *svc_name)
 {
+    if (!cgroup_name_safe(svc_name)) return;
     cgroup_kill_service(svc_name);
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
@@ -518,6 +551,24 @@ static int parse_config(const char *path)
             init_log("Parse err: nama layanan '%s' tidak boleh memuat '/'", name);
             continue;
         }
+
+        /* Tolak nama kosong, ".", "..", atau yang memuat "..": path cgroup
+           dibangun sebagai CGROUP_BASE/<nama>, dan komponen "."/".." membuat
+           path melarikan diri dari base (SANE-06-02). */
+        if (name[0] == '\0' || strcmp(name, ".") == 0 ||
+            strcmp(name, "..") == 0 || strstr(name, "..") != NULL) {
+            init_log("Parse err: nama layanan '%s' tidak valid (kosong, '.', '..', atau memuat '..'), entri ditolak",
+                     name);
+            continue;
+        }
+
+        /* Tolak nama duplikat: find_service() selalu memakai kemunculan
+           pertama, jadi entri kedua diam-diam berbagi leaf cgroup,
+           dependensi, dan jadwal respawn dengan yang pertama (SANE-06-03). */
+        if (find_service(name) >= 0) {
+            init_log("Parse err: nama layanan '%s' sudah terdaftar, entri duplikat ditolak", name);
+            continue;
+        }
         
         /* Cari tag opsi (:requires=, :memory_max=, :cpu_max=, :pids_max=) */
         char *deps = "";
@@ -645,6 +696,8 @@ static int parse_config(const char *path)
         services[num_services].respawn      = is_respawn;
         services[num_services].need_respawn = 0;
         services[num_services].spawn_tries  = 0;
+        services[num_services].crash_count  = 0;
+        services[num_services].respawn_delay = RESPAWN_DELAY;
         services[num_services].cgroup_fail_open = 0;
         services[num_services].pid          = 0;
         services[num_services].pgid         = 0;
@@ -794,12 +847,13 @@ static int spawn_service(service_t *svc)
     time_t now = time(NULL);
 
     /* Jangan blokir event loop dengan sleep(): kalau masih di dalam jendela
-       RESPAWN_DELAY, tandai need_respawn dan biarkan timeout ppoll di loop utama
-       yang berperan sebagai timer. */
-    if (svc->last_start && (now - svc->last_start) < RESPAWN_DELAY) {
+       respawn_delay, tandai need_respawn dan biarkan timeout ppoll di loop utama
+       yang berperan sebagai timer. respawn_delay naik eksponensial saat
+       crash-loop (T8D), bukan tetap RESPAWN_DELAY. */
+    if (svc->last_start && (now - svc->last_start) < svc->respawn_delay) {
         if (!svc->need_respawn)
             init_log("%s: respawn ditunda (timer %d detik, loop tidak diblokir)",
-                     svc->name, RESPAWN_DELAY);
+                     svc->name, svc->respawn_delay);
         svc->need_respawn = 1;
         return 0;
     }
@@ -928,6 +982,15 @@ static int spawn_service(service_t *svc)
             close(sync_pipe[0]);
         }
 
+        /* T8B: jangan biarkan fd kontrol PID 1 bocor ke layanan. Flag
+           O_CLOEXEC sudah dipasang di sisi induk, tetapi penutupan eksplisit
+           di cabang anak ini menutupi fd yang dibuka sebelum flag itu ada
+           dan memastikan batas privilege-drop -> control plane tidak
+           ditembus (SANE-06-01). */
+        if (initctl_fd >= 0)    close(initctl_fd);
+        if (g_log_fifo_fd >= 0) close(g_log_fifo_fd);
+        if (log_file_fd >= 0)   close(log_file_fd);
+
         execl("/bin/sh", "sh", "-c", svc->cmd, (char *)NULL);
         _exit(127);
     }
@@ -988,6 +1051,36 @@ static void reap_zombies(void)
                            runtime mungkin masih hidup di grup */
                         if (services[i].pgid > 0)
                             kill(-services[i].pgid, SIGKILL);
+                    }
+
+                    /* T8D: deteksi crash-loop + start-limit. Layanan respawn
+                       yang mati dalam < RESPAWN_DELAY detik dianggap crash;
+                       jeda respawn naik eksponensial (min(BACKOFF_MAX,
+                       2 << crash_count)) dan setelah CRASH_LIMIT kegagalan
+                       berturut-turut layanan dinyatakan gagal. Hidup lebih
+                       dari STABLE_RUNTIME detik menandakan stabil: hitungan
+                       dan jeda direset. */
+                    if (!shutting_down) {
+                        long lifetime = services[i].last_start
+                                        ? (long)(time(NULL) - services[i].last_start) : 0;
+                        if (lifetime >= 0 && lifetime < RESPAWN_DELAY) {
+                            services[i].crash_count++;
+                            int d = 2 << services[i].crash_count;
+                            services[i].respawn_delay = d > BACKOFF_MAX ? BACKOFF_MAX : d;
+                            if (services[i].crash_count >= CRASH_LIMIT) {
+                                init_log("%s: crash-loop terdeteksi (%d kegagalan berturut-turut), layanan dinyatakan gagal",
+                                         services[i].name, services[i].crash_count);
+                                services[i].state = SVC_STATE_FAILED;
+                                services[i].need_respawn = 0;
+                            } else {
+                                init_log("%s: crash-loop ke-%d, jeda respawn naik ke %d detik",
+                                         services[i].name, services[i].crash_count,
+                                         services[i].respawn_delay);
+                            }
+                        } else if (lifetime > STABLE_RUNTIME) {
+                            services[i].crash_count = 0;
+                            services[i].respawn_delay = RESPAWN_DELAY;
+                        }
                     }
                 }
                 break;
@@ -1098,7 +1191,7 @@ static void respawn_services(void)
     }
 }
 
-/* Ada layanan yang menunggu timer RESPAWN_DELAY? Kalau ada, ppoll dipanggil
+/* Ada layanan yang menunggu timer respawn_delay? Kalau ada, ppoll dipanggil
    dengan timeout 100 ms; kalau tidak, NULL (blokir sampai sinyal/fd). */
 static int respawn_pending(void)
 {
@@ -1106,6 +1199,85 @@ static int respawn_pending(void)
         if (services[i].need_respawn)
             return 1;
     return 0;
+}
+
+/* Timeout ppoll untuk housekeeping loop utama:
+   - 100 ms bila ada respawn tertunda (timer respawn_delay/backoff);
+   - 1 detik bila ada layanan once yang sedang berjalan, supaya
+     enforce_once_timeout() tetap dijalankan walau ppoll akan selamanya
+     blokir (tanpa sinyal/fd baru);
+   - NULL (blokir penuh) bila tidak ada housekeeping yang tertunda. */
+static struct timespec *compute_poll_timeout(struct timespec *ts)
+{
+    if (respawn_pending()) {
+        ts->tv_sec = 0;
+        ts->tv_nsec = 100 * 1000 * 1000;
+        return ts;
+    }
+    for (int i = 0; i < num_services; i++) {
+        if (services[i].respawn) continue;
+        if (services[i].state == SVC_STATE_RUNNING) {
+            ts->tv_sec = 1;
+            ts->tv_nsec = 0;
+            return ts;
+        }
+    }
+    return NULL;
+}
+
+/* T8D: batalkan semua layanan (transitif) yang bergantung pada layanan yang
+   gagal. Penutupan transitif dijalankan sampai titik tetap supaya dependen
+   dari dependen ikut batal, bukan hanya satu level. Layanan yang masih
+   berjalan (pid > 0) dibiarkan — itu tugas shutdown. */
+static void cancel_dependents(void)
+{
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < num_services; i++) {
+            service_t *svc = &services[i];
+            if (svc->state == SVC_STATE_FAILED || svc->state == SVC_STATE_DONE)
+                continue;
+            if (svc->pid > 0) continue;
+            int off = 0;
+            char token[256];
+            while (next_dep(svc->deps_str, &off, token, sizeof(token))) {
+                int di = find_service(token);
+                if (di >= 0 && services[di].state == SVC_STATE_FAILED) {
+                    init_log("layanan '%s' dibatalkan: dependensi '%s' gagal",
+                             svc->name, token);
+                    svc->state = SVC_STATE_FAILED;
+                    changed = 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* T8D: layanan once yang berjalan melewati ONCE_START_TIMEOUT dinyatakan
+   gagal (fail-closed). Prosesnya dihentikan dan semua dependen yang
+   menunggunya dibatalkan, supaya boot progression tidak menggantung
+   selamanya tanpa escalasi. last_start menyimpan waktu spawn terakhir. */
+static void enforce_once_timeout(void)
+{
+    if (shutting_down) return;
+
+    time_t now = time(NULL);
+    for (int i = 0; i < num_services; i++) {
+        service_t *svc = &services[i];
+        if (svc->respawn) continue;
+        if (svc->state != SVC_STATE_RUNNING) continue;
+        if (!svc->last_start || (now - svc->last_start) < ONCE_START_TIMEOUT) continue;
+
+        init_log("%s: layanan once melebihi batas waktu %d detik, dinyatakan gagal",
+                 svc->name, ONCE_START_TIMEOUT);
+        svc->state = SVC_STATE_FAILED;
+        svc->need_respawn = 0;
+        if (svc->pid > 0)
+            kill_service_group(svc, SIGKILL);
+        cancel_dependents();
+    }
 }
 
 /* Baca SEMUA output layanan yang tertunda di /run/log.fifo dan teruskan ke
@@ -1163,6 +1335,27 @@ static int service_still_alive(service_t *svc)
     return 0;
 }
 
+/* T8E: tutup filesystem sebelum reboot. Remount / read-only dulu supaya tidak
+   ada lagi penulisan ke rootfs, lalu lepas entri fstab yang dicatat
+   mount_fstab() dengan MNT_DETACH (aman bila masih ada proses memakainya).
+   Kegagalan di-log dan tidak menggagalkan shutdown. */
+static void prepare_filesystems(void)
+{
+    if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
+        init_log("shutdown: remount / read-only gagal: %s", strerror(errno));
+    else
+        init_log("shutdown: / remounted read-only");
+
+    for (int i = 0; i < g_seen_cnt; i++) {
+        if (umount2(g_seen_mnt[i], MNT_DETACH) < 0) {
+            if (errno != EINVAL && errno != ENOENT)
+                init_log("shutdown: umount2 %s gagal: %s", g_seen_mnt[i], strerror(errno));
+        } else {
+            init_log("shutdown: umount2 %s ok", g_seen_mnt[i]);
+        }
+    }
+}
+
 /* ---------- shutdown ---------- */
 static void shutdown_all(int reboot_cmd, int force)
 {
@@ -1182,7 +1375,7 @@ static void shutdown_all(int reboot_cmd, int force)
             cleanup_cgroup(services[i].name);
         }
         rmdir(CGROUP_BASE);
-        reap_zombies(); sync();
+        reap_zombies(); prepare_filesystems(); sync();
         if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
         while (1) pause();
     }
@@ -1226,14 +1419,17 @@ static void shutdown_all(int reboot_cmd, int force)
         cleanup_cgroup(services[i].name);
     }
     rmdir(CGROUP_BASE);
+    prepare_filesystems();
     sync();
     if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
     while (1) pause();
 }
 
 /* ---------- setup IPC (FIXED: O_RDWR) ---------- */
-static int setup_initctl(void) { mkfifo("/run/initctl", 0600); return open("/run/initctl", O_RDWR | O_NONBLOCK); }
-static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/run/log.fifo", O_RDWR | O_NONBLOCK); }
+/* T8B: O_CLOEXEC wajib pada fd kontrol PID 1 agar tidak bocor ke proses
+   layanan (SANE-06-01). O_RDWR menjaga FIFO selalu punya pembaca. */
+static int setup_initctl(void) { mkfifo("/run/initctl", 0600); return open("/run/initctl", O_RDWR | O_NONBLOCK | O_CLOEXEC); }
+static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/run/log.fifo", O_RDWR | O_NONBLOCK | O_CLOEXEC); }
 
 /* ---------- /etc/fstab (FITUR BARU) ---------- */
 #ifndef FSTAB_PATH
@@ -1471,10 +1667,9 @@ static void mount_fstab(void)
        bawahnya (nosuid bisa hilang tanpa jejak). Entri duplikat kini
        dilewati dan dicatat. Hanya mount yang BERHASIL yang dicatat, jadi
        kegagalan entri pertama tidak menghalangi mountpoint yang sama
-       dicoba lagi oleh entri berikutnya. */
-    enum { MAX_SEEN_MNT = 64 };
-    static char seen_mnt[MAX_SEEN_MNT][MAX_LINE];
-    int seen_cnt = 0;
+       dicoba lagi oleh entri berikutnya. Catatan ini juga dipakai
+       prepare_filesystems() saat shutdown (T8E). */
+    /* g_seen_mnt/g_seen_cnt didefinisikan di scope file (T8E). */
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
@@ -1529,8 +1724,8 @@ static void mount_fstab(void)
            entri yang dilewati tidak meninggalkan direktori hantu, sama
            seperti noauto/bind. */
         int is_dup = 0;
-        for (int i = 0; i < seen_cnt; i++)
-            if (same_mountpoint(seen_mnt[i], mnt)) { is_dup = 1; break; }
+        for (int i = 0; i < g_seen_cnt; i++)
+            if (same_mountpoint(g_seen_mnt[i], mnt)) { is_dup = 1; break; }
         if (is_dup) {
             init_log("fstab: %s -> %s dilewati (mountpoint duplikat, sudah di-mount entri sebelumnya)", dev, mnt);
             continue;
@@ -1546,8 +1741,8 @@ static void mount_fstab(void)
         else {
             init_log("fstab: mount %s -> %s (%s) [data: %s] ok", dev, mnt, type,
                      databuf[0] ? databuf : "-");
-            if (seen_cnt < MAX_SEEN_MNT)
-                snprintf(seen_mnt[seen_cnt++], MAX_LINE, "%s", mnt);
+            if (g_seen_cnt < MAX_SEEN_MNT)
+                snprintf(g_seen_mnt[g_seen_cnt++], MAX_LINE, "%s", mnt);
         }
     }
     fclose(f);
@@ -1581,6 +1776,15 @@ static void enter_rescue_mode(const char *reason)
 
     init_log("Masuk rescue mode (shell).");
     signal(SIGPIPE, SIG_DFL);
+
+    /* T8B: lepaskan fd kontrol PID 1 sebelum exec (SANE-06-01). Flag
+       O_CLOEXEC sudah dipasang di sisi induk; penutupan eksplisit ini
+       menutupi fd yang dibuka sebelum flag itu ada dan menutupi jalur
+       rescue yang dipanggil sebelum setup_initctl()/setup_log_fifo(). */
+    if (initctl_fd >= 0)    close(initctl_fd);
+    if (g_log_fifo_fd >= 0) close(g_log_fifo_fd);
+    if (log_file_fd >= 0)   close(log_file_fd);
+
     execl("/bin/sh", "sh", (char *)NULL);
     init_log("FATAL: execl /bin/sh gagal: %s", strerror(errno));
     _exit(1);
@@ -1613,7 +1817,7 @@ int main(int argc, char **argv)
     setup_pseudo_fs();
     mount_fstab();
     
-    log_file_fd = open("/var/log/ninit.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    log_file_fd = open("/var/log/ninit.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     init_log("=== ninit start (PID 1) v1.0.0 ===");
 
     set_hostname();
@@ -1633,7 +1837,7 @@ int main(int argc, char **argv)
     if (num_services > 0 && sort_services() < 0)
         enter_rescue_mode("Cycle terdeteksi!");
 
-    int initctl_fd = setup_initctl();
+    initctl_fd = setup_initctl();
     int log_fifo_fd = setup_log_fifo();
     g_log_fifo_fd = log_fifo_fd;
 
@@ -1658,9 +1862,12 @@ int main(int argc, char **argv)
     } else init_log("Peringatan: log_fifo_fd tidak valid");
 
     for (;;) {
-        /* FIXED: Gunakan nfds yang dinamis, ppoll dengan mask orig */
-        struct timespec respawn_ts = { 0, 100 * 1000 * 1000 };   /* timer 100 ms */
-        struct timespec *pto = respawn_pending() ? &respawn_ts : NULL;
+        /* FIXED: Gunakan nfds yang dinamis, ppoll dengan mask orig.
+           Timeout housekeeping: 100 ms bila ada respawn tertunda, atau
+           1 detik bila ada layanan once yang berjalan (supaya
+           enforce_once_timeout() tetap jalan tanpa menunggu sinyal). */
+        struct timespec ts;
+        struct timespec *pto = compute_poll_timeout(&ts);
 
         int ret = ppoll(fds, nfds, pto, &orig);
         int perr = errno;   /* simpan segera: errno mudah berubah oleh panggilan lain */
@@ -1714,8 +1921,10 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Akhir loop: proses layanan yang respawn-nya tertunda. Juga terpanggil
-           saat ppoll timeout (ret == 0) -> timer merespawn tanpa sleep(). */
+        /* Akhir loop: housekeeping timeout layanan once, lalu proses layanan
+           yang respawn-nya tertunda. Juga terpanggil saat ppoll timeout
+           (ret == 0) -> timer merespawn tanpa sleep(). */
+        enforce_once_timeout();
         respawn_services();
         spawn_eligible_services();
     }

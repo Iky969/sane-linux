@@ -74,6 +74,19 @@ mencantumkan kredit pelapor di advisory bila diinginkan.
 - Output layanan dibaca dari `/run/log.fifo` dengan mode non-blocking, sehingga
   layanan tidak bisa memblokir init lewat FD penuh (tetap ada batas buffer
   kernel — laporan bila hal ini bisa menggantungkan sistem).
+- **Cgroup v2 adalah pembatasan resource, bukan sandbox isolasi proses.**
+  Controller `memory`/`cpu`/`pids` membatasi kuota, tetapi:
+  - Batas **tidak** mengisolasi PID, mount, network, atau filesystem namespace;
+    semua layanan berbagi namespace yang sama dengan PID 1.
+  - Bila controller tidak tersedia (kernel tanpa `CONFIG_CGROUPS`, container
+    tanpa delegasi), ninit membaca *fail-open*: layanan berjalan **tanpa batas**
+    dan hanya dicatat di log. Tidak ada mode fail-closed untuk resource.
+  - Layanan yang menurunkan hak (`setuid`/`setgid`) tetap berada di leaf cgroup
+    yang sama; cgroup v2 **tidak** menegakkan privilege boundary.
+- FD kontrol PID 1 (`/run/initctl`, `/run/log.fifo`, `/var/log/ninit.log`)
+  bertanda `O_CLOEXEC` dan ditutup eksplisit di cabang anak/di rescue shell
+  sebelum `execl()`, sehingga layanan yang menurunkan hak tidak mewarisi handle
+  ke control plane (SANE-06-01).
 - `/dev/kmsg` ditulis oleh init; pada sistem nyata ini berarti log boot masuk ke
   kernel ring buffer dan bisa terekam di journal/dmesg.
 - Sebelum dipakai di mesin penting: uji dulu di VM/container, siapkan akses serial
