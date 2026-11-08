@@ -8,7 +8,7 @@ menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 
 Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
 initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
-[`ninit.c`](ninit.c) (~1580 baris), biner statis, nol warning dengan
+[`ninit.c`](ninit.c) (~1932 baris), biner statis, nol warning dengan
 `-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
@@ -38,6 +38,23 @@ responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
   `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
   penulisan tidak saling menelan.
 - **Biner statis** (`gcc -static`): cukup libc, tanpa library tambahan.
+
+### Cgroup v2 — kapabilitas pembatasan resource
+
+Setiap layanan ditempatkan di leaf `/sys/fs/cgroup/ninit/<nama>` dan batas
+berikut ditegakkan kernel **sebelum** proses layanan dijalankan (melalui
+handshake pre-exec):
+
+| Controller | File cgroup v2 | Opsi `/etc/init.conf` | Dampak bila terlampaui |
+|---|---|---|---|
+| memory | `memory.max` | `:memory_max=16M` | OOM killer (SIGKILL, exit `0x9`) |
+| memory (swap) | `memory.swap.max` | *(otomatis)* | dipaksa `0` agar batas memory tidak bocor ke swap |
+| cpu | `cpu.max` | `:cpu_max=50000 100000` | kuota CPU `<quota> <period>` (period 100000 µs) |
+| pids | `pids.max` | `:pids_max=50` | `fork()` ditolak dengan `EAGAIN` |
+
+Bila hierarki cgroup v2 tidak tersedia (kernel tanpa `CONFIG_CGROUPS`,
+container/chroot tanpa delegasi controller), ninit mencatat fallback
+*fail-open* dan layanan tetap berjalan tanpa batas — bukan menggagalkan boot.
 
 ## Mulai cepat
 
@@ -146,9 +163,16 @@ net:respawn:/sbin/dhcpcd -B eth0:requires=logd:memory_max=32M
 # daemon aplikasi: kuota CPU 50% dan maks 20 proses
 app:respawn:/usr/bin/myapp:cpu_max=50000 100000:pids_max=20
 
+# semua opsi sekaligus: memori 64M, kuota CPU 50%, maks 25 proses
+db:respawn:/usr/bin/db:requires=logd:memory_max=64M:cpu_max=50000 100000:pids_max=25
+
 # shell darurat
 tty1:respawn:/bin/sh
 ```
+
+`memory.swap.max` tidak perlu ditulis: ninit memaksa `0` otomatis pada leaf
+setiap layanan yang memakai `:memory_max=`, sehingga batas memory tidak bocor
+ke swap.
 
 `/etc/fstab` — kolom `device mountpoint type options` (`dump`/`pass` opsional,
 komentar `#` diabaikan):
