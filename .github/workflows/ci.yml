@@ -25,6 +25,8 @@ jobs:
 
   build-and-smoke-test:
     runs-on: ubuntu-latest
+    env:
+      CFLAGS: "-static -O2 -Wall -Werror"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -70,6 +72,8 @@ jobs:
     # kompilasi BusyBox defconfig pernah gagal total di kernel headers baru dan
     # tidak ketahuan karena tidak ada yang membangunnya.
     runs-on: ubuntu-latest
+    env:
+      CFLAGS: "-static -O2 -Wall -Werror"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

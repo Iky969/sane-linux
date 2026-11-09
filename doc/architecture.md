@@ -205,19 +205,27 @@ tidak ada respawn setelah shutdown dimulai.
 
 ### Timeout `once` & backoff `respawn`
 
-- **`ONCE_START_TIMEOUT` (30 detik)**: `enforce_once_timeout()` dijalankan di
-  akhir tiap iterasi loop. Layanan `once` yang `SVC_STATE_RUNNING` lebih dari
-  30 detik dinyatakan `SVC_STATE_FAILED`, prosesnya dihentikan
-  (`kill_service_group` SIGKILL), dan semua dependen transitif dibatalkan
-  (`cancel_dependents()`). Housekeeping ini dijamin berjalan karena
-  `compute_poll_timeout()` memasang timeout ppoll 1 detik selama ada layanan
-  `once` yang berjalan.
+- **`ONCE_START_TIMEOUT` (default 30 detik, konfigurabel via `:timeout=`)**:
+  `enforce_once_timeout()` dijalankan di akhir tiap iterasi loop. Default batas waktu
+  layanan `once` adalah 30 detik (`ONCE_START_TIMEOUT`), atau ditentukan per-layanan
+  lewat opsi `:timeout=<detik>`. Nilai `0` atau `none` menonaktifkan timeout.
+  Layanan `once` yang berjalan melebihi batas waktunya dinyatakan `SVC_STATE_FAILED`,
+  prosesnya dihentikan (`kill_service_group` SIGKILL), dan semua dependen transitif
+  dibatalkan (`cancel_dependents()`). Housekeeping ini dijamin berjalan karena
+  `compute_poll_timeout()` memasang timeout ppoll 1 detik selama ada layanan `once`
+  dengan timeout aktif yang sedang berjalan.
+  > **Peringatan**: menonaktifkan timeout (`:timeout=0` atau `none`) berisiko membuat
+  > seluruh layanan dependen menggantung selamanya bila perintah layanan `once`
+  > mengalami kebuntuan (*hang* / *deadlock*).
 - **Backoff eksponensial + start-limit `respawn`**: saat layanan `respawn`
   mati kurang dari `RESPAWN_DELAY` (2 detik) setelah start, `crash_count`
   naik dan `respawn_delay` menjadi `min(BACKOFF_MAX=32, 2 << crash_count)`
   (4, 8, 16, 32, 32, …). Setelah `CRASH_LIMIT` (5) kegagalan berturut-turut,
-  layanan dinyatakan `SVC_STATE_FAILED` dan respawn dihentikan. Hidup lebih
-  dari `STABLE_RUNTIME` (10 detik) me-reset `crash_count` dan `respawn_delay`.
+  layanan dinyatakan `SVC_STATE_FAILED` dan respawn dihentikan.
+  `deps_satisfied()` memperlakukan dependensi `respawn` yang berstatus
+  `SVC_STATE_FAILED` sebagai kegagalan (`-1`), sehingga `spawn_eligible_services()`
+  langsung membatalkan seluruh layanan yang bergantung padanya secara transitif.
+  Hidup lebih dari `STABLE_RUNTIME` (10 detik) me-reset `crash_count` dan `respawn_delay`.
 
 ### Dependensi (`validate_dependencies` + `sort_services`)
 

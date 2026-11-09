@@ -23,6 +23,10 @@
 # fork() mengembalikan EAGAIN lewat controller cgroup v2 `pids` (root kebal
 # RLIMIT_NPROC, jadi pids.max=1 adalah satu-satunya cara deterministik);
 # skenario ini dilewati dengan catatan bila pids controller tidak terdelegasi.
+# Skenario 4 menguji crash-loop limit pada layanan respawn yang membatalkan
+# layanan dependen (transitif).
+# Skenario 5 menguji penegakan batas waktu :timeout= pada layanan once yang
+# mengeksekusi SIGKILL dan membatalkan layanan dependen.
 #
 # Pemakaian:
 #   sudo sh ./scripts/test-spawn-failure.sh      # atau: make test
@@ -58,6 +62,7 @@ $SUDO true 2>/dev/null || fail "butuh root atau sudo tanpa password (unshare + c
 CG=/sys/fs/cgroup/ninit-spawnfail-$$
 ROOTS=""
 LOGS=""
+HELPERS=""
 INNER=$(mktemp /tmp/ninit-spawnfail-inner.XXXXXX)
 cleanup() {
 	for d in ${ROOTS:-}; do
@@ -65,6 +70,7 @@ cleanup() {
 		rm -rf "$d"
 	done
 	for f in ${LOGS:-}; do rm -f "$f"; done
+	for h in ${HELPERS:-}; do rm -f "$h"; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
 	# Bersihkan HANYA cgroup khusus skenario 3 (nama unik per-PID). Jangan
 	# pernah menyentuh /sys/fs/cgroup/ninit milik workload lain di host.
@@ -213,6 +219,65 @@ else
 		bad "percobaan fork() boot tidak terbatas: $nfork baris (dugaan busy-loop)"
 	fi
 fi
+
+# ------------------------------------------------------------- Skenario 4
+# Layanan respawn yang crash-loop berulang hingga FAILED membatalkan seluruh
+# layanan dependennya transitif (bukan menggantung di STOPPED selamanya).
+# Biner ninit dikompilasi dengan batas override -DCRASH_LIMIT=2 -DBACKOFF_MAX=1
+# agar crash-loop terdeteksi cepat (<3 detik) tanpa menunggu interval 60s.
+printf '\n== Skenario 4: Layanan respawn crash-loop membatalkan layanan dependen ==\n'
+BIN_FAST=$(mktemp /tmp/ninit-fast-bin.XXXXXX)
+HELPERS="$HELPERS $BIN_FAST"
+gcc -static -O2 -Wall -DCRASH_LIMIT=2 -DBACKOFF_MAX=1 ./ninit.c -o "$BIN_FAST"
+
+R4=$(new_root sleep)
+L4=$(new_log)
+ROOTS="$ROOTS $R4"
+LOGS="$LOGS $L4"
+
+# Ganti biner ninit di guest dengan biner fast-crash
+cp "$BIN_FAST" "$R4/ninit"
+
+cat > "$R4/etc/init.conf" << 'EOF'
+slow:once:/bin/sleep 2
+crasher:respawn:exit 1
+dep:once:echo DEP_STARTED > /var/dep.txt:requires=crasher,slow
+stopper:once:/bin/sh -c "/bin/sleep 4 && echo poweroff > /run/initctl"
+EOF
+
+boot_guest "$R4" 6 "" >"$L4" 2>&1
+
+check_in  "crasher terdeteksi crash-loop dan dinyatakan gagal" "$L4" \
+	'crasher: crash-loop terdeteksi'
+check_in  "dependen dibatalkan karena dependensi respawn gagal" "$L4" \
+	"layanan 'dep' dibatalkan: dependensi 'crasher' gagal"
+absent_in "dependen tidak pernah dijalankan" "$L4" 'started dep'
+
+# ------------------------------------------------------------- Skenario 5
+# Layanan once dengan batas :timeout=2 yang tidur melebihi batas waktu di-SIGKILL
+# dan seluruh dependennya dibatalkan secara transitif.
+printf '\n== Skenario 5: Layanan once dengan :timeout=2 dibunuh & dependen dibatalkan ==\n'
+R5=$(new_root sleep)
+L5=$(new_log)
+ROOTS="$ROOTS $R5"
+LOGS="$LOGS $L5"
+
+cat > "$R5/etc/init.conf" << 'EOF'
+hanger:once:/bin/sleep 20:timeout=2
+dep:once:echo DEP_STARTED > /var/dep.txt:requires=hanger
+stopper:once:/bin/sh -c "/bin/sleep 4 && echo poweroff > /run/initctl"
+EOF
+
+boot_guest "$R5" 6 "" >"$L5" 2>&1
+
+check_in  "hanger dibunuh karena batas waktu timeout 2 detik" "$L5" \
+	'hanger: layanan once melebihi batas waktu 2 detik, dinyatakan gagal'
+check_in  "hanger dimatikan paksa oleh sinyal (exit status=0x9)" "$L5" \
+	'hanger (pid .* exit status=0x9'
+check_in  "dependen dibatalkan saat layanan once timeout" "$L5" \
+	"layanan 'dep' dibatalkan: dependensi 'hanger' gagal"
+absent_in "hanger tidak selesai secara sukses" "$L5" 'hanger (pid .* exit status=0x0'
+absent_in "dependen tidak pernah dijalankan" "$L5" 'started dep'
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nHASIL: LULUS (semua pemeriksaan)\n'

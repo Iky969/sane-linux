@@ -8,7 +8,7 @@ menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 
 Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
 initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
-[`ninit.c`](ninit.c) (~1932 baris), biner statis, nol warning dengan
+[`ninit.c`](ninit.c) (~1986 baris), biner statis, nol warning dengan
 `-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
@@ -151,7 +151,7 @@ Varian `--mount --propagation private` + `mount -t proc` manual dipakai karena
 
 ## Konfigurasi
 
-`/etc/init.conf` — satu layanan per baris, `nama:mode:perintah[:requires=a,b][:memory_max=16M][:cpu_max=50000 100000][:pids_max=50]`:
+`/etc/init.conf` — satu layanan per baris, `nama:mode:perintah[:requires=a,b][:memory_max=16M][:cpu_max=50000 100000][:pids_max=50][:timeout=60]`:
 
 ```
 # layanan wajib: jalankan sekali, jangan respawn
