@@ -35,6 +35,12 @@
 #             OOM killer mematikan worker; kontrol 2 worker x 12MB (24MB)
 #             lolos tanpa OOM. Leader tidak mengalokasi besar dan tidak
 #             memanggil raise(SIGKILL).
+#  11. Fallback fail-open saat cgroup v2 tidak tersedia:
+#      - Deteksi kegagalan mount /sys/fs/cgroup dan pencatatan log fail-open aktif.
+#      - Peringatan batas resource yang diabaikan.
+#      - Eksekusi layanan tetap berjalan normal melalui handshake pre-exec.
+#      - Fallback kill(-pgid) pada layanan once saat leader mati, memastikan
+#        proses latar belakang (orphan) disapu bersih saat cgroup tidak aktif.
 #
 # Pemakaian:
 #   sudo sh ./scripts/test-cgroup-limits.sh      # atau: make test
@@ -1169,16 +1175,33 @@ fi
 # 1. Init mencatat baris fail-open aktif: "cgroup: fail-open aktif untuk ..."
 # 2. Init mencatat warning pengabaian limit: "Warning: batas resource diabaikan pada layanan '...' karena cgroup tidak tersedia"
 # 3. Layanan tetap dieksekusi dengan normal melalui handshake T1
-# 4. Init PID 1 melakukan shutdown bersih (graceful shutdown) tanpa crash atau orphan hang
+# 4. Fallback kill(-pgid) pada layanan once membersihkan proses anak orphan di background saat leader mati
+# 5. Init PID 1 melakukan shutdown bersih (graceful shutdown) tanpa crash atau orphan hang
 printf '\n== Skenario 11: Fallback fail-open saat cgroup v2 tidak tersedia ==\n'
-R11=$(new_root sleep)
+R11=$(new_root sleep grep)
 L11=$(new_log)
 ROOTS="$ROOTS $R11"
 LOGS="$LOGS $L11"
 
+cat > "$R11/bin/check_failopen.sh" << 'EOF'
+#!/bin/sh
+# Verifikasi bahwa background orphan (sleep 300) telah disapu bersih oleh fallback kill(-pgid)
+lingering=0
+for cmd in /proc/[0-9]*/cmdline; do
+    [ -f "$cmd" ] || continue
+    if grep -q "300" "$cmd" 2>/dev/null; then
+        lingering=$((lingering + 1))
+    fi
+done
+echo "LINGERING_FAILOPEN_ORPHANS=$lingering" > /var/failopen_clean_audit.txt
+echo poweroff > /run/initctl
+exit 0
+EOF
+chmod 0755 "$R11/bin/check_failopen.sh"
+
 cat > "$R11/etc/init.conf" << 'EOF'
-failopen_svc:once:/bin/sh -c "echo FAILOPEN_EXECUTED > /var/failopen_audit.txt":memory_max=32M:pids_max=10
-stopper:once:/bin/sh -c "/bin/sleep 2 && echo poweroff > /run/initctl":requires=failopen_svc
+failopen_svc:once:/bin/sh -c "/bin/sleep 300 & echo FAILOPEN_EXECUTED > /var/failopen_audit.txt":memory_max=32M:pids_max=10
+checker:once:/bin/sh /bin/check_failopen.sh:requires=failopen_svc
 EOF
 
 # Siapkan lingkungan tiruan di mana /sys/fs/cgroup berupa berkas biasa pada tmpfs,
@@ -1195,6 +1218,8 @@ check_in  "warning batas resource diabaikan tercatat di log" "$L11" \
 	"Warning: batas resource diabaikan pada layanan 'failopen_svc' karena cgroup tidak tersedia"
 check_in  "layanan tetap berhasil dieksekusi normal saat cgroup tidak tersedia" \
 	"$R11/var/failopen_audit.txt" 'FAILOPEN_EXECUTED'
+check_in  "orphan sleep 300 disapu bersih via fallback kill(-pgid) saat fail-open (LINGERING_FAILOPEN_ORPHANS=0)" \
+	"$R11/var/failopen_clean_audit.txt" 'LINGERING_FAILOPEN_ORPHANS=0'
 check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L11" \
 	'graceful shutdown'
 

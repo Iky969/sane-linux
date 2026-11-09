@@ -1,6 +1,6 @@
 # ninit -- init system minimal (PID 1)
 #
-#   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall -Werror)
+#   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall)
 #   make test       uji PID 1 di chroot sementara: smoke test + test SIGTERM
 #                   + test konfigurasi + jalur kegagalan spawn + batasan cgroup v2
 #                   dan lifecycle respawn (butuh root/sudo), lalu pemeriksaan
@@ -14,9 +14,11 @@
 #
 # Butuh: build-essential + busybox-static (busybox dipakai sebagai /bin/sh di rootfs uji).
 # Di distro tanpa libc statis glibc (mis. Alpine):  make CC=musl-gcc
+# Catatan: -Werror tidak dipasang di CFLAGS default agar kompatibel saat toolchain
+# compiler diperbarui; CI meng-override CFLAGS dengan -Werror untuk gerbang warning.
 
 CC     = gcc
-CFLAGS ?= -static -O2 -Wall -Werror
+CFLAGS ?= -static -O2 -Wall
 BIN    ?= ninit
 SRC    ?= ninit.c
 

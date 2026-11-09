@@ -26,14 +26,30 @@
 #include <poll.h>
 #include <ctype.h>
 
+#ifndef MAX_SERVICES
 #define MAX_SERVICES    64
+#endif
+#ifndef MAX_LINE
 #define MAX_LINE        1024
+#endif
+#ifndef RESPAWN_DELAY
 #define RESPAWN_DELAY   2
+#endif
+#ifndef MAX_SPAWN_RETRY
 #define MAX_SPAWN_RETRY 3   /* percobaan fork() ulang untuk layanan once */
+#endif
+#ifndef ONCE_START_TIMEOUT
 #define ONCE_START_TIMEOUT 30  /* detik maksimum layanan once boleh berjalan */
+#endif
+#ifndef CRASH_LIMIT
 #define CRASH_LIMIT        5   /* crash berturut-turut sebelum respawn dihentikan */
+#endif
+#ifndef BACKOFF_MAX
 #define BACKOFF_MAX        32  /* batas atas jeda respawn eksponensial (detik) */
+#endif
+#ifndef STABLE_RUNTIME
 #define STABLE_RUNTIME     10  /* detik hidup stabil sebelum backoff direset */
+#endif
 
 typedef enum {
     SVC_STATE_STOPPED = 0,
@@ -57,6 +73,7 @@ typedef struct {
     time_t      last_start;     /* waktu spawn terakhir (timeout once & jeda respawn) */
     int         crash_count;    /* crash berturut-turut saat respawn (start-limit) */
     int         respawn_delay;  /* jeda respawn saat ini (detik, backoff eksponensial) */
+    int         timeout;        /* batas waktu layanan once (detik); default ONCE_START_TIMEOUT; 0 = nonaktif */
     char        deps_str[256]; 
     svc_state_t state;
     char        memory_max[64];
@@ -570,16 +587,18 @@ static int parse_config(const char *path)
             continue;
         }
         
-        /* Cari tag opsi (:requires=, :memory_max=, :cpu_max=, :pids_max=) */
+        /* Cari tag opsi (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=) */
         char *deps = "";
         char *mem_max = "";
         char *cpu_limit = "";
         char *pids_limit = "";
+        int timeout_val = ONCE_START_TIMEOUT;
 
         char *t_req = strstr(cmd, ":requires=");
         char *t_mem = strstr(cmd, ":memory_max=");
         char *t_cpu = strstr(cmd, ":cpu_max=");
         char *t_pid = strstr(cmd, ":pids_max=");
+        char *t_tout = strstr(cmd, ":timeout=");
 
         /* Cari tag yang muncul paling awal agar cmd dengan ':' tetap aman */
         char *first_tag = NULL;
@@ -587,6 +606,7 @@ static int parse_config(const char *path)
         if (t_mem && (!first_tag || t_mem < first_tag)) first_tag = t_mem;
         if (t_cpu && (!first_tag || t_cpu < first_tag)) first_tag = t_cpu;
         if (t_pid && (!first_tag || t_pid < first_tag)) first_tag = t_pid;
+        if (t_tout && (!first_tag || t_tout < first_tag)) first_tag = t_tout;
 
         if (first_tag) {
             *first_tag = 0; /* Potong cmd tepat sebelum opsi pertama */
@@ -603,6 +623,30 @@ static int parse_config(const char *path)
                     cpu_limit = trim(scan + 8);
                 } else if (strncmp(scan, "pids_max=", 9) == 0) {
                     pids_limit = trim(scan + 9);
+                } else if (strncmp(scan, "timeout=", 8) == 0) {
+                    char *tout_str = trim(scan + 8);
+                    if (strcmp(tout_str, "0") == 0 || strcmp(tout_str, "none") == 0 ||
+                        strcmp(tout_str, "infinity") == 0) {
+                        timeout_val = 0;
+                    } else {
+                        int valid = 1;
+                        if (!*tout_str || strlen(tout_str) > 10) valid = 0;
+                        for (const char *tp = tout_str; *tp; tp++) {
+                            if (!isdigit((unsigned char)*tp)) { valid = 0; break; }
+                        }
+                        if (valid) {
+                            long v = strtol(tout_str, NULL, 10);
+                            if (v > 0 && v <= 86400) {
+                                timeout_val = (int)v;
+                            } else {
+                                init_log("Parse err: timeout '%s' di luar jangkauan (1-86400s) pada layanan '%s', memakai default %ds",
+                                         tout_str, name, ONCE_START_TIMEOUT);
+                            }
+                        } else {
+                            init_log("Parse err: format timeout '%s' tidak valid pada layanan '%s', memakai default %ds",
+                                     tout_str, name, ONCE_START_TIMEOUT);
+                        }
+                    }
                 } else {
                     init_log("Warning: opsi '%s' tidak dikenal pada layanan '%s'", scan, name);
                 }
@@ -698,6 +742,7 @@ static int parse_config(const char *path)
         services[num_services].spawn_tries  = 0;
         services[num_services].crash_count  = 0;
         services[num_services].respawn_delay = RESPAWN_DELAY;
+        services[num_services].timeout      = timeout_val;
         services[num_services].cgroup_fail_open = 0;
         services[num_services].pid          = 0;
         services[num_services].pgid         = 0;
@@ -1041,6 +1086,10 @@ static void reap_zombies(void)
                         services[i].state = SVC_STATE_FAILED;
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
+                        /* Fallback kill saat cgroup fail-open: leader mati tapi orphan
+                           runtime mungkin masih hidup di grup */
+                        if (services[i].cgroup_fail_open && services[i].pgid > 0)
+                            kill(-services[i].pgid, SIGKILL);
                         cleanup_cgroup(services[i].name);
                     }
                 } else {
@@ -1049,7 +1098,7 @@ static void reap_zombies(void)
                         cgroup_kill_service(services[i].name);
                         /* Fallback kill saat cgroup fail-open: leader mati tapi orphan
                            runtime mungkin masih hidup di grup */
-                        if (services[i].pgid > 0)
+                        if (services[i].cgroup_fail_open && services[i].pgid > 0)
                             kill(-services[i].pgid, SIGKILL);
                     }
 
@@ -1095,7 +1144,7 @@ static void reap_zombies(void)
    Mengembalikan:
      1 = semua dependensi terpenuhi
      0 = masih menunggu dependensi
-    -1 = ada dependensi once yang gagal
+    -1 = ada dependensi yang gagal (once gagal/timeout atau respawn FAILED)
 */
 static int deps_satisfied(const service_t *svc, const char **failed_dep)
 {
@@ -1106,6 +1155,10 @@ static int deps_satisfied(const service_t *svc, const char **failed_dep)
         if (idx < 0) continue;
         const service_t *dep = &services[idx];
         if (dep->respawn) {
+            if (dep->state == SVC_STATE_FAILED) {
+                if (failed_dep) *failed_dep = dep->name;
+                return -1;
+            }
             if (dep->pid <= 0) return 0;
         } else {
             if (dep->state == SVC_STATE_FAILED) {
@@ -1216,7 +1269,7 @@ static struct timespec *compute_poll_timeout(struct timespec *ts)
     }
     for (int i = 0; i < num_services; i++) {
         if (services[i].respawn) continue;
-        if (services[i].state == SVC_STATE_RUNNING) {
+        if (services[i].state == SVC_STATE_RUNNING && services[i].timeout > 0) {
             ts->tv_sec = 1;
             ts->tv_nsec = 0;
             return ts;
@@ -1255,10 +1308,10 @@ static void cancel_dependents(void)
     }
 }
 
-/* T8D: layanan once yang berjalan melewati ONCE_START_TIMEOUT dinyatakan
-   gagal (fail-closed). Prosesnya dihentikan dan semua dependen yang
-   menunggunya dibatalkan, supaya boot progression tidak menggantung
-   selamanya tanpa escalasi. last_start menyimpan waktu spawn terakhir. */
+/* T8D: layanan once yang berjalan melewati batas timeout-nya dinyatakan
+   gagal (fail-closed). Default ONCE_START_TIMEOUT (30 detik), atau ditentukan
+   lewat opsi :timeout=. Opsi :timeout=0 / none menonaktifkan timeout.
+   Prosesnya dihentikan dan semua dependen yang menunggunya dibatalkan. */
 static void enforce_once_timeout(void)
 {
     if (shutting_down) return;
@@ -1268,10 +1321,11 @@ static void enforce_once_timeout(void)
         service_t *svc = &services[i];
         if (svc->respawn) continue;
         if (svc->state != SVC_STATE_RUNNING) continue;
-        if (!svc->last_start || (now - svc->last_start) < ONCE_START_TIMEOUT) continue;
+        if (svc->timeout <= 0) continue;
+        if (!svc->last_start || (now - svc->last_start) < svc->timeout) continue;
 
         init_log("%s: layanan once melebihi batas waktu %d detik, dinyatakan gagal",
-                 svc->name, ONCE_START_TIMEOUT);
+                 svc->name, svc->timeout);
         svc->state = SVC_STATE_FAILED;
         svc->need_respawn = 0;
         if (svc->pid > 0)
