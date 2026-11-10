@@ -107,42 +107,128 @@ ROOTS=""
 LOGS=""
 HELPERS=""
 CG_DYNAMIC=""
-# Leaf cgroup yang SAH dibuat suite ini (nama layanan di init.conf skenario).
-# Pembersihan host hanya menyentuh leaf ini -- bukan menyapu global
-# /sys/fs/cgroup/ninit/*, yang bisa membunuh layanan asli host.
+
+# Snapshot keberadaan /sys/fs/cgroup/ninit di host sebelum pengujian dimulai
+HOST_NINIT_PREEXISTED=0
+[ -d /sys/fs/cgroup/ninit ] && HOST_NINIT_PREEXISTED=1
+
+# Sentinel Guard: cgroup eksternal independen di host untuk membuktikan
+# secara deterministik bahwa test suite TIDAK PERNAH menyentuh cgroup di luar RUN_CG.
+EXTERNAL_GUARD_CG="/sys/fs/cgroup/ninit-ext-guard-$$"
+if [ -e "$EXTERNAL_GUARD_CG" ]; then
+	fail "sentinel guard cgroup '$EXTERNAL_GUARD_CG' sudah ada (collision)"
+fi
+$SUDO mkdir "$EXTERNAL_GUARD_CG" || fail "gagal membuat sentinel guard cgroup"
+
+# -----------------------------------------------------------------------------
+# 1. Isolasi $RUN_CG (Root Eksklusif Test) & Verifikasi Identitas Inode
+# -----------------------------------------------------------------------------
+RUN_ID="ninit-test-$$-$(date +%s%N 2>/dev/null || date +%s)"
+RUN_CG="/sys/fs/cgroup/$RUN_ID"
+RUN_CG_BASE="$RUN_CG/ninit"
+NINIT_BASE="$RUN_CG_BASE"
+TEST_TRACKED_LEAVES=""
+
+# Poin 8: TEST_LEAVES murni sebagai daftar ekspektasi assertion (bukan sweep host)
 TEST_LEAVES="mem_test pids_test leak limits_audit valid_svc bad_mem1 bad_mem2 bad_mem3
 bad_cpu1 bad_cpu2 bad_cpu3 bad_pid1 bad_pid2 bad_pid3 stopper svc_nested boot_pr9 app_dep
-orphan_maker checker escape_svc pids_tree mem_cumul failopen_svc app ping slow boot
-sender shell sigterm-test pipe-svc stubborn-svc a b c d dep topo root s63 astall"
-INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
-clean_host_ninit() {
-	# Bersihkan HANYA leaf milik suite ini (TEST_LEAVES). Jangan pernah
-	# menyapu /sys/fs/cgroup/ninit/* secara global.
-	for leaf in $TEST_LEAVES; do
-		d="/sys/fs/cgroup/ninit/$leaf"
-		[ -d "$d" ] || continue
-		if [ -f "$d/cgroup.kill" ]; then
-			echo 1 | $SUDO tee "$d/cgroup.kill" >/dev/null 2>&1 || true
-		fi
-		$SUDO rmdir "$d" 2>/dev/null || {
-			sleep 0.1
-			$SUDO rmdir "$d" 2>/dev/null || true
-		}
-	done
-	# Hapus direktori dasar hanya bila benar-benar kosong (tidak ada sub-cgroup
-	# asing tersisa); jangan sentuh leaf di luar TEST_LEAVES.
-	if [ -d /sys/fs/cgroup/ninit ]; then
-		has_subdir=0
-		for e in /sys/fs/cgroup/ninit/*; do
-			if [ -d "$e" ]; then has_subdir=1; break; fi
-		done
-		if [ "$has_subdir" -eq 0 ]; then
-			$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
-		fi
+orphan_maker checker escape_svc pids_tree mem_cumul failopen_svc"
+
+# Poin 2: Strict mkdir tanpa -p, abort on collision
+if [ -e "$RUN_CG" ]; then
+	fail "cgroup collision: path '$RUN_CG' sudah ada sebelum test dimulai (abort)"
+fi
+
+$SUDO mkdir "$RUN_CG" || fail "gagal membuat isolasi root cgroup '$RUN_CG'"
+
+# Poin 3: Catat identitas dev:ino tepat setelah pembuatan untuk proteksi TOCTOU/symlink
+RUN_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$RUN_CG" 2>/dev/null || true)
+[ -n "$RUN_CG_DEV_INO" ] || fail "gagal membaca dev:ino untuk '$RUN_CG'"
+
+# Aktifkan controller memory, pids, cpu di $RUN_CG
+for c in memory pids cpu; do
+	if grep -qw "$c" /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
+		echo "+$c" | $SUDO tee "$RUN_CG/cgroup.subtree_control" >/dev/null 2>&1 || true
 	fi
+done
+
+# Buat base cgroup layanan ninit di bawah $RUN_CG
+$SUDO mkdir "$RUN_CG_BASE" || fail "gagal membuat base cgroup '$RUN_CG_BASE'"
+for c in memory pids cpu; do
+	if grep -qw "$c" /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
+		echo "+$c" | $SUDO tee "$RUN_CG_BASE/cgroup.subtree_control" >/dev/null 2>&1 || true
+	fi
+done
+
+INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
+
+# Verifikasi kepemilikan proses: membuktikan apakah proses dengan PID $1
+# berjalan di dalam salah satu root guest test ($ROOTS) via /proc/<pid>/root.
+is_test_process() {
+	p=$1
+	[ -d "/proc/$p" ] || return 0
+	p_root=$($SUDO readlink /proc/"$p"/root 2>/dev/null || true)
+	[ -n "$p_root" ] || return 1
+	for r in ${ROOTS:-}; do
+		case "$p_root" in
+			"$r"|"$r"/*|"$r (deleted)"|"$r/"*|"/tmp/ninit-cgtest."*)
+				return 0
+				;;
+		esac
+	done
+	return 1
+}
+
+# Poin 5 & 6: Cleanup parent-first cgroup.kill, lalu depth-first rmdir
+clean_run_cgroup() {
+	# Poin 4: Guard ${RUN_CG:-} dan ${RUN_CG_DEV_INO:-} aman pada semua fase setup
+	[ -n "${RUN_CG:-}" ] || return 0
+	[ -n "${RUN_CG_DEV_INO:-}" ] || return 0
+	[ -d "$RUN_CG" ] || return 0
+
+	# Poin 1 & 3: Pastikan path bukan symlink dan identitas inode tidak berubah
+	if [ -L "$RUN_CG" ]; then
+		printf 'SECURITY: %s adalah symlink! Operasi pembersihan dibatalkan.\n' "$RUN_CG" >&2
+		return 1
+	fi
+	cur_dev_ino=$($SUDO stat -c '%d:%i' "$RUN_CG" 2>/dev/null || true)
+	if [ "$cur_dev_ino" != "$RUN_CG_DEV_INO" ]; then
+		printf 'SECURITY: dev:ino %s berubah (awal: %s, sekarang: %s)! Operasi dibatalkan.\n' 			"$RUN_CG" "$RUN_CG_DEV_INO" "$cur_dev_ino" >&2
+		return 1
+	fi
+
+	# Poin 5: Parent-first cgroup.kill di root isolasi
+	if [ -f "$RUN_CG/cgroup.kill" ]; then
+		echo 1 | $SUDO tee "$RUN_CG/cgroup.kill" >/dev/null 2>&1 || true
+	fi
+
+	# Fallback untuk kernel < 5.14: telusuri cgroup.procs di bawah $RUN_CG
+	for pfile in $(find "$RUN_CG" -type f -name "cgroup.procs" 2>/dev/null); do
+		procs=$($SUDO cat "$pfile" 2>/dev/null || true)
+		for p in $procs; do
+			if is_test_process "$p"; then
+				$SUDO kill -9 "$p" 2>/dev/null || true
+			fi
+		done
+	done
+
+	# Poin 6: rmdir depth-first strictly di dalam batasan $RUN_CG
+	find "$RUN_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || {
+		sleep 0.1
+		find "$RUN_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || true
+	}
+
+	$SUDO rmdir "$RUN_CG" 2>/dev/null || {
+		sleep 0.1
+		$SUDO rmdir "$RUN_CG" 2>/dev/null || true
+	}
 }
 
 cleanup() {
+	# 1. Bersihkan hierarki cgroup isolasi test
+	clean_run_cgroup
+
+	# 2. Unmount dan bersihkan direktori guest test
 	for d in ${ROOTS:-}; do
 		$SUDO umount -R "$d" 2>/dev/null || $SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
@@ -151,26 +237,22 @@ cleanup() {
 	for h in ${HELPERS:-}; do rm -f "$h"; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
 
-	# Bersihkan cgroup ninit dan leaf cgroups yang tertinggal pada host
-	clean_host_ninit
-
-	# Bersihkan cgroup dinamis/ephemeral yang dibuat selama pengujian
+	# 3. Bersihkan cgroup dinamis/ephemeral tambahan
 	for cg in ${CG_DYNAMIC:-}; do
-		if [ -d "$cg" ]; then
+		if [ -d "$cg" ] && [ ! -L "$cg" ]; then
 			if [ -f "$cg/cgroup.kill" ]; then
 				echo 1 | $SUDO tee "$cg/cgroup.kill" >/dev/null 2>&1 || true
 			fi
-			$SUDO rmdir "$cg" 2>/dev/null || {
-				sleep 0.1
-				$SUDO rmdir "$cg" 2>/dev/null || true
-			}
+			$SUDO rmdir "$cg" 2>/dev/null || true
 		fi
 	done
+
+	# 4. Bersihkan sentinel guard jika masih ada
+	if [ -n "${EXTERNAL_GUARD_CG:-}" ] && [ -d "$EXTERNAL_GUARD_CG" ] && [ ! -L "$EXTERNAL_GUARD_CG" ]; then
+		$SUDO rmdir "$EXTERNAL_GUARD_CG" 2>/dev/null || true
+	fi
 }
 trap cleanup EXIT INT TERM
-
-# Bersihkan sisa cgroup dari pengujian sebelumnya agar pengujian mulai dari state bersih
-clean_host_ninit
 
 fail_count=0
 ok()   { printf '  [ OK ]   %s\n' "$1"; }
@@ -204,6 +286,22 @@ new_log() {
 
 boot_guest() {
 	root=$1; secs=$2; cg=${3:-}; extra_setup=${4:-}
+
+	# Daftarkan leaf cgroup dari init.conf ke TEST_TRACKED_LEAVES
+	if [ -f "$root/etc/init.conf" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			case "$line" in
+				\#*|"") continue ;;
+			esac
+			svc_name=$(printf '%s\n' "$line" | cut -d: -f1)
+			[ -n "$svc_name" ] || continue
+			case " ${TEST_TRACKED_LEAVES:-} " in
+				*" $svc_name "*) ;;
+				*) TEST_TRACKED_LEAVES="${TEST_TRACKED_LEAVES:-} $svc_name" ;;
+			esac
+		done < "$root/etc/init.conf"
+	fi
+
 	if [ -n "$cg" ]; then
 		move="echo \$\$ > $cg/cgroup.procs;"
 	else
@@ -212,6 +310,7 @@ boot_guest() {
 	cat > "$INNER" <<EOI
 #!/bin/sh
 mount -t proc proc $root/proc
+export NINIT_CGROUP_BASE="$RUN_CG_BASE"
 $move
 $extra_setup
 exec chroot $root /ninit
@@ -373,10 +472,14 @@ int main(void) {
         fclose(fcg);
     }
 
-    /* Verify grandchild PID is present in /sys/fs/cgroup/ninit/escape_svc/cgroup.procs */
+    /* Verify grandchild PID is present in escape_svc/cgroup.procs */
+    const char *cg_base = getenv("NINIT_CGROUP_BASE");
+    char esc_procs_path[320];
+    snprintf(esc_procs_path, sizeof(esc_procs_path), "%s/escape_svc/cgroup.procs",
+             cg_base ? cg_base : "/sys/fs/cgroup/ninit");
     int in_procs = 0;
     for (int retry = 0; retry < 10 && !in_procs; retry++) {
-        FILE *fp = fopen("/sys/fs/cgroup/ninit/escape_svc/cgroup.procs", "r");
+        FILE *fp = fopen(esc_procs_path, "r");
         if (fp) {
             int p;
             while (fscanf(fp, "%d", &p) == 1) {
@@ -743,8 +846,8 @@ else
 	L4=$(new_log)
 	ROOTS="$ROOTS $R4"
 	LOGS="$LOGS $L4"
-	printf 'limits_audit:once:/bin/sh -c "cat /sys/fs/cgroup/ninit/limits_audit/memory.max > /var/mem.val && cat /sys/fs/cgroup/ninit/limits_audit/cpu.max > /var/cpu.val && cat /sys/fs/cgroup/ninit/limits_audit/pids.max > /var/pids.val && echo poweroff > /run/initctl":pids_max=20:cpu_max=50000 100000:memory_max=32M\n' \
-		> "$R4/etc/init.conf"
+	printf 'limits_audit:once:/bin/sh -c "cat %s/limits_audit/memory.max > /var/mem.val && cat %s/limits_audit/cpu.max > /var/cpu.val && cat %s/limits_audit/pids.max > /var/pids.val && echo poweroff > /run/initctl":pids_max=20:cpu_max=50000 100000:memory_max=32M\n' \
+		"$RUN_CG_BASE" "$RUN_CG_BASE" "$RUN_CG_BASE" > "$R4/etc/init.conf"
 	boot_guest "$R4" "$WAIT4" >"$L4" 2>&1
 
 	check_in "konfigurasi memory.max tercatat di log" "$L4" \
@@ -863,7 +966,7 @@ printf '\n== Skenario 7: Interaksi PR #9 (once + pids.max=1 fork EAGAIN -> FAILE
 CG_PR9=""
 pids_available=0
 if [ "$has_cg2" -eq 1 ] && [ "$has_pids" -eq 1 ]; then
-	CG_PR9=$($SUDO mktemp -d /sys/fs/cgroup/ninit-cg-pr9.XXXXXX)
+	CG_PR9=$($SUDO mktemp -d "$RUN_CG/ninit-cg-pr9.XXXXXX")
 	CG_DYNAMIC="$CG_DYNAMIC $CG_PR9"
 	if [ -e "$CG_PR9/pids.max" ] && printf '1\n' | $SUDO tee "$CG_PR9/pids.max" >/dev/null 2>&1; then
 		pids_available=1
@@ -1008,7 +1111,7 @@ else
 #       state pasca-cgroup_kill_service bisa diamati sebelum ninit menghapusnya
 #       saat shutdown.
 #   (b) /proc: tidak ada proses escape_workload yang masih berjalan.
-CG="/sys/fs/cgroup/ninit/escape_svc"
+CG="${NINIT_CGROUP_BASE:-/sys/fs/cgroup/ninit}/escape_svc"
 
 # Tunggu workload adversarial menulis bukti audit (cucu sudah aktif).
 waited=0
@@ -1223,26 +1326,84 @@ check_in  "orphan sleep 300 disapu bersih via fallback kill(-pgid) saat fail-ope
 check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L11" \
 	'graceful shutdown'
 
-# ------------------------------------------------------------- Verifikasi Teardown Cgroup Host
-printf '\n== Verifikasi Teardown Cgroup Host ==\n'
-# Jangan menyalahkan keberadaan /sys/fs/cgroup/ninit secara langsung: host
-# boleh saja memuat leaf cgroup milik workload lain. Yang diperiksa adalah
-# leaf milik suite ini (TEST_LEAVES) yang tertinggal.
+# ------------------------------------------------------------- Verifikasi Guard & Kasus Ekstrem
+printf '\n== Verifikasi Guard Isolasi & Kasus Ekstrem ==\n'
+
+# 1. Assertion TEST_LEAVES: seluruh leaf test di $RUN_CG_BASE tidak bocor
 leaked=""
 for leaf in $TEST_LEAVES; do
-	if [ -d "/sys/fs/cgroup/ninit/$leaf" ]; then
+	if [ -d "$RUN_CG_BASE/$leaf" ]; then
 		leaked="$leaked $leaf"
 	fi
 done
 if [ -n "$leaked" ]; then
 	bad "kebocoran leaf cgroup milik test:$leaked"
 else
-	$SUDO rmdir /sys/fs/cgroup/ninit 2>/dev/null || true
+	ok "assertion TEST_LEAVES: seluruh leaf test di $RUN_CG_BASE ter-reap bersih"
+fi
+
+# 2. Perlindungan cgroup eksternal host (sentinel guard)
+if [ -d "$EXTERNAL_GUARD_CG" ]; then
+	ok "cgroup host eksternal ($EXTERNAL_GUARD_CG) 100% utuh dan tidak tersentuh"
+	$SUDO rmdir "$EXTERNAL_GUARD_CG" 2>/dev/null || true
+else
+	bad "cgroup host eksternal terganggu atau hilang!"
+fi
+
+# 3. Host /sys/fs/cgroup/ninit tidak pernah disentuh
+if [ "$HOST_NINIT_PREEXISTED" -eq 0 ]; then
 	if [ -d /sys/fs/cgroup/ninit ]; then
-		ok "hierarki cgroup test bersih (resource eksternal host tidak disentuh)"
+		bad "/sys/fs/cgroup/ninit muncul di host (isolasi jebol)"
 	else
-		ok "hierarki cgroup bersih: /sys/fs/cgroup/ninit dihapus"
+		ok "/sys/fs/cgroup/ninit host tidak pernah dibuat/disentuh (isolasi 100% di $RUN_CG)"
 	fi
+fi
+
+# 4. Collision rejection test
+collision_code=0
+(
+	mkdir "$RUN_CG" 2>/dev/null
+) || collision_code=$?
+if [ "$collision_code" -ne 0 ]; then
+	ok "guard collision: strict mkdir menolak tabrakan cgroup eksisting (exit=$collision_code)"
+else
+	bad "guard collision: strict mkdir seharusnya gagal jika direktori sudah ada!"
+fi
+
+# 5. Trap safety pada partial setup (RUN_CG kosong / belum dibuat)
+partial_trap_ok=1
+(
+	RUN_CG=""
+	RUN_CG_DEV_INO=""
+	clean_run_cgroup || exit 1
+) || partial_trap_ok=0
+if [ "$partial_trap_ok" -eq 1 ]; then
+	ok "guard trap safety: clean_run_cgroup aman dieksekusi saat RUN_CG belum diinisialisasi"
+else
+	bad "guard trap safety: clean_run_cgroup melempar error saat setup parsial"
+fi
+
+# 6. Inode identity / symlink tampering detection
+tamper_detected=0
+(
+	temp_d=$(mktemp -d /tmp/cg-tamper.XXXXXX)
+	fake_ino="0:0"
+	(
+		RUN_CG="$temp_d"
+		RUN_CG_DEV_INO="$fake_ino"
+		if clean_run_cgroup 2>/dev/null; then
+			exit 0
+		else
+			exit 1
+		fi
+	) || tamper_detected=1
+	rmdir "$temp_d" 2>/dev/null || true
+	exit "$tamper_detected"
+) || tamper_detected=1
+if [ "$tamper_detected" -eq 1 ]; then
+	ok "guard integritas inode: clean_run_cgroup menolak operasi saat dev:ino berubah"
+else
+	bad "guard integritas inode: clean_run_cgroup lolos saat dev:ino tidak cocok"
 fi
 
 # ------------------------------------------------------------- Ringkasan

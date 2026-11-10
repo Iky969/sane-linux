@@ -8,7 +8,7 @@ menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 
 Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
 initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
-[`ninit.c`](ninit.c) (~1986 baris), biner statis, nol warning dengan
+[`ninit.c`](ninit.c) (~2027 baris), biner statis, nol warning dengan
 `-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
