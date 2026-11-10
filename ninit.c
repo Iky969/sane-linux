@@ -226,7 +226,44 @@ static void set_hostname(void)
 }
 
 /* ---------- cgroups v2 ---------- */
-#define CGROUP_BASE "/sys/fs/cgroup/ninit"
+/* Base path default untuk hierarki cgroup layanan ninit. Bisa di-override lewat
+   variabel lingkungan NINIT_CGROUP_BASE agar test suite dapat mengisolasi
+   cgroup ke subtree khusus per-run tanpa menyentuh /sys/fs/cgroup/ninit host.
+   Validasi ketat: path WAJIB diawali "/sys/fs/cgroup/" dan tidak boleh
+   mengandung ".." agar tidak terjadi path traversal. */
+#ifndef CGROUP_BASE_DEFAULT
+#define CGROUP_BASE_DEFAULT "/sys/fs/cgroup/ninit"
+#endif
+#define CGROUP_BASE_PREFIX "/sys/fs/cgroup/"
+
+static char cgroup_base_buf[256];
+static const char *cgroup_base_ptr = NULL;
+
+static const char *get_cgroup_base(void)
+{
+    if (cgroup_base_ptr) return cgroup_base_ptr;
+    const char *env = getenv("NINIT_CGROUP_BASE");
+    if (env && env[0] == '/' &&
+        strncmp(env, CGROUP_BASE_PREFIX, strlen(CGROUP_BASE_PREFIX)) == 0 &&
+        strstr(env, "..") == NULL &&
+        strlen(env) < sizeof(cgroup_base_buf)) {
+        strncpy(cgroup_base_buf, env, sizeof(cgroup_base_buf) - 1);
+        cgroup_base_buf[sizeof(cgroup_base_buf) - 1] = 0;
+        /* Hapus trailing slash */
+        size_t len = strlen(cgroup_base_buf);
+        while (len > 1 && cgroup_base_buf[len - 1] == '/')
+            cgroup_base_buf[--len] = 0;
+        cgroup_base_ptr = cgroup_base_buf;
+        init_log("cgroup: base path di-override: %s", cgroup_base_ptr);
+    } else {
+        cgroup_base_ptr = CGROUP_BASE_DEFAULT;
+    }
+    return cgroup_base_ptr;
+}
+
+/* Makro akses: seluruh kode yang sebelumnya memakai CGROUP_BASE
+   secara transparan menggunakan path yang sudah ter-resolve. */
+#define CGROUP_BASE (get_cgroup_base())
 
 /* Lapis pertahanan kedua untuk path cgroup (SANE-06-02): parse_config sudah
    menolak nama kosong/"."/".."/mengandung "..", tapi setup_cgroup(),
@@ -306,7 +343,11 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
         cgroup_fail_open(svc_name);
         return 1;
     }
-    enable_cgroup_subtree(CGROUP_BASE "/cgroup.subtree_control");
+    {
+        char subtree_path[320];
+        snprintf(subtree_path, sizeof(subtree_path), "%s/cgroup.subtree_control", CGROUP_BASE);
+        enable_cgroup_subtree(subtree_path);
+    }
 
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
     if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
