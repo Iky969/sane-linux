@@ -163,10 +163,36 @@ done
 INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
 
 # Verifikasi kepemilikan proses: membuktikan apakah proses dengan PID $1
-# berjalan di dalam salah satu root guest test ($ROOTS) via /proc/<pid>/root.
+# berjalan di dalam cgroup isolasi test ($RUN_CG) DAN di dalam salah satu
+# root guest test ($ROOTS). Fail-closed: PID yang mati/tidak ada, cgroup
+# di luar RUN_CG, atau root di luar $ROOTS semuanya DITOLAK (return 1).
 is_test_process() {
 	p=$1
-	[ -d "/proc/$p" ] || return 0
+	# PID reuse guard: /proc/$p yang hilang TIDAK BOLEH dianggap milik test.
+	# Kondisi ini return 1 (fail-closed), bukan return 0.
+	[ -n "$p" ] && [ -d "/proc/$p" ] || return 1
+
+	# Verifikasi cgroup membership (cgroup v2, format "0::$path"):
+	# /sys/fs/cgroup$path harus berada di dalam atau turunan dari $RUN_CG.
+	if [ -n "${RUN_CG:-}" ] && [ -d "$RUN_CG" ]; then
+		p_cg_path=""
+		if [ -r "/proc/$p/cgroup" ]; then
+			p_cg_path=$(sed -n 's/^0::\([^[:space:]]*\).*$/\1/p' "/proc/$p/cgroup" 2>/dev/null | head -n 1)
+		fi
+		[ -n "$p_cg_path" ] || return 1
+		case "/sys/fs/cgroup$p_cg_path" in
+			"$RUN_CG"|"$RUN_CG"/*)
+				;;
+			*)
+				return 1
+				;;
+		esac
+		[ -d "/sys/fs/cgroup$p_cg_path" ] || return 1
+	else
+		return 1
+	fi
+
+	# Verifikasi chroot root: /proc/$p/root harus di bawah salah satu $ROOTS.
 	p_root=$($SUDO readlink /proc/"$p"/root 2>/dev/null || true)
 	[ -n "$p_root" ] || return 1
 	for r in ${ROOTS:-}; do
@@ -197,20 +223,41 @@ clean_run_cgroup() {
 		return 1
 	fi
 
-	# Poin 5: Parent-first cgroup.kill di root isolasi
+	# Poin 5: Jalur cgroup.kill (kernel >= 5.14) -- bunuh SEMUA proses di
+	# seluruh subtree $RUN_CG sekaligus. Jika cgroup.kill tersedia DAN berhasil
+	# mengosongkan cgroup.procs di bawah $RUN_CG, pemindaian fallback manual
+	# TIDAK PERNAH dijalankan.
+	kill_ok=0
 	if [ -f "$RUN_CG/cgroup.kill" ]; then
 		echo 1 | $SUDO tee "$RUN_CG/cgroup.kill" >/dev/null 2>&1 || true
+		# Tunggu cgroup.procs di bawah $RUN_CG menjadi kosong (polling <= ~1s).
+		waited=0
+		while [ "$waited" -lt 20 ]; do
+			remaining=0
+			for pfile in $(find "$RUN_CG" -type f -name "cgroup.procs" 2>/dev/null); do
+				procs=$($SUDO cat "$pfile" 2>/dev/null || true)
+				for p in $procs; do
+					[ -n "$p" ] && remaining=$((remaining + 1))
+				done
+			done
+			[ "$remaining" -eq 0 ] && { kill_ok=1; break; }
+			sleep 0.05
+			waited=$((waited + 1))
+		done
 	fi
 
-	# Fallback untuk kernel < 5.14: telusuri cgroup.procs di bawah $RUN_CG
-	for pfile in $(find "$RUN_CG" -type f -name "cgroup.procs" 2>/dev/null); do
-		procs=$($SUDO cat "$pfile" 2>/dev/null || true)
-		for p in $procs; do
-			if is_test_process "$p"; then
-				$SUDO kill -9 "$p" 2>/dev/null || true
-			fi
+	# Fallback (kernel < 5.14 atau cgroup.kill gagal mengosongkan proses):
+	# telusuri cgroup.procs di bawah $RUN_CG dan bunuh hanya proses milik test.
+	if [ "$kill_ok" -ne 1 ]; then
+		for pfile in $(find "$RUN_CG" -type f -name "cgroup.procs" 2>/dev/null); do
+			procs=$($SUDO cat "$pfile" 2>/dev/null || true)
+			for p in $procs; do
+				if is_test_process "$p"; then
+					$SUDO kill -9 "$p" 2>/dev/null || true
+				fi
+			done
 		done
-	done
+	fi
 
 	# Poin 6: rmdir depth-first strictly di dalam batasan $RUN_CG
 	find "$RUN_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || {
@@ -225,16 +272,18 @@ clean_run_cgroup() {
 }
 
 cleanup() {
-	# 1. Bersihkan hierarki cgroup isolasi test
-	clean_run_cgroup
+	# 1. Bersihkan hierarki cgroup isolasi test.
+	# Trap safety: kegagalan dev:ino / inode TIDAK BOLEH membatalkan seluruh
+	# trap via set -e. Tahap pembersihan resource lain tetap dieksekusi.
+	clean_run_cgroup || printf 'WARN: clean_run_cgroup gagal (status %d), melanjutkan pembersihan resource lain...\n' $? >&2
 
 	# 2. Unmount dan bersihkan direktori guest test
 	for d in ${ROOTS:-}; do
 		$SUDO umount -R "$d" 2>/dev/null || $SUDO umount "$d/proc" 2>/dev/null || true
-		rm -rf "$d"
+		rm -rf "$d" 2>/dev/null || true
 	done
-	for f in ${LOGS:-}; do rm -f "$f"; done
-	for h in ${HELPERS:-}; do rm -f "$h"; done
+	for f in ${LOGS:-}; do rm -f "$f" 2>/dev/null || true; done
+	for h in ${HELPERS:-}; do rm -f "$h" 2>/dev/null || true; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
 
 	# 3. Bersihkan cgroup dinamis/ephemeral tambahan
@@ -1404,6 +1453,53 @@ if [ "$tamper_detected" -eq 1 ]; then
 	ok "guard integritas inode: clean_run_cgroup menolak operasi saat dev:ino berubah"
 else
 	bad "guard integritas inode: clean_run_cgroup lolos saat dev:ino tidak cocok"
+fi
+
+# 7. Assertion guard PID reuse: PID non-eksisten HARUS ditolak (fail-closed).
+pid_reuse_guard=0
+dead_pid=9999999
+if [ -r /proc/sys/kernel/pid_max ]; then
+	dead_pid=$(($(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 4194304) + 1))
+fi
+is_test_process "$dead_pid" 2>/dev/null && pid_reuse_guard=1
+if [ "$pid_reuse_guard" -ne 1 ]; then
+	ok "guard PID reuse: is_test_process $dead_pid (PID non-eksisten) ditolak fail-closed (status 1)"
+else
+	bad "guard PID reuse: is_test_process $dead_pid (PID non-eksisten) dianggap milik test!"
+fi
+
+# 8. Assertion guard proses eksternal host: proses di luar cgroup/chroot test
+#    HARUS ditolak DAN TIDAK PERNAH dibunuh oleh clean_run_cgroup.
+ext_pid=""
+if command -v sleep >/dev/null 2>&1; then
+	sleep 60 &
+	ext_pid=$!
+fi
+if [ -n "$ext_pid" ] && kill -0 "$ext_pid" 2>/dev/null; then
+	ext_rej=0
+	if is_test_process "$ext_pid" 2>/dev/null; then
+		ext_rej=1
+	fi
+	if [ "$ext_rej" -ne 1 ]; then
+		ok "guard proses eksternal: is_test_process $ext_pid (proses host di luar cgroup/chroot test) ditolak"
+	else
+		bad "guard proses eksternal: is_test_process $ext_pid keliru menganggap proses host eksternal milik test!"
+	fi
+
+	# clean_run_cgroup TIDAK BOLEH membunuh proses host eksternal.
+	clean_run_cgroup >/dev/null 2>&1 || true
+	sleep 0.3
+	if kill -0 "$ext_pid" 2>/dev/null; then
+		ok "guard proses eksternal: clean_run_cgroup tidak membunuh proses host eksternal (pid $ext_pid)"
+	else
+		bad "guard proses eksternal: clean_run_cgroup MEMBUNUH proses host eksternal (pid $ext_pid)!"
+	fi
+
+	# Hentikan sleep dummy (bukan bagian dari pembersihan test).
+	kill "$ext_pid" 2>/dev/null || true
+	wait "$ext_pid" 2>/dev/null || true
+else
+	skip "guard proses eksternal dilewati: tidak dapat menjalankan proses dummy host"
 fi
 
 # ------------------------------------------------------------- Ringkasan
