@@ -177,9 +177,9 @@ report() {
 	absent() { if grep -q "$2" "$CONSOLE_LOG"; then printf '  [GAGAL] %s\n' "$1"; fail_count=$((fail_count + 1)); else printf '  [ OK ]   %s\n' "$1"; fi; }
 
 	printf '\n== pemeriksaan konsol QEMU ==\n'
-	check "banner 'ninit start (PID 1)' dari dalam guest" 'ninit start (PID 1)'
-	check "event loop masuk ('main loop siap')"          'main loop siap'
-	check "layanan /etc/init.conf dijalankan ('started console')" 'started console'
+	check "banner 'ninit start (PID 1)' from guest" 'ninit start (PID 1)'
+	check "event loop entered ('main loop ready')"          'main loop ready'
+	check "service /etc/init.conf executed ('started console')" 'started console'
 
 	# Liveness console. 'started console' ditulis spawn_service() SAAT FORK,
 	# bukan setelah exec berhasil; layanan yang langsung mati (mis. binary
@@ -190,23 +190,23 @@ report() {
 	console_pids=$(grep -o 'started console (pid [0-9]\{1,\}' "$CONSOLE_LOG" 2>/dev/null | sed 's/.*pid //' | sort -u || true)
 	console_pid_count=$(printf '%s\n' "$console_pids" | grep -c '[0-9]' || true)
 	if [ "$console_pid_count" = 1 ]; then
-		printf '  [ OK ]   console start tepat satu PID (%s) - tanpa respawn loop\n' "$console_pids"
+		printf '  [ OK ]   console started with exactly one PID (%s) - no respawn loop\n' "$console_pids"
 	else
-		printf '  [GAGAL] console punya %s PID unik (start ulang): %s\n' \
+		printf '  [GAGAL] console has %s unique PIDs (restarted): %s\n' \
 			"$console_pid_count" "$(printf '%s ' $console_pids)"
 		fail_count=$((fail_count + 1))
 	fi
-	absent "console tidak pernah keluar ('console (pid N) exit status')" 'console (pid [0-9]*) exit status'
+	absent "console never exited ('console (pid N) exit status')" 'console (pid [0-9]*) exit status'
 	# Di-scope ke console: service respawn LAIN yang pernah tertunda window-nya
 	# adalah perilaku normal (catatan review PR #6); yang dilarang adalah
 	# console-nya sendiri yang di-respawn.
-	absent "console tidak di-respawn tertunda ('console: respawn ditunda')" 'console: respawn ditunda'
+	absent "console was not respawn-delayed ('console: respawn delayed')" 'console: respawn delayed'
 
-	absent "tidak ada kernel panic"                      'Kernel panic'
+	absent "no kernel panic"                      'Kernel panic'
 	if [ -n "${ready_ms:-}" ]; then
-		printf '  [ OK ]   boot sampai "main loop siap" dalam %s ms (mode TCG/emulasi)\n' "$ready_ms"
+		printf '  [ OK ]   boot reached "main loop ready" in %s ms (TCG/emulation mode)\n' "$ready_ms"
 	else
-		printf '  [GAGAL] "main loop siap" tidak muncul dalam %s detik\n' "$SECS"
+		printf '  [GAGAL] "main loop ready" did not appear within %s seconds\n' "$SECS"
 		fail_count=$((fail_count + 1))
 	fi
 
@@ -224,7 +224,7 @@ if [ "${REPORT_ONLY:-0}" = 1 ]; then
 	[ -r "$CONSOLE_LOG" ] || die "REPORT_ONLY=1 butuh CONSOLE_LOG '$CONSOLE_LOG' yang bisa dibaca"
 	log "REPORT_ONLY=1: memeriksa $CONSOLE_LOG tanpa boot QEMU"
 	T0=$(date +%s%N)
-	ready_ms=$(mark_ms 'main loop siap')
+	ready_ms=$(mark_ms 'main loop ready')
 	report
 	[ "${fail_count:-1}" -eq 0 ] || exit 1
 	exit 0
@@ -261,7 +261,7 @@ i=0
 while [ "$i" -lt $((SECS * 20)) ]; do
 	[ -z "$banner_ms" ] && banner_ms=$(mark_ms 'ninit start (PID 1)')
 	if [ -z "$ready_ms" ]; then
-		ready_ms=$(mark_ms 'main loop siap')
+		ready_ms=$(mark_ms 'main loop ready')
 		[ -n "$ready_ms" ] && break
 	fi
 	sleep 0.05
@@ -271,8 +271,8 @@ done
 wait "$qemu_pid" 2>/dev/null || true   # timeout menghentikan QEMU setelah $SECS detik
 kill -TERM "$qemu_pid" 2>/dev/null || true
 
-[ -n "$banner_ms" ] && printf '   banner ninit terdeteksi setelah %s ms\n' "$banner_ms"
-[ -n "$ready_ms" ]  && printf '   "main loop siap" setelah %s ms\n' "$ready_ms"
+[ -n "$banner_ms" ] && printf '   banner ninit detected after %s ms\n' "$banner_ms"
+[ -n "$ready_ms" ]  && printf '   "main loop ready" after %s ms\n' "$ready_ms"
 
 printf '\n== konsol serial QEMU (%s) ==\n' "$CONSOLE_LOG"
 sed 's/^/  | /' "$CONSOLE_LOG"

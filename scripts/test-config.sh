@@ -147,7 +147,7 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "event loop jalan ('main loop siap')" 'main loop siap'
+check "event loop jalan ('main loop ready')" 'main loop ready'
 check "layanan berdaftar dependensi dijalankan ('started a')" 'ninit: started a (pid'
 check "layanan tanpa dependensi jalan lebih dulu ('started c')" 'ninit: started c (pid'
 check_absent "berlian tidak salah dianggap cycle" 'CYCLE DETECTED'
@@ -210,7 +210,7 @@ if [ "$dense_started" -eq 64 ]; then
 else
 	bad "konfigurasi padat: hanya $dense_started/64 layanan dijalankan"
 fi
-check "event loop jalan ('main loop siap')" 'main loop siap'
+check "event loop jalan ('main loop ready')" 'main loop ready'
 check_absent "tidak ada FATAL (stack overflow/cycle) pada konfigurasi valid" 'FATAL'
 
 # --------------------------------------------------------------- skenario 2
@@ -227,9 +227,9 @@ if ! wait_for 'rescue mode'; then
 	bad "ninit tidak melaporkan rescue mode untuk dependensi hilang"
 fi
 
-check "dependensi hilang dilaporkan FATAL" "FATAL: Dependensi 'db' untuk 'web' tidak ditemukan"
-check "init masuk rescue mode (shell)" 'Masuk rescue mode (shell)'
-check_absent "boot tidak dilanjutkan (tanpa 'main loop siap')" 'main loop siap'
+check "dependensi hilang dilaporkan FATAL" "FATAL: Dependency 'db' for 'web' not found"
+check "init masuk rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "boot tidak dilanjutkan (tanpa 'main loop ready')" 'main loop ready'
 check_absent "layanan bermasalah tidak dijalankan" 'ninit: started web'
 
 i=0
@@ -284,7 +284,7 @@ check "perintah baris kedua benar-benar dieksekusi" 'graceful shutdown'
 
 # --------------------------------------------------------------- skenario 4a
 # parse_config() gagal (file tidak ada) HARUS masuk rescue shell, bukan lanjut
-# boot dengan nol layanan lalu mengaku "main loop siap".
+# boot dengan nol layanan lalu mengaku "main loop ready".
 printf '\n== 4a. config tidak terbaca -> rescue shell ==\n'
 start_root badconf
 LOG6="$LOG"
@@ -298,9 +298,9 @@ if ! wait_for 'rescue mode'; then
 	bad "config tidak terbaca tidak memicu rescue mode"
 fi
 
-check "config gagal dilaporkan" 'Config gagal dibaca/di-parse!'
-check "init masuk rescue mode (shell)" 'Masuk rescue mode (shell)'
-check_absent "boot tidak dilanjutkan (tanpa 'main loop siap')" 'main loop siap'
+check "config gagal dilaporkan" 'Config failed to read/parse!'
+check "init masuk rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "boot tidak dilanjutkan (tanpa 'main loop ready')" 'main loop ready'
 
 i=0
 while [ "$i" -lt 50 ]; do
@@ -336,8 +336,8 @@ if ! wait_for 'rescue mode'; then
 	bad "siklus dependensi tidak memicu rescue mode"
 fi
 check "siklus dilaporkan FATAL" 'FATAL: CYCLE DETECTED'
-check "init masuk rescue mode (shell)" 'Masuk rescue mode (shell)'
-check_absent "boot tidak dilanjutkan (tanpa 'main loop siap')" 'main loop siap'
+check "init masuk rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "boot tidak dilanjutkan (tanpa 'main loop ready')" 'main loop ready'
 
 # Cari proses rescue shell: proses yang root filesystem-nya $ROOT dan argv[0]-nya
 # "sh" (setelah execl, PID 1 yang sama kini menjalankan busybox sh).
@@ -394,7 +394,7 @@ ${long_name}:once:${long_cmd}:requires=${long_deps}
 EOCFG
 
 run_init
-if ! wait_for 'entri ditolak'; then
+if ! wait_for 'entry rejected'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak mencatat penolakan string terlalu panjang dalam ${READY_TIMEOUT}s"
 fi
@@ -402,9 +402,9 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "nama terlalu panjang ditolak" 'Parse err: nama layanan terlalu panjang'
-check "perintah terlalu panjang ditolak" 'Parse err: perintah layanan'
-check "dependensi terlalu panjang ditolak" 'Parse err: dependensi layanan'
+check "nama terlalu panjang ditolak" 'Parse err: service name too long'
+check "perintah terlalu panjang ditolak" 'Parse err: service command'
+check "dependensi terlalu panjang ditolak" 'Parse err: service dependency'
 check "layanan sehat tetap jalan ('started dep')" 'ninit: started dep (pid'
 check_absent "layanan terlalu panjang TIDAK dijalankan" 'started longname'
 
@@ -422,7 +422,7 @@ LOG9="$LOG"
 } > "$ROOT/etc/init.conf"
 
 run_init
-if ! wait_for 'main loop siap'; then
+if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak selesai boot dalam ${READY_TIMEOUT}s pada uji layanan ke-65"
 fi
@@ -430,7 +430,7 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "peringatan batas 64 layanan tercapai" 'Peringatan: batas 64 layanan tercapai'
+check "peringatan batas 64 layanan tercapai" 'Warning: limit of 64 services reached'
 check_absent "layanan ke-65 tidak dijalankan" 'started svc65'
 
 # -------------------------------------------------------------- skenario 7
@@ -472,7 +472,7 @@ bad/svc:once:true
 EOCFG
 
 run_init
-if ! wait_for 'main loop siap'; then
+if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak boot dalam ${READY_TIMEOUT}s pada uji nama dengan slash"
 fi
@@ -480,11 +480,11 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "error nama mengandung slash dicatat" 'Parse err: nama layanan'
+check "error nama mengandung slash dicatat" 'Parse err: service name'
 check_absent "layanan dengan slash tidak dijalankan" 'started bad/svc'
 
 # -------------------------------------------------------------- skenario 8
-printf '\n== 9. baris config melebihi MAX_LINE ditolak utuh (audit SANE-03) ==\n'
+printf '\n== 9. baris config exceeds MAX_LINE ditolak utuh (audit SANE-03) ==\n'
 start_root longline
 LOG11="$LOG"
 
@@ -495,7 +495,7 @@ realsvc:once:true
 EOCFG
 
 run_init
-if ! wait_for 'main loop siap'; then
+if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak mencapai main loop pada skenario baris panjang dalam ${READY_TIMEOUT}s"
 fi
@@ -503,7 +503,7 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "baris terlalu panjang dicatat sebagai ditolak" 'melebihi MAX_LINE'
+check "baris terlalu panjang dicatat sebagai ditolak" 'exceeds MAX_LINE'
 check "layanan sesudah baris panjang tetap terdaftar ('started realsvc')" 'ninit: started realsvc (pid'
 check_absent "tidak ada layanan hantu dari potongan baris ('started ghost')" 'started ghost'
 
@@ -520,7 +520,7 @@ EOFSTAB
 printf 'fstabprobe:once:true\n' > "$ROOT/etc/init.conf"
 
 run_init
-if ! wait_for 'main loop siap'; then
+if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak mencapai main loop pada skenario fstab dalam ${READY_TIMEOUT}s"
 fi
@@ -529,11 +529,11 @@ INIT_PID="${init_pid:-}"
 stop_init
 
 check "fstab a: flag VFS dipisah, data hanya opsi filesystem, mount ok" '\[data: size=4M\] ok'
-check "fstab b: entri noauto dilewati" 'dilewati (opsi noauto)'
+check "fstab b: entri noauto dilewati" 'skipped (noauto option)'
 check_absent "fstab b: entri noauto TIDAK di-mount" 'mount tmpfs -> /mnt/b'
-check "fstab c: opsi userspace dicatat sebagai diabaikan" 'khusus userspace, diabaikan'
+check "fstab c: opsi userspace dicatat sebagai diabaikan" 'is userspace-only, ignored'
 check "fstab c: mount ok, data hanya mode=755" '\[data: mode=755\] ok'
-check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* failed'
 
 # ------------------------------------------------------------- skenario 11
 printf '\n== 11. batas baris di EOF: tepat MAX_LINE-1 diterima, MAX_LINE ditolak ==\n'
@@ -545,7 +545,7 @@ LOG13="$LOG"
 { printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1022))"; } > "$ROOT/etc/init.conf"
 
 run_init
-if ! wait_for 'main loop siap'; then
+if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak mencapai main loop pada skenario batas EOF dalam ${READY_TIMEOUT}s"
 fi
@@ -554,7 +554,7 @@ INIT_PID="${init_pid:-}"
 stop_init
 
 check "layanan normal tetap jalan pada skenario batas EOF" 'ninit: started first (pid'
-check_absent "baris EOF tepat MAX_LINE-1 (1023) TIDAK ditolak" 'melebihi MAX_LINE'
+check_absent "baris EOF tepat MAX_LINE-1 (1023) TIDAK ditolak" 'exceeds MAX_LINE'
 
 start_root eolover
 LOG14="$LOG"
@@ -562,7 +562,7 @@ LOG14="$LOG"
 { printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1023))"; } > "$ROOT/etc/init.conf"
 
 run_init
-if ! wait_for 'main loop siap'; then
+if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
 	fail "ninit tidak mencapai main loop pada skenario batas EOF+1 dalam ${READY_TIMEOUT}s"
 fi
@@ -570,7 +570,7 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "baris EOF MAX_LINE (1024) ditolak walau tanpa newline" 'melebihi MAX_LINE'
+check "baris EOF MAX_LINE (1024) ditolak walau tanpa newline" 'exceeds MAX_LINE'
 check "layanan normal tetap jalan setelah baris EOF ditolak" 'ninit: started first (pid'
 
 # ------------------------------------------------------------- skenario 12
@@ -602,8 +602,8 @@ INIT_PID="${init_pid:-}"
 stop_init
 
 check "fstab e1: exec/suid/dev terkonsumsi (bukan data), mount ok" 'mount tmpfs -> /mnt/e1 (tmpfs) \[data: size=1M\] ok'
-check "fstab e2: user dicatat menerapkan implikasinya" "opsi 'user' menerapkan noexec,nosuid,nodev"
-check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* gagal'
+check "fstab e2: user dicatat menerapkan implikasinya" "option 'user' applies noexec,nosuid,nodev"
+check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* failed'
 
 # Bukti dari /proc/mounts di dalam guest: flag yang BENAR-BENAR terpakai,
 # bukan sekadar mount() yang tidak error.
@@ -686,16 +686,16 @@ TEST_UMASK=""
 
 check "fstab f1: mountpoint bertingkat dibuat rekursif, mount ok" 'mount tmpfs -> /mnt/deep/nested (tmpfs) \[data: size=1M\] ok'
 check "fstab f2: trailing slash ditangani, mount ok" 'mount tmpfs -> /mnt/trail/ (tmpfs) \[data: size=1M\] ok'
-check "fstab f3: entri noauto dilewati" 'tmpfs -> /mnt/noauto-dir dilewati (opsi noauto)'
-check "fstab f4: entri bind ditolak eksplisit" '/sumber -> /mnt/bind-dir dilewati (bind/rbind tidak didukung)'
+check "fstab f3: entri noauto dilewati" 'tmpfs -> /mnt/noauto-dir skipped (noauto option)'
+check "fstab f4: entri bind ditolak eksplisit" '/sumber -> /mnt/bind-dir skipped (bind/rbind not supported)'
 check_absent "fstab f4: bind TIDAK ter-mount" 'mount /sumber -> /mnt/bind-dir'
-check "fstab f4b: bind+noauto -> alasan pertama (noauto) yang dicatat" '/sumber2 -> /mnt/nobind-dir dilewati (opsi noauto)'
-check_absent "fstab f4b: bind+noauto TIDAK dicatat sebagai bind" 'nobind-dir dilewati (bind'
-check "fstab f5: komponen symlink-ke-file ditolak jelas" "komponen '/mnt/filelink' dari mountpoint '/mnt/filelink/x' bukan direktori"
-check "fstab f6: komponen file biasa ditolak jelas" "komponen '/mnt/blocked' dari mountpoint '/mnt/blocked/x' bukan direktori"
-check "fstab f7: komponen '.' ditolak" "memuat komponen '.', ditolak"
-check "fstab f7b: komponen '..' ditolak oleh pra-pindai" "memuat komponen '..', ditolak"
-check "fstab f7c: symlink menggantung ditolak jelas" "stat '/mnt/dangle' gagal"
+check "fstab f4b: bind+noauto -> alasan pertama (noauto) yang dicatat" '/sumber2 -> /mnt/nobind-dir skipped (noauto option)'
+check_absent "fstab f4b: bind+noauto TIDAK dicatat sebagai bind" 'nobind-dir skipped (bind'
+check "fstab f5: komponen symlink-ke-file ditolak jelas" "component '/mnt/filelink' of mountpoint '/mnt/filelink/x' is not a directory"
+check "fstab f6: komponen file biasa ditolak jelas" "component '/mnt/blocked' of mountpoint '/mnt/blocked/x' is not a directory"
+check "fstab f7: komponen '.' ditolak" "contains component '.', rejected"
+check "fstab f7b: komponen '..' ditolak oleh pra-pindai" "contains component '..', rejected"
+check "fstab f7c: symlink menggantung ditolak jelas" "stat '/mnt/dangle' failed"
 check "fstab f8: symlink-ke-direktori diikuti, mount ok" 'mount tmpfs -> /mnt/linkdir/deep (tmpfs) \[data: size=1M\] ok'
 
 # Bukti sisi host: direktori yang benar-benar dibuat / tidak dibuat.
@@ -746,8 +746,8 @@ stop_init
 
 check "fstab g1: escape oktal didekode, mount ke path berisi spasi ok" 'mount tmpfs -> /mnt/spa ce (tmpfs) \[data: size=1M\] ok'
 check_absent "fstab g1: TIDAK ada mount ke nama harfiah backslash" 'mount tmpfs -> /mnt/spa\\040ce'
-check "fstab g2: entri duplikat dilewati dengan catatan" 'tmpfs -> /mnt/dup dilewati (mountpoint duplikat'
-check "fstab g3: escape terdekode menjadi '..' lalu ditolak pra-pindai" "memuat komponen '..', ditolak"
+check "fstab g2: entri duplikat dilewati dengan catatan" 'tmpfs -> /mnt/dup skipped (duplicate mountpoint'
+check "fstab g3: escape terdekode menjadi '..' lalu ditolak pra-pindai" "contains component '..', rejected"
 check "fstab g4: entri normal sesudahnya tetap diproses" 'mount tmpfs -> /mnt/plain (tmpfs) \[data: size=1M\] ok'
 
 # Bukti sisi host: direktori yang benar-benar dibuat / tidak dibuat.
@@ -785,7 +785,7 @@ printf '\n== log 6 (layanan ke-65) ==\n'
 sed 's/^/  | /' "$LOG9"
 printf '\n== log 7 (dependensi README: logd -> net) ==\n'
 sed 's/^/  | /' "$LOG10"
-printf '\n== log 9 (baris melebihi MAX_LINE) ==\n'
+printf '\n== log 9 (baris exceeds MAX_LINE) ==\n'
 sed 's/^/  | /' "$LOG11"
 printf '\n== log 10 (klasifikasi opsi fstab) ==\n'
 sed 's/^/  | /' "$LOG12"

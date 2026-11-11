@@ -83,8 +83,8 @@ cp "$BUSYBOX" "$ROOT/bin/sh"
 # menerima SIGTERM. String "bye!" di bawah yang diperiksa test ini.
 cat > "$ROOT/sigterm-service.sh" <<'EOSVC'
 #!/bin/sh
-trap 'echo "Menerima SIGTERM, bye!"; exit 0' TERM
-echo "sigterm-service: jalan, menunggu SIGTERM (pid $$)"
+trap 'echo "Received SIGTERM, bye!"; exit 0' TERM
+echo "sigterm-service: waiting for SIGTERM (pid $$)"
 while true; do sleep 1; done
 EOSVC
 chmod 0755 "$ROOT/sigterm-service.sh"
@@ -125,8 +125,8 @@ job=$!
 i=0
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 	init_pid=$(find_init_pid || true)
-	if [ -n "${init_pid:-}" ] && grep -q 'main loop siap' "$LOG" 2>/dev/null \
-	   && grep -q 'jalan, menunggu SIGTERM' "$LOG" 2>/dev/null; then
+	if [ -n "${init_pid:-}" ] && grep -q 'main loop ready' "$LOG" 2>/dev/null \
+	   && grep -q 'waiting for SIGTERM' "$LOG" 2>/dev/null; then
 		break
 	fi
 	sleep 0.2
@@ -175,7 +175,7 @@ bad() { printf '  [GAGAL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
 check() { if grep -q "$2" "$LOG"; then ok "$1"; else bad "$1"; fi; }
 
 printf '\n== pemeriksaan ==\n'
-check "layanan uji berjalan ('menunggu SIGTERM')" 'jalan, menunggu SIGTERM'
+check "layanan uji berjalan ('menunggu SIGTERM')" 'waiting for SIGTERM'
 
 if [ "$mask_checked" -eq 1 ]; then
 	if [ "$service_blocked" -eq 0 ]; then
@@ -187,7 +187,7 @@ else
 	printf '  [ -- ]   mask sinyal layanan tidak diperiksa (pid layanan tidak ketemu)\n'
 fi
 
-check "layanan menerima SIGTERM ('bye!' dari trap)" 'Menerima SIGTERM, bye!'
+check "layanan menerima SIGTERM ('bye!' dari trap)" 'Received SIGTERM, bye!'
 if grep -qE 'sigterm-test \(pid [0-9]+\) exit status=0x0' "$LOG"; then
 	ok "layanan keluar sendiri lewat trap (exit status=0x0)"
 else
@@ -238,7 +238,7 @@ i=0
 init_pid2=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 	init_pid2=$(find_init_pid || true)
-	if [ -n "${init_pid2:-}" ] && grep -q 'main loop siap' "$LOG2" 2>/dev/null \
+	if [ -n "${init_pid2:-}" ] && grep -q 'main loop ready' "$LOG2" 2>/dev/null \
 	   && grep -q 'started pipe-svc' "$LOG2" 2>/dev/null; then
 		break
 	fi
@@ -310,8 +310,8 @@ cat > "$ROOT3/stubborn-service.sh" <<'EOSVC'
 #!/bin/sh
 ( trap '' TERM; exec sleep 47 ) &
 echo $! > /var/stubborn.pid
-echo "stubborn-service: leader jalan (pid $$), anak bandel sleep 47"
-trap 'echo "leader menerima SIGTERM, bye!"; exit 0' TERM
+echo "stubborn-service: leader running (pid $$), stubborn child sleep 47"
+trap 'echo "leader received SIGTERM, bye!"; exit 0' TERM
 while true; do sleep 1; done
 EOSVC
 chmod 0755 "$ROOT3/stubborn-service.sh"
@@ -329,7 +329,7 @@ i=0
 init_pid3=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 	init_pid3=$(find_init_pid || true)
-	if [ -n "${init_pid3:-}" ] && grep -q 'main loop siap' "$LOG3" 2>/dev/null \
+	if [ -n "${init_pid3:-}" ] && grep -q 'main loop ready' "$LOG3" 2>/dev/null \
 	   && grep -q 'started stubborn-svc' "$LOG3" 2>/dev/null; then
 		break
 	fi
@@ -412,7 +412,7 @@ shutdown_secs=$(( $(date +%s) - t0 ))
 
 if stubborn_alive; then stubborn_after=1; else stubborn_after=0; fi
 
-if grep -q 'leader menerima SIGTERM, bye!' "$LOG3"; then
+if grep -q 'leader received SIGTERM, bye!' "$LOG3"; then
 	ok "leader keluar sendiri lewat trap SIGTERM"
 else
 	bad "leader tidak menjalankan trap SIGTERM"
@@ -487,7 +487,7 @@ i=0
 init_pid4=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 	init_pid4=$(find_init_pid || true)
-	if [ -n "${init_pid4:-}" ] && grep -q 'main loop siap' "$LOG4" 2>/dev/null \
+	if [ -n "${init_pid4:-}" ] && grep -q 'main loop ready' "$LOG4" 2>/dev/null \
 	   && grep -q 'started astall' "$LOG4" 2>/dev/null \
 	   && grep -q 'started zdead' "$LOG4" 2>/dev/null; then
 		break
@@ -524,9 +524,9 @@ check4() { if grep -q "$2" "$LOG4"; then ok "$1"; else bad "$1"; fi; }
 absent4() { if grep -q "$2" "$LOG4"; then bad "$1"; else ok "$1"; fi; }
 
 check4  "zdead ter-probe dan SIGKILL dilewati (pgid basi tidak dipakai)" \
-	'zdead: grup sudah mati, SIGKILL dilewati'
+	'zdead: process group already dead, SIGKILL skipped'
 absent4 "astall TIDAK dianggap grup mati (grupnya masih hidup)" \
-	'astall: grup sudah mati'
+	'astall: process group already dead'
 # Tidak ada asersi ketiga di sini. Baris "astall (pid N) exit status=0x9"
 # tidak dicetak karena shutdown_all() langsung reboot() begitu SIGKILL
 # terkirim — namespace mati sebelum ninit sempat reaping. Menandai cgroup
