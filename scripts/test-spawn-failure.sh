@@ -146,7 +146,7 @@ boot_guest "$R1" "$WAIT1" "" >"$L1" 2>&1
 check_in  "boot dijalankan lalu gagal (exit status=0x300)" "$L1" \
 	'boot (pid .* exit status=0x300'
 check_in  "app dibatalkan karena dependensi gagal" "$L1" \
-	"layanan 'app' dibatalkan: dependensi 'boot' gagal"
+	"service 'app' cancelled: dependency 'boot' failed"
 absent_in "app TIDAK pernah di-start setelah dibatalkan" "$L1" 'started app'
 
 # ------------------------------------------------------------- Skenario 2
@@ -184,7 +184,7 @@ fi
 # ------------------------------------------------------------- Skenario 3
 # fork() gagal terus (EAGAIN) pada layanan once -> percobaan dibatasi, lalu
 # state terminal FAILED, lalu dependennya dibatalkan. Bila do-while benar-benar
-# terkunci seperti dugaan audit, 'main loop siap' tidak akan pernah tercetak.
+# terkunci seperti dugaan audit, 'main loop ready' tidak akan pernah tercetak.
 printf '\n== Skenario 3: kegagalan fork() pada layanan once (pids.max=1) ==\n'
 pids_ok=0
 if [ -r /sys/fs/cgroup/cgroup.controllers ] \
@@ -203,13 +203,13 @@ else
 	printf 'boot:once:exit 0\napp:respawn:exit 0:requires=boot\n' > "$R3/etc/init.conf"
 	boot_guest "$R3" "$WAIT3" "$CG" >"$L3" 2>&1
 
-	check_in  "event loop tetap masuk (tidak ada busy-loop)" "$L3" 'main loop siap'
+	check_in  "event loop tetap masuk (tidak ada busy-loop)" "$L3" 'main loop ready'
 	check_in  "kegagalan fork() tercatat untuk boot" "$L3" \
 		'fork boot: Resource temporarily unavailable'
 	check_in  "percobaan dibatasi lalu boot dinyatakan gagal" "$L3" \
-		'percobaan, layanan dinyatakan gagal'
+		'attempts, service marked failed'
 	check_in  "dependen dibatalkan bersih" "$L3" \
-		"layanan 'app' dibatalkan: dependensi 'boot' gagal"
+		"service 'app' cancelled: dependency 'boot' failed"
 	absent_in "boot tidak pernah berhasil di-spawn" "$L3" 'started boot'
 	absent_in "app tidak dicoba spawn sebelum dependensi terminal" "$L3" 'fork app'
 	nfork=$(grep -c 'fork boot' "$L3" 2>/dev/null || true)
@@ -248,9 +248,9 @@ EOF
 boot_guest "$R4" 6 "" >"$L4" 2>&1
 
 check_in  "crasher terdeteksi crash-loop dan dinyatakan gagal" "$L4" \
-	'crasher: crash-loop terdeteksi'
+	'crasher: crash-loop detected'
 check_in  "dependen dibatalkan karena dependensi respawn gagal" "$L4" \
-	"layanan 'dep' dibatalkan: dependensi 'crasher' gagal"
+	"service 'dep' cancelled: dependency 'crasher' failed"
 absent_in "dependen tidak pernah dijalankan" "$L4" 'started dep'
 
 # ------------------------------------------------------------- Skenario 5
@@ -271,11 +271,11 @@ EOF
 boot_guest "$R5" 6 "" >"$L5" 2>&1
 
 check_in  "hanger dibunuh karena batas waktu timeout 2 detik" "$L5" \
-	'hanger: layanan once melebihi batas waktu 2 detik, dinyatakan gagal'
+	'hanger: once service exceeded 2 seconds timeout, marked failed'
 check_in  "hanger dimatikan paksa oleh sinyal (exit status=0x9)" "$L5" \
 	'hanger (pid .* exit status=0x9'
 check_in  "dependen dibatalkan saat layanan once timeout" "$L5" \
-	"layanan 'dep' dibatalkan: dependensi 'hanger' gagal"
+	"service 'dep' cancelled: dependency 'hanger' failed"
 absent_in "hanger tidak selesai secara sukses" "$L5" 'hanger (pid .* exit status=0x0'
 absent_in "dependen tidak pernah dijalankan" "$L5" 'started dep'
 

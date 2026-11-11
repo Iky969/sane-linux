@@ -795,7 +795,7 @@ else
 	check_in  "layanan mem_test dihentikan deterministik oleh OOM (exit status=0x9)" "$L1" \
 		'mem_test (pid .* exit status=0x9'
 	check_in  "leaf cgroup dibersihkan setelah OOM" "$L1" \
-		"cgroup: dibersihkan 'mem_test'"
+		"cgroup: cleaned up 'mem_test'"
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L1" \
 		'graceful shutdown'
 fi
@@ -823,7 +823,7 @@ else
 	check_in  "fork melebihi batas ditolak deterministik dengan EAGAIN" "$R2/var/pids_audit.txt" \
 		'EAGAIN_CONFIRMED count=4'
 	check_in  "leaf cgroup dibersihkan setelah selesai" "$L2" \
-		"cgroup: dibersihkan 'pids_test'"
+		"cgroup: cleaned up 'pids_test'"
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L2" \
 		'graceful shutdown'
 fi
@@ -870,7 +870,7 @@ EOF
 	check_in  "layanan leak generasi 1 dijalankan" "$L3" \
 		"started leak (pid "
 	check_in  "respawn generasi 1 ditunda timer" "$L3" \
-		'leak: respawn ditunda'
+		'leak: respawn delayed'
 	if [ -f "$R3/var/gen2_started" ]; then
 		ok "layanan leak generasi 2 berhasil dijalankan kembali"
 	else
@@ -879,7 +879,7 @@ EOF
 	check_in  "orphan generasi 1 disapu bersih tanpa sisa (LINGERING_ORPHANS=0)" "$R3/var/leak_audit.txt" \
 		'LINGERING_ORPHANS=0'
 	check_in  "leaf cgroup dibersihkan saat shutdown" "$L3" \
-		"cgroup: dibersihkan 'leak'"
+		"cgroup: cleaned up 'leak'"
 fi
 
 # ------------------------------------------------------------- Skenario 4
@@ -924,7 +924,7 @@ else
 		skip "pembacaan leaf pids.max dilewati: controller pids tidak aktif"
 	fi
 	check_in "leaf cgroup dibersihkan setelah selesai" "$L4" \
-		"cgroup: dibersihkan 'limits_audit'"
+		"cgroup: cleaned up 'limits_audit'"
 fi
 
 # ------------------------------------------------------------- Skenario 5
@@ -960,11 +960,11 @@ EOF
 boot_guest "$R5" "$WAIT5" >"$L5" 2>&1
 
 check_in  "peringatan memory_max invalid dicatat di log" "$L5" \
-	"memory_max '64MB' tidak valid"
+	"invalid memory_max '64MB'"
 check_in  "peringatan cpu_max invalid dicatat di log" "$L5" \
-	"cpu_max 'invalid 100000' tidak valid"
+	"invalid cpu_max 'invalid 100000'"
 check_in  "peringatan pids_max invalid dicatat di log" "$L5" \
-	"pids_max '-5' tidak valid"
+	"invalid pids_max '-5'"
 check_in  "layanan dengan limit valid tetap berjalan normal" "$R5/var/valid.txt" \
 	'VALID_OK'
 check_in  "limit valid diterapkan ke leaf cgroup" "$L5" \
@@ -998,9 +998,9 @@ setup_r6="mount -t sysfs sysfs $R6/sys; mkdir -p $R6/sys/fs/cgroup; mount -t tmp
 boot_guest "$R6" "$WAIT6" "" "$setup_r6" >"$L6" 2>&1
 
 check_in  "kegagalan buka/tulis subtree_control ditoleransi dengan log" "$L6" \
-	'buka .*subtree_control gagal'
-check_in  "toleransi nested/container tercatat di log" "$L6" \
-	'toleransi nested/container'
+	'open .*subtree_control failed'
+check_in  "nested/container tolerant tercatat di log" "$L6" \
+	'nested/container tolerant'
 check_in  "layanan berhasil di-spawn meskipun subtree_control terhambat" "$R6/var/nested.txt" \
 	'NESTED_OK'
 check_in  "sistem masuk ke main loop dan shutdown bersih" "$L6" \
@@ -1033,13 +1033,13 @@ else
 	printf 'boot_pr9:once:exit 0\napp_dep:respawn:exit 0:requires=boot_pr9\n' > "$R7/etc/init.conf"
 	boot_guest "$R7" "$WAIT7" "$CG_PR9" >"$L7" 2>&1
 
-	check_in  "event loop tetap masuk dan responsif" "$L7" 'main loop siap'
+	check_in  "event loop tetap masuk dan responsif" "$L7" 'main loop ready'
 	check_in  "kegagalan fork() terdeteksi karena cgroup pids habis" "$L7" \
 		'fork boot_pr9: Resource temporarily unavailable'
 	check_in  "layanan once mencoba ulang hingga batas lalu dinyatakan gagal" "$L7" \
-		'percobaan, layanan dinyatakan gagal'
+		'attempts, service marked failed'
 	check_in  "layanan dependen dibatalkan deterministik" "$L7" \
-		"layanan 'app_dep' dibatalkan: dependensi 'boot_pr9' gagal"
+		"service 'app_dep' cancelled: dependency 'boot_pr9' failed"
 	absent_in "boot_pr9 tidak pernah berhasil di-spawn" "$L7" 'started boot_pr9'
 	absent_in "app_dep tidak pernah di-spawn saat dependensi gagal" "$L7" 'fork app_dep'
 	nfork=$(grep -c 'fork boot_pr9' "$L7" 2>/dev/null || true)
@@ -1098,13 +1098,13 @@ EOF
 	check_in  "layanan orphan_maker dijalankan" "$L8" \
 		'started orphan_maker'
 	check_in  "leaf cgroup orphan_maker berhasil dibersihkan tanpa EBUSY" "$L8" \
-		"cgroup: dibersihkan 'orphan_maker'"
+		"cgroup: cleaned up 'orphan_maker'"
 	absent_in "tidak ada kegagalan rmdir leaf cgroup" "$L8" \
 		"Device or resource busy"
 	check_in  "orphan dari layanan once disapu bersih sebelum checker (LINGERING_ONCE_ORPHANS=0)" \
 		"$R8/var/once_orphan_audit.txt" 'LINGERING_ONCE_ORPHANS=0'
 	before_in "leaf cgroup orphan_maker dibersihkan sebelum graceful shutdown" "$L8" \
-		"cgroup: dibersihkan 'orphan_maker'" 'graceful shutdown'
+		"cgroup: cleaned up 'orphan_maker'" 'graceful shutdown'
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L8" \
 		'graceful shutdown'
 fi
@@ -1239,7 +1239,7 @@ EOF
 	check_in  "cgroup.procs leaf escape_svc kosong sebelum rmdir" \
 		"$R9/var/escape_clean_audit.txt" 'CGROUP_PROCS=0'
 	check_in  "leaf cgroup escape_svc dibersihkan setelah sweep" "$L9" \
-		"cgroup: dibersihkan 'escape_svc'"
+		"cgroup: cleaned up 'escape_svc'"
 	absent_in "tidak ada kegagalan rmdir leaf cgroup (EBUSY)" "$L9" \
 		"Device or resource busy"
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L9" \
@@ -1279,7 +1279,7 @@ EOF
 	absent_in "tidak ada fork yang lolos melebihi batas pids.max" \
 		"$R10A/var/pids_tree_audit.txt" 'UNEXPECTED_FORK_SUCCESS'
 	check_in  "leaf cgroup dibersihkan setelah selesai" "$L10A" \
-		"cgroup: dibersihkan 'pids_tree'"
+		"cgroup: cleaned up 'pids_tree'"
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L10A" \
 		'graceful shutdown'
 fi
@@ -1316,7 +1316,7 @@ EOF
 	absent_in "tidak ada exit status=0x9 palsu pada leader mem_cumul" "$L10B" \
 		'mem_cumul (pid .* exit status=0x9'
 	check_in  "leaf cgroup dibersihkan setelah OOM kumulatif" "$L10B" \
-		"cgroup: dibersihkan 'mem_cumul'"
+		"cgroup: cleaned up 'mem_cumul'"
 	check_in  "event loop tetap jalan dan shutdown bersih" "$L10B" \
 		'graceful shutdown'
 fi
@@ -1363,11 +1363,11 @@ setup_r11="mount -t sysfs sysfs $R11/sys; mkdir -p $R11/sys/fs; mount -t tmpfs t
 boot_guest "$R11" "$WAIT11" "" "$setup_r11" >"$L11" 2>&1
 
 check_in  "kegagalan mount cgroup v2 tercatat di log" "$L11" \
-	'cgroup2: mount /sys/fs/cgroup gagal'
+	'cgroup2: mount /sys/fs/cgroup failed'
 check_in  "fallback fail-open aktif tercatat di log" "$L11" \
-	"cgroup: fail-open aktif untuk 'failopen_svc'"
+	"cgroup: fail-open active for 'failopen_svc'"
 check_in  "warning batas resource diabaikan tercatat di log" "$L11" \
-	"Warning: batas resource diabaikan pada layanan 'failopen_svc' karena cgroup tidak tersedia"
+	"Warning: resource limits ignored on service 'failopen_svc' because cgroup unavailable"
 check_in  "layanan tetap berhasil dieksekusi normal saat cgroup tidak tersedia" \
 	"$R11/var/failopen_audit.txt" 'FAILOPEN_EXECUTED'
 check_in  "orphan sleep 300 disapu bersih via fallback kill(-pgid) saat fail-open (LINGERING_FAILOPEN_ORPHANS=0)" \

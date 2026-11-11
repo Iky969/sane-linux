@@ -156,14 +156,14 @@ static void try_mount(const char *src, const char *tgt, const char *fstype, unsi
 {
     mkdir(tgt, 0755);
     if (mount(src, tgt, fstype, flags, NULL) < 0)
-        init_log("mount %s -> %s gagal: %s", src, tgt, strerror(errno));
+        init_log("mount %s -> %s failed: %s", src, tgt, strerror(errno));
 }
 
 static void enable_cgroup_subtree(const char *path)
 {
     int fd = open(path, O_WRONLY);
     if (fd < 0) {
-        init_log("cgroup: buka %s gagal: %s (toleransi nested/container)", path, strerror(errno));
+        init_log("cgroup: open %s failed: %s (nested/container tolerant)", path, strerror(errno));
         return;
     }
 
@@ -175,7 +175,7 @@ static void enable_cgroup_subtree(const char *path)
             char buf[32];
             snprintf(buf, sizeof(buf), "%s\n", controllers[i]);
             if (write(fd, buf, strlen(buf)) < 0) {
-                init_log("cgroup: controller '%s' pada %s gagal: %s (toleransi partial)",
+                init_log("cgroup: controller '%s' at %s failed: %s (partial tolerance)",
                          controllers[i], path, strerror(errno));
             }
         }
@@ -198,13 +198,13 @@ static void setup_pseudo_fs(void)
     {
         struct stat st;
         if (stat("/sys/fs/cgroup/cgroup.controllers", &st) == 0) {
-            init_log("cgroup2: /sys/fs/cgroup sudah ter-mount");
+            init_log("cgroup2: /sys/fs/cgroup already mounted");
         } else {
             mkdir("/sys/fs/cgroup", 0755);
             if (mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, NULL) < 0)
-                init_log("cgroup2: mount /sys/fs/cgroup gagal: %s", strerror(errno));
+                init_log("cgroup2: mount /sys/fs/cgroup failed: %s", strerror(errno));
             else
-                init_log("cgroup2: /sys/fs/cgroup ter-mount");
+                init_log("cgroup2: /sys/fs/cgroup mounted");
         }
         enable_cgroup_subtree("/sys/fs/cgroup/cgroup.subtree_control");
     }
@@ -254,7 +254,7 @@ static const char *get_cgroup_base(void)
         while (len > 1 && cgroup_base_buf[len - 1] == '/')
             cgroup_base_buf[--len] = 0;
         cgroup_base_ptr = cgroup_base_buf;
-        init_log("cgroup: base path di-override: %s", cgroup_base_ptr);
+        init_log("cgroup: base path overridden: %s", cgroup_base_ptr);
     } else {
         cgroup_base_ptr = CGROUP_BASE_DEFAULT;
     }
@@ -274,7 +274,7 @@ static int cgroup_name_safe(const char *name)
 {
     if (!name || name[0] == '\0' || strcmp(name, ".") == 0 ||
         strcmp(name, "..") == 0 || strstr(name, "..") != NULL) {
-        init_log("cgroup: nama layanan '%s' tidak valid, operasi cgroup dibatalkan",
+        init_log("cgroup: service name '%s' invalid, cgroup operation aborted",
                  name ? name : "(null)");
         return 0;
     }
@@ -293,7 +293,7 @@ static void cgroup_kill_service(const char *name)
     if (fd >= 0) {
         written = write(fd, "1\n", 2);
         if (written < 0) {
-            init_log("cgroup: tulis 1 ke %s gagal: %s", kill_path, strerror(errno));
+            init_log("cgroup: write 1 to %s failed: %s", kill_path, strerror(errno));
         }
         close(fd);
         if (written >= 0) return;
@@ -318,12 +318,12 @@ static void cgroup_kill_service(const char *name)
 /* Fallback fail-open eksplisit saat cgroup tidak dapat disiapkan */
 static void cgroup_fail_open(const char *svc_name)
 {
-    init_log("cgroup: fail-open aktif untuk '%s' (cgroup tidak tersedia)", svc_name);
+    init_log("cgroup: fail-open active for '%s' (cgroup unavailable)", svc_name);
     int idx = find_service(svc_name);
     if (idx >= 0) {
         const service_t *svc = &services[idx];
         if (svc->memory_max[0] || svc->cpu_max[0] || svc->pids_max[0]) {
-            init_log("Warning: batas resource diabaikan pada layanan '%s' karena cgroup tidak tersedia", svc_name);
+            init_log("Warning: resource limits ignored on service '%s' because cgroup unavailable", svc_name);
         }
     }
 }
@@ -339,7 +339,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
 
     /* cgroup v2 tidak membuat parent otomatis */
     if (mkdir(CGROUP_BASE, 0755) < 0 && errno != EEXIST) {
-        init_log("cgroup: mkdir %s gagal: %s", CGROUP_BASE, strerror(errno));
+        init_log("cgroup: mkdir %s failed: %s", CGROUP_BASE, strerror(errno));
         cgroup_fail_open(svc_name);
         return 1;
     }
@@ -351,7 +351,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
 
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
     if (mkdir(dir, 0755) < 0 && errno != EEXIST) {
-        init_log("cgroup: mkdir %s gagal: %s", dir, strerror(errno));
+        init_log("cgroup: mkdir %s failed: %s", dir, strerror(errno));
         cgroup_fail_open(svc_name);
         return 1;
     }
@@ -370,16 +370,16 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
             if (lim_fd >= 0) {
                 if (dprintf(lim_fd, "%s\n", svc->memory_max) < 0) {
                     int err = errno;
-                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->memory_max, path, strerror(err));
-                    init_log("Warning: batas resource memory.max diabaikan pada layanan '%s'", svc_name);
+                    init_log("cgroup: write %s to %s failed: %s", svc->memory_max, path, strerror(err));
+                    init_log("Warning: memory.max resource limit ignored on service '%s'", svc_name);
                 } else {
                     init_log("cgroup: '%s' memory.max = %s", svc_name, svc->memory_max);
                 }
                 close(lim_fd);
             } else {
                 int err = errno;
-                init_log("cgroup: buka %s gagal: %s", path, strerror(err));
-                init_log("Warning: batas resource memory.max diabaikan pada layanan '%s'", svc_name);
+                init_log("cgroup: open %s failed: %s", path, strerror(err));
+                init_log("Warning: memory.max resource limit ignored on service '%s'", svc_name);
             }
 
             /* Batasi memory.swap.max=0 jika didukung, agar batas memory_max tidak bocor ke swap */
@@ -399,16 +399,16 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
             if (lim_fd >= 0) {
                 if (dprintf(lim_fd, "%s\n", svc->cpu_max) < 0) {
                     int err = errno;
-                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->cpu_max, path, strerror(err));
-                    init_log("Warning: batas resource cpu.max diabaikan pada layanan '%s'", svc_name);
+                    init_log("cgroup: write %s to %s failed: %s", svc->cpu_max, path, strerror(err));
+                    init_log("Warning: cpu.max resource limit ignored on service '%s'", svc_name);
                 } else {
                     init_log("cgroup: '%s' cpu.max = %s", svc_name, svc->cpu_max);
                 }
                 close(lim_fd);
             } else {
                 int err = errno;
-                init_log("cgroup: buka %s gagal: %s", path, strerror(err));
-                init_log("Warning: batas resource cpu.max diabaikan pada layanan '%s'", svc_name);
+                init_log("cgroup: open %s failed: %s", path, strerror(err));
+                init_log("Warning: cpu.max resource limit ignored on service '%s'", svc_name);
             }
         }
         if (svc->pids_max[0]) {
@@ -418,16 +418,16 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
             if (lim_fd >= 0) {
                 if (dprintf(lim_fd, "%s\n", svc->pids_max) < 0) {
                     int err = errno;
-                    init_log("cgroup: tulis %s ke %s gagal: %s", svc->pids_max, path, strerror(err));
-                    init_log("Warning: batas resource pids.max diabaikan pada layanan '%s'", svc_name);
+                    init_log("cgroup: write %s to %s failed: %s", svc->pids_max, path, strerror(err));
+                    init_log("Warning: pids.max resource limit ignored on service '%s'", svc_name);
                 } else {
                     init_log("cgroup: '%s' pids.max = %s", svc_name, svc->pids_max);
                 }
                 close(lim_fd);
             } else {
                 int err = errno;
-                init_log("cgroup: buka %s gagal: %s", path, strerror(err));
-                init_log("Warning: batas resource pids.max diabaikan pada layanan '%s'", svc_name);
+                init_log("cgroup: open %s failed: %s", path, strerror(err));
+                init_log("Warning: pids.max resource limit ignored on service '%s'", svc_name);
             }
         }
     }
@@ -435,7 +435,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
     fd = open(procs, O_WRONLY);
     if (fd < 0) {
-        init_log("cgroup: buka %s gagal: %s", procs, strerror(errno));
+        init_log("cgroup: open %s failed: %s", procs, strerror(errno));
         /* Bersihkan direktori leaf parsial supaya tidak bocor di host */
         rmdir(dir);
         cgroup_fail_open(svc_name);
@@ -443,7 +443,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     }
 
     if (dprintf(fd, "%d\n", (int)pid) < 0) {
-        init_log("cgroup: tulis pid %d ke %s gagal: %s", (int)pid, procs, strerror(errno));
+        init_log("cgroup: write pid %d to %s failed: %s", (int)pid, procs, strerror(errno));
         close(fd);
         /* Bersihkan direktori leaf parsial */
         rmdir(dir);
@@ -465,19 +465,19 @@ static void cleanup_cgroup(const char *svc_name)
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
     for (int i = 0; i < 20; i++) {
         if (rmdir(dir) == 0) {
-            init_log("cgroup: dibersihkan '%s'", svc_name);
+            init_log("cgroup: cleaned up '%s'", svc_name);
             return;
         }
         if (errno != EBUSY) {
             if (errno != ENOENT) {
-                init_log("cgroup: rmdir %s gagal: %s", dir, strerror(errno));
+                init_log("cgroup: rmdir %s failed: %s", dir, strerror(errno));
             }
             return;
         }
         usleep(5000);
     }
     if (errno != ENOENT) {
-        init_log("cgroup: rmdir %s gagal: %s", dir, strerror(errno));
+        init_log("cgroup: rmdir %s failed: %s", dir, strerror(errno));
     }
 }
 
@@ -578,12 +578,12 @@ static int validate_pids_max(const char *s)
 static int parse_config(const char *path)
 {
     FILE *f = fopen(path, "r");
-    if (!f) { init_log("buka %s gagal: %s", path, strerror(errno)); return -1; }
+    if (!f) { init_log("open %s failed: %s", path, strerror(errno)); return -1; }
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
         if (line_overlong(f, line)) {
-            init_log("Parse err: baris melebihi MAX_LINE (%d), baris ditolak", MAX_LINE);
+            init_log("Parse err: line exceeds MAX_LINE (%d), line rejected", MAX_LINE);
             continue;
         }
         line[strcspn(line, "\n")] = 0;
@@ -592,7 +592,7 @@ static int parse_config(const char *path)
         if (*p == '#' || *p == 0) continue;
 
         if (num_services >= MAX_SERVICES) {
-            init_log("Peringatan: batas %d layanan tercapai, '%s' diabaikan", MAX_SERVICES, p);
+            init_log("Warning: limit of %d services reached, '%s' ignored", MAX_SERVICES, p);
             continue;
         }
 
@@ -606,7 +606,7 @@ static int parse_config(const char *path)
 
         /* Validasi Nama Layanan: tidak boleh memuat '/' (dipakai untuk direktori cgroup) */
         if (strchr(name, '/')) {
-            init_log("Parse err: nama layanan '%s' tidak boleh memuat '/'", name);
+            init_log("Parse err: service name '%s' cannot contain '/'", name);
             continue;
         }
 
@@ -615,7 +615,7 @@ static int parse_config(const char *path)
            path melarikan diri dari base (SANE-06-02). */
         if (name[0] == '\0' || strcmp(name, ".") == 0 ||
             strcmp(name, "..") == 0 || strstr(name, "..") != NULL) {
-            init_log("Parse err: nama layanan '%s' tidak valid (kosong, '.', '..', atau memuat '..'), entri ditolak",
+            init_log("Parse err: service name '%s' invalid (empty, '.', '..' or contains '..'), entry rejected",
                      name);
             continue;
         }
@@ -624,7 +624,7 @@ static int parse_config(const char *path)
            pertama, jadi entri kedua diam-diam berbagi leaf cgroup,
            dependensi, dan jadwal respawn dengan yang pertama (SANE-06-03). */
         if (find_service(name) >= 0) {
-            init_log("Parse err: nama layanan '%s' sudah terdaftar, entri duplikat ditolak", name);
+            init_log("Parse err: service name '%s' already registered, duplicate entry rejected", name);
             continue;
         }
         
@@ -680,16 +680,16 @@ static int parse_config(const char *path)
                             if (v > 0 && v <= 86400) {
                                 timeout_val = (int)v;
                             } else {
-                                init_log("Parse err: timeout '%s' di luar jangkauan (1-86400s) pada layanan '%s', memakai default %ds",
+                                init_log("Parse err: timeout '%s' out of range (1-86400s) on service '%s', using default %ds",
                                          tout_str, name, ONCE_START_TIMEOUT);
                             }
                         } else {
-                            init_log("Parse err: format timeout '%s' tidak valid pada layanan '%s', memakai default %ds",
+                            init_log("Parse err: invalid timeout format '%s' on service '%s', using default %ds",
                                      tout_str, name, ONCE_START_TIMEOUT);
                         }
                     }
                 } else {
-                    init_log("Warning: opsi '%s' tidak dikenal pada layanan '%s'", scan, name);
+                    init_log("Warning: unknown option '%s' on service '%s'", scan, name);
                 }
 
                 scan = next_tag ? next_tag + 1 : NULL;
@@ -699,21 +699,21 @@ static int parse_config(const char *path)
         /* Validasi Semantik Limit Resource Cgroup v2 */
         if (mem_max[0] != '\0') {
             if (!validate_memory_max(mem_max)) {
-                init_log("Parse err: memory_max '%s' tidak valid pada layanan '%s', batas diabaikan",
+                init_log("Parse err: invalid memory_max '%s' on service '%s', limit ignored",
                          mem_max, name);
                 mem_max = "";
             }
         }
         if (cpu_limit[0] != '\0') {
             if (!validate_cpu_max(cpu_limit)) {
-                init_log("Parse err: cpu_max '%s' tidak valid pada layanan '%s', batas diabaikan",
+                init_log("Parse err: invalid cpu_max '%s' on service '%s', limit ignored",
                          cpu_limit, name);
                 cpu_limit = "";
             }
         }
         if (pids_limit[0] != '\0') {
             if (!validate_pids_max(pids_limit)) {
-                init_log("Parse err: pids_max '%s' tidak valid pada layanan '%s', batas diabaikan",
+                init_log("Parse err: invalid pids_max '%s' on service '%s', limit ignored",
                          pids_limit, name);
                 pids_limit = "";
             }
@@ -723,7 +723,7 @@ static int parse_config(const char *path)
         int is_respawn = 0;
         if (strcmp(mode, "respawn") == 0) is_respawn = 1;
         else if (strcmp(mode, "once") != 0) {
-            init_log("Warning: mode '%s' tidak dikenal untuk '%s'. Default: once", mode, name);
+            init_log("Warning: unknown mode '%s' for '%s'. Default: once", mode, name);
         }
 
         /* Tolak entri yang bidangnya melebihi buffer (audit SANE-03): versi
@@ -734,32 +734,32 @@ static int parse_config(const char *path)
            berbeda dari yang ditulis pengguna. */
         int too_long = 0;
         if (strlen(name) >= sizeof(services[num_services].name)) {
-            init_log("Parse err: nama layanan terlalu panjang (panjang %zu > maks %d), entri ditolak",
+            init_log("Parse err: service name too long (length %zu > max %d), entry rejected",
                      strlen(name), (int)sizeof(services[num_services].name) - 1);
             too_long = 1;
         }
         if (strlen(cmd) >= sizeof(services[num_services].cmd)) {
-            init_log("Parse err: perintah layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+            init_log("Parse err: service command '%s' too long (length %zu > max %d), entry rejected",
                      name, strlen(cmd), (int)sizeof(services[num_services].cmd) - 1);
             too_long = 1;
         }
         if (strlen(deps) >= sizeof(services[num_services].deps_str)) {
-            init_log("Parse err: dependensi layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+            init_log("Parse err: service dependency '%s' too long (length %zu > max %d), entry rejected",
                      name, strlen(deps), (int)sizeof(services[num_services].deps_str) - 1);
             too_long = 1;
         }
         if (strlen(mem_max) >= sizeof(services[num_services].memory_max)) {
-            init_log("Parse err: memory_max layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+            init_log("Parse err: service memory_max '%s' too long (length %zu > max %d), entry rejected",
                      name, strlen(mem_max), (int)sizeof(services[num_services].memory_max) - 1);
             too_long = 1;
         }
         if (strlen(cpu_limit) >= sizeof(services[num_services].cpu_max)) {
-            init_log("Parse err: cpu_max layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+            init_log("Parse err: service cpu_max '%s' too long (length %zu > max %d), entry rejected",
                      name, strlen(cpu_limit), (int)sizeof(services[num_services].cpu_max) - 1);
             too_long = 1;
         }
         if (strlen(pids_limit) >= sizeof(services[num_services].pids_max)) {
-            init_log("Parse err: pids_max layanan '%s' terlalu panjang (panjang %zu > maks %d), entri ditolak",
+            init_log("Parse err: service pids_max '%s' too long (length %zu > max %d), entry rejected",
                      name, strlen(pids_limit), (int)sizeof(services[num_services].pids_max) - 1);
             too_long = 1;
         }
@@ -840,7 +840,7 @@ static int validate_dependencies(void)
         char token[256];
         while (next_dep(services[i].deps_str, &off, token, sizeof(token))) {
             if (find_service(token) < 0) {
-                init_log("FATAL: Dependensi '%s' untuk '%s' tidak ditemukan",
+                init_log("FATAL: Dependency '%s' for '%s' not found",
                          token, services[i].name);
                 return -1;
             }
@@ -871,7 +871,7 @@ static int sort_services(void)
         int stack[MAX_SERVICES], stack_top = 0;
 
         if (stack_top >= MAX_SERVICES) {        /* guard sebelum setiap push */
-            init_log("FATAL: Stack overflow pada topological sort!");
+            init_log("FATAL: Stack overflow in topological sort!");
             return -1;
         }
         temp_visited[i] = 1;                    /* tandai SEBELUM push */
@@ -889,12 +889,12 @@ static int sort_services(void)
                 if (dep_idx < 0) continue;
 
                 if (temp_visited[dep_idx]) {
-                    init_log("FATAL: CYCLE DETECTED di %s -> %s", services[curr].name, token);
+                    init_log("FATAL: CYCLE DETECTED at %s -> %s", services[curr].name, token);
                     return -1; /* Abort! */
                 }
                 if (!visited[dep_idx]) {
                     if (stack_top >= MAX_SERVICES) {
-                        init_log("FATAL: Stack overflow pada topological sort!");
+                        init_log("FATAL: Stack overflow in topological sort!");
                         return -1;
                     }
                     temp_visited[dep_idx] = 1;  /* tandai SEBELUM push */
@@ -938,7 +938,7 @@ static int spawn_service(service_t *svc)
        crash-loop (T8D), bukan tetap RESPAWN_DELAY. */
     if (svc->last_start && (now - svc->last_start) < svc->respawn_delay) {
         if (!svc->need_respawn)
-            init_log("%s: respawn ditunda (timer %d detik, loop tidak diblokir)",
+            init_log("%s: respawn delayed (timer %d seconds, loop unblocked)",
                      svc->name, svc->respawn_delay);
         svc->need_respawn = 1;
         return 0;
@@ -949,11 +949,11 @@ static int spawn_service(service_t *svc)
     if (pipe2(sync_pipe, O_CLOEXEC) < 0) {
         if (pipe(sync_pipe) < 0) {
             /* Pembuatan pipe gagal: jangan fork tanpa sync, retry nanti */
-            init_log("pipe2 %s: %s (spawn digagalkan, retry)",
+            init_log("pipe2 %s: %s (spawn aborted, retry)",
                      svc->name, strerror(errno));
             svc->spawn_tries++;
             if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
-                init_log("%s: gagal buat pipe %d kali, layanan dinyatakan gagal",
+                init_log("%s: failed to create pipe %d times, service marked failed",
                          svc->name, svc->spawn_tries);
                 svc->state = SVC_STATE_FAILED;
                 svc->spawn_tries = 0;
@@ -972,14 +972,14 @@ static int spawn_service(service_t *svc)
                 fcntl(sync_pipe[0], F_SETFD, fl0 | FD_CLOEXEC) < 0 ||
                 fcntl(sync_pipe[1], F_SETFD, fl1 | FD_CLOEXEC) < 0) {
                 int err = errno;
-                init_log("fcntl CLOEXEC %s: %s (spawn digagalkan, retry)",
+                init_log("fcntl CLOEXEC %s: %s (spawn aborted, retry)",
                          svc->name, strerror(err));
                 close(sync_pipe[0]);
                 close(sync_pipe[1]);
                 sync_pipe[0] = sync_pipe[1] = -1;
                 svc->spawn_tries++;
                 if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
-                    init_log("%s: gagal pasang CLOEXEC %d kali, layanan dinyatakan gagal",
+                    init_log("%s: failed to set CLOEXEC %d times, service marked failed",
                              svc->name, svc->spawn_tries);
                     svc->state = SVC_STATE_FAILED;
                     svc->spawn_tries = 0;
@@ -1007,7 +1007,7 @@ static int spawn_service(service_t *svc)
            MAX_SPAWN_RETRY: nyatakan gagal supaya deps_satisfied() melaporkan
            dependensi sebagai batal, bukan menggantung selamanya. */
         if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
-            init_log("fork %s: %s (%d percobaan, layanan dinyatakan gagal)",
+            init_log("fork %s: %s (%d attempts, service marked failed)",
                      svc->name, strerror(err), svc->spawn_tries);
             svc->state = SVC_STATE_FAILED;
             svc->spawn_tries = 0;
@@ -1158,12 +1158,12 @@ static void reap_zombies(void)
                             int d = 2 << services[i].crash_count;
                             services[i].respawn_delay = d > BACKOFF_MAX ? BACKOFF_MAX : d;
                             if (services[i].crash_count >= CRASH_LIMIT) {
-                                init_log("%s: crash-loop terdeteksi (%d kegagalan berturut-turut), layanan dinyatakan gagal",
+                                init_log("%s: crash-loop detected (%d consecutive failures), service marked failed",
                                          services[i].name, services[i].crash_count);
                                 services[i].state = SVC_STATE_FAILED;
                                 services[i].need_respawn = 0;
                             } else {
-                                init_log("%s: crash-loop ke-%d, jeda respawn naik ke %d detik",
+                                init_log("%s: crash-loop #%d, respawn delay increased to %d seconds",
                                          services[i].name, services[i].crash_count,
                                          services[i].respawn_delay);
                             }
@@ -1230,7 +1230,7 @@ static void spawn_eligible_services(void)
             const char *failed_dep = NULL;
             int ret = deps_satisfied(svc, &failed_dep);
             if (ret < 0) {
-                init_log("layanan '%s' dibatalkan: dependensi '%s' gagal", svc->name, failed_dep);
+                init_log("service '%s' cancelled: dependency '%s' failed", svc->name, failed_dep);
                 svc->state = SVC_STATE_FAILED;
                 progress = 1;
             } else if (ret == 1) {
@@ -1267,7 +1267,7 @@ static void respawn_services(void)
         const char *failed_dep = NULL;
         int ret = deps_satisfied(svc, &failed_dep);
         if (ret < 0) {
-            init_log("layanan '%s' dibatalkan: dependensi '%s' gagal", svc->name, failed_dep);
+            init_log("service '%s' cancelled: dependency '%s' failed", svc->name, failed_dep);
             svc->state = SVC_STATE_FAILED;
             svc->need_respawn = 0;
             continue;
@@ -1338,7 +1338,7 @@ static void cancel_dependents(void)
             while (next_dep(svc->deps_str, &off, token, sizeof(token))) {
                 int di = find_service(token);
                 if (di >= 0 && services[di].state == SVC_STATE_FAILED) {
-                    init_log("layanan '%s' dibatalkan: dependensi '%s' gagal",
+                    init_log("service '%s' cancelled: dependency '%s' failed",
                              svc->name, token);
                     svc->state = SVC_STATE_FAILED;
                     changed = 1;
@@ -1365,7 +1365,7 @@ static void enforce_once_timeout(void)
         if (svc->timeout <= 0) continue;
         if (!svc->last_start || (now - svc->last_start) < svc->timeout) continue;
 
-        init_log("%s: layanan once melebihi batas waktu %d detik, dinyatakan gagal",
+        init_log("%s: once service exceeded %d seconds timeout, marked failed",
                  svc->name, svc->timeout);
         svc->state = SVC_STATE_FAILED;
         svc->need_respawn = 0;
@@ -1437,14 +1437,14 @@ static int service_still_alive(service_t *svc)
 static void prepare_filesystems(void)
 {
     if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
-        init_log("shutdown: remount / read-only gagal: %s", strerror(errno));
+        init_log("shutdown: remount / read-only failed: %s", strerror(errno));
     else
         init_log("shutdown: / remounted read-only");
 
     for (int i = 0; i < g_seen_cnt; i++) {
         if (umount2(g_seen_mnt[i], MNT_DETACH) < 0) {
             if (errno != EINVAL && errno != ENOENT)
-                init_log("shutdown: umount2 %s gagal: %s", g_seen_mnt[i], strerror(errno));
+                init_log("shutdown: umount2 %s failed: %s", g_seen_mnt[i], strerror(errno));
         } else {
             init_log("shutdown: umount2 %s ok", g_seen_mnt[i]);
         }
@@ -1471,7 +1471,7 @@ static void shutdown_all(int reboot_cmd, int force)
         }
         rmdir(CGROUP_BASE);
         reap_zombies(); prepare_filesystems(); sync();
-        if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
+        if (reboot(reboot_cmd) < 0) init_log("reboot(%d) failed: %s", reboot_cmd, strerror(errno));
         while (1) pause();
     }
 
@@ -1508,7 +1508,7 @@ static void shutdown_all(int reboot_cmd, int force)
         if (service_still_alive(&services[i])) {
             kill_service_group(&services[i], SIGKILL);
         } else {
-            init_log("%s: grup sudah mati, SIGKILL dilewati", services[i].name);
+            init_log("%s: process group already dead, SIGKILL skipped", services[i].name);
             cgroup_kill_service(services[i].name);
         }
         cleanup_cgroup(services[i].name);
@@ -1516,7 +1516,7 @@ static void shutdown_all(int reboot_cmd, int force)
     rmdir(CGROUP_BASE);
     prepare_filesystems();
     sync();
-    if (reboot(reboot_cmd) < 0) init_log("reboot(%d) gagal: %s", reboot_cmd, strerror(errno));
+    if (reboot(reboot_cmd) < 0) init_log("reboot(%d) failed: %s", reboot_cmd, strerror(errno));
     while (1) pause();
 }
 
@@ -1599,12 +1599,12 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
             /* mount(8): user/users mengimplikasikan noexec+nosuid+nodev
                (bisa dibatalkan token exec/suid/dev sesudahnya). */
             flags |= MS_NOEXEC | MS_NOSUID | MS_NODEV;
-            init_log("fstab: opsi '%s' menerapkan noexec,nosuid,nodev", tok);
+            init_log("fstab: option '%s' applies noexec,nosuid,nodev", tok);
         }
         else if (!strcmp(tok, "owner") || !strcmp(tok, "group")) {
             /* mount(8): owner/group mengimplikasikan nosuid+nodev. */
             flags |= MS_NOSUID | MS_NODEV;
-            init_log("fstab: opsi '%s' menerapkan nosuid,nodev", tok);
+            init_log("fstab: option '%s' applies nosuid,nodev", tok);
         }
         else if (!strcmp(tok, "noauto")) {
             if (skip_reason && *skip_reason == SKIP_NONE) *skip_reason = SKIP_NOAUTO;
@@ -1612,10 +1612,10 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
         else if (!strcmp(tok, "auto") || !strcmp(tok, "nouser") ||
                  !strcmp(tok, "_netdev") || !strcmp(tok, "nofail") ||
                  !strncmp(tok, "x-", 2) || !strncmp(tok, "comment=", 8)) {
-            init_log("fstab: opsi '%s' khusus userspace, diabaikan", tok);
+            init_log("fstab: option '%s' is userspace-only, ignored", tok);
         }
         else {
-            init_log("fstab: opsi '%s' bukan flag, diteruskan sebagai data", tok);
+            init_log("fstab: option '%s' is not a flag, passed as data", tok);
             if (data && datasz) {
                 if (data[0]) strncat(data, ",", datasz - strlen(data) - 1);
                 strncat(data, tok, datasz - strlen(data) - 1);
@@ -1653,7 +1653,7 @@ static int mkdir_p(const char *path)
     if (!path) return -1;
     len = strlen(path);
     if (path[0] != '/' || len >= sizeof(buf)) {
-        init_log("fstab: mountpoint '%s' tidak valid (harus absolut, maks %zu karakter)",
+        init_log("fstab: mountpoint '%s' invalid (must be absolute, max %zu chars)",
                  path, sizeof(buf) - 1);
         return -1;
     }
@@ -1666,7 +1666,7 @@ static int mkdir_p(const char *path)
         size_t clen = (size_t)(e - s);
         if ((clen == 1 && s[0] == '.') ||
             (clen == 2 && s[0] == '.' && s[1] == '.')) {
-            init_log("fstab: mountpoint '%s' memuat komponen '%.*s', ditolak",
+            init_log("fstab: mountpoint '%s' contains component '%.*s', rejected",
                      path, (int)clen, s);
             return -1;
         }
@@ -1684,21 +1684,21 @@ static int mkdir_p(const char *path)
         *p = '\0';
         if (mkdir(buf, 0755) == 0) {
             if (chmod(buf, 0755) < 0) {
-                init_log("fstab: chmod '%s' gagal: %s", buf, strerror(errno));
+                init_log("fstab: chmod '%s' failed: %s", buf, strerror(errno));
                 return -1;
             }
         } else if (errno == EEXIST) {
             struct stat st;
             if (stat(buf, &st) < 0) {
-                init_log("fstab: stat '%s' gagal: %s", buf, strerror(errno));
+                init_log("fstab: stat '%s' failed: %s", buf, strerror(errno));
                 return -1;
             }
             if (!S_ISDIR(st.st_mode)) {
-                init_log("fstab: komponen '%s' dari mountpoint '%s' bukan direktori", buf, path);
+                init_log("fstab: component '%s' of mountpoint '%s' is not a directory", buf, path);
                 return -1;
             }
         } else {
-            init_log("fstab: mkdir '%s' gagal: %s", buf, strerror(errno));
+            init_log("fstab: mkdir '%s' failed: %s", buf, strerror(errno));
             return -1;
         }
         *p = save;
@@ -1752,7 +1752,7 @@ static void mount_fstab(void)
 {
     FILE *f = fopen(FSTAB_PATH, "r");
     if (!f) {
-        init_log("fstab: %s tidak ada, dilewati", FSTAB_PATH);
+        init_log("fstab: %s does not exist, skipped", FSTAB_PATH);
         return;
     }
 
@@ -1769,7 +1769,7 @@ static void mount_fstab(void)
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
         if (line_overlong(f, line)) {
-            init_log("fstab: baris melebihi MAX_LINE (%d), dilewati", MAX_LINE);
+            init_log("fstab: line exceeds MAX_LINE (%d), skipped", MAX_LINE);
             continue;
         }
         line[strcspn(line, "\n")] = 0;
@@ -1783,7 +1783,7 @@ static void mount_fstab(void)
         char *opts = strtok(NULL, " \t");
 
         if (!dev || !mnt || !type) {
-            init_log("fstab: baris tidak lengkap: '%s'", p);
+            init_log("fstab: incomplete line: '%s'", p);
             continue;
         }
 
@@ -1807,11 +1807,11 @@ static void mount_fstab(void)
            SEBELUM mountpoint dibuat: entri yang dilewati tidak meninggalkan
            direktori hantu di rootfs. */
         if (skip_reason == SKIP_NOAUTO) {
-            init_log("fstab: %s -> %s dilewati (opsi noauto)", dev, mnt);
+            init_log("fstab: %s -> %s skipped (noauto option)", dev, mnt);
             continue;
         }
         if (skip_reason == SKIP_BIND) {
-            init_log("fstab: %s -> %s dilewati (bind/rbind tidak didukung)", dev, mnt);
+            init_log("fstab: %s -> %s skipped (bind/rbind not supported)", dev, mnt);
             continue;
         }
 
@@ -1822,16 +1822,16 @@ static void mount_fstab(void)
         for (int i = 0; i < g_seen_cnt; i++)
             if (same_mountpoint(g_seen_mnt[i], mnt)) { is_dup = 1; break; }
         if (is_dup) {
-            init_log("fstab: %s -> %s dilewati (mountpoint duplikat, sudah di-mount entri sebelumnya)", dev, mnt);
+            init_log("fstab: %s -> %s skipped (duplicate mountpoint, already mounted by previous entry)", dev, mnt);
             continue;
         }
 
         if (mkdir_p(mnt) < 0) {
-            init_log("fstab: %s -> %s dilewati (mountpoint tidak bisa disiapkan)", dev, mnt);
+            init_log("fstab: %s -> %s skipped (mountpoint could not be prepared)", dev, mnt);
             continue;
         }
         if (mount(dev, mnt, type, flags, databuf[0] ? databuf : NULL) < 0)
-            init_log("fstab: mount %s -> %s (%s) [data: %s] gagal: %s", dev, mnt, type,
+            init_log("fstab: mount %s -> %s (%s) [data: %s] failed: %s", dev, mnt, type,
                      databuf[0] ? databuf : "-", strerror(errno));
         else {
             init_log("fstab: mount %s -> %s (%s) [data: %s] ok", dev, mnt, type,
@@ -1867,9 +1867,9 @@ static void enter_rescue_mode(const char *reason)
 
     sigemptyset(&empty);
     if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
-        init_log("Peringatan: gagal mengosongkan signal mask: %s", strerror(errno));
+        init_log("Warning: failed to clear signal mask: %s", strerror(errno));
 
-    init_log("Masuk rescue mode (shell).");
+    init_log("Entering rescue mode (shell).");
     signal(SIGPIPE, SIG_DFL);
 
     /* T8B: lepaskan fd kontrol PID 1 sebelum exec (SANE-06-01). Flag
@@ -1881,7 +1881,7 @@ static void enter_rescue_mode(const char *reason)
     if (log_file_fd >= 0)   close(log_file_fd);
 
     execl("/bin/sh", "sh", (char *)NULL);
-    init_log("FATAL: execl /bin/sh gagal: %s", strerror(errno));
+    init_log("FATAL: execl /bin/sh failed: %s", strerror(errno));
     _exit(1);
 }
 
@@ -1889,7 +1889,7 @@ static void enter_rescue_mode(const char *reason)
 int main(int argc, char **argv)
 {
     if (getpid() != 1) {
-        fprintf(stderr, "ninit harus dijalankan sebagai PID 1\n");
+        fprintf(stderr, "ninit must be run as PID 1\n");
         return 1;
     }
     umask(022);
@@ -1921,16 +1921,16 @@ int main(int argc, char **argv)
        lanjut dengan nol layanan dan mengaku "siap". */
     const char *conf = (argc > 1) ? argv[1] : "/etc/init.conf";
     if (parse_config(conf) < 0)
-        enter_rescue_mode("Config gagal dibaca/di-parse!");
+        enter_rescue_mode("Config failed to read/parse!");
 
     /* Dipanggil tepat setelah parse_config(): dependensi harus menunjuk layanan
        yang ada. Bila ada yang hilang, sistem diserahkan ke rescue shell. */
     if (validate_dependencies() < 0)
-        enter_rescue_mode("Dependensi tidak valid!");
+        enter_rescue_mode("Invalid dependencies!");
 
     /* Panggil sort, jika return -1 (cycle), jangan spawn apa-apa */
     if (num_services > 0 && sort_services() < 0)
-        enter_rescue_mode("Cycle terdeteksi!");
+        enter_rescue_mode("Cycle detected!");
 
     initctl_fd = setup_initctl();
     int log_fifo_fd = setup_log_fifo();
@@ -1938,7 +1938,7 @@ int main(int argc, char **argv)
 
     spawn_eligible_services();
 
-    init_log("main loop siap");
+    init_log("main loop ready");
 
     /* FIXED: Susun array fds secara dinamis */
     struct pollfd fds[2];
@@ -1948,13 +1948,13 @@ int main(int argc, char **argv)
         fds[nfds].fd = initctl_fd; 
         fds[nfds].events = POLLIN; 
         nfds++;
-    } else init_log("Peringatan: initctl_fd tidak valid");
+    } else init_log("Warning: initctl_fd invalid");
 
     if (log_fifo_fd >= 0) {
         fds[nfds].fd = log_fifo_fd; 
         fds[nfds].events = POLLIN; 
         nfds++;
-    } else init_log("Peringatan: log_fifo_fd tidak valid");
+    } else init_log("Warning: log_fifo_fd invalid");
 
     for (;;) {
         /* FIXED: Gunakan nfds yang dinamis, ppoll dengan mask orig.

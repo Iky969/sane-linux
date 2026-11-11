@@ -1,6 +1,6 @@
 #!/bin/sh
 # Smoke test ninit: jalankan sebagai PID 1 di dalam PID + mount namespace baru
-# dengan rootfs chroot sementara, tunggu sampai "main loop siap", kirim SIGTERM,
+# dengan rootfs chroot sementara, tunggu sampai "main loop ready", kirim SIGTERM,
 # lalu periksa shutdown berjalan bersih (tanpa respawn setelah shutdown).
 #
 # Pemakaian:
@@ -77,7 +77,7 @@ i=0
 pid=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 	pid=$(find_init_pid || true)
-	if [ -n "${pid:-}" ] && grep -q 'main loop siap' "$LOG" 2>/dev/null; then
+	if [ -n "${pid:-}" ] && grep -q 'main loop ready' "$LOG" 2>/dev/null; then
 		break
 	fi
 	sleep 0.2
@@ -101,7 +101,7 @@ check() { if grep -q "$2" "$LOG"; then ok "$1"; else bad "$1"; fi; }
 
 printf '\n== pemeriksaan ==\n'
 check "banner 'ninit start (PID 1)'"          'ninit start (PID 1)'
-check "event loop masuk ('main loop siap')"   'main loop siap'
+check "event loop entered ('main loop ready')"   'main loop ready'
 check "layanan dijalankan ('started shell')"  'started shell'
 check "SIGTERM diproses ('graceful shutdown')" 'graceful shutdown'
 

@@ -93,12 +93,12 @@ check "entri normal ter-mount dengan opsi data (size=1m)" \
 check "escape oktal didekode lalu di-mount kernel apa adanya ('/mnt/a b')" \
 	'fstab: mount tmpfs -> /mnt/a b (tmpfs)'
 check "entri duplikat DILEWATI, bukan mount ganda" \
-	'fstab: tmpfs -> /mnt/intg dilewati (mountpoint duplikat'
+	'fstab: tmpfs -> /mnt/intg skipped (duplicate mountpoint'
 # Scope kegagalan mount ke HANYA path fixture: kalau nanti suite ini dipakai
 # sebagai host untuk uji negatif (entri yang sengaja gagal), mount gagal di
 # path lain tidak boleh membuat pemeriksaan ini ikut merah.
-absent "entri fixture /mnt/intg tidak gagal mount" 'fstab: mount .* /mnt/intg .* gagal'
-absent "entri fixture /mnt/a b tidak gagal mount"  'fstab: mount .* /mnt/a b .* gagal'
+absent "entri fixture /mnt/intg tidak gagal mount" 'fstab: mount .* /mnt/intg .* failed'
+absent "entri fixture /mnt/a b tidak gagal mount"  'fstab: mount .* /mnt/a b .* failed'
 check "layanan mountproof start"            'started mountproof'
 check "mount fstab terlihat dari /proc/mounts guest" 'INTEGRATION-MOUNT-VISIBLE'
 absent "tidak ada mount yang hilang dari sudut pandang layanan" 'INTEGRATION-MOUNT-MISSING'
@@ -110,7 +110,7 @@ n_first_fstab=$(line_no 'fstab: mount tmpfs -> /mnt/intg (tmpfs)')
 n_last_fstab=$(grep -n 'fstab: ' "$CONSOLE_LOG" | tail -n 1 | cut -d: -f1 || true)
 n_started=$(line_no 'started mountproof')
 n_console=$(line_no 'started console')
-n_loop=$(line_no 'main loop siap')
+n_loop=$(line_no 'main loop ready')
 if [ -n "$n_first_fstab" ] && [ -n "$n_started" ] && [ "$n_first_fstab" -lt "$n_started" ]; then
 	printf '  [ OK ]   fstab ter-mount sebelum layanan mountproof start\n'
 else
@@ -131,7 +131,7 @@ fi
 if [ -n "$n_last_fstab" ] && [ -n "$n_loop" ] && [ "$n_last_fstab" -lt "$n_loop" ]; then
 	printf '  [ OK ]   fstab selesai sebelum event loop masuk (tidak ada mount di dalam loop)\n'
 else
-	printf '  [GAGAL] baris fstab terakhir (baris %s) tidak mendahului main loop siap (baris %s)\n' \
+	printf '  [GAGAL] baris fstab terakhir (baris %s) tidak mendahului main loop ready (baris %s)\n' \
 		"${n_last_fstab:-?}" "${n_loop:-?}"
 	fail_count=$((fail_count + 1))
 fi

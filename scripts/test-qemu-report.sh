@@ -8,7 +8,7 @@
 # console yang langsung mati (mis. `console:respawn:/bin/does-not-exist`)
 # tetap menghasilkan baris 'started console' berulang, exit status=0x7f00, dan
 # 'respawn ditunda' — sementara harness lama hanya mencocokkan tiga penanda
-# ('ninit start (PID 1)', 'main loop siap', 'started console') sehingga tetap
+# ('ninit start (PID 1)', 'main loop ready', 'started console') sehingga tetap
 # melaporkan HASIL: LULUS. Test ini gagal bila pelonggaran itu kembali.
 #
 # Cara kerja: scripts/run-qemu.sh dijalankan dengan REPORT_ONLY=1 terhadap
@@ -62,9 +62,9 @@ run_report() { # $1 = nama fixture; menyetel RC dan OUT
 cat > "$FIX/sehat.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [2026-11-05 09:00:01] ninit: ninit start (PID 1)
-[    1.200000] ninit: mount fstab: /etc/fstab tidak ada, dilewati
-[    1.250000] ninit: main loop siap
-[2026-11-05 09:00:01] ninit: main loop siap
+[    1.200000] ninit: mount fstab: /etc/fstab does not exist, skipped
+[    1.250000] ninit: main loop ready
+[2026-11-05 09:00:01] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
 [2026-11-05 09:00:01] ninit: started console (pid 42)
 / # 
@@ -76,14 +76,14 @@ EOF
 cat > "$FIX/console-mati.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [2026-11-05 09:00:01] ninit: ninit start (PID 1)
-[    1.250000] ninit: main loop siap
-[2026-11-05 09:00:01] ninit: main loop siap
+[    1.250000] ninit: main loop ready
+[2026-11-05 09:00:01] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
 [2026-11-05 09:00:01] ninit: started console (pid 42)
 [    1.301000] ninit: console (pid 42) exit status=0x7f00
 [2026-11-05 09:00:02] ninit: console (pid 42) exit status=0x7f00
-[    2.300000] ninit: console: respawn ditunda (timer 2 detik, loop tidak diblokir)
-[2026-11-05 09:00:03] ninit: console: respawn ditunda (timer 2 detik, loop tidak diblokir)
+[    2.300000] ninit: console: respawn delayed (timer 2 seconds, loop unblocked)
+[2026-11-05 09:00:03] ninit: console: respawn delayed (timer 2 seconds, loop unblocked)
 [    3.400000] ninit: started console (pid 51)
 [2026-11-05 09:00:04] ninit: started console (pid 51)
 [    3.401000] ninit: console (pid 51) exit status=0x7f00
@@ -95,7 +95,7 @@ EOF
 # sudah pernah keluar -> tetap harus GAGAL lewat pemeriksaan exit status.
 cat > "$FIX/console-exit-satu-pid.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
-[    1.250000] ninit: main loop siap
+[    1.250000] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
 [2026-11-05 09:00:01] ninit: started console (pid 42)
 [    2.000000] ninit: console (pid 42) exit status=0x0
@@ -104,7 +104,7 @@ EOF
 
 cat > "$FIX/panic.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
-[    1.250000] ninit: main loop siap
+[    1.250000] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
 [    2.000000] Kernel panic - not syncing: Attempted to kill init!
 EOF
@@ -112,7 +112,7 @@ EOF
 # Konsol belum pernah start sama sekali.
 cat > "$FIX/konsol-tidak-start.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
-[    1.250000] ninit: main loop siap
+[    1.250000] ninit: main loop ready
 EOF
 
 # ninit tidak pernah masuk event loop.
@@ -127,16 +127,16 @@ EOF
 cat > "$FIX/respawn-service-lain.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [2026-11-05 09:00:01] ninit: ninit start (PID 1)
-[    1.250000] ninit: main loop siap
-[2026-11-05 09:00:01] ninit: main loop siap
+[    1.250000] ninit: main loop ready
+[2026-11-05 09:00:01] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
 [2026-11-05 09:00:01] ninit: started console (pid 42)
 [    1.310000] ninit: started web (pid 43)
 [2026-11-05 09:00:01] ninit: started web (pid 43)
 [    4.000000] ninit: web (pid 43) exit status=0x0
 [2026-11-05 09:00:04] ninit: web (pid 43) exit status=0x0
-[    4.100000] ninit: web: respawn ditunda (timer 2 detik, loop tidak diblokir)
-[2026-11-05 09:00:04] ninit: web: respawn ditunda (timer 2 detik, loop tidak diblokir)
+[    4.100000] ninit: web: respawn delayed (timer 2 seconds, loop unblocked)
+[2026-11-05 09:00:04] ninit: web: respawn delayed (timer 2 seconds, loop unblocked)
 [    6.200000] ninit: started web (pid 55)
 [2026-11-05 09:00:06] ninit: started web (pid 55)
 EOF
@@ -146,51 +146,51 @@ printf '\n== skenario 1: boot sehat -> LULUS ==\n'
 run_report sehat
 expect_rc "skenario 1: kode keluar" "$RC" 0
 expect_line "$OUT" 'HASIL: LULUS' "skenario 1: laporan LULUS"
-expect_line "$OUT" 'console start tepat satu PID (42)' \
+expect_line "$OUT" 'console started with exactly one PID (42)' \
 	"skenario 1: baris ganda kmsg/stderr terdedup (tetap satu PID)"
 
 printf '\n== skenario 2: console mati + respawn loop -> GAGAL (regresi PR #1) ==\n'
 run_report console-mati
 expect_rc "skenario 2: kode keluar" "$RC" 1
-expect_line "$OUT" 'console punya 2 PID unik' \
+expect_line "$OUT" 'console has 2 unique PIDs' \
 	"skenario 2: respawn loop tertangkap lewat PID unik"
-expect_line "$OUT" '[GAGAL] console tidak pernah keluar' \
+expect_line "$OUT" '[GAGAL] console never exited' \
 	"skenario 2: exit status console tertangkap"
-expect_line "$OUT" '[GAGAL] console tidak di-respawn tertunda' \
-	"skenario 2: 'console: respawn ditunda' tertangkap"
-expect_line "$OUT" "[ OK ]   layanan /etc/init.conf dijalankan ('started console')" \
+expect_line "$OUT" '[GAGAL] console was not respawn-delayed' \
+	"skenario 2: 'console: respawn delayed' tertangkap"
+expect_line "$OUT" "[ OK ]   service /etc/init.conf executed ('started console')" \
 	"skenario 2: pemeriksaan lama lolos (bukti lama: harness lama LULUS di log ini)"
 
 printf '\n== skenario 3: console keluar, satu PID -> GAGAL ==\n'
 run_report console-exit-satu-pid
 expect_rc "skenario 3: kode keluar" "$RC" 1
-expect_line "$OUT" '[GAGAL] console tidak pernah keluar' \
+expect_line "$OUT" '[GAGAL] console never exited' \
 	"skenario 3: exit status tertangkap walau PID tunggal"
 
 printf '\n== skenario 4: kernel panic -> GAGAL ==\n'
 run_report panic
 expect_rc "skenario 4: kode keluar" "$RC" 1
-expect_line "$OUT" '[GAGAL] tidak ada kernel panic' "skenario 4: panic tertangkap"
+expect_line "$OUT" '[GAGAL] no kernel panic' "skenario 4: panic tertangkap"
 
 printf '\n== skenario 5: layanan console tidak pernah start -> GAGAL ==\n'
 run_report konsol-tidak-start
 expect_rc "skenario 5: kode keluar" "$RC" 1
-expect_line "$OUT" "[GAGAL] layanan /etc/init.conf dijalankan" \
+expect_line "$OUT" "[GAGAL] service /etc/init.conf executed" \
 	"skenario 5: 'started console' yang hilang tertangkap"
-expect_line "$OUT" 'console punya 0 PID unik' \
+expect_line "$OUT" 'console has 0 unique PIDs' \
 	"skenario 5: hitungan PID unik 0"
 
 printf '\n== skenario 6: main loop tidak muncul -> GAGAL ==\n'
 run_report tanpa-main-loop
 expect_rc "skenario 6: kode keluar" "$RC" 1
-expect_line "$OUT" 'tidak muncul dalam' "skenario 6: ketiadaan 'main loop siap' tertangkap"
+expect_line "$OUT" 'did not appear within' "skenario 6: ketiadaan 'main loop ready' tertangkap"
 
 printf '\n== skenario 7: service lain di-respawn, console sehat -> LULUS ==\n'
 run_report respawn-service-lain
 expect_rc "skenario 7: kode keluar" "$RC" 0
 expect_line "$OUT" 'HASIL: LULUS' \
-	"skenario 7: 'web: respawn ditunda' tidak menyeret harness (check ter-scope)"
-expect_line "$OUT" "[ OK ]   console tidak di-respawn tertunda" \
+	"skenario 7: 'web: respawn delayed' tidak menyeret harness (check ter-scope)"
+expect_line "$OUT" "[ OK ]   console was not respawn-delayed" \
 	"skenario 7: pemeriksaan respawn console tetap dieksekusi dan lolos"
 
 printf '\n== konsol: REPORT_ONLY tanpa CONSOLE_LOG -> berhenti dengan pesan jelas ==\n'
