@@ -1,39 +1,39 @@
 #!/bin/sh
-# Test konfigurasi + IPC initctl: mengunci tiga perbaikan reliabilitas.
+# Configuration + initctl IPC test: locks in three reliability fixes.
 #
-#   1a. urut topologis `:requires=` benar untuk bentuk berlian (a butuh b,c ;
-#       b butuh c -> urutan c, b, a).
-#   1b. konfigurasi padat tepat 64 layanan (root butuh semua s2..s64, s63 butuh
-#       dua saudara) selesai tanpa stack overflow.
-#       Regresi lama: layanan yang masih "pending" di stack di-push berulang,
-#       sehingga stack_top melewati MAX_SERVICES -> stack-buffer-overflow di
-#       sort_services() (terbukti dengan AddressSanitizer pada versi lama).
-#   2.  dependensi hilang (web:requires=db) -> "FATAL: Dependensi ... tidak
-#       ditemukan" + rescue shell, BUKAN boot setengah jalan.
-#   3a. dua perintah dalam satu penulisan ke /run/initctl (poweroff + reboot):
-#       hanya baris pertama yang dieksekusi.
-#   3b. perintah tak dikenal di baris pertama (status + poweroff): perintah di
-#       baris kedua TIDAK hilang tanpa jejak (regresi parsing lama).
-#   4a. config tidak bisa dibuka -> rescue shell sungguhan (regresi lama: hanya
-#       di-log, lalu init "sukses" boot dengan nol layanan).
-#   4b. siklus dependensi -> rescue shell, dan shell itu mewarisi signal mask
-#       KOSONG sehingga SIGINT (Ctrl+C) berfungsi (regresi lama: mask ppoll PID 1
-#       terbawa ke shell darurat).
+#   1a. topological `:requires=` order is correct for a diamond shape (a needs b,c ;
+#       b needs c -> order c, b, a).
+#   1b. a dense configuration of exactly 64 services (root needs all of s2..s64,
+#       s63 needs two siblings) completes without a stack overflow.
+#       Old regression: services still "pending" on the stack were pushed again and
+#       again, so stack_top passed MAX_SERVICES -> stack-buffer-overflow in
+#       sort_services() (proven with AddressSanitizer on the old version).
+#   2.  a missing dependency (web:requires=db) -> "FATAL: Dependency ... not
+#       found" + rescue shell, NOT a half-finished boot.
+#   3a. two commands in one write to /run/initctl (poweroff + reboot):
+#       only the first line is executed.
+#   3b. an unknown command on the first line (status + poweroff): the command on
+#       the second line is NOT lost without a trace (old parsing regression).
+#   4a. an unreadable config -> a real rescue shell (old regression: only logged,
+#       then init "successfully" booted with zero services).
+#   4b. a dependency cycle -> rescue shell, and that shell inherits an EMPTY
+#       signal mask so SIGINT (Ctrl+C) works (old regression: PID 1's ppoll mask
+#       leaked into the emergency shell).
 #
 # Pemakaian:
-#   sudo sh ./scripts/test-config.sh      # atau: make test
+#   sudo sh ./scripts/test-config.sh      # or: make test
 #
 # Variabel lingkungan:
-#   BIN=./ninit              biner yang diuji
-#   BUSYBOX=/bin/busybox     busybox statis (apt-get install busybox-static)
-#   READY_TIMEOUT=10         detik maksimum menunggu ninit siap/bereaksi
+#   BIN=./ninit              binary under test
+#   BUSYBOX=/bin/busybox     static busybox (apt-get install busybox-static)
+#   READY_TIMEOUT=10         max seconds to wait for ninit to be ready/reactive
 #
-# Catatan: sama seperti scripts/smoke-test.sh, script ini sengaja TIDAK memakai
-# `unshare --mount-proc=<dir>` (sebagian kernel menolak perubahan mount
-# propagation dengan EINVAL), dan stdin ninit diarahkan ke /dev/null supaya
-# rescue shell langsung mendapat EOF dan tidak menggantung di CI. Pengecualian:
-# skenario 4b memberi stdin fifo yang ditahan `sleep` agar shell darurat cukup
-# lama hidup untuk dibaca /proc/<pid>/status-nya.
+# Note: same as scripts/smoke-test.sh, this script deliberately does NOT use
+# `unshare --mount-proc=<dir>` (some kernels reject mount propagation changes
+# with EINVAL), and ninit's stdin is pointed at /dev/null so the rescue shell
+# immediately gets EOF and does not hang CI. Exception: scenario 4b provides a
+# fifo stdin held open by `sleep` so the emergency shell lives long enough for
+# its /proc/<pid>/status to be read.
 
 set -eu
 
@@ -43,20 +43,20 @@ READY_TIMEOUT=${READY_TIMEOUT:-10}
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
-fail() { printf 'GAGAL: %s\n' "$1" >&2; exit 1; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 fail_count=0
 ok()  { printf '  [ OK ]   %s\n' "$1"; }
-bad() { printf '  [GAGAL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
+bad() { printf '  [FAIL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
 check() { if grep -q "$2" "$LOG"; then ok "$1"; else bad "$1"; fi; }
 check_absent() { if grep -q "$2" "$LOG"; then bad "$1"; else ok "$1"; fi; }
 
-[ -x "$BIN" ] || fail "biner '$BIN' tidak ditemukan/tidak executable (jalankan: make)"
-[ -f "$BUSYBOX" ] || fail "busybox statis tidak ada di '$BUSYBOX' (apt-get install busybox-static)"
+[ -x "$BIN" ] || fail "binary '$BIN' not found/not executable (run: make)"
+[ -f "$BUSYBOX" ] || fail "static busybox missing at '$BUSYBOX' (apt-get install busybox-static)"
 for t in unshare chroot timeout ps mktemp; do
-	command -v "$t" >/dev/null 2>&1 || fail "perkakas '$t' tidak ditemukan"
+	command -v "$t" >/dev/null 2>&1 || fail "tool '$t' not found"
 done
-$SUDO true 2>/dev/null || fail "butuh root atau sudo tanpa password (unshare + chroot)"
+$SUDO true 2>/dev/null || fail "root or passwordless sudo required (unshare + chroot)"
 
 ROOTS=""
 LOGS=""
@@ -75,7 +75,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Siapkan rootfs uji terpisah untuk tiap skenario ($1 = nama/tag uji).
+# Prepare a separate test rootfs for each scenario ($1 = test name/tag).
 start_root() {
 	ROOT=$(mktemp -d "/tmp/ninit-$1.XXXXXX")
 	LOG=$(mktemp "/tmp/ninit-$1-log.XXXXXX")
@@ -87,7 +87,7 @@ start_root() {
 	cp "$BUSYBOX" "$ROOT/bin/sh"
 }
 
-# Jalankan ninit sebagai PID 1 di PID + mount namespace baru.
+# Run ninit as PID 1 inside a new PID + mount namespace.
 run_init() {
 	(
 		$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
@@ -107,7 +107,7 @@ find_init_pid() {
 	fi
 }
 
-# Tunggu sampai pola muncul di log. 0 = ketemu, 1 = timeout.
+# Wait until the pattern appears in the log. 0 = found, 1 = timeout.
 wait_for() {
 	i=0
 	while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
@@ -124,15 +124,15 @@ stop_init() {
 	INIT_PID=""
 }
 
-printf '== biner uji  : %s\n' "$BIN"
+printf '== test binary : %s\n' "$BIN"
 printf '== busybox    : %s\n' "$BUSYBOX"
 
-# -------------------------------------------------------------- skenario 1a
-printf '\n== 1a. urut dependensi: bentuk berlian ==\n'
+# -------------------------------------------------------------- scenario 1a
+printf '\n== 1a. dependency order: diamond shape ==\n'
 start_root topo
 LOG1="$LOG"
 cat > "$ROOT/etc/init.conf" <<'EOCFG'
-# bentuk berlian -> dua layanan butuh satu layanan yang sama (bukan cycle)
+# diamond shape -> two services need the same service (not a cycle)
 a:once:echo svc-a:requires=b,c
 b:once:echo svc-b:requires=c
 c:once:echo svc-c
@@ -141,26 +141,26 @@ EOCFG
 run_init
 if ! wait_for 'ninit: started a (pid'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak selesai menjalankan layanan berlian dalam ${READY_TIMEOUT}s"
+	fail "ninit did not finish running the diamond services within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "event loop jalan ('main loop ready')" 'main loop ready'
-check "layanan berdaftar dependensi dijalankan ('started a')" 'ninit: started a (pid'
-check "layanan tanpa dependensi jalan lebih dulu ('started c')" 'ninit: started c (pid'
-check_absent "berlian tidak salah dianggap cycle" 'CYCLE DETECTED'
+check "event loop running ('main loop ready')" 'main loop ready'
+check "dependency-ordered service ran ('started a')" 'ninit: started a (pid'
+check "service without dependencies runs first ('started c')" 'ninit: started c (pid'
+check_absent "diamond not misjudged as a cycle" 'CYCLE DETECTED'
 
-# Urutan spawn harus mengikuti urut topologis: c -> b -> a.
+# Spawn order must follow the topological order: c -> b -> a.
 order=$(sed -n 's/.*ninit: started \([abc]\) (pid.*/\1/p' "$LOG" | tr -d '\n')
 if [ "$order" = "cba" ]; then
-	ok "urut topologis benar: c -> b -> a (dapat: $order)"
+	ok "topological order correct: c -> b -> a (got: $order)"
 else
-	bad "urut topologis salah (harap cba, dapat: '$order')"
+	bad "topological order wrong (expected cba, got: '$order')"
 fi
 
-# Layanan once harus benar-benar selesai (exit status) sebelum dependensinya jalan
+# A once service must really finish (exit status) before its dependency runs
 seq_c_exit=$(grep -nE 'ninit: c \(pid [0-9]+\) exit status=0x0' "$LOG" | head -n 1 | cut -d: -f1 || true)
 seq_b_start=$(grep -nE 'ninit: started b \(pid' "$LOG" | head -n 1 | cut -d: -f1 || true)
 seq_b_exit=$(grep -nE 'ninit: b \(pid [0-9]+\) exit status=0x0' "$LOG" | head -n 1 | cut -d: -f1 || true)
@@ -168,17 +168,17 @@ seq_a_start=$(grep -nE 'ninit: started a \(pid' "$LOG" | head -n 1 | cut -d: -f1
 
 if [ -n "$seq_c_exit" ] && [ -n "$seq_b_start" ] && [ "$seq_c_exit" -lt "$seq_b_start" ] && \
    [ -n "$seq_b_exit" ] && [ -n "$seq_a_start" ] && [ "$seq_b_exit" -lt "$seq_a_start" ]; then
-	ok "layanan once selesai sebelum dependensinya jalan (c exit -> b start -> b exit -> a start)"
+	ok "once service finishes before its dependency runs (c exit -> b start -> b exit -> a start)"
 else
-	bad "layanan once tidak menunggu selesai sebelum dependensi jalan (c_exit=$seq_c_exit b_start=$seq_b_start b_exit=$seq_b_exit a_start=$seq_a_start)"
+	bad "once service did not wait for completion before the dependency ran (c_exit=$seq_c_exit b_start=$seq_b_start b_exit=$seq_b_exit a_start=$seq_a_start)"
 fi
 
-# -------------------------------------------------------------- skenario 1b
-printf '\n== 1b. konfigurasi padat 64 layanan (regresi stack overflow) ==\n'
+# -------------------------------------------------------------- scenario 1b
+printf '\n== 1b. dense configuration of 64 services (stack overflow regression) ==\n'
 start_root dense
 LOG2="$LOG"
 {
-	printf '# root butuh semua s2..s64 (63 dependensi) dan s63 butuh dua saudara\n'
+	printf '# root needs all of s2..s64 (63 dependencies) and s63 needs two siblings\n'
 	printf 'root:once:::requires='
 	i=2; sep=""
 	while [ "$i" -le 64 ]; do
@@ -198,7 +198,7 @@ LOG2="$LOG"
 run_init
 if ! wait_for 'ninit: started root (pid'; then
 	sed 's/^/  | /' "$LOG" | grep -vE 'started s[0-9]+ \(pid'
-	fail "ninit tidak menyelesaikan spawn konfigurasi padat dalam ${READY_TIMEOUT}s"
+	fail "ninit did not finish spawning the dense configuration within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
@@ -206,15 +206,15 @@ stop_init
 
 dense_started=$(grep -cE 'ninit: started (s[0-9]+|root) \(pid' "$LOG" || true)
 if [ "$dense_started" -eq 64 ]; then
-	ok "konfigurasi padat: 64/64 layanan dijalankan tanpa stack overflow"
+	ok "dense configuration: 64/64 services ran without a stack overflow"
 else
-	bad "konfigurasi padat: hanya $dense_started/64 layanan dijalankan"
+	bad "dense configuration: only $dense_started/64 services ran"
 fi
-check "event loop jalan ('main loop ready')" 'main loop ready'
-check_absent "tidak ada FATAL (stack overflow/cycle) pada konfigurasi valid" 'FATAL'
+check "event loop running ('main loop ready')" 'main loop ready'
+check_absent "no FATAL (stack overflow/cycle) on a valid configuration" 'FATAL'
 
-# --------------------------------------------------------------- skenario 2
-printf '\n== 2. dependensi hilang -> rescue shell ==\n'
+# --------------------------------------------------------------- scenario 2
+printf '\n== 2. missing dependency -> rescue shell ==\n'
 start_root missing
 LOG3="$LOG"
 printf 'web:once:echo web:requires=db\n' > "$ROOT/etc/init.conf"
@@ -224,13 +224,13 @@ init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 if ! wait_for 'rescue mode'; then
 	sed 's/^/  | /' "$LOG"
-	bad "ninit tidak melaporkan rescue mode untuk dependensi hilang"
+	bad "ninit did not report rescue mode for the missing dependency"
 fi
 
-check "dependensi hilang dilaporkan FATAL" "FATAL: Dependency 'db' for 'web' not found"
-check "init masuk rescue mode (shell)" 'Entering rescue mode (shell)'
-check_absent "boot tidak dilanjutkan (tanpa 'main loop ready')" 'main loop ready'
-check_absent "layanan bermasalah tidak dijalankan" 'ninit: started web'
+check "missing dependency reported as FATAL" "FATAL: Dependency 'db' for 'web' not found"
+check "init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "boot not continued (no 'main loop ready')" 'main loop ready'
+check_absent "problematic service not run" 'ninit: started web'
 
 i=0
 while [ "$i" -lt 50 ]; do
@@ -239,15 +239,15 @@ while [ "$i" -lt 50 ]; do
 	i=$((i + 1))
 done
 if kill -0 "$JOB" 2>/dev/null; then
-	bad "PID 1 tidak digantikan rescue shell (proses masih hidup)"
+	bad "PID 1 not replaced by the rescue shell (process still alive)"
 else
-	ok "PID 1 digantikan rescue shell /bin/sh (execl mengganti proses init)"
+	ok "PID 1 replaced by the rescue shell /bin/sh (execl replaces the init process)"
 fi
 stop_init
 
-# --------------------------------------------------------------- skenario 3
-# $1 = tag uji, $2 = isi printf yang dikirim layanan ke /run/initctl
-#      (mis. 'poweroff\nreboot\n')
+# --------------------------------------------------------------- scenario 3
+# $1 = test tag, $2 = printf payload the service sends to /run/initctl
+#      (e.g. 'poweroff\nreboot\n')
 run_cmdtest() {
 	start_root "$1"
 	cat > "$ROOT/send-cmd.sh" <<EOSVC
@@ -263,44 +263,44 @@ EOSVC
 	INIT_PID="${init_pid:-}"
 	if ! wait_for 'graceful shutdown'; then
 		sed 's/^/  | /' "$LOG"
-		bad "$1: ninit tidak bereaksi terhadap perintah di /run/initctl"
+		bad "$1: ninit did not react to the command in /run/initctl"
 	fi
 	stop_init
 }
 
-printf '\n== 3a. dua perintah dalam satu penulisan: poweroff + reboot ==\n'
+printf '\n== 3a. two commands in one write: poweroff + reboot ==\n'
 run_cmdtest ipc 'poweroff\nreboot\n'
 LOG4="$LOG"
-check "baris pertama dieksekusi" "initctl cmd: 'poweroff'"
-check_absent "baris kedua tidak dieksekusi (poweroff mematikan sistem)" "initctl cmd: 'reboot'"
-check "shutdown dari /run/initctl berjalan rapi" 'graceful shutdown'
+check "first line executed" "initctl cmd: 'poweroff'"
+check_absent "second line not executed (poweroff turns the system off)" "initctl cmd: 'reboot'"
+check "shutdown from /run/initctl ran cleanly" 'graceful shutdown'
 
-printf '\n== 3b. perintah tak dikenal di baris pertama: status + poweroff ==\n'
+printf '\n== 3b. unknown command on the first line: status + poweroff ==\n'
 run_cmdtest ipc2 'status\npoweroff\n'
 LOG5="$LOG"
-check "baris tak dikenal tetap dicatat" "initctl cmd: 'status'"
-check "perintah di baris kedua TIDAK hilang" "initctl cmd: 'poweroff'"
-check "perintah baris kedua benar-benar dieksekusi" 'graceful shutdown'
+check "unknown line still logged" "initctl cmd: 'status'"
+check "command on the second line NOT lost" "initctl cmd: 'poweroff'"
+check "command on the second line really executed" 'graceful shutdown'
 
-# --------------------------------------------------------------- skenario 4a
-# parse_config() gagal (file tidak ada) HARUS masuk rescue shell, bukan lanjut
-# boot dengan nol layanan lalu mengaku "main loop ready".
-printf '\n== 4a. config tidak terbaca -> rescue shell ==\n'
+# --------------------------------------------------------------- scenario 4a
+# parse_config() fails (file missing) MUST enter the rescue shell, not continue
+# booting with zero services and then claim "main loop ready".
+printf '\n== 4a. unreadable config -> rescue shell ==\n'
 start_root badconf
 LOG6="$LOG"
-# sengaja tidak membuat /etc/init.conf
-INIT_ARGS=/etc/init.conf.tidak-ada
+# deliberately do not create /etc/init.conf
+INIT_ARGS=/etc/init.conf.missing
 INIT_STDIN=/dev/null
 run_init
 INIT_ARGS=""
 if ! wait_for 'rescue mode'; then
 	sed 's/^/  | /' "$LOG"
-	bad "config tidak terbaca tidak memicu rescue mode"
+	bad "an unreadable config did not trigger rescue mode"
 fi
 
-check "config gagal dilaporkan" 'Config failed to read/parse!'
-check "init masuk rescue mode (shell)" 'Entering rescue mode (shell)'
-check_absent "boot tidak dilanjutkan (tanpa 'main loop ready')" 'main loop ready'
+check "config failure reported" 'Config failed to read/parse!'
+check "init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "boot not continued (no 'main loop ready')" 'main loop ready'
 
 i=0
 while [ "$i" -lt 50 ]; do
@@ -309,18 +309,18 @@ while [ "$i" -lt 50 ]; do
 	i=$((i + 1))
 done
 if kill -0 "$JOB" 2>/dev/null; then
-	bad "4a: PID 1 tidak digantikan rescue shell (proses masih hidup)"
+	bad "4a: PID 1 not replaced by the rescue shell (process still alive)"
 else
-	ok "4a: PID 1 digantikan rescue shell /bin/sh"
+	ok "4a: PID 1 replaced by the rescue shell /bin/sh"
 fi
 stop_init
 
-# --------------------------------------------------------------- skenario 4b
-# Siklus dependensi => rescue shell. Shell ini harus mewarisi signal mask
-# KOSONG; kalau tidak, Ctrl+C tidak akan pernah sampai ke shell darurat.
-# stdin-nya fifo yang ditahan `sleep` supaya shell tidak langsung EOF dan kita
-# sempat membaca /proc/<pid>/status.
-printf '\n== 4b. siklus dependensi -> rescue shell + signal mask kosong ==\n'
+# --------------------------------------------------------------- scenario 4b
+# A dependency cycle => rescue shell. This shell must inherit an EMPTY signal
+# mask; otherwise Ctrl+C would never reach the emergency shell. Its stdin is a
+# fifo held open by `sleep` so the shell does not immediately hit EOF and we
+# have time to read its /proc/<pid>/status.
+printf '\n== 4b. dependency cycle -> rescue shell + empty signal mask ==\n'
 start_root cycle
 LOG7="$LOG"
 printf 'a:once:echo svc-a:requires=b\nb:once:echo svc-b:requires=a\n' > "$ROOT/etc/init.conf"
@@ -333,14 +333,14 @@ run_init
 
 if ! wait_for 'rescue mode'; then
 	sed 's/^/  | /' "$LOG"
-	bad "siklus dependensi tidak memicu rescue mode"
+	bad "a dependency cycle did not trigger rescue mode"
 fi
-check "siklus dilaporkan FATAL" 'FATAL: CYCLE DETECTED'
-check "init masuk rescue mode (shell)" 'Entering rescue mode (shell)'
-check_absent "boot tidak dilanjutkan (tanpa 'main loop ready')" 'main loop ready'
+check "cycle reported as FATAL" 'FATAL: CYCLE DETECTED'
+check "init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "boot not continued (no 'main loop ready')" 'main loop ready'
 
-# Cari proses rescue shell: proses yang root filesystem-nya $ROOT dan argv[0]-nya
-# "sh" (setelah execl, PID 1 yang sama kini menjalankan busybox sh).
+# Find the rescue shell process: the process whose root filesystem is $ROOT and
+# whose argv[0] is "sh" (after execl, the same PID 1 now runs busybox sh).
 find_rescue_pid() {
 	for s in /proc/[0-9]*/status; do
 		p=${s#/proc/}; p=${p%/status}
@@ -363,14 +363,14 @@ while [ "$i" -lt 50 ]; do
 done
 
 if [ -z "$rescue_pid" ]; then
-	bad "rescue shell tidak ditemukan (tidak bisa memeriksa signal mask)"
+	bad "rescue shell not found (cannot check the signal mask)"
 else
 	sigblk=$(awk '/^SigBlk/ { print $2; exit }' "/proc/$rescue_pid/status" 2>/dev/null || true)
 	mask_nonzero=$(printf '%s' "${sigblk:-0}" | sed 's/^0*//')
 	if [ -z "$mask_nonzero" ]; then
-		ok "signal mask rescue shell kosong (SigBlk=0, Ctrl+C berfungsi)"
+		ok "rescue shell signal mask empty (SigBlk=0, Ctrl+C works)"
 	else
-		bad "rescue shell mewarisi signal mask (SigBlk=$sigblk) -> Ctrl+C tidak sampai"
+		bad "rescue shell inherited a signal mask (SigBlk=$sigblk) -> Ctrl+C does not arrive"
 	fi
 	$SUDO kill -KILL "$rescue_pid" 2>/dev/null || true
 fi
@@ -380,8 +380,8 @@ HOLDER=""
 INIT_STDIN=/dev/null
 stop_init
 
-# -------------------------------------------------------------- skenario 5
-printf '\n== 5. penolakan string terlalu panjang (nama, perintah, dependensi) ==\n'
+# -------------------------------------------------------------- scenario 5
+printf '\n== 5. over-long string rejection (name, command, dependency) ==\n'
 start_root trunc
 LOG8="$LOG"
 
@@ -396,20 +396,20 @@ EOCFG
 run_init
 if ! wait_for 'entry rejected'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencatat penolakan string terlalu panjang dalam ${READY_TIMEOUT}s"
+	fail "ninit did not log the over-long string rejection within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "nama terlalu panjang ditolak" 'Parse err: service name too long'
-check "perintah terlalu panjang ditolak" 'Parse err: service command'
-check "dependensi terlalu panjang ditolak" 'Parse err: service dependency'
-check "layanan sehat tetap jalan ('started dep')" 'ninit: started dep (pid'
-check_absent "layanan terlalu panjang TIDAK dijalankan" 'started longname'
+check "over-long name rejected" 'Parse err: service name too long'
+check "over-long command rejected" 'Parse err: service command'
+check "over-long dependency rejected" 'Parse err: service dependency'
+check "healthy service still runs ('started dep')" 'ninit: started dep (pid'
+check_absent "over-long service NOT run" 'started longname'
 
-# -------------------------------------------------------------- skenario 6
-printf '\n== 6. layanan ke-65 melebihi batas MAX_SERVICES ==\n'
+# -------------------------------------------------------------- scenario 6
+printf '\n== 6. the 65th service exceeds the MAX_SERVICES limit ==\n'
 start_root maxsvc
 LOG9="$LOG"
 
@@ -424,17 +424,17 @@ LOG9="$LOG"
 run_init
 if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak selesai boot dalam ${READY_TIMEOUT}s pada uji layanan ke-65"
+	fail "ninit did not finish booting within ${READY_TIMEOUT}s on the 65th-service test"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "peringatan batas 64 layanan tercapai" 'Warning: limit of 64 services reached'
-check_absent "layanan ke-65 tidak dijalankan" 'started svc65'
+check "warning that the 64-service limit is reached" 'Warning: limit of 64 services reached'
+check_absent "65th service not run" 'started svc65'
 
-# -------------------------------------------------------------- skenario 7
-printf '\n== 7. urutan dependensi yang dijanjikan README (logd once -> net once) ==\n'
+# -------------------------------------------------------------- scenario 7
+printf '\n== 7. the dependency order promised by the README (logd once -> net once) ==\n'
 start_root readmedep
 LOG10="$LOG"
 
@@ -446,7 +446,7 @@ EOCFG
 run_init
 if ! wait_for 'net-started'; then
 	sed 's/^/  | /' "$LOG"
-	fail "net tidak berjalan dalam ${READY_TIMEOUT}s"
+	fail "net did not run within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
@@ -456,13 +456,13 @@ seq_logd=$(grep -n '\[service\] logd-ready' "$LOG" | head -n 1 | cut -d: -f1 || 
 seq_net=$(grep -n 'ninit: started net' "$LOG" | head -n 1 | cut -d: -f1 || true)
 
 if [ -n "$seq_logd" ] && [ -n "$seq_net" ] && [ "$seq_logd" -lt "$seq_net" ]; then
-	ok "net baru berjalan SETELAH logd selesai ('logd-ready' sebelum 'started net')"
+	ok "net runs only AFTER logd finishes ('logd-ready' before 'started net')"
 else
-	bad "urutan dependensi README salah (posisi logd_ready=$seq_logd net_started=$seq_net)"
+	bad "README dependency order wrong (logd_ready=$seq_logd net_started=$seq_net)"
 fi
 
-# -------------------------------------------------------------- skenario 8
-printf '\n== 8. validasi nama layanan tidak boleh mengandung / ==\n'
+# -------------------------------------------------------------- scenario 8
+printf '\n== 8. service name validation must not contain / ==\n'
 start_root slashname
 LOG11="$LOG"
 
@@ -474,17 +474,17 @@ EOCFG
 run_init
 if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak boot dalam ${READY_TIMEOUT}s pada uji nama dengan slash"
+	fail "ninit did not boot within ${READY_TIMEOUT}s on the slash-name test"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "error nama mengandung slash dicatat" 'Parse err: service name'
-check_absent "layanan dengan slash tidak dijalankan" 'started bad/svc'
+check "name-with-slash error logged" 'Parse err: service name'
+check_absent "service with a slash not run" 'started bad/svc'
 
-# -------------------------------------------------------------- skenario 8
-printf '\n== 9. baris config exceeds MAX_LINE ditolak utuh (audit SANE-03) ==\n'
+# -------------------------------------------------------------- scenario 9
+printf '\n== 9. config line exceeds MAX_LINE rejected whole (SANE-03 audit) ==\n'
 start_root longline
 LOG11="$LOG"
 
@@ -497,18 +497,18 @@ EOCFG
 run_init
 if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencapai main loop pada skenario baris panjang dalam ${READY_TIMEOUT}s"
+	fail "ninit did not reach the main loop on the long-line scenario within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "baris terlalu panjang dicatat sebagai ditolak" 'exceeds MAX_LINE'
-check "layanan sesudah baris panjang tetap terdaftar ('started realsvc')" 'ninit: started realsvc (pid'
-check_absent "tidak ada layanan hantu dari potongan baris ('started ghost')" 'started ghost'
+check "over-long line recorded as rejected" 'exceeds MAX_LINE'
+check "service after the long line still registered ('started realsvc')" 'ninit: started realsvc (pid'
+check_absent "no ghost service from the line fragment ('started ghost')" 'started ghost'
 
-# ------------------------------------------------------------- skenario 10
-printf '\n== 10. klasifikasi opsi fstab: flag VFS vs userspace vs data (audit SANE-02) ==\n'
+# ------------------------------------------------------------- scenario 10
+printf '\n== 10. fstab option classification: VFS flags vs userspace vs data (SANE-02 audit) ==\n'
 start_root fstab
 LOG12="$LOG"
 mkdir -p "$ROOT/mnt"
@@ -522,39 +522,39 @@ printf 'fstabprobe:once:true\n' > "$ROOT/etc/init.conf"
 run_init
 if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencapai main loop pada skenario fstab dalam ${READY_TIMEOUT}s"
+	fail "ninit did not reach the main loop on the fstab scenario within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "fstab a: flag VFS dipisah, data hanya opsi filesystem, mount ok" '\[data: size=4M\] ok'
-check "fstab b: entri noauto dilewati" 'skipped (noauto option)'
-check_absent "fstab b: entri noauto TIDAK di-mount" 'mount tmpfs -> /mnt/b'
-check "fstab c: opsi userspace dicatat sebagai diabaikan" 'is userspace-only, ignored'
-check "fstab c: mount ok, data hanya mode=755" '\[data: mode=755\] ok'
-check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* failed'
+check "fstab a: VFS flags split out, data holds only filesystem options, mount ok" '\[data: size=4M\] ok'
+check "fstab b: noauto entry skipped" 'skipped (noauto option)'
+check_absent "fstab b: noauto entry NOT mounted" 'mount tmpfs -> /mnt/b'
+check "fstab c: userspace option recorded as ignored" 'is userspace-only, ignored'
+check "fstab c: mount ok, data holds only mode=755" '\[data: mode=755\] ok'
+check_absent "no fstab mount failed" 'fstab: mount .* failed'
 
-# ------------------------------------------------------------- skenario 11
-printf '\n== 11. batas baris di EOF: tepat MAX_LINE-1 diterima, MAX_LINE ditolak ==\n'
+# ------------------------------------------------------------- scenario 11
+printf '\n== 11. line limit at EOF: exactly MAX_LINE-1 accepted, MAX_LINE rejected ==\n'
 start_root eolbound
 LOG13="$LOG"
 
-# Baris komentar dipakai supaya yang diuji murni batas BARIS (MAX_LINE),
-# bukan batas bidang nama/cmd/deps yang punya penolakan sendiri.
+# A comment line is used so that only the LINE limit (MAX_LINE) is tested,
+# not the name/cmd/deps field limits, which have their own rejections.
 { printf 'first:once:true\n'; printf '#%s' "$(printf 'x%.0s' $(seq 1 1022))"; } > "$ROOT/etc/init.conf"
 
 run_init
 if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencapai main loop pada skenario batas EOF dalam ${READY_TIMEOUT}s"
+	fail "ninit did not reach the main loop on the EOF-limit scenario within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "layanan normal tetap jalan pada skenario batas EOF" 'ninit: started first (pid'
-check_absent "baris EOF tepat MAX_LINE-1 (1023) TIDAK ditolak" 'exceeds MAX_LINE'
+check "normal service still runs on the EOF-limit scenario" 'ninit: started first (pid'
+check_absent "EOF line of exactly MAX_LINE-1 (1023) NOT rejected" 'exceeds MAX_LINE'
 
 start_root eolover
 LOG14="$LOG"
@@ -564,17 +564,17 @@ LOG14="$LOG"
 run_init
 if ! wait_for 'main loop ready'; then
 	sed 's/^/  | /' "$LOG"
-	fail "ninit tidak mencapai main loop pada skenario batas EOF+1 dalam ${READY_TIMEOUT}s"
+	fail "ninit did not reach the main loop on the EOF+1-limit scenario within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "baris EOF MAX_LINE (1024) ditolak walau tanpa newline" 'exceeds MAX_LINE'
-check "layanan normal tetap jalan setelah baris EOF ditolak" 'ninit: started first (pid'
+check "EOF line of MAX_LINE (1024) rejected even without a newline" 'exceeds MAX_LINE'
+check "normal service still runs after the EOF line is rejected" 'ninit: started first (pid'
 
-# ------------------------------------------------------------- skenario 12
-printf '\n== 12. fstab: exec/suid/dev, implikasi user, override kiri-ke-kanan (review PR #2) ==\n'
+# ------------------------------------------------------------- scenario 12
+printf '\n== 12. fstab: exec/suid/dev, user implications, left-to-right override (PR #2 review) ==\n'
 start_root fstabflags
 LOG15="$LOG"
 mkdir -p "$ROOT/mnt"
@@ -595,66 +595,66 @@ while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 done
 if [ ! -s "$ROOT/var/mounts.txt" ]; then
 	sed 's/^/  | /' "$LOG"
-	fail "dumpro tidak menulis /var/mounts.txt dalam ${READY_TIMEOUT}s"
+	fail "dumpro did not write /var/mounts.txt within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "fstab e1: exec/suid/dev terkonsumsi (bukan data), mount ok" 'mount tmpfs -> /mnt/e1 (tmpfs) \[data: size=1M\] ok'
-check "fstab e2: user dicatat menerapkan implikasinya" "option 'user' applies noexec,nosuid,nodev"
-check_absent "tidak ada mount fstab yang gagal" 'fstab: mount .* failed'
+check "fstab e1: exec/suid/dev consumed (not data), mount ok" 'mount tmpfs -> /mnt/e1 (tmpfs) \[data: size=1M\] ok'
+check "fstab e2: user recorded as applying its implications" "option 'user' applies noexec,nosuid,nodev"
+check_absent "no fstab mount failed" 'fstab: mount .* failed'
 
-# Bukti dari /proc/mounts di dalam guest: flag yang BENAR-BENAR terpakai,
-# bukan sekadar mount() yang tidak error.
+# Evidence from the guest's /proc/mounts: the flags REALLY in effect, not
+# merely a mount() that did not error.
 mount_opts() { awk -v m="$1" '$2 == m { print $4 }' "$ROOT/var/mounts.txt"; }
 has_opt() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 e1_opts=$(mount_opts /mnt/e1)
 if ! has_opt noexec "$e1_opts" && ! has_opt nosuid "$e1_opts" && ! has_opt nodev "$e1_opts"; then
-	ok "fstab e1: /proc/mounts tanpa noexec/nosuid/nodev ($e1_opts)"
+	ok "fstab e1: /proc/mounts without noexec/nosuid/nodev ($e1_opts)"
 else
-	bad "fstab e1: opts mengandung peniada yang tidak diminta ($e1_opts)"
+	bad "fstab e1: opts contain an unwanted negator ($e1_opts)"
 fi
 
 e2_opts=$(mount_opts /mnt/e2)
 if has_opt noexec "$e2_opts" && has_opt nosuid "$e2_opts" && has_opt nodev "$e2_opts"; then
-	ok "fstab e2: /proc/mounts membuktikan user -> noexec,nosuid,nodev ($e2_opts)"
+	ok "fstab e2: /proc/mounts proves user -> noexec,nosuid,nodev ($e2_opts)"
 else
-	bad "fstab e2: implikasi user tidak terpakai (opts: '$e2_opts')"
+	bad "fstab e2: user implications not in effect (opts: '$e2_opts')"
 fi
 
 e3_opts=$(mount_opts /mnt/e3)
 if has_opt nosuid "$e3_opts" && has_opt nodev "$e3_opts" && ! has_opt noexec "$e3_opts"; then
-	ok "fstab e3: user,exec -> exec membatalkan noexec saja ($e3_opts)"
+	ok "fstab e3: user,exec -> exec cancels only noexec ($e3_opts)"
 else
-	bad "fstab e3: override user,exec salah (opts: '$e3_opts')"
+	bad "fstab e3: user,exec override wrong (opts: '$e3_opts')"
 fi
 
 e4_opts=$(mount_opts /mnt/e4)
 if has_opt rw "$e4_opts" && ! has_opt ro "$e4_opts"; then
-	ok "fstab e4: ro,rw -> berakhir rw ($e4_opts)"
+	ok "fstab e4: ro,rw -> ends up rw ($e4_opts)"
 else
-	bad "fstab e4: override ro,rw salah (opts: '$e4_opts')"
+	bad "fstab e4: ro,rw override wrong (opts: '$e4_opts')"
 fi
 
-# ------------------------------------------------------------- skenario 13
-printf '\n== 13. fstab: mkdir rekursif, bind ditolak, skip sebelum mkdir (PR lanjutan) ==\n'
+# ------------------------------------------------------------- scenario 13
+printf '\n== 13. fstab: recursive mkdir, bind rejected, skip before mkdir (follow-up PR) ==\n'
 start_root fstabdeep
 LOG16="$LOG"
-# /mnt dibuat sebagai induk kontrol; yang diuji adalah level DI BAWAHNYA
-# yang tidak dibuat dari luar (skenario 10/12 selalu menyiapkan jalurnya).
+# /mnt is created as a control parent; what is tested is the level BELOW it,
+# which is not created from outside (scenarios 10/12 always prepare the path).
 mkdir -p "$ROOT/mnt" "$ROOT/var/realdir"
 touch "$ROOT/mnt/blocked" "$ROOT/var/afile"
 ln -s /var/realdir "$ROOT/mnt/linkdir"
 ln -s /var/afile "$ROOT/mnt/filelink"
-ln -s /var/tidak-ada "$ROOT/mnt/dangle"
+ln -s /var/missing "$ROOT/mnt/dangle"
 cat > "$ROOT/etc/fstab" <<'EOFSTAB'
 tmpfs /mnt/deep/nested tmpfs size=1M 0 0
 tmpfs /mnt/trail/ tmpfs size=1M 0 0
 tmpfs /mnt/noauto-dir tmpfs noauto,size=1M 0 0
-/sumber /mnt/bind-dir none bind 0 0
-/sumber2 /mnt/nobind-dir none bind,noauto 0 0
+/src /mnt/bind-dir none bind 0 0
+/src2 /mnt/nobind-dir none bind,noauto 0 0
 tmpfs /mnt/filelink/x tmpfs size=1M 0 0
 tmpfs /mnt/blocked/x tmpfs size=1M 0 0
 tmpfs /mnt/./evil tmpfs size=1M 0 0
@@ -665,8 +665,8 @@ tmpfs /mnt/after tmpfs size=1M 0 0
 EOFSTAB
 printf 'dumpro:once:cat /proc/mounts > /var/mounts.txt\n' > "$ROOT/etc/init.conf"
 
-# umask ketat di guest: mountpoint hasil mkdir_p harus TETAP 0755 berkat
-# chmod eksplisit, bukan 0700 warisan umask.
+# Strict umask in the guest: the mountpoint created by mkdir_p must STAY 0755
+# thanks to an explicit chmod, not 0700 inherited from the umask.
 TEST_UMASK=077
 run_init
 i=0
@@ -677,46 +677,46 @@ while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 done
 if [ ! -s "$ROOT/var/mounts.txt" ]; then
 	sed 's/^/  | /' "$LOG"
-	fail "dumpro tidak menulis /var/mounts.txt pada skenario 13 dalam ${READY_TIMEOUT}s"
+	fail "dumpro did not write /var/mounts.txt on scenario 13 within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 TEST_UMASK=""
 
-check "fstab f1: mountpoint bertingkat dibuat rekursif, mount ok" 'mount tmpfs -> /mnt/deep/nested (tmpfs) \[data: size=1M\] ok'
-check "fstab f2: trailing slash ditangani, mount ok" 'mount tmpfs -> /mnt/trail/ (tmpfs) \[data: size=1M\] ok'
-check "fstab f3: entri noauto dilewati" 'tmpfs -> /mnt/noauto-dir skipped (noauto option)'
-check "fstab f4: entri bind ditolak eksplisit" '/sumber -> /mnt/bind-dir skipped (bind/rbind not supported)'
-check_absent "fstab f4: bind TIDAK ter-mount" 'mount /sumber -> /mnt/bind-dir'
-check "fstab f4b: bind+noauto -> alasan pertama (noauto) yang dicatat" '/sumber2 -> /mnt/nobind-dir skipped (noauto option)'
-check_absent "fstab f4b: bind+noauto TIDAK dicatat sebagai bind" 'nobind-dir skipped (bind'
-check "fstab f5: komponen symlink-ke-file ditolak jelas" "component '/mnt/filelink' of mountpoint '/mnt/filelink/x' is not a directory"
-check "fstab f6: komponen file biasa ditolak jelas" "component '/mnt/blocked' of mountpoint '/mnt/blocked/x' is not a directory"
-check "fstab f7: komponen '.' ditolak" "contains component '.', rejected"
-check "fstab f7b: komponen '..' ditolak oleh pra-pindai" "contains component '..', rejected"
-check "fstab f7c: symlink menggantung ditolak jelas" "stat '/mnt/dangle' failed"
-check "fstab f8: symlink-ke-direktori diikuti, mount ok" 'mount tmpfs -> /mnt/linkdir/deep (tmpfs) \[data: size=1M\] ok'
+check "fstab f1: nested mountpoint created recursively, mount ok" 'mount tmpfs -> /mnt/deep/nested (tmpfs) \[data: size=1M\] ok'
+check "fstab f2: trailing slash handled, mount ok" 'mount tmpfs -> /mnt/trail/ (tmpfs) \[data: size=1M\] ok'
+check "fstab f3: noauto entry skipped" 'tmpfs -> /mnt/noauto-dir skipped (noauto option)'
+check "fstab f4: bind entry explicitly rejected" '/src -> /mnt/bind-dir skipped (bind/rbind not supported)'
+check_absent "fstab f4: bind NOT mounted" 'mount /src -> /mnt/bind-dir'
+check "fstab f4b: bind+noauto -> the first reason (noauto) is recorded" '/src2 -> /mnt/nobind-dir skipped (noauto option)'
+check_absent "fstab f4b: bind+noauto NOT recorded as bind" 'nobind-dir skipped (bind'
+check "fstab f5: symlink-to-file component clearly rejected" "component '/mnt/filelink' of mountpoint '/mnt/filelink/x' is not a directory"
+check "fstab f6: plain file component clearly rejected" "component '/mnt/blocked' of mountpoint '/mnt/blocked/x' is not a directory"
+check "fstab f7: '.' component rejected" "contains component '.', rejected"
+check "fstab f7b: '..' component rejected by the pre-scan" "contains component '..', rejected"
+check "fstab f7c: dangling symlink clearly rejected" "stat '/mnt/dangle' failed"
+check "fstab f8: symlink-to-directory followed, mount ok" 'mount tmpfs -> /mnt/linkdir/deep (tmpfs) \[data: size=1M\] ok'
 
-# Bukti sisi host: direktori yang benar-benar dibuat / tidak dibuat.
-if [ -d "$ROOT/mnt/deep/nested" ]; then ok "host: /mnt/deep/nested benar-benar dibuat"; else bad "host: /mnt/deep/nested tidak dibuat"; fi
-if [ "$(stat -c %a "$ROOT/mnt/deep")" = "755" ] && [ "$(stat -c %a "$ROOT/mnt/deep/nested")" = "755" ]; then ok "host: mountpoint tetap 0755 walau umask guest 077 (chmod eksplisit)"; else bad "host: mode mountpoint bukan 0755 (deep=$(stat -c %a "$ROOT/mnt/deep" 2>/dev/null), nested=$(stat -c %a "$ROOT/mnt/deep/nested" 2>/dev/null))"; fi
-if [ ! -e "$ROOT/mnt/noauto-dir" ]; then ok "host: entri noauto TIDAK meninggalkan direktori hantu"; else bad "host: entri noauto meninggalkan direktori hantu"; fi
-if [ ! -e "$ROOT/mnt/bind-dir" ]; then ok "host: entri bind TIDAK meninggalkan direktori hantu"; else bad "host: entri bind meninggalkan direktori hantu"; fi
-if [ ! -e "$ROOT/mnt/nobind-dir" ]; then ok "host: entri bind+noauto TIDAK meninggalkan direktori hantu"; else bad "host: entri bind+noauto meninggalkan direktori hantu"; fi
-if [ ! -e "$ROOT/mnt/ghostdir" ]; then ok "host: pra-pindai '..' TIDAK meninggalkan direktori induk hantu"; else bad "host: pra-pindai '..' meninggalkan direktori induk hantu"; fi
-if [ -d "$ROOT/var/realdir/deep" ]; then ok "host: mkdir lewat symlink membuat direktori di target aslinya"; else bad "host: direktori di target symlink tidak dibuat"; fi
-if [ ! -e "$ROOT/mnt/evil" ]; then ok "host: path dengan '.' TIDAK dibuat"; else bad "host: path dengan '.' dibuat"; fi
+# Host-side evidence: directories really created / not created.
+if [ -d "$ROOT/mnt/deep/nested" ]; then ok "host: /mnt/deep/nested really created"; else bad "host: /mnt/deep/nested not created"; fi
+if [ "$(stat -c %a "$ROOT/mnt/deep")" = "755" ] && [ "$(stat -c %a "$ROOT/mnt/deep/nested")" = "755" ]; then ok "host: mountpoint stays 0755 despite guest umask 077 (explicit chmod)"; else bad "host: mountpoint mode is not 0755 (deep=$(stat -c %a "$ROOT/mnt/deep" 2>/dev/null), nested=$(stat -c %a "$ROOT/mnt/deep/nested" 2>/dev/null))"; fi
+if [ ! -e "$ROOT/mnt/noauto-dir" ]; then ok "host: noauto entry leaves no ghost directory"; else bad "host: noauto entry leaves a ghost directory"; fi
+if [ ! -e "$ROOT/mnt/bind-dir" ]; then ok "host: bind entry leaves no ghost directory"; else bad "host: bind entry leaves a ghost directory"; fi
+if [ ! -e "$ROOT/mnt/nobind-dir" ]; then ok "host: bind+noauto entry leaves no ghost directory"; else bad "host: bind+noauto entry leaves a ghost directory"; fi
+if [ ! -e "$ROOT/mnt/ghostdir" ]; then ok "host: '..' pre-scan leaves no ghost parent directory"; else bad "host: '..' pre-scan leaves a ghost parent directory"; fi
+if [ -d "$ROOT/var/realdir/deep" ]; then ok "host: mkdir through a symlink creates the directory at the real target"; else bad "host: directory at the symlink target not created"; fi
+if [ ! -e "$ROOT/mnt/evil" ]; then ok "host: path with '.' NOT created"; else bad "host: path with '.' created"; fi
 
-# Bukti /proc/mounts guest: yang ter-mount dan isolasi kegagalan per entri.
-if [ -n "$(mount_opts /mnt/deep/nested)" ]; then ok "guest: /mnt/deep/nested ter-mount"; else bad "guest: /mnt/deep/nested tidak ter-mount"; fi
-if [ -n "$(mount_opts /mnt/trail)" ]; then ok "guest: /mnt/trail ter-mount (tanpa slash)"; else bad "guest: /mnt/trail tidak ter-mount"; fi
-if [ -n "$(mount_opts /mnt/after)" ]; then ok "guest: entri sesudah yang gagal tetap ter-mount (isolasi per entri)"; else bad "guest: entri sesudah yang gagal TIDAK ter-mount"; fi
-if [ -z "$(mount_opts /mnt/bind-dir)" ]; then ok "guest: /mnt/bind-dir tidak ter-mount"; else bad "guest: /mnt/bind-dir ter-mount"; fi
-if [ -z "$(mount_opts /mnt/blocked/x)" ]; then ok "guest: /mnt/blocked/x tidak ter-mount"; else bad "guest: /mnt/blocked/x ter-mount"; fi
+# Guest /proc/mounts evidence: what is mounted and the per-entry failure isolation.
+if [ -n "$(mount_opts /mnt/deep/nested)" ]; then ok "guest: /mnt/deep/nested mounted"; else bad "guest: /mnt/deep/nested not mounted"; fi
+if [ -n "$(mount_opts /mnt/trail)" ]; then ok "guest: /mnt/trail mounted (without slash)"; else bad "guest: /mnt/trail not mounted"; fi
+if [ -n "$(mount_opts /mnt/after)" ]; then ok "guest: the entry after the failing one is still mounted (per-entry isolation)"; else bad "guest: the entry after the failing one is NOT mounted"; fi
+if [ -z "$(mount_opts /mnt/bind-dir)" ]; then ok "guest: /mnt/bind-dir not mounted"; else bad "guest: /mnt/bind-dir mounted"; fi
+if [ -z "$(mount_opts /mnt/blocked/x)" ]; then ok "guest: /mnt/blocked/x not mounted"; else bad "guest: /mnt/blocked/x mounted"; fi
 
-# ------------------------------------------------------------- skenario 14
-printf '\n== 14. fstab: escape oktal didekode + mountpoint duplikat dilewati (PR3-C1/C2) ==\n'
+# ------------------------------------------------------------- scenario 14
+printf '\n== 14. fstab: octal escape decoded + duplicate mountpoint skipped (PR3-C1/C2) ==\n'
 start_root fstabesc
 LOG17="$LOG"
 mkdir -p "$ROOT/mnt"
@@ -738,71 +738,71 @@ while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
 done
 if [ ! -s "$ROOT/var/mounts.txt" ]; then
 	sed 's/^/  | /' "$LOG"
-	fail "dumpro tidak menulis /var/mounts.txt pada skenario 14 dalam ${READY_TIMEOUT}s"
+	fail "dumpro did not write /var/mounts.txt on scenario 14 within ${READY_TIMEOUT}s"
 fi
 init_pid=$(find_init_pid || true)
 INIT_PID="${init_pid:-}"
 stop_init
 
-check "fstab g1: escape oktal didekode, mount ke path berisi spasi ok" 'mount tmpfs -> /mnt/spa ce (tmpfs) \[data: size=1M\] ok'
-check_absent "fstab g1: TIDAK ada mount ke nama harfiah backslash" 'mount tmpfs -> /mnt/spa\\040ce'
-check "fstab g2: entri duplikat dilewati dengan catatan" 'tmpfs -> /mnt/dup skipped (duplicate mountpoint'
-check "fstab g3: escape terdekode menjadi '..' lalu ditolak pra-pindai" "contains component '..', rejected"
-check "fstab g4: entri normal sesudahnya tetap diproses" 'mount tmpfs -> /mnt/plain (tmpfs) \[data: size=1M\] ok'
+check "fstab g1: octal escape decoded, mount to a path with a space ok" 'mount tmpfs -> /mnt/spa ce (tmpfs) \[data: size=1M\] ok'
+check_absent "fstab g1: no mount to the literal backslash name" 'mount tmpfs -> /mnt/spa\\040ce'
+check "fstab g2: duplicate entry skipped with a record" 'tmpfs -> /mnt/dup skipped (duplicate mountpoint'
+check "fstab g3: escape decoded to '..' then rejected by the pre-scan" "contains component '..', rejected"
+check "fstab g4: the normal entry after it is still processed" 'mount tmpfs -> /mnt/plain (tmpfs) \[data: size=1M\] ok'
 
-# Bukti sisi host: direktori yang benar-benar dibuat / tidak dibuat.
-if [ -d "$ROOT/mnt/spa ce" ]; then ok "host: direktori 'spa ce' (spasi asli) benar-benar dibuat"; else bad "host: direktori 'spa ce' tidak dibuat"; fi
-if [ ! -e "$ROOT/mnt/spa\040ce" ]; then ok "host: TIDAK ada direktori bernama harfiah 'spa\\040ce'"; else bad "host: ada direktori bernama harfiah backslash"; fi
-if [ ! -e "$ROOT/mnt/evil" ]; then ok "host: escape '..' TIDAK meloloskan path"; else bad "host: escape '..' meloloskan path"; fi
+# Host-side evidence: directories really created / not created.
+if [ -d "$ROOT/mnt/spa ce" ]; then ok "host: directory 'spa ce' (real space) really created"; else bad "host: directory 'spa ce' not created"; fi
+if [ ! -e "$ROOT/mnt/spa\040ce" ]; then ok "host: no directory literally named 'spa\\040ce'"; else bad "host: a directory literally named with a backslash exists"; fi
+if [ ! -e "$ROOT/mnt/evil" ]; then ok "host: the '..' escape does NOT smuggle the path through"; else bad "host: the '..' escape smuggles the path through"; fi
 
-# Bukti /proc/mounts guest: duplikat tidak menumpuk, proteksi entri
-# pertama tidak tertutupi, dan path spasi tercatat (kernel menulis
-# spasi sebagai \040 di /proc/mounts).
-if [ "$(grep -c ' /mnt/dup ' "$ROOT/var/mounts.txt")" = "1" ]; then ok "guest: /mnt/dup ter-mount TEPAT satu kali"; else bad "guest: /mnt/dup ter-mount bukan satu kali"; fi
+# Guest /proc/mounts evidence: duplicates do not stack, the first entry's
+# protection is not overridden, and the space path is recorded (the kernel
+# writes spaces as \040 in /proc/mounts).
+if [ "$(grep -c ' /mnt/dup ' "$ROOT/var/mounts.txt")" = "1" ]; then ok "guest: /mnt/dup mounted EXACTLY once"; else bad "guest: /mnt/dup mounted other than once"; fi
 dup_opts=$(mount_opts /mnt/dup)
-if has_opt nosuid "$dup_opts"; then ok "guest: proteksi entri pertama (nosuid) TIDAK tertutupi duplikat ($dup_opts)"; else bad "guest: nosuid entri pertama hilang (opts: '$dup_opts')"; fi
-if grep -qF ' /mnt/spa\040ce ' "$ROOT/var/mounts.txt"; then ok "guest: mount path berisi spasi tercatat di /proc/mounts"; else bad "guest: mount path berisi spasi tidak tercatat"; fi
+if has_opt nosuid "$dup_opts"; then ok "guest: the first entry's protection (nosuid) is NOT overridden by the duplicate ($dup_opts)"; else bad "guest: the first entry's nosuid is lost (opts: '$dup_opts')"; fi
+if grep -qF ' /mnt/spa\040ce ' "$ROOT/var/mounts.txt"; then ok "guest: the mount path with a space is recorded in /proc/mounts"; else bad "guest: the mount path with a space is not recorded"; fi
 
-# --------------------------------------------------------------- ringkasan
-printf '\n== log 1a (urut dependensi) ==\n'
+# --------------------------------------------------------------- summary
+printf '\n== log 1a (dependency order) ==\n'
 sed 's/^/  | /' "$LOG1"
-printf '\n== log 1b (konfigurasi padat; 63 baris layanan s2..s64 disembunyikan) ==\n'
+printf '\n== log 1b (dense configuration; 63 service lines s2..s64 hidden) ==\n'
 grep -vE "ninit: (started s[0-9]+ \(pid|cgroup: 's[0-9]+'|s[0-9]+ \(pid [0-9]+\) exit)" \
 	"$LOG2" | sed 's/^/  | /'
-printf '\n== log 2 (dependensi hilang) ==\n'
+printf '\n== log 2 (missing dependency) ==\n'
 sed 's/^/  | /' "$LOG3"
 printf '\n== log 3a (/run/initctl: poweroff + reboot) ==\n'
 sed 's/^/  | /' "$LOG4"
 printf '\n== log 3b (/run/initctl: status + poweroff) ==\n'
 sed 's/^/  | /' "$LOG5"
-printf '\n== log 4a (config tidak terbaca) ==\n'
+printf '\n== log 4a (unreadable config) ==\n'
 sed 's/^/  | /' "$LOG6"
-printf '\n== log 4b (siklus dependensi) ==\n'
+printf '\n== log 4b (dependency cycle) ==\n'
 sed 's/^/  | /' "$LOG7"
-printf '\n== log 5 (penolakan string panjang) ==\n'
+printf '\n== log 5 (over-long string rejection) ==\n'
 sed 's/^/  | /' "$LOG8"
-printf '\n== log 6 (layanan ke-65) ==\n'
+printf '\n== log 6 (the 65th service) ==\n'
 sed 's/^/  | /' "$LOG9"
-printf '\n== log 7 (dependensi README: logd -> net) ==\n'
+printf '\n== log 7 (README dependency: logd -> net) ==\n'
 sed 's/^/  | /' "$LOG10"
-printf '\n== log 9 (baris exceeds MAX_LINE) ==\n'
+printf '\n== log 9 (line exceeds MAX_LINE) ==\n'
 sed 's/^/  | /' "$LOG11"
-printf '\n== log 10 (klasifikasi opsi fstab) ==\n'
+printf '\n== log 10 (fstab option classification) ==\n'
 sed 's/^/  | /' "$LOG12"
-printf '\n== log 11 (batas EOF MAX_LINE) ==\n'
+printf '\n== log 11 (EOF MAX_LINE limit) ==\n'
 sed 's/^/  | /' "$LOG13"
-printf '\n== log 11b (batas EOF MAX_LINE+1) ==\n'
+printf '\n== log 11b (EOF MAX_LINE+1 limit) ==\n'
 sed 's/^/  | /' "$LOG14"
-printf '\n== log 12 (fstab: exec/suid/dev + implikasi user) ==\n'
+printf '\n== log 12 (fstab: exec/suid/dev + user implications) ==\n'
 sed 's/^/  | /' "$LOG15"
-printf '\n== log 13 (fstab: mkdir rekursif + bind ditolak) ==\n'
+printf '\n== log 13 (fstab: recursive mkdir + bind rejected) ==\n'
 sed 's/^/  | /' "$LOG16"
-printf '\n== log 14 (fstab: escape oktal + duplikat) ==\n'
+printf '\n== log 14 (fstab: octal escape + duplicate) ==\n'
 sed 's/^/  | /' "$LOG17"
 
 if [ "$fail_count" -eq 0 ]; then
-	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
+	printf '\nRESULT: PASS (all checks)\n'
 else
-	printf '\nHASIL: GAGAL (%s pemeriksaan)\n' "$fail_count"
+	printf '\nRESULT: FAIL (%s checks)\n' "$fail_count"
 	exit 1
 fi

@@ -1,68 +1,68 @@
 #!/bin/sh
-# Test-qemu-report: membuktikan pemeriksaan report() di scripts/run-qemu.sh
-# tidak longgar — log konsol di mana layanan console mati dan di-respawn ulang
-# harus GAGAL, bukan LULUS.
+# Test-qemu-report: proves that the report() checks in scripts/run-qemu.sh are
+# not lax — a console log where the console service dies and is respawned again
+# must FAIL, not PASS.
 #
-# Kenapa test ini ada (catatan PR #1, "Temuan berikutnya"): 'started console'
-# ditulis spawn_service() saat FORK, bukan setelah exec berhasil. Layanan
-# console yang langsung mati (mis. `console:respawn:/bin/does-not-exist`)
-# tetap menghasilkan baris 'started console' berulang, exit status=0x7f00, dan
-# 'respawn ditunda' — sementara harness lama hanya mencocokkan tiga penanda
-# ('ninit start (PID 1)', 'main loop ready', 'started console') sehingga tetap
-# melaporkan HASIL: LULUS. Test ini gagal bila pelonggaran itu kembali.
+# Why this test exists (PR #1 note, "next finding"): 'started console' is
+# written by spawn_service() at FORK, not after a successful exec. A console
+# service that dies immediately (e.g. `console:respawn:/bin/does-not-exist`)
+# still produces repeated 'started console' lines, exit status=0x7f00, and
+# 'respawn delayed' — while the old harness only matched three markers
+# ('ninit start (PID 1)', 'main loop ready', 'started console') and therefore
+# still reported RESULT: PASS. This test fails if that laxness returns.
 #
-# Cara kerja: scripts/run-qemu.sh dijalankan dengan REPORT_ONLY=1 terhadap
-# fixture log konsol (tidak ada QEMU yang di-boot, tidak butuh root). Setiap
-# skenario menguji kode keluar DAN baris pemeriksaan spesifik yang diharapkan,
-# supaya kegagalan tidak boleh datang dari pemeriksaan yang salah sasaran.
+# How it works: scripts/run-qemu.sh is run with REPORT_ONLY=1 against console
+# log fixtures (no QEMU is booted, no root needed). Each scenario checks both
+# the exit code AND the specific expected check line, so a failure cannot come
+# from a check aimed at the wrong target.
 #
 # Pemakaian:
 #   sh ./scripts/test-qemu-report.sh
 #
 # Variabel lingkungan:
-#   HARNESS=./scripts/run-qemu.sh   harness yang diperiksa
+#   HARNESS=./scripts/run-qemu.sh   harness under test
 
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 HARNESS=${HARNESS:-$SCRIPT_DIR/run-qemu.sh}
 
-fail() { printf 'GAGAL: %s\n' "$1" >&2; exit 1; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
-[ -f "$HARNESS" ] || fail "harness '$HARNESS' tidak ada"
-sh -n "$HARNESS" || fail "'$HARNESS' tidak lolos sh -n"
+[ -f "$HARNESS" ] || fail "harness '$HARNESS' not found"
+sh -n "$HARNESS" || fail "'$HARNESS' failed sh -n"
 
 FIX=$(mktemp -d)
 trap 'rm -rf "$FIX"' EXIT INT TERM
 
 fail_count=0
 ok()  { printf '  [ OK ]   %s\n' "$1"; }
-bad() { printf '  [GAGAL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
+bad() { printf '  [FAIL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
 
-expect_rc() { # $1 = skenario, $2 = rc aktual, $3 = rc yang diharapkan
-	if [ "$2" = "$3" ]; then ok "$1 (exit=$2)"; else bad "$1: exit=$2, seharusnya $3"; fi
+expect_rc() { # $1 = scenario, $2 = actual rc, $3 = expected rc
+	if [ "$2" = "$3" ]; then ok "$1 (exit=$2)"; else bad "$1: exit=$2, expected $3"; fi
 }
 
-expect_line() { # $1 = keluaran harness, $2 = teks yang harus muncul, $3 = label
-	if printf '%s' "$1" | grep -qF "$2"; then ok "$3"; else bad "$3 (tidak ditemukan: '$2')"; fi
+expect_line() { # $1 = harness output, $2 = text expected to appear, $3 = label
+	if printf '%s' "$1" | grep -qF "$2"; then ok "$3"; else bad "$3 (not found: '$2')"; fi
 }
 
-expect_absent() { # $1 = keluaran harness, $2 = teks yang TIDAK boleh muncul, $3 = label
-	if printf '%s' "$1" | grep -qF "$2"; then bad "$3 (muncul padahal tidak boleh: '$2')"; else ok "$3"; fi
+expect_absent() { # $1 = harness output, $2 = text that must NOT appear, $3 = label
+	if printf '%s' "$1" | grep -qF "$2"; then bad "$3 (appeared but must not: '$2')"; else ok "$3"; fi
 }
 
-run_report() { # $1 = nama fixture; menyetel RC dan OUT
+run_report() { # $1 = fixture name; sets RC and OUT
 	RC=0
 	OUT=$(CONSOLE_LOG="$FIX/$1.log" REPORT_ONLY=1 sh "$HARNESS" 2>&1) || RC=$?
 }
 
 # ------------------------------------------------------------------ fixture
-# Setiap baris ninit ditulis DUA kali (via /dev/kmsg dan stderr); fixture
-# meniru itu supaya deduplikasi PID ikut teruji.
-cat > "$FIX/sehat.log" <<'EOF'
+# Every ninit line is written TWICE (via /dev/kmsg and stderr); the fixture
+# imitates that so PID deduplication is exercised too.
+cat > "$FIX/healthy.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [2026-11-05 09:00:01] ninit: ninit start (PID 1)
-[    1.200000] ninit: mount fstab: /etc/fstab does not exist, skipped
+[    1.200000] ninit: fstab: /etc/fstab does not exist, skipped
 [    1.250000] ninit: main loop ready
 [2026-11-05 09:00:01] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
@@ -70,10 +70,10 @@ cat > "$FIX/sehat.log" <<'EOF'
 / # 
 EOF
 
-# Skenario pembuktian PR #1: console:respawn:/bin/does-not-exist.
-# Pemeriksaan LAMA semuanya lolos; yang harus menangkap adalah pemeriksaan
-# liveness baru (PID unik, exit status, respawn ditunda).
-cat > "$FIX/console-mati.log" <<'EOF'
+# PR #1 proof scenario: console:respawn:/bin/does-not-exist.
+# The OLD checks all pass; what must catch it is the new liveness check
+# (unique PIDs, exit status, respawn delay).
+cat > "$FIX/console-dead.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [2026-11-05 09:00:01] ninit: ninit start (PID 1)
 [    1.250000] ninit: main loop ready
@@ -90,10 +90,10 @@ cat > "$FIX/console-mati.log" <<'EOF'
 [2026-11-05 09:00:04] ninit: console (pid 51) exit status=0x7f00
 EOF
 
-# 'started console' muncul dua kali untuk PID yang SAMA (hanya duplikasi
-# kmsg/stderr) + satu exit status: respawn loop belum terjadi, tapi console
-# sudah pernah keluar -> tetap harus GAGAL lewat pemeriksaan exit status.
-cat > "$FIX/console-exit-satu-pid.log" <<'EOF'
+# 'started console' appears twice for the SAME PID (just kmsg/stderr
+# duplication) + one exit status: no respawn loop happened yet, but the
+# console did exit -> it must still FAIL via the exit status check.
+cat > "$FIX/console-exit-single-pid.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [    1.250000] ninit: main loop ready
 [    1.300000] ninit: started console (pid 42)
@@ -109,22 +109,22 @@ cat > "$FIX/panic.log" <<'EOF'
 [    2.000000] Kernel panic - not syncing: Attempted to kill init!
 EOF
 
-# Konsol belum pernah start sama sekali.
-cat > "$FIX/konsol-tidak-start.log" <<'EOF'
+# The console never started at all.
+cat > "$FIX/console-never-start.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [    1.250000] ninit: main loop ready
 EOF
 
-# ninit tidak pernah masuk event loop.
-cat > "$FIX/tanpa-main-loop.log" <<'EOF'
+# ninit never entered the event loop.
+cat > "$FIX/no-main-loop.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 EOF
 
-# Console sehat, tapi service respawn LAIN ('web') pernah menunda jendela
-# respawn-nya — perilaku normal pada init.conf multi-layanan. Pemeriksaan
-# 'respawn ditunda' yang di-scope ke console TIDAK boleh membuat ini GAGAL
-# (regresi balik dari catatan review PR #6: pola global terlalu ketat).
-cat > "$FIX/respawn-service-lain.log" <<'EOF'
+# Healthy console, but ANOTHER respawn service ('web') once delayed its
+# respawn window — normal behavior for a multi-service init.conf. The
+# console-scoped 'respawn delayed' check must NOT make this FAIL (a
+# regression back to the PR #6 review note: a global pattern is too strict).
+cat > "$FIX/respawn-other-service.log" <<'EOF'
 [    1.100000] ninit: ninit start (PID 1)
 [2026-11-05 09:00:01] ninit: ninit start (PID 1)
 [    1.250000] ninit: main loop ready
@@ -141,66 +141,66 @@ cat > "$FIX/respawn-service-lain.log" <<'EOF'
 [2026-11-05 09:00:06] ninit: started web (pid 55)
 EOF
 
-# ------------------------------------------------------------------ skenario
-printf '\n== skenario 1: boot sehat -> LULUS ==\n'
-run_report sehat
-expect_rc "skenario 1: kode keluar" "$RC" 0
-expect_line "$OUT" 'HASIL: LULUS' "skenario 1: laporan LULUS"
+# ------------------------------------------------------------------ scenarios
+printf '\n== scenario 1: healthy boot -> PASS ==\n'
+run_report healthy
+expect_rc "scenario 1: exit code" "$RC" 0
+expect_line "$OUT" 'RESULT: PASS' "scenario 1: PASS report"
 expect_line "$OUT" 'console started with exactly one PID (42)' \
-	"skenario 1: baris ganda kmsg/stderr terdedup (tetap satu PID)"
+	"scenario 1: duplicate kmsg/stderr lines deduplicated (still one PID)"
 
-printf '\n== skenario 2: console mati + respawn loop -> GAGAL (regresi PR #1) ==\n'
-run_report console-mati
-expect_rc "skenario 2: kode keluar" "$RC" 1
+printf '\n== scenario 2: console dies + respawn loop -> FAIL (PR #1 regression) ==\n'
+run_report console-dead
+expect_rc "scenario 2: exit code" "$RC" 1
 expect_line "$OUT" 'console has 2 unique PIDs' \
-	"skenario 2: respawn loop tertangkap lewat PID unik"
-expect_line "$OUT" '[GAGAL] console never exited' \
-	"skenario 2: exit status console tertangkap"
-expect_line "$OUT" '[GAGAL] console was not respawn-delayed' \
-	"skenario 2: 'console: respawn delayed' tertangkap"
+	"scenario 2: respawn loop caught via unique PIDs"
+expect_line "$OUT" '[FAIL] console never exited' \
+	"scenario 2: console exit status caught"
+expect_line "$OUT" '[FAIL] console was not respawn-delayed' \
+	"scenario 2: 'console: respawn delayed' caught"
 expect_line "$OUT" "[ OK ]   service /etc/init.conf executed ('started console')" \
-	"skenario 2: pemeriksaan lama lolos (bukti lama: harness lama LULUS di log ini)"
+	"scenario 2: old checks pass (proof: the old harness PASSES on this log)"
 
-printf '\n== skenario 3: console keluar, satu PID -> GAGAL ==\n'
-run_report console-exit-satu-pid
-expect_rc "skenario 3: kode keluar" "$RC" 1
-expect_line "$OUT" '[GAGAL] console never exited' \
-	"skenario 3: exit status tertangkap walau PID tunggal"
+printf '\n== scenario 3: console exits, single PID -> FAIL ==\n'
+run_report console-exit-single-pid
+expect_rc "scenario 3: exit code" "$RC" 1
+expect_line "$OUT" '[FAIL] console never exited' \
+	"scenario 3: exit status caught despite a single PID"
 
-printf '\n== skenario 4: kernel panic -> GAGAL ==\n'
+printf '\n== scenario 4: kernel panic -> FAIL ==\n'
 run_report panic
-expect_rc "skenario 4: kode keluar" "$RC" 1
-expect_line "$OUT" '[GAGAL] no kernel panic' "skenario 4: panic tertangkap"
+expect_rc "scenario 4: exit code" "$RC" 1
+expect_line "$OUT" '[FAIL] no kernel panic' "scenario 4: panic caught"
 
-printf '\n== skenario 5: layanan console tidak pernah start -> GAGAL ==\n'
-run_report konsol-tidak-start
-expect_rc "skenario 5: kode keluar" "$RC" 1
-expect_line "$OUT" "[GAGAL] service /etc/init.conf executed" \
-	"skenario 5: 'started console' yang hilang tertangkap"
+printf '\n== scenario 5: console service never starts -> FAIL ==\n'
+run_report console-never-start
+expect_rc "scenario 5: exit code" "$RC" 1
+expect_line "$OUT" "[FAIL] service /etc/init.conf executed" \
+	"scenario 5: missing 'started console' caught"
 expect_line "$OUT" 'console has 0 unique PIDs' \
-	"skenario 5: hitungan PID unik 0"
+	"scenario 5: unique PID count 0"
 
-printf '\n== skenario 6: main loop tidak muncul -> GAGAL ==\n'
-run_report tanpa-main-loop
-expect_rc "skenario 6: kode keluar" "$RC" 1
-expect_line "$OUT" 'did not appear within' "skenario 6: ketiadaan 'main loop ready' tertangkap"
+printf '\n== scenario 6: main loop missing -> FAIL ==\n'
+run_report no-main-loop
+expect_rc "scenario 6: exit code" "$RC" 1
+expect_line "$OUT" 'did not appear within' "scenario 6: absence of 'main loop ready' caught"
 
-printf '\n== skenario 7: service lain di-respawn, console sehat -> LULUS ==\n'
-run_report respawn-service-lain
-expect_rc "skenario 7: kode keluar" "$RC" 0
-expect_line "$OUT" 'HASIL: LULUS' \
-	"skenario 7: 'web: respawn delayed' tidak menyeret harness (check ter-scope)"
+printf '\n== scenario 7: another service respawns, console healthy -> PASS ==\n'
+run_report respawn-other-service
+expect_rc "scenario 7: exit code" "$RC" 0
+expect_line "$OUT" 'RESULT: PASS' \
+	"scenario 7: 'web: respawn delayed' does not drag the harness down (scoped check)"
 expect_line "$OUT" "[ OK ]   console was not respawn-delayed" \
-	"skenario 7: pemeriksaan respawn console tetap dieksekusi dan lolos"
+	"scenario 7: the console respawn check still runs and passes"
 
-printf '\n== konsol: REPORT_ONLY tanpa CONSOLE_LOG -> berhenti dengan pesan jelas ==\n'
+printf '\n== console: REPORT_ONLY without CONSOLE_LOG -> stops with a clear message ==\n'
 RC=0
-CONSOLE_LOG="$FIX/tidak-ada.log" REPORT_ONLY=1 sh "$HARNESS" >/dev/null 2>&1 || RC=$?
-expect_rc "konfigurasi salah: kode keluar non-nol" "$RC" 1
+CONSOLE_LOG="$FIX/missing.log" REPORT_ONLY=1 sh "$HARNESS" >/dev/null 2>&1 || RC=$?
+expect_rc "bad configuration: non-zero exit code" "$RC" 1
 
 if [ "$fail_count" -eq 0 ]; then
-	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
+	printf '\nRESULT: PASS (all checks)\n'
 else
-	printf '\nHASIL: GAGAL (%s pemeriksaan)\n' "$fail_count"
+	printf '\nRESULT: FAIL (%s checks)\n' "$fail_count"
 	exit 1
 fi
