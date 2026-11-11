@@ -28,7 +28,9 @@ teknis yang lebih dalam, dengan indeks di bawah.
   bukan `sleep()`, sehingga init tetap responsif terhadap sinyal.
 - **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
   `sync()` → `reboot()`; varian force untuk mem-bypass grace.
-- **Cgroups v2**: tiap layanan dipindahkan ke `/sys/fs/cgroup/ninit/<nama>`.
+- **Cgroups v2**: tiap layanan dipindahkan ke leaf `/sys/fs/cgroup/ninit/<nama>`
+  dengan batas `memory.max`, `memory.swap.max=0`, `cpu.max`, dan `pids.max` yang
+  ditegakkan kernel (fallback fail-open bila cgroup tidak tersedia).
 - **`/etc/fstab`**: memasang filesystem dengan flag *dan* opsi data
   (`size=`, `mode=`, `uid=`, …) diteruskan ke `mount()`.
 - **Logging ganda**: `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus
@@ -110,7 +112,8 @@ dijaga `scripts/test-config.sh`.
 Catatan arah pengembangan, bukan janji:
 
 - Hak akses & user privilege dropping (`:user=`/`:uid=`) per layanan.
-- Timeout/kill policy dan mode `restart=on-failure` yang eksplisit.
+- Mode `restart=on-failure` yang eksplisit (timeout once & backoff/start-limit
+  respawn sudah tersedia; yang belum adalah kebijakan restart selektif).
 - Dukungan mount namespace per layanan + `chroot` rootfs layanan.
 - Parser konfigurasi bergaya inittab SysV (`id:runlevels:action:proses`) atau
   unit file sederhana, plus dependensi berbasis event (`after=`, `wants=`).

@@ -5,7 +5,7 @@
 Format per baris:
 
 ```
-<nama>:<mode>:<perintah>[:requires=<nama1>,<nama2>,...][:memory_max=<nilai>][:cpu_max=<nilai>][:pids_max=<nilai>]
+<nama>:<mode>:<perintah>[:requires=<nama1>,<nama2>,...][:memory_max=<nilai>][:cpu_max=<nilai>][:pids_max=<nilai>][:timeout=<detik>]
 ```
 
 | Bagian | Aturan |
@@ -13,22 +13,24 @@ Format per baris:
 | `<nama>` | Maks 127 karakter. Lebih dari itu entri **ditolak** (`Parse err: ... entri ditolak`), bukan dipotong. Tidak boleh memuat karakter `/` (karena nama dipakai sebagai path direktori cgroup). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
 | `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
 | `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari tag opsi paling awal). |
-| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). |
+| `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). Bila dependensi `respawn` crash berulang kali hingga `SVC_STATE_FAILED`, atau dependensi `once` gagal/timeout, layanan yang membutuhkannya otomatis dibatalkan (`SVC_STATE_FAILED`). |
 | `:memory_max=` | Opsional. Batas alokasi memori layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/memory.max`. Nilai valid: `max` atau angka desimal positif dengan akhiran satuan tunggal opsional (`K`/`k`, `M`/`m`, `G`/`g`, atau byte murni; contoh: `16M`, `256M`, `1G`, `max`). Pelanggaran batas memori memicu OOM killer kernel secara deterministik (`SIGKILL`, status `0x9`). Format rusak (huruf acak, angka negatif, satuan ganda seperti `64MB`, atau nol) ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Lebih dari 63 karakter entri **ditolak**. |
 | `:cpu_max=` | Opsional. Batas kuota bandwidth CPU CFS (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/cpu.max`. Format valid: `<kuota> <periode>` yaitu dua angka desimal positif yang dipisahkan tepat satu spasi tunggal (contoh: `50000 100000` untuk 50% kuota per periode 100ms). Format rusak (non-numerik, spasi ganda/berlebih, nilai kuota/periode nol atau negatif, tanpa spasi pemisah) ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Lebih dari 63 karakter entri **ditolak**. |
 | `:pids_max=` | Opsional. Batas jumlah proses maksimum dalam cgroup layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/pids.max`. Format valid: `max` atau angka desimal positif (contoh: `5`, `50`, `max`). Nilai negatif, nol, atau karakter non-numerik ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Upaya `fork()` melebihi batas ini deterministik ditolak oleh kernel dengan `EAGAIN` (`Resource temporarily unavailable`). Lebih dari 63 karakter entri **ditolak**. |
+| `:timeout=` | Opsional (khusus layanan `once`, maks 10 karakter). Batas waktu berjalan layanan dalam detik (contoh: `:timeout=60`, `:timeout=120`). Default: 30 detik (`ONCE_START_TIMEOUT`). Bila layanan berjalan melebihi batas ini, ia dihentikan paksa (`SIGKILL`), ditandai `SVC_STATE_FAILED`, dan seluruh dependennya dibatalkan secara transitif. Nilai `0`, `none`, atau `infinity` menonaktifkan timeout. **Peringatan**: menonaktifkan timeout (`0` atau `none`) berisiko membuat layanan dependen menggantung selamanya bila proses layanan mengalami kebuntuan (hang/deadlock). Format di luar rentang 1–86400s ditolak secara graceful dan memakai default 30 detik. |
  
 Aturan umum:
  
 - Baris komentar dimulai `#` (spasi/tab di depan diizinkan) dan baris kosong diabaikan.
 - Baris lebih dari 1023 karakter ditolak utuh dan dicatat (`Parse err: baris melebihi MAX_LINE ...`); baris berikutnya tetap diproses. Aturan yang sama berlaku untuk baris `/etc/fstab`.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
-- Tag opsi (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`) dapat ditulis dalam urutan bebas setelah `<perintah>`. Parser memisahkan perintah pada kemunculan tag opsi paling awal, sehingga perintah yang memuat karakter titik dua (misal URL `http://...`) tetap utuh.
+- Tag opsi (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`) dapat ditulis dalam urutan bebas setelah `<perintah>`. Parser memisahkan perintah pada kemunculan tag opsi paling awal, sehingga perintah yang memuat karakter titik dua (misal URL `http://...`) tetap utuh.
 - Batasan resource cgroup v2 diterapkan pada leaf node `/sys/fs/cgroup/ninit/<nama>/` sebelum PID layanan dimasukkan ke `cgroup.procs`. Penulisan controller (`+memory +cpu +pids`) ke root cgroup `/sys/fs/cgroup/cgroup.subtree_control` mentoleransi kegagalan atau status partial pada lingkungan nested/container tanpa menggagalkan booting. Bila kernel tidak mengaktifkan controller tertentu, kegagalan penulisan dicatat di log tanpa menggagalkan PID 1.
 - Validasi semantik & penanganan kesalahan graceful: parser memeriksa format nilai `memory_max`, `cpu_max`, dan `pids_max` sebelum diterapkan. Bila format tidak valid/rusak (malformed), ninit mencatat pesan log peringatan informatif (`Parse err: ... tidak valid pada layanan '...', batas diabaikan`) dan mengosongkan batas tersebut. Layanan tetap dijalankan tanpa limit bersangkutan (unconstrained) tanpa membuat PID 1 crash atau masuk rescue shell.
 - Pembersihan siklus hidup orphan (lifecycle orphan cleanup):
   - Layanan `respawn`: saat proses pemimpin mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (atau fallback scanning PIDs pada kernel pra-5.14) untuk menyapu bersih sisa proses anak/orphan selama jeda `RESPAWN_DELAY` (2 detik). Pembersihan juga dipanggil kembali sebelum PID baru dimasukkan ke leaf cgroup.
   - Layanan `once`: saat proses pemimpin selesai/exit (`SVC_STATE_DONE` atau `SVC_STATE_FAILED`), `cgroup_kill_service` menyapu bersih seluruh proses anak/orphan sebelum pemanggilan penghapusan direktori cgroup leaf (`rmdir`). Fungsi `cleanup_cgroup` juga melakukan polling `rmdir` dengan toleransi `EBUSY` (hingga 20 kali percobaan / 100ms) untuk mengantisipasi latensi pelepasan referensi proses oleh kernel, mencegah kegagalan penghapusan leaf cgroup.
+- **Perilaku Fail-Open Cgroup**: Bila sistem host tidak menyediakan hierarki cgroup v2 atau inisialisasi cgroup gagal, ninit beroperasi secara fail-open — seluruh layanan tetap dijalankan secara normal tanpa batasan (*unconstrained*). Jika suatu layanan mendefinisikan batas resource (`:memory_max=`, `:cpu_max=`, atau `:pids_max=`), ninit mencatat peringatan bahwa batas resource diabaikan karena cgroup tidak tersedia (`Warning: batas resource diabaikan pada layanan '<nama>' karena cgroup tidak tersedia`) dan melanjutkan eksekusi layanan.
 - File config yang tidak bisa dibuka (tidak ada/tak terbaca) →
   `Config gagal dibaca/di-parse!` + rescue shell; boot tidak dilanjutkan dengan
   nol layanan.
@@ -94,6 +96,26 @@ Untuk mencegah kebocoran proses zombie/orphan di latar belakang saat proses utam
 - **Pembersihan Layanan Respawn**: Ketika proses pemimpin layanan bertipe `respawn` mati, `cgroup_kill_service` segera mengeksekusi `cgroup.kill` (dengan fallback pemindaian PID melalui `/proc` untuk kernel pra-5.14) guna menghentikan semua proses turunan selama jendela `RESPAWN_DELAY` (2 detik). Pembersihan juga diulang sesaat sebelum PID generasi baru dipindahkan ke dalam cgroup leaf.
 - **Pembersihan Layanan Once**: Ketika layanan bertipe `once` selesai (`exit 0` maupun keluar dengan error/sinyal), `cgroup_kill_service` menyapu bersih seluruh proses anak/orphan yang ditinggalkan sebelum memanggil `cleanup_cgroup`.
 - **Polling `rmdir` pada Leaf Cgroup**: Fungsi `cleanup_cgroup` memanggil `cgroup_kill_service` dan mencoba menghapus direktori leaf cgroup `/sys/fs/cgroup/ninit/<nama>`. Bila kernel masih dalam proses merealisasikan terminasi task sehingga `rmdir` mengembalikan `EBUSY`, ninit melakukan polling hingga 20 kali dengan jeda 5 ms (`usleep(5000)`, total maksimal 100 ms). Saat berhasil, ninit mencatat `cgroup: dibersihkan '<nama>'`.
+
+#### 4. Kontrak Fallback Fail-Open Saat Cgroup Unavailable
+
+Bila ninit dijalankan di lingkungan di mana hierarki cgroup v2 tidak tersedia (misalnya container tanpa delegasi cgroupfs, chroot minimal tanpa mount cgroup, atau kernel legacy tanpa cgroups):
+
+1. **Ketersediaan Layanan Terjamin (Fail-Open)**:
+   Kegagalan inisialisasi cgroup tidak menggagalkan proses boot PID 1 dan tidak membatalkan eksekusi layanan. Layanan tetap di-spawn dan bertransisi ke state `SVC_STATE_RUNNING`.
+2. **Pencatatan Log Fail-Open Eksplisit**:
+   ninit secara transparan mencatat bahwa mekanisme fallback fail-open sedang aktif untuk layanan tersebut:
+   ```
+   [YYYY-MM-DD HH:MM:SS] ninit: cgroup: fail-open aktif untuk '<nama>' (cgroup tidak tersedia)
+   ```
+3. **Peringatan Penegakan Batas Resource**:
+   Jika konfigurasi layanan menyertakan batas resource (`:memory_max=`, `:cpu_max=`, atau `:pids_max=`), batas tersebut tidak dapat ditegakkan oleh kernel. ninit mencatat peringatan eksplisit:
+   ```
+   [YYYY-MM-DD HH:MM:SS] ninit: Warning: batas resource diabaikan pada layanan '<nama>' karena cgroup tidak tersedia
+   ```
+   Layanan tetap dieksekusi tanpa pembatasan resource (*unconstrained*). Bila layanan tidak mengonfigurasi batas resource apa pun, pesan peringatan ini tidak dicetak (hanya log fail-open aktif).
+4. **Jaminan Bebas Deadlock pada Handshake Pre-Exec**:
+   Pada mekanisme sinkronisasi parent-child sebelum `execl()`, kegagalan cgroup langsung memicu pelepasan blokir proses anak via penulisan sinyal dan penutupan pipe sinkronisasi (`O_CLOEXEC`), memastikan proses anak tidak pernah tertahan (*hang*) atau mengalami kebuntuan (*deadlock*).
 
 ## `/etc/fstab`
 
