@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Deteksi rahasia bocor (Gitleaks)
+      - name: Detect leaked secrets (Gitleaks)
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -30,66 +30,69 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Dependensi
+      - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static
+          sudo apt-get install -y build-essential busybox-static python3
 
-      - name: Build statis
+      - name: Static build
         run: make
 
-      - name: Biner benar-benar statis
+      - name: Strictly static binary check
         run: |
           if readelf -l ninit | grep -q 'INTERP'; then
-            echo "GAGAL: biner punya INTERP (butuh loader dinamis)"; exit 1
+            echo "FAIL: binary has INTERP (dynamic loader required)"; exit 1
           fi
-          echo "OK: tidak ada INTERP -> biner statis"
+          echo "OK: no INTERP -> static binary"
 
-      - name: Smoke test PID 1 (SIGTERM -> shutdown bersih)
+      - name: Lint log patterns & format strings
+        run: make lint
+
+      - name: Smoke test PID 1 (SIGTERM -> clean shutdown)
         run: sudo sh ./scripts/smoke-test.sh
 
-      - name: SIGTERM benar-benar sampai ke layanan (bukan SIGKILL)
+      - name: SIGTERM delivered to service (not SIGKILL)
         run: sudo sh ./scripts/test-sigterm.sh
 
-      - name: Dependensi, rescue mode, dan initctl per baris
+      - name: Dependencies, rescue mode, and line-by-line initctl
         run: sudo sh ./scripts/test-config.sh
 
-      - name: Pemeriksaan harness run-qemu.sh (fixture log, tanpa QEMU)
+      - name: Verify run-qemu.sh harness (log fixture, no QEMU)
         run: sh ./scripts/test-qemu-report.sh
 
-      - name: Jalur kegagalan spawn (dependensi di jalur respawn + fork EAGAIN)
+      - name: Spawn failure paths (respawn dependency + fork EAGAIN)
         run: sudo sh ./scripts/test-spawn-failure.sh
 
-      - name: Batasan resource cgroup v2 & pembersihan orphan respawn
+      - name: cgroup v2 resource limits & respawn orphan cleanup
         run: sudo sh ./scripts/test-cgroup-limits.sh
 
-      - name: Build tanpa warning (-Wall -Werror)
+      - name: Build with zero warnings (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
 
   rootfs-distro:
-    # scripts/build-rootfs.sh dan scripts/run-qemu.sh tidak dipakai job di atas,
-    # jadi jalur "make rootfs && make qemu" bisa rusak tanpa ada yang melihat:
-    # kompilasi BusyBox defconfig pernah gagal total di kernel headers baru dan
-    # tidak ketahuan karena tidak ada yang membangunnya.
+    # scripts/build-rootfs.sh and scripts/run-qemu.sh are not used in the job above,
+    # so the "make rootfs && make qemu" path could break unnoticed:
+    # BusyBox defconfig compilation previously failed completely on newer kernel headers
+    # without detection because nothing was building it.
     runs-on: ubuntu-latest
     env:
       CFLAGS: "-static -O2 -Wall -Werror"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Dependensi
+      - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static bzip2 cpio qemu-system-x86
+          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio qemu-system-x86
 
-      - name: rootfs + initramfs dari sumber (BUSYBOX_MODE=auto)
+      - name: rootfs + initramfs from source (BUSYBOX_MODE=auto)
         run: |
           make
           sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
 
-      - name: Boot initramfs di QEMU (TCG, tanpa /dev/kvm)
+      - name: Boot initramfs in QEMU (TCG, no /dev/kvm)
         run: sudo SECS=20 sh ./scripts/run-qemu.sh
 
-      - name: Uji integrasi lintas lapisan fstab <-> kernel <-> layanan (boot QEMU kedua)
+      - name: Cross-layer integration test fstab <-> kernel <-> services (second QEMU boot)
         run: sudo SECS=40 sh ./scripts/test-integration.sh

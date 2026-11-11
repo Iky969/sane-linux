@@ -90,19 +90,41 @@ def check_script_assertions():
                     
     return errors
 
+LEGACY_MARKERS = [
+    r"HASIL:",
+    r"\[GAGAL\]",
+    r"\bGAGAL:",
+    r"\bSkenario\b",
+]
+
+def check_script_markers():
+    errors = []
+    script_files = sorted(SCRIPTS_DIR.glob("*.sh"))
+    for sf in script_files:
+        with open(sf, "r", encoding="utf-8") as f:
+            for lnum, line in enumerate(f, 1):
+                clean = line.strip()
+                if clean.startswith("#"):
+                    continue
+                for pat in LEGACY_MARKERS:
+                    if re.search(pat, line):
+                        errors.append(f"{sf.name}:{lnum}: contains legacy Indonesian marker matching '{pat}': {clean}")
+    return errors
+
 def main():
     print("=== Sane-Linux Log & Pattern Lint ===")
     ninit_errs = check_ninit_strings()
     script_errs = check_script_assertions()
+    marker_errs = check_script_markers()
     
-    all_errs = ninit_errs + script_errs
+    all_errs = ninit_errs + script_errs + marker_errs
     if all_errs:
         print(f"\nFAILED: Found {len(all_errs)} issue(s):")
         for e in all_errs:
             print(f"  ❌ {e}")
         return 1
     else:
-        print("✅ PASSED: All log strings and test patterns are cleanly in English with zero Indonesian keywords.")
+        print("✅ PASSED: All log strings, assertions, and test script markers are cleanly in English with zero legacy keywords.")
         return 0
 
 if __name__ == "__main__":
