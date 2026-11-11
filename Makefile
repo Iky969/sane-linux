@@ -28,12 +28,20 @@ $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $<
 
 test: $(BIN)
-	sh ./scripts/smoke-test.sh
-	sh ./scripts/test-sigterm.sh
-	sh ./scripts/test-config.sh
-	sh ./scripts/test-qemu-report.sh
-	sh ./scripts/test-spawn-failure.sh
-	sh ./scripts/test-cgroup-limits.sh
+	@PRE_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
+	sh ./scripts/smoke-test.sh && \
+	sh ./scripts/test-sigterm.sh && \
+	sh ./scripts/test-config.sh && \
+	sh ./scripts/test-qemu-report.sh && \
+	sh ./scripts/test-spawn-failure.sh && \
+	sh ./scripts/test-cgroup-limits.sh && \
+	POST_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
+	if [ "$$PRE_CGROUPS" != "$$POST_CGROUPS" ]; then \
+		echo "FAIL: new lingering cgroups detected in /sys/fs/cgroup/ninit*:" >&2; \
+		echo "Before: $$PRE_CGROUPS" >&2; \
+		echo "After : $$POST_CGROUPS" >&2; \
+		exit 1; \
+	fi
 
 rootfs:
 	sh ./scripts/build-rootfs.sh

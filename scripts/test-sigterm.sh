@@ -57,10 +57,118 @@ LOGS=""
 init_pid=""
 init_pid2=""
 init_pid3=""
+init_pid4=""
+
+RUN_ID="ninit-sigterm-$$-$(date +%s%N 2>/dev/null || date +%s)"
+SUITE_CG="/sys/fs/cgroup/$RUN_ID"
+if [ -e "$SUITE_CG" ]; then
+	fail "cgroup collision: path '$SUITE_CG' already exists before test starts"
+fi
+$SUDO mkdir "$SUITE_CG" || fail "failed to create isolation root '$SUITE_CG'"
+SUITE_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$SUITE_CG" 2>/dev/null || true)
+[ -n "$SUITE_CG_DEV_INO" ] || fail "failed to read dev:ino for '$SUITE_CG'"
+SUITE_CG_BASE="$SUITE_CG/ninit"
+
+is_test_process() {
+	p=$1
+	[ -n "$p" ] && [ -d "/proc/$p" ] || return 1
+	if [ -n "${SUITE_CG:-}" ] && [ -d "$SUITE_CG" ]; then
+		p_cg_path=""
+		if [ -r "/proc/$p/cgroup" ]; then
+			p_cg_path=$(sed -n 's/^0::\([^[:space:]]*\).*$/\1/p' "/proc/$p/cgroup" 2>/dev/null | head -n 1)
+		fi
+		[ -n "$p_cg_path" ] || return 1
+		case "/sys/fs/cgroup$p_cg_path" in
+			"$SUITE_CG"|"$SUITE_CG"/*) ;;
+			*) return 1 ;;
+		esac
+		[ -d "/sys/fs/cgroup$p_cg_path" ] || return 1
+	else
+		return 1
+	fi
+	p_root=$($SUDO readlink /proc/"$p"/root 2>/dev/null || true)
+	[ -n "$p_root" ] || return 1
+	for r in ${ROOTS:-}; do
+		case "$p_root" in
+			"$r"|"$r"/*|"$r (deleted)"|"$r/"*) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+clean_suite_cgroup() {
+	cg_target="${1:-}"
+	expected_dev_ino="${2:-}"
+	[ -n "$cg_target" ] || return 0
+	[ -d "$cg_target" ] || return 0
+	if [ -L "$cg_target" ]; then
+		printf 'SECURITY: %s is a symlink, cleanup aborted!\n' "$cg_target" >&2
+		return 1
+	fi
+	if [ -n "$expected_dev_ino" ]; then
+		cur_ino=$($SUDO stat -c '%d:%i' "$cg_target" 2>/dev/null || true)
+		if [ "$cur_ino" != "$expected_dev_ino" ]; then
+			printf 'SECURITY: %s dev:ino changed (expected %s, got %s)!\n' "$cg_target" "$expected_dev_ino" "$cur_ino" >&2
+			return 1
+		fi
+	fi
+
+	kill_ok=0
+	if [ -f "$cg_target/cgroup.kill" ]; then
+		echo 1 | $SUDO tee "$cg_target/cgroup.kill" >/dev/null 2>&1 || true
+		waited=0
+		while [ "$waited" -lt 20 ]; do
+			has_proc=0
+			set -f
+			for pf in $(find "$cg_target" -type f -name "cgroup.procs" 2>/dev/null); do
+				procs=$($SUDO cat "$pf" 2>/dev/null || true)
+				for p in $procs; do
+					[ -n "$p" ] && { has_proc=1; break; }
+				done
+				[ "$has_proc" -eq 1 ] && break
+			done
+			set +f
+			[ "$has_proc" -eq 0 ] && { kill_ok=1; break; }
+			sleep 0.05
+			waited=$((waited + 1))
+		done
+	fi
+
+	if [ "$kill_ok" -ne 1 ]; then
+		set -f
+		for pf in $(find "$cg_target" -type f -name "cgroup.procs" 2>/dev/null); do
+			procs=$($SUDO cat "$pf" 2>/dev/null || true)
+			for p in $procs; do
+				if is_test_process "$p"; then
+					$SUDO kill -9 "$p" 2>/dev/null || true
+				fi
+			done
+		done
+		set +f
+	fi
+
+	find "$cg_target" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || {
+		sleep 0.1
+		find "$cg_target" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || true
+	}
+
+	$SUDO rmdir "$cg_target" 2>/dev/null || {
+		sleep 0.1
+		$SUDO rmdir "$cg_target" 2>/dev/null || true
+	}
+}
+
+clean_suite_leaves() {
+	[ -n "${SUITE_CG:-}" ] && [ -d "$SUITE_CG" ] || return 0
+	find "$SUITE_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || true
+}
+
 cleanup() {
+	clean_suite_cgroup "${SUITE_CG:-}" "${SUITE_CG_DEV_INO:-}" || printf 'WARN: clean_suite_cgroup failed (status %d), continuing...\n' $? >&2
 	[ -n "${init_pid:-}" ] && $SUDO kill -KILL "$init_pid" 2>/dev/null || true
 	[ -n "${init_pid2:-}" ] && $SUDO kill -KILL "$init_pid2" 2>/dev/null || true
 	[ -n "${init_pid3:-}" ] && $SUDO kill -KILL "$init_pid3" 2>/dev/null || true
+	[ -n "${init_pid4:-}" ] && $SUDO kill -KILL "$init_pid4" 2>/dev/null || true
 	for d in ${ROOTS:-}; do
 		$SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
@@ -117,7 +225,7 @@ synblk_has_term() {
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT/proc' && exec chroot '$ROOT' /ninit" \
+		sh -c "mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit" \
 		>"$LOG" 2>&1
 ) &
 job=$!
@@ -175,6 +283,7 @@ bad() { printf '  [FAIL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
 check() { if grep -q "$2" "$LOG"; then ok "$1"; else bad "$1"; fi; }
 
 printf '\n== checks ==\n'
+check "cgroup base path overridden ($SUITE_CG_BASE)" "cgroup: base path overridden: $SUITE_CG_BASE"
 check "test service running ('waiting for SIGTERM')" 'waiting for SIGTERM'
 
 if [ "$mask_checked" -eq 1 ]; then
@@ -229,7 +338,7 @@ printf 'pipe-svc:once:/bin/sh -c "/bin/sleep 50 | /bin/sleep 50"\n' > "$ROOT2/et
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT2/proc' && exec chroot '$ROOT2' /ninit" \
+		sh -c "mount -t proc proc '$ROOT2/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT2' /ninit" \
 		>"$LOG2" 2>&1
 ) &
 job2=$!
@@ -320,7 +429,7 @@ printf 'stubborn-svc:once:/stubborn-service.sh\n' > "$ROOT3/etc/init.conf"
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT3/proc' && exec chroot '$ROOT3' /ninit" \
+		sh -c "mount -t proc proc '$ROOT3/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT3' /ninit" \
 		>"$LOG3" 2>&1
 ) &
 job3=$!
@@ -478,7 +587,7 @@ printf 'astall:respawn:trap "" TERM; exec /bin/sleep 60\nzdead:once:/bin/sleep 1
 (
 	$SUDO timeout -k 5 40 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT4/proc' && exec chroot '$ROOT4' /ninit" \
+		sh -c "mount -t proc proc '$ROOT4/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT4' /ninit" \
 		>"$LOG4" 2>&1
 ) &
 job4=$!
