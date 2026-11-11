@@ -14,6 +14,8 @@
 #
 # Butuh: build-essential + busybox-static (busybox dipakai sebagai /bin/sh di rootfs uji).
 # Di distro tanpa libc statis glibc (mis. Alpine):  make CC=musl-gcc
+# Catatan: -Werror tidak dipasang di CFLAGS default agar kompatibel saat toolchain
+# compiler diperbarui; CI meng-override CFLAGS dengan -Werror untuk gerbang warning.
 
 CC     = gcc
 CFLAGS ?= -static -O2 -Wall
