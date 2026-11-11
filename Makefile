@@ -1,21 +1,23 @@
-# ninit -- init system minimal (PID 1)
+# ninit -- minimal init system (PID 1)
 #
-#   make            bangun biner statis ./ninit  (gcc -static -O2 -Wall)
-#   make test       uji PID 1 di chroot sementara: smoke test + test SIGTERM
-#                   + test konfigurasi + jalur kegagalan spawn + batasan cgroup v2
-#                   dan lifecycle respawn (butuh root/sudo), lalu pemeriksaan
-#                   harness run-qemu.sh lewat fixture log (tanpa root/QEMU)
-#   make rootfs     bangun rootfs distro minimal + initramfs (busybox statis,
-#                   ninit sebagai /sbin/init; lihat doc/distro-builder.md)
-#   make qemu       boot rootfs itu di QEMU (butuh qemu-system-x86)
-#   make integration  uji integrasi lintas lapisan fstab<->kernel<->layanan
-#                   lewat satu boot QEMU sungguhan (butuh root + qemu-system-x86)
-#   make clean      hapus biner hasil build
+#   make            build static binary ./ninit  (gcc -static -O2 -Wall)
+#   make test       test PID 1 in temporary chroot: smoke test + SIGTERM test
+#                   + config test + spawn failure paths + cgroup v2 limits
+#                   and respawn lifecycle (requires root/sudo), then run-qemu.sh
+#                   harness verification via log fixtures (without root/QEMU)
+#   make rootfs     build minimal distro rootfs + initramfs (static busybox,
+#                   ninit as /sbin/init; see doc/distro-builder.md)
+#   make qemu       boot rootfs in QEMU (requires qemu-system-x86)
+#   make integration  cross-layer integration test fstab<->kernel<->services
+#                   via one real QEMU boot (requires root + qemu-system-x86)
+#   make lint       run python linter on log patterns, markers, and format specifiers
+#   make clean      remove built binary
+#   make clean-distro remove distro build artifacts
 #
-# Butuh: build-essential + busybox-static (busybox dipakai sebagai /bin/sh di rootfs uji).
-# Di distro tanpa libc statis glibc (mis. Alpine):  make CC=musl-gcc
-# Catatan: -Werror tidak dipasang di CFLAGS default agar kompatibel saat toolchain
-# compiler diperbarui; CI meng-override CFLAGS dengan -Werror untuk gerbang warning.
+# Requires: build-essential + busybox-static (busybox used as /bin/sh in test rootfs).
+# On distros without static glibc (e.g. Alpine):  make CC=musl-gcc
+# Note: -Werror is omitted from default CFLAGS for compatibility across compiler toolchains;
+# CI overrides CFLAGS with -Werror to enforce the zero-warning gate.
 
 CC     = gcc
 CFLAGS ?= -static -O2 -Wall
@@ -59,4 +61,8 @@ clean-distro:
 	rm -rf distro/rootfs distro/build distro/cache distro/initramfs.cpio.gz \
 	       distro/qemu-console.log distro/qemu.log
 
-.PHONY: all test rootfs qemu integration clean clean-distro
+lint:
+	python3 ./scripts/lint-log-patterns.py
+	python3 ./scripts/verify-format-strings.py
+
+.PHONY: all test rootfs qemu integration clean clean-distro lint
