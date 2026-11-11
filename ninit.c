@@ -2,12 +2,12 @@
  * ninit - minimal init system (PID 1)
  * Compile : gcc -static -O2 -Wall -o ninit ninit.c
  * v5 Fixes: ppoll nfds, O_RDWR FIFO, strict cycle detection, robust parser.
- * v10+    : opsi data fstab, cgroup v2, timer respawn non-blocking, mask sinyal
- *           anak, validasi dependensi, initctl per baris, topo-sort tanpa
- *           stack overflow.
- * v1.0.0  : rescue mode sungguhan lewat enter_rescue_mode() (config rusak,
- *           dependensi hilang, siklus) + signal mask dikosongkan sebelum
- *           execl supaya Ctrl+C berfungsi di shell darurat.
+ * v10+    : fstab data options, cgroup v2, non-blocking respawn timer, child
+ *           signal mask, dependency validation, line-by-line initctl, topo-sort
+ *           without stack overflow.
+ * v1.0.0  : real rescue mode via enter_rescue_mode() (broken config,
+ *           missing dependencies, cycles) + signal mask cleared before
+ *           execl so Ctrl+C works in emergency shell.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -36,19 +36,19 @@
 #define RESPAWN_DELAY   2
 #endif
 #ifndef MAX_SPAWN_RETRY
-#define MAX_SPAWN_RETRY 3   /* percobaan fork() ulang untuk layanan once */
+#define MAX_SPAWN_RETRY 3   /* maximum fork() retries for once services */
 #endif
 #ifndef ONCE_START_TIMEOUT
-#define ONCE_START_TIMEOUT 30  /* detik maksimum layanan once boleh berjalan */
+#define ONCE_START_TIMEOUT 30  /* maximum runtime (seconds) for once services */
 #endif
 #ifndef CRASH_LIMIT
-#define CRASH_LIMIT        5   /* crash berturut-turut sebelum respawn dihentikan */
+#define CRASH_LIMIT        5   /* consecutive crashes before respawn is aborted */
 #endif
 #ifndef BACKOFF_MAX
-#define BACKOFF_MAX        32  /* batas atas jeda respawn eksponensial (detik) */
+#define BACKOFF_MAX        32  /* upper bound for exponential respawn backoff (seconds) */
 #endif
 #ifndef STABLE_RUNTIME
-#define STABLE_RUNTIME     10  /* detik hidup stabil sebelum backoff direset */
+#define STABLE_RUNTIME     10  /* seconds of stable runtime before backoff is reset */
 #endif
 
 typedef enum {
@@ -62,18 +62,18 @@ typedef struct {
     char        name[128];
     char        cmd[512];
     pid_t       pid;
-    pid_t       pgid;           /* grup proses layanan: anak memanggil setsid() sehingga
-                                   pgid == pid saat spawn. SENGAJA tidak di-nol-kan saat
-                                   leader mati — grup bisa hidup lebih lama dari
-                                   leadernya (audit SANE-01). */
+    pid_t       pgid;           /* service process group: child calls setsid() so
+                                   pgid == pid at spawn. INTENTIONALLY not cleared when
+                                   the leader exits — the group may outlive its
+                                   leader (audit SANE-01). */
     int         respawn;
-    int         need_respawn;   /* 1 = menunggu jendela RESPAWN_DELAY (tanpa blokir loop) */
-    int         spawn_tries;    /* jumlah berturut-turut fork() gagal; dinolkan saat spawn sukses */
-    int         cgroup_fail_open; /* 1 = cgroup setup gagal, orphan cleanup via kill(-pgid) */
-    time_t      last_start;     /* waktu spawn terakhir (timeout once & jeda respawn) */
-    int         crash_count;    /* crash berturut-turut saat respawn (start-limit) */
-    int         respawn_delay;  /* jeda respawn saat ini (detik, backoff eksponensial) */
-    int         timeout;        /* batas waktu layanan once (detik); default ONCE_START_TIMEOUT; 0 = nonaktif */
+    int         need_respawn;   /* 1 = waiting for RESPAWN_DELAY window (without blocking loop) */
+    int         spawn_tries;    /* consecutive fork() failures; reset to 0 on successful spawn */
+    int         cgroup_fail_open; /* 1 = cgroup setup failed, orphan cleanup via kill(-pgid) */
+    time_t      last_start;     /* last spawn timestamp (once timeout & respawn backoff) */
+    int         crash_count;    /* consecutive crashes during respawn (start-limit) */
+    int         respawn_delay;  /* current respawn delay (seconds, exponential backoff) */
+    int         timeout;        /* timeout for once service (seconds); default ONCE_START_TIMEOUT; 0 = disabled */
     char        deps_str[256]; 
     svc_state_t state;
     char        memory_max[64];
@@ -96,12 +96,12 @@ static volatile sig_atomic_t sigusr1_flag  = 0;
 static volatile sig_atomic_t sigusr2_flag  = 0;
 
 static int log_file_fd = -1;
-static int g_log_fifo_fd = -1;  /* ujung baca /run/log.fifo; dipakai juga saat shutdown */
-static int initctl_fd = -1;     /* ujung /run/initctl; ditutup sebelum exec */
-static int shutting_down = 0;   /* 1 = shutdown sedang berjalan: jangan respawn layanan */
+static int g_log_fifo_fd = -1;  /* read end of /run/log.fifo; also used during shutdown */
+static int initctl_fd = -1;     /* /run/initctl fd; closed before exec */
+static int shutting_down = 0;   /* 1 = shutdown in progress: do not respawn services */
 
-/* Mountpoint fstab yang berhasil di-mount mount_fstab(); dipakai
-   shutdown_all() untuk unmount sebelum reboot (T8E). */
+/* fstab mountpoints successfully mounted by mount_fstab(); used by
+   shutdown_all() to unmount before reboot (T8E). */
 #define MAX_SEEN_MNT 64
 static char g_seen_mnt[MAX_SEEN_MNT][MAX_LINE];
 static int  g_seen_cnt = 0;
@@ -134,8 +134,8 @@ static void init_log(const char *fmt, ...)
     }
 }
 
-/* Buang spasi/tab/CR di ujung string (di tempat) dan kembalikan pointer ke awal
-   teks yang sudah dipangkas. Dipakai pembaca perintah /run/initctl. */
+/* Strip leading and trailing whitespace/tabs/CR in-place and return pointer to
+   start of trimmed text. Used by /run/initctl command reader. */
 static char *trim(char *s)
 {
     while (*s == ' ' || *s == '\t' || *s == '\r') s++;
@@ -168,8 +168,8 @@ static void enable_cgroup_subtree(const char *path)
     }
 
     if (write(fd, "+memory +cpu +pids\n", 19) < 0) {
-        /* Bila penulisan multi-token gagal (misal salah satu controller tidak didukung kernel),
-           coba tulis setiap token secara individual */
+        /* If multi-token write fails (e.g. a controller is unsupported by kernel),
+           attempt writing each token individually */
         const char *controllers[] = {"+memory", "+cpu", "+pids"};
         for (size_t i = 0; i < sizeof(controllers) / sizeof(controllers[0]); i++) {
             char buf[32];
@@ -194,7 +194,7 @@ static void setup_pseudo_fs(void)
     mkdir("/var", 0755);
     mkdir("/var/log", 0755);
 
-    /* cgroup v2 (unified): mount hanya jika belum ter-mount */
+    /* cgroup v2 (unified): mount only if not already mounted */
     {
         struct stat st;
         if (stat("/sys/fs/cgroup/cgroup.controllers", &st) == 0) {
@@ -226,11 +226,11 @@ static void set_hostname(void)
 }
 
 /* ---------- cgroups v2 ---------- */
-/* Base path default untuk hierarki cgroup layanan ninit. Bisa di-override lewat
-   variabel lingkungan NINIT_CGROUP_BASE agar test suite dapat mengisolasi
-   cgroup ke subtree khusus per-run tanpa menyentuh /sys/fs/cgroup/ninit host.
-   Validasi ketat: path WAJIB diawali "/sys/fs/cgroup/" dan tidak boleh
-   mengandung ".." agar tidak terjadi path traversal. */
+/* Default base path for ninit service cgroup hierarchy. Can be overridden via
+   NINIT_CGROUP_BASE environment variable so test suites can isolate cgroups
+   to a dedicated per-run subtree without touching host /sys/fs/cgroup/ninit.
+   Strict validation: path MUST begin with "/sys/fs/cgroup/" and must NOT
+   contain ".." to prevent path traversal. */
 #ifndef CGROUP_BASE_DEFAULT
 #define CGROUP_BASE_DEFAULT "/sys/fs/cgroup/ninit"
 #endif
@@ -249,7 +249,7 @@ static const char *get_cgroup_base(void)
         strlen(env) < sizeof(cgroup_base_buf)) {
         strncpy(cgroup_base_buf, env, sizeof(cgroup_base_buf) - 1);
         cgroup_base_buf[sizeof(cgroup_base_buf) - 1] = 0;
-        /* Hapus trailing slash */
+        /* Strip trailing slashes */
         size_t len = strlen(cgroup_base_buf);
         while (len > 1 && cgroup_base_buf[len - 1] == '/')
             cgroup_base_buf[--len] = 0;
@@ -261,15 +261,15 @@ static const char *get_cgroup_base(void)
     return cgroup_base_ptr;
 }
 
-/* Makro akses: seluruh kode yang sebelumnya memakai CGROUP_BASE
-   secara transparan menggunakan path yang sudah ter-resolve. */
+/* Access macro: all code previously using CGROUP_BASE transparently uses
+   the resolved path. */
 #define CGROUP_BASE (get_cgroup_base())
 
-/* Lapis pertahanan kedua untuk path cgroup (SANE-06-02): parse_config sudah
-   menolak nama kosong/"."/".."/mengandung "..", tapi setup_cgroup(),
-   cgroup_kill_service(), dan cleanup_cgroup() membangun path
-   CGROUP_BASE/<nama> — pastikan tidak ada nama bermasalah yang lolos dari
-   state internal. Mengembalikan 1 bila nama aman, 0 bila harus ditolak. */
+/* Second line of defense for cgroup paths (SANE-06-02): parse_config already
+   rejects empty/"."/".."/names containing "..", but setup_cgroup(),
+   cgroup_kill_service(), and cleanup_cgroup() construct paths as
+   CGROUP_BASE/<name> — verify no problematic name escapes from internal
+   state. Returns 1 if name is safe, 0 if rejected. */
 static int cgroup_name_safe(const char *name)
 {
     if (!name || name[0] == '\0' || strcmp(name, ".") == 0 ||
@@ -281,9 +281,9 @@ static int cgroup_name_safe(const char *name)
     return 1;
 }
 
-/* Picu cgroup.kill layanan (berdasarkan NAMA, bukan pid): membunuh seluruh
-   anggota cgroup, termasuk proses yang grup prosesnya sudah berubah.
-   Dipanggil saat respawn, leader exit, dan saat shutdown. */
+/* Trigger service cgroup.kill (by NAME, not PID): kills all members of
+   the cgroup, including processes whose process group changed.
+   Called during respawn, leader exit, and shutdown. */
 static void cgroup_kill_service(const char *name)
 {
     char kill_path[320];
@@ -299,8 +299,8 @@ static void cgroup_kill_service(const char *name)
         if (written >= 0) return;
     }
 
-    /* Fallback pra-Linux 5.14 atau bila penulisan cgroup.kill gagal:
-       baca cgroup.procs dan kirim SIGKILL ke setiap PID yang terdaftar */
+    /* Fallback for pre-Linux 5.14 or when cgroup.kill write fails:
+       read cgroup.procs and send SIGKILL to every listed PID */
     char procs_path[320];
     snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
     FILE *fp = fopen(procs_path, "r");
@@ -315,7 +315,7 @@ static void cgroup_kill_service(const char *name)
     }
 }
 
-/* Fallback fail-open eksplisit saat cgroup tidak dapat disiapkan */
+/* Explicit fail-open fallback when cgroup cannot be prepared */
 static void cgroup_fail_open(const char *svc_name)
 {
     init_log("cgroup: fail-open active for '%s' (cgroup unavailable)", svc_name);
@@ -328,16 +328,16 @@ static void cgroup_fail_open(const char *svc_name)
     }
 }
 
-/* Pindahkan pid layanan ke /sys/fs/cgroup/ninit/<nama>. Dipanggil dari parent
-   setelah fork() berhasil. Mengembalikan 0=ok, 1=fail-open. */
+/* Move service PID to /sys/fs/cgroup/ninit/<name>. Called from parent
+   after successful fork(). Returns 0=ok, 1=fail-open. */
 static int setup_cgroup(const char *svc_name, pid_t pid)
 {
-    char dir[256], procs[320];   /* procs = dir (maks 255) + "/cgroup.procs" */
+    char dir[256], procs[320];   /* procs = dir (max 255) + "/cgroup.procs" */
     int fd;
 
-    if (!cgroup_name_safe(svc_name)) return 1;   /* fail-open: jangan sentuh path */
+    if (!cgroup_name_safe(svc_name)) return 1;   /* fail-open: do not touch path */
 
-    /* cgroup v2 tidak membuat parent otomatis */
+    /* cgroup v2 does not automatically create parent directories */
     if (mkdir(CGROUP_BASE, 0755) < 0 && errno != EEXIST) {
         init_log("cgroup: mkdir %s failed: %s", CGROUP_BASE, strerror(errno));
         cgroup_fail_open(svc_name);
@@ -356,10 +356,10 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
         return 1;
     }
 
-    /* R3: Sapu bersih proses anak / orphan lama sebelum memindahkan PID baru */
+    /* R3: Clean up any old child/orphan processes before moving the new PID */
     cgroup_kill_service(svc_name);
 
-    /* R2: Terapkan batas resource jika ditentukan */
+    /* R2: Apply resource limits if configured */
     int idx = find_service(svc_name);
     if (idx >= 0) {
         const service_t *svc = &services[idx];
@@ -382,12 +382,12 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
                 init_log("Warning: memory.max resource limit ignored on service '%s'", svc_name);
             }
 
-            /* Batasi memory.swap.max=0 jika didukung, agar batas memory_max tidak bocor ke swap */
+            /* Limit memory.swap.max=0 if supported, so memory_max does not leak to swap */
             snprintf(path, sizeof(path), "%s/memory.swap.max", dir);
             int swap_fd = open(path, O_WRONLY);
             if (swap_fd >= 0) {
                 if (write(swap_fd, "0\n", 2) < 0) {
-                    /* abaikan jika controller swap tidak aktif atau menolak */
+                    /* ignore if swap controller is not active or rejects */
                 }
                 close(swap_fd);
             }
@@ -436,7 +436,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     fd = open(procs, O_WRONLY);
     if (fd < 0) {
         init_log("cgroup: open %s failed: %s", procs, strerror(errno));
-        /* Bersihkan direktori leaf parsial supaya tidak bocor di host */
+        /* Clean up partial leaf directory to avoid leaks on the host */
         rmdir(dir);
         cgroup_fail_open(svc_name);
         return 1;
@@ -445,7 +445,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     if (dprintf(fd, "%d\n", (int)pid) < 0) {
         init_log("cgroup: write pid %d to %s failed: %s", (int)pid, procs, strerror(errno));
         close(fd);
-        /* Bersihkan direktori leaf parsial */
+        /* Clean up partial leaf directory */
         rmdir(dir);
         cgroup_fail_open(svc_name);
         return 1;
@@ -456,7 +456,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     return 0;
 }
 
-/* Hapus direktori cgroup layanan saat layanan berhenti */
+/* Remove service cgroup directory when service stops */
 static void cleanup_cgroup(const char *svc_name)
 {
     if (!cgroup_name_safe(svc_name)) return;
@@ -482,35 +482,35 @@ static void cleanup_cgroup(const char *svc_name)
 }
 
 /* ---------- config parser (FIXED: Robust) ---------- */
-/* fgets() membelah baris yang lebih panjang dari buffer menjadi beberapa
-   potongan yang tampak seperti baris terpisah; tanpa deteksi, potongan ekor
-   bisa terparsing sebagai entri hantu (audit SANE-03). Batasnya eksplisit:
-   baris berisi sampai MAX_LINE-1 karakter DITERIMA (dengan atau tanpa '\n',
-   termasuk baris terakhir yang berakhir tepat di EOF); baris yang masih
-   punya karakter kelanjutan setelah buffer penuh DITOLAK — sisa barisnya
-   dibuang sampai '\n'/EOF di sini supaya tidak terparsing sebagai baris
-   baru. Satu karakter sondir (fgetc) membedakan kedua kasus itu tanpa
-   bergantung pada kapan libc memasang indikator EOF. */
+/* fgets() splits lines longer than the buffer into multiple chunks that look
+   like distinct lines; without detection, trailing fragments could be parsed
+   as phantom entries (audit SANE-03). The boundary is explicit:
+   lines containing up to MAX_LINE-1 characters are ACCEPTED (with or without
+   '\n', including the final line ending exactly at EOF); lines that still have
+   continuation characters after the buffer fills are REJECTED — the remainder
+   of the line is discarded until '\n'/EOF here so it is not parsed as a new
+   line. A single probe character (fgetc) distinguishes between the two cases
+   without relying on when libc sets the EOF indicator. */
 static int line_overlong(FILE *f, const char *line)
 {
     size_t len = strlen(line);
     if (len == MAX_LINE - 1 && line[len - 1] != '\n') {
         int c = fgetc(f);
-        if (c == EOF) return 0;   /* baris terakhir tepat di batas, utuh */
+        if (c == EOF) return 0;   /* last line exactly at boundary, intact */
         while (c != EOF && c != '\n') c = fgetc(f);
         return 1;
     }
     return 0;
 }
 
-/* Validasi format cpu_max: <kuota> <period> (angka positif dipisah spasi tunggal) */
+/* Validate cpu_max format: <quota> <period> (positive numbers separated by single space) */
 static int validate_cpu_max(const char *s)
 {
     if (!s || !*s) return 0;
     const char *sp = strchr(s, ' ');
     if (!sp) return 0;
-    if (strchr(sp + 1, ' ')) return 0; /* tolak bila ada lebih dari satu spasi */
-    if (sp == s || *(sp + 1) == '\0') return 0; /* kuota atau period kosong */
+    if (strchr(sp + 1, ' ')) return 0; /* reject if more than one space */
+    if (sp == s || *(sp + 1) == '\0') return 0; /* empty quota or period */
 
     for (const char *p = s; p < sp; p++) {
         if (!isdigit((unsigned char)*p)) return 0;
@@ -530,7 +530,7 @@ static int validate_cpu_max(const char *s)
     return 1;
 }
 
-/* Validasi format memory_max: 'max' atau angka dengan satuan K, M, G (atau byte murni) */
+/* Validate memory_max format: 'max' or number with K, M, G units (or raw bytes) */
 static int validate_memory_max(const char *s)
 {
     if (!s || !*s) return 0;
@@ -558,7 +558,7 @@ static int validate_memory_max(const char *s)
     return 1;
 }
 
-/* Validasi format pids_max: 'max' atau angka positif */
+/* Validate pids_max format: 'max' or positive integer */
 static int validate_pids_max(const char *s)
 {
     if (!s || !*s) return 0;
@@ -604,15 +604,15 @@ static int parse_config(const char *path)
         *c2 = 0;
         char *cmd = c2 + 1;
 
-        /* Validasi Nama Layanan: tidak boleh memuat '/' (dipakai untuk direktori cgroup) */
+        /* Service Name Validation: cannot contain '/' (used for cgroup directory) */
         if (strchr(name, '/')) {
             init_log("Parse err: service name '%s' cannot contain '/'", name);
             continue;
         }
 
-        /* Tolak nama kosong, ".", "..", atau yang memuat "..": path cgroup
-           dibangun sebagai CGROUP_BASE/<nama>, dan komponen "."/".." membuat
-           path melarikan diri dari base (SANE-06-02). */
+        /* Reject empty names, ".", "..", or names containing "..": cgroup paths
+           are constructed as CGROUP_BASE/<name>, and "."/".." components would
+           allow path traversal escaping the base directory (SANE-06-02). */
         if (name[0] == '\0' || strcmp(name, ".") == 0 ||
             strcmp(name, "..") == 0 || strstr(name, "..") != NULL) {
             init_log("Parse err: service name '%s' invalid (empty, '.', '..' or contains '..'), entry rejected",
@@ -620,15 +620,15 @@ static int parse_config(const char *path)
             continue;
         }
 
-        /* Tolak nama duplikat: find_service() selalu memakai kemunculan
-           pertama, jadi entri kedua diam-diam berbagi leaf cgroup,
-           dependensi, dan jadwal respawn dengan yang pertama (SANE-06-03). */
+        /* Reject duplicate names: find_service() always resolves to the first
+           occurrence, so a second entry would silently share cgroup leaves,
+           dependencies, and respawn schedules with the first (SANE-06-03). */
         if (find_service(name) >= 0) {
             init_log("Parse err: service name '%s' already registered, duplicate entry rejected", name);
             continue;
         }
         
-        /* Cari tag opsi (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=) */
+        /* Scan for option tags (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=) */
         char *deps = "";
         char *mem_max = "";
         char *cpu_limit = "";
@@ -641,7 +641,7 @@ static int parse_config(const char *path)
         char *t_pid = strstr(cmd, ":pids_max=");
         char *t_tout = strstr(cmd, ":timeout=");
 
-        /* Cari tag yang muncul paling awal agar cmd dengan ':' tetap aman */
+        /* Find the earliest occurring tag so commands containing ':' remain intact */
         char *first_tag = NULL;
         if (t_req && (!first_tag || t_req < first_tag)) first_tag = t_req;
         if (t_mem && (!first_tag || t_mem < first_tag)) first_tag = t_mem;
@@ -650,7 +650,7 @@ static int parse_config(const char *path)
         if (t_tout && (!first_tag || t_tout < first_tag)) first_tag = t_tout;
 
         if (first_tag) {
-            *first_tag = 0; /* Potong cmd tepat sebelum opsi pertama */
+            *first_tag = 0; /* Split cmd right before first option tag */
             char *scan = first_tag + 1;
             while (scan && *scan) {
                 char *next_tag = strchr(scan, ':');
@@ -696,7 +696,7 @@ static int parse_config(const char *path)
             }
         }
 
-        /* Validasi Semantik Limit Resource Cgroup v2 */
+        /* Semantic Validation for Cgroup v2 Resource Limits */
         if (mem_max[0] != '\0') {
             if (!validate_memory_max(mem_max)) {
                 init_log("Parse err: invalid memory_max '%s' on service '%s', limit ignored",
@@ -719,19 +719,18 @@ static int parse_config(const char *path)
             }
         }
 
-        /* Validasi Mode */
+        /* Mode Validation */
         int is_respawn = 0;
         if (strcmp(mode, "respawn") == 0) is_respawn = 1;
         else if (strcmp(mode, "once") != 0) {
             init_log("Warning: unknown mode '%s' for '%s'. Default: once", mode, name);
         }
 
-        /* Tolak entri yang bidangnya melebihi buffer (audit SANE-03): versi
-           lama hanya memperingatkan lalu mendaftarkan layanan dalam keadaan
-           TERPOTONG — nama bisa menabrak layanan lain, cmd berubah arti, dan
-           dependensi terpotong bisa menunjuk nama yang salah. Lebih aman
-           entri ditolak keras daripada sistem jalan dengan config yang
-           berbeda dari yang ditulis pengguna. */
+        /* Reject entries where fields exceed buffer limits (audit SANE-03):
+           earlier versions only warned and registered TRUNCATED services — names
+           could collide with other services, commands could alter semantics, and
+           truncated dependencies could point to invalid service names. Rejecting
+           the entry fail-closed is safer than running with modified configuration. */
         int too_long = 0;
         if (strlen(name) >= sizeof(services[num_services].name)) {
             init_log("Parse err: service name too long (length %zu > max %d), entry rejected",
@@ -765,7 +764,7 @@ static int parse_config(const char *path)
         }
         if (too_long) continue;
 
-        /* Batasi presisi ke ukuran tujuan: menghilangkan -Wformat-truncation (nama max 127 char) */
+        /* Bound precision to destination size to eliminate -Wformat-truncation warnings (name max 127 chars) */
         snprintf(services[num_services].name, sizeof(services[num_services].name), "%.*s",
                  (int)sizeof(services[num_services].name) - 1, name);
         snprintf(services[num_services].cmd,  sizeof(services[num_services].cmd),  "%.*s",
@@ -795,7 +794,7 @@ static int parse_config(const char *path)
     return 0;
 }
 
-/* ---------- dependensi ---------- */
+/* ---------- dependencies ---------- */
 static int find_service(const char *name)
 {
     for (int i = 0; i < num_services; i++)
@@ -803,10 +802,10 @@ static int find_service(const char *name)
     return -1;
 }
 
-/* Token berikutnya dari deps_str (dipisah koma) TANPA mengubah string aslinya:
-   posisi baca disimpan di *off supaya pemanggil bisa melanjutkan dari titik
-   terakhir. Token kosong (mis. "a,,b") dan spasi di ujung dibuang.
-   Mengembalikan 1 bila ada token, 0 bila sudah habis. */
+/* Next comma-separated token from deps_str WITHOUT mutating the original string:
+   read offset is tracked in *off so callers can resume from the last point.
+   Empty tokens (e.g. "a,,b") and outer whitespace are stripped.
+   Returns 1 if token retrieved, 0 when exhausted. */
 static int next_dep(const char *deps_str, int *off, char *out, size_t outsz)
 {
     const char *s = deps_str + *off;
@@ -817,22 +816,22 @@ static int next_dep(const char *deps_str, int *off, char *out, size_t outsz)
         if (*s == 0) { *off = (int)(s - deps_str); return 0; }
 
         while (*s && *s != ',' && n < outsz - 1) out[n++] = *s++;
-        /* Token lebih panjang dari buffer keluaran: buang sisa token ini
-           supaya ekornya tidak terbaca sebagai token dependensi kedua pada
-           panggilan berikutnya (audit SANE-03). deps_str sendiri sudah
-           divalidasi panjangnya di parse_config(); ini lapis pertahanan
-           kedua agar tokenizer tidak pernah membelah satu nama menjadi dua. */
+        /* Token exceeds output buffer size: discard remainder of this token
+           so its trailing chunk is not parsed as a second dependency on the
+           next call (audit SANE-03). deps_str length is already validated in
+           parse_config(); this is a second line of defense ensuring the
+           tokenizer never splits a single dependency name into two. */
         while (*s && *s != ',') s++;
         while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\t')) n--;
         if (n > 0) { out[n] = 0; *off = (int)(s - deps_str); return 1; }
-        /* token kosong -> lanjut ke token berikutnya */
+        /* empty token -> continue to next token */
     }
 }
 
-/* Setiap nama di `:requires=` harus benar-benar ada di daftar layanan.
-   Dependensi yang menunjuk layanan tak dikenal bikin urutan boot diam-diam salah
-   (layanan jalan tanpa prasyaratnya), jadi lebih baik menyerahkan sistem ke
-   rescue shell daripada boot setengah jalan. */
+/* Every name in `:requires=` must exist in the service registry.
+   Dependencies pointing to unknown services cause silently incorrect boot order
+   (services running without prerequisites); falling back to the rescue shell
+   is strictly preferred over an invalid partial boot. */
 static int validate_dependencies(void)
 {
     for (int i = 0; i < num_services; i++) {
@@ -849,19 +848,20 @@ static int validate_dependencies(void)
     return 0;
 }
 
-/* ---------- Topological Sort (DFS iteratif; tandai SEBELUM push) ----------
-   Versi lama menandai node saat di-expand, bukan saat di-push. Akibatnya layanan
-   yang masih "pending" di stack bisa di-push ulang setiap kali layanan lain
-   meng-expand dependensinya, dan stack_top bisa melewati MAX_SERVICES -> tulis di
-   luar batas array stack[] (stack overflow). Dengan penandaan saat push, satu
-   layanan hanya masuk stack sekali; dan karena dependensi diproses satu per satu,
-   node "abu-abu" selalu berarti leluhur (bukan saudara), sehingga dependensi
-   berbentuk berlian tidak salah dilaporkan sebagai cycle. */
+/* ---------- Topological Sort (Iterative DFS; mark BEFORE push) ----------
+   Legacy implementations marked nodes on expansion rather than on push.
+   Consequently, services still "pending" on the stack could be pushed again
+   whenever another service expanded its dependencies, exceeding MAX_SERVICES
+   and causing an out-of-bounds write on stack[] (stack overflow). By marking
+   upon push, each service enters the stack at most once; since dependencies
+   are processed sequentially, "gray" nodes strictly represent ancestors (not
+   siblings), preventing diamond-shaped dependencies from falsely triggering
+   cycle detection. */
 static int sort_services(void)
 {
-    int visited[MAX_SERVICES]      = {0};   /* hitam: sudah masuk urutan akhir */
-    int temp_visited[MAX_SERVICES] = {0};   /* abu-abu: ada di dalam stack */
-    int dep_off[MAX_SERVICES]      = {0};   /* progres baca deps_str per layanan */
+    int visited[MAX_SERVICES]      = {0};   /* black: entered final sorted order */
+    int temp_visited[MAX_SERVICES] = {0};   /* gray: currently on stack */
+    int dep_off[MAX_SERVICES]      = {0};   /* deps_str read progress per service */
     service_t sorted[MAX_SERVICES];
     int sorted_count = 0;
 
@@ -870,11 +870,11 @@ static int sort_services(void)
 
         int stack[MAX_SERVICES], stack_top = 0;
 
-        if (stack_top >= MAX_SERVICES) {        /* guard sebelum setiap push */
+        if (stack_top >= MAX_SERVICES) {        /* guard before each push */
             init_log("FATAL: Stack overflow in topological sort!");
             return -1;
         }
-        temp_visited[i] = 1;                    /* tandai SEBELUM push */
+        temp_visited[i] = 1;                    /* mark BEFORE push */
         stack[stack_top++] = i;
 
         while (stack_top > 0) {
@@ -884,8 +884,8 @@ static int sort_services(void)
             if (next_dep(services[curr].deps_str, &dep_off[curr], token, sizeof(token))) {
                 int dep_idx = find_service(token);
 
-                /* Nama tak dikenal sudah ditolak validate_dependencies();
-                   kalau tetap sampai di sini, dependensi itu dilewati saja. */
+                /* Unknown service names are already rejected by validate_dependencies();
+                   if encountered here, skip the dependency. */
                 if (dep_idx < 0) continue;
 
                 if (temp_visited[dep_idx]) {
@@ -897,14 +897,14 @@ static int sort_services(void)
                         init_log("FATAL: Stack overflow in topological sort!");
                         return -1;
                     }
-                    temp_visited[dep_idx] = 1;  /* tandai SEBELUM push */
+                    temp_visited[dep_idx] = 1;  /* mark BEFORE push */
                     dep_off[dep_idx]      = 0;
                     stack[stack_top++]    = dep_idx;
                 }
-                continue;   /* dependensi berikutnya setelah anak selesai */
+                continue;   /* next dependency after child finishes */
             }
 
-            /* Semua dependensi selesai -> masukkan ke urutan akhir */
+            /* All dependencies satisfied -> add to final ordering */
             visited[curr]          = 1;
             temp_visited[curr]     = 0;
             sorted[sorted_count++] = services[curr];
@@ -913,29 +913,29 @@ static int sort_services(void)
     }
 
     for (int i = 0; i < sorted_count; i++) services[i] = sorted[i];
-    return 0; /* Sukses */
+    return 0; /* Success */
 }
 
 /* ---------- process management ---------- */
-/* Kembalikan:
-     1 = ada kemajuan nyata (proses berjalan, ATAU kegagalan final yang
-         menjadikan state terminal) -> pemanggil boleh menandai progress
-     0 = tidak ada kemajuan (ditunda jendela RESPAWN_DELAY, atau fork() gagal
-         tapi masih punya jatah percobaan)
-   Dulu fungsi ini void dan spawn_eligible_services() menandai progress tanpa
-   melihat hasilnya, sehingga kegagalan fork() tidak punya keadaan akhir:
-   layanan once tertinggal di STOPPED selamanya dan dependensinya menunggu
-   tanpa pesan apa pun. */
+/* Return values:
+     1 = concrete progress made (process spawned, OR terminal failure reached)
+         -> caller may mark progress
+     0 = no progress (delayed by RESPAWN_DELAY window, or fork() failed but
+         retry attempts remain)
+   Previously void, allowing spawn_eligible_services() to mark progress
+   blindly without inspecting results. Fork failures had no terminal state,
+   leaving once services indefinitely STOPPED and dependencies blocked without
+   diagnostic logs. */
 static int spawn_service(service_t *svc)
 {
-    if (shutting_down) return 0;   /* saat shutdown: jangan sleep, jangan fork */
+    if (shutting_down) return 0;   /* during shutdown: do not sleep, do not fork */
 
     time_t now = time(NULL);
 
-    /* Jangan blokir event loop dengan sleep(): kalau masih di dalam jendela
-       respawn_delay, tandai need_respawn dan biarkan timeout ppoll di loop utama
-       yang berperan sebagai timer. respawn_delay naik eksponensial saat
-       crash-loop (T8D), bukan tetap RESPAWN_DELAY. */
+    /* Never block event loop with sleep(): if within respawn_delay window,
+       mark need_respawn and let ppoll timeout in main loop act as timer.
+       respawn_delay increases exponentially on crash loops (T8D), rather than
+       staying fixed at RESPAWN_DELAY. */
     if (svc->last_start && (now - svc->last_start) < svc->respawn_delay) {
         if (!svc->need_respawn)
             init_log("%s: respawn delayed (timer %d seconds, loop unblocked)",
@@ -948,7 +948,7 @@ static int spawn_service(service_t *svc)
     int has_sync = 1;
     if (pipe2(sync_pipe, O_CLOEXEC) < 0) {
         if (pipe(sync_pipe) < 0) {
-            /* Pembuatan pipe gagal: jangan fork tanpa sync, retry nanti */
+            /* Pipe creation failed: do not fork without synchronization, retry later */
             init_log("pipe2 %s: %s (spawn aborted, retry)",
                      svc->name, strerror(errno));
             svc->spawn_tries++;
@@ -962,10 +962,10 @@ static int spawn_service(service_t *svc)
             svc->need_respawn = 1;
             return 0;
         } else {
-            /* Fallback pipe() berhasil: pasang FD_CLOEXEC secara eksplisit.
-               Fail-closed: kalau fcntl gagal, pipe TIDAK boleh dipakai
-               (anak bisa mewarisi FD sync melewati exec), jadi tutup kedua
-               ujung dan retry lewat ppoll. */
+            /* Fallback pipe() succeeded: explicitly set FD_CLOEXEC.
+               Fail-closed: if fcntl fails, the pipe MUST NOT be used
+               (child could inherit synchronization FD across exec), so close
+               both ends and retry via ppoll. */
             int fl0 = fcntl(sync_pipe[0], F_GETFD);
             int fl1 = fcntl(sync_pipe[1], F_GETFD);
             if (fl0 < 0 || fl1 < 0 ||
@@ -996,16 +996,16 @@ static int spawn_service(service_t *svc)
     pid_t pid = fork();
     
     if (pid < 0) {
-        int err = errno;   /* dibaca sebelum init_log(): open/dprintf mengubah errno */
+        int err = errno;   /* capture before init_log(): open/dprintf modifies errno */
         if (has_sync) {
             if (sync_pipe[0] >= 0) close(sync_pipe[0]);
             if (sync_pipe[1] >= 0) close(sync_pipe[1]);
         }
         svc->spawn_tries++;
-        /* Layanan once tidak di respawn, jadi tanpa batas percobaan kegagalan
-           fork() tidak akan pernah berakhir di keadaan terminal. Setelah
-           MAX_SPAWN_RETRY: nyatakan gagal supaya deps_satisfied() melaporkan
-           dependensi sebagai batal, bukan menggantung selamanya. */
+        /* Once services are never respawned, so without retry limits, fork()
+           failures would never transition to a terminal state. After
+           MAX_SPAWN_RETRY: mark failed so deps_satisfied() cancels dependent
+           services instead of hanging indefinitely. */
         if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
             init_log("fork %s: %s (%d attempts, service marked failed)",
                      svc->name, strerror(err), svc->spawn_tries);
@@ -1014,7 +1014,7 @@ static int spawn_service(service_t *svc)
             return 1;
         }
         init_log("fork %s: %s", svc->name, strerror(err));
-        svc->need_respawn = 1;   /* retry lewat timer ppoll, bukan busy-loop */
+        svc->need_respawn = 1;   /* retry via ppoll timer, not a busy loop */
         return 0;
     }
 
@@ -1025,11 +1025,11 @@ static int spawn_service(service_t *svc)
 
         setsid();
 
-        /* Anak mewarisi signal mask PID 1 (SIGCHLD/SIGTERM/SIGINT/SIGUSR1/
-           SIGUSR2 diblokir di main() untuk ppoll). Selama mask itu masih
-           terpasang, layanan TIDAK PERNAH menerima SIGTERM -> shutdown_all()
-           akhirnya membunuhnya dengan SIGKILL. Kosongkan mask di child supaya
-           handler/trap milik layanan benar-benar jalan. */
+        /* Child inherits PID 1 signal mask (SIGCHLD/SIGTERM/SIGINT/SIGUSR1/
+           SIGUSR2 blocked in main() for ppoll). With this mask inherited,
+           the service NEVER receives SIGTERM -> shutdown_all() would kill it
+           via SIGKILL. Clear mask in child so service signal handlers and
+           traps function properly. */
         sigset_t empty;
         sigemptyset(&empty);
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) {
@@ -1044,7 +1044,7 @@ static int spawn_service(service_t *svc)
         int fd = open("/dev/null", O_RDONLY);
         if (fd >= 0) { dup2(fd, 0); close(fd); }
 
-        /* Buka FIFO tanpa O_NONBLOCK agar stdout/stderr layanan tidak mengembalikan EAGAIN */
+        /* Open FIFO blocking (without O_NONBLOCK) so child stdout/stderr does not return EAGAIN */
         fd = open("/run/log.fifo", O_WRONLY);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
         else {
@@ -1052,7 +1052,7 @@ static int spawn_service(service_t *svc)
             if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
         }
 
-        /* Handshake sinkronisasi: tunggu konfirmasi dari parent setelah setup cgroup selesai */
+        /* Synchronization handshake: wait for parent confirmation after cgroup setup finishes */
         if (has_sync && sync_pipe[0] >= 0) {
             char sync_byte;
             ssize_t nr;
@@ -1060,7 +1060,7 @@ static int spawn_service(service_t *svc)
                 if (errno == EINTR) continue;
                 break;
             }
-            /* Validasi strict: harus tepat 1 byte bernilai '1' */
+            /* Strict validation: require exactly 1 byte containing '1' */
             if (nr != 1 || sync_byte != '1') {
                 close(sync_pipe[0]);
                 _exit(127);
@@ -1068,11 +1068,10 @@ static int spawn_service(service_t *svc)
             close(sync_pipe[0]);
         }
 
-        /* T8B: jangan biarkan fd kontrol PID 1 bocor ke layanan. Flag
-           O_CLOEXEC sudah dipasang di sisi induk, tetapi penutupan eksplisit
-           di cabang anak ini menutupi fd yang dibuka sebelum flag itu ada
-           dan memastikan batas privilege-drop -> control plane tidak
-           ditembus (SANE-06-01). */
+        /* T8B: prevent PID 1 control fds from leaking to child services.
+           O_CLOEXEC is set on parent fds, but explicit closure in the child
+           covers fds opened before flags were set and guarantees privilege
+           separation preventing control plane leaks (SANE-06-01). */
         if (initctl_fd >= 0)    close(initctl_fd);
         if (g_log_fifo_fd >= 0) close(g_log_fifo_fd);
         if (log_file_fd >= 0)   close(log_file_fd);
@@ -1086,7 +1085,7 @@ static int spawn_service(service_t *svc)
     }
 
     svc->pid  = pid;
-    svc->pgid = pid;   /* anak memanggil setsid(): dia pemimpin grup prosesnya */
+    svc->pgid = pid;   /* child called setsid(): acts as process group leader */
     svc->state = SVC_STATE_RUNNING;
     svc->spawn_tries = 0;
     init_log("started %s (pid %d)", svc->name, pid);
@@ -1108,18 +1107,18 @@ static void reap_zombies(void)
 {
     int status; pid_t pid;
 
-    /* Hanya mengubur anak yang mati. JANGAN spawn di dalam while(waitpid) ini:
-       kalau layanan yang di-respawn langsung mati lagi, waitpid() terus
-       mengembalikan pid baru -> loop ini tidak pernah selesai dan loop utama
-       (ppoll) tidak pernah dieksekusi lagi, sehingga sinyal shutdown tertahan. */
+    /* Only reap terminated child processes. NEVER spawn inside this while(waitpid) loop:
+       if a respawned service immediately exits, waitpid() continues returning
+       new PIDs -> loop never terminates, starving the main ppoll event loop
+       and delaying shutdown signals. */
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         for (int i = 0; i < num_services; i++) {
             if (services[i].pid == pid) {
                 init_log("%s (pid %d) exit status=0x%x", services[i].name, pid, status);
                 services[i].pid = 0;
-                /* pgid SENGAJA tidak ikut di-nol-kan: anggota grup lain bisa
-                   masih hidup setelah leader mati (audit SANE-01).
-                   shutdown_all() memeriksa grup lewat pgid ini. */
+                /* pgid INTENTIONALLY preserved: other group members may
+                   still be alive after leader exits (audit SANE-01).
+                   shutdown_all() tracks the group via this pgid. */
                 if (!services[i].respawn) {
                     if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
                         services[i].state = SVC_STATE_DONE;
@@ -1127,8 +1126,8 @@ static void reap_zombies(void)
                         services[i].state = SVC_STATE_FAILED;
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
-                        /* Fallback kill saat cgroup fail-open: leader mati tapi orphan
-                           runtime mungkin masih hidup di grup */
+                        /* Fallback kill when cgroup fails open: leader exited but runtime
+                           orphans may remain alive in group */
                         if (services[i].cgroup_fail_open && services[i].pgid > 0)
                             kill(-services[i].pgid, SIGKILL);
                         cleanup_cgroup(services[i].name);
@@ -1137,19 +1136,19 @@ static void reap_zombies(void)
                     services[i].state = SVC_STATE_STOPPED;
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
-                        /* Fallback kill saat cgroup fail-open: leader mati tapi orphan
-                           runtime mungkin masih hidup di grup */
+                        /* Fallback kill when cgroup fails open: leader exited but runtime
+                           orphans may remain alive in group */
                         if (services[i].cgroup_fail_open && services[i].pgid > 0)
                             kill(-services[i].pgid, SIGKILL);
                     }
 
-                    /* T8D: deteksi crash-loop + start-limit. Layanan respawn
-                       yang mati dalam < RESPAWN_DELAY detik dianggap crash;
-                       jeda respawn naik eksponensial (min(BACKOFF_MAX,
-                       2 << crash_count)) dan setelah CRASH_LIMIT kegagalan
-                       berturut-turut layanan dinyatakan gagal. Hidup lebih
-                       dari STABLE_RUNTIME detik menandakan stabil: hitungan
-                       dan jeda direset. */
+                    /* T8D: crash-loop detection & start-limiting. Respawning
+                       services that terminate within < RESPAWN_DELAY seconds
+                       are treated as crashes; delay increases exponentially
+                       (min(BACKOFF_MAX, 2 << crash_count)) and after
+                       CRASH_LIMIT consecutive failures the service is marked
+                       failed. Running longer than STABLE_RUNTIME seconds indicates
+                       stability: crash count and backoff delay are reset. */
                     if (!shutting_down) {
                         long lifetime = services[i].last_start
                                         ? (long)(time(NULL) - services[i].last_start) : 0;
@@ -1179,13 +1178,13 @@ static void reap_zombies(void)
     }
 }
 
-/* Cek apakah semua dependensi layanan sudah terpenuhi:
-   - Layanan once harus sudah selesai dengan sukses (SVC_STATE_DONE).
-   - Layanan respawn harus sedang berjalan (pid > 0).
-   Mengembalikan:
-     1 = semua dependensi terpenuhi
-     0 = masih menunggu dependensi
-    -1 = ada dependensi yang gagal (once gagal/timeout atau respawn FAILED)
+/* Check if all service dependencies are satisfied:
+   - Once services must have completed successfully (SVC_STATE_DONE).
+   - Respawn services must be currently running (pid > 0).
+   Returns:
+     1 = all dependencies satisfied
+     0 = still waiting on dependencies
+    -1 = dependency failed (once failed/timed out, or respawn marked FAILED)
 */
 static int deps_satisfied(const service_t *svc, const char **failed_dep)
 {
@@ -1212,7 +1211,7 @@ static int deps_satisfied(const service_t *svc, const char **failed_dep)
     return 1;
 }
 
-/* Menjalankan semua layanan yang dependensinya sudah terpenuhi. */
+/* Spawn all services whose dependencies are satisfied. */
 static void spawn_eligible_services(void)
 {
     if (shutting_down) return;
@@ -1234,25 +1233,23 @@ static void spawn_eligible_services(void)
                 svc->state = SVC_STATE_FAILED;
                 progress = 1;
             } else if (ret == 1) {
-                /* Hanya tandai kemajuan bila spawn_service benar-benar mengubah
-                   keadaan layanan. Tanpa ini, kegagalan fork() (yang hanya
-                   menandai need_respawn) akan membuat do-while berputar lagi
-                   dan lagi tanpa ada yang berubah. */
+                /* Only mark progress if spawn_service made actual state changes.
+                   Otherwise, fork() failures (which only set need_respawn) would
+                   cause the do-while loop to spin repeatedly without state progress. */
                 if (spawn_service(svc)) progress = 1;
             }
         }
     } while (progress);
 }
 
-/* Respawn hanya dijalankan dari loop utama, di luar reap_zombies().
-   Dependensi WAJIB diperiksa di sini. Versi lama hanya melihat
-   `respawn && pid == 0` lalu langsung spawn, sehingga layanan yang sudah
-   "dibatalkan" karena dependensi once-nya gagal (state FAILED) tetap
-   dihidupkan ulang selamanya — janji urutan `requires=` dilanggar lewat
-   jalur respawn ini, dan pembatalannya menjadi pesan tanpa efek.
-   Sekaligus menjadi jalur retry bagi layanan once yang fork()-nya gagal
-   (need_respawn): layanan jenis ini tidak pernah di-respawn, jadi tanpa
-   jalur itu ia berhenti sebagai STOPPED selamanya. */
+/* Respawn execution occurs only from the main event loop, outside reap_zombies().
+   Dependencies MUST be checked here. Earlier versions only evaluated
+   `respawn && pid == 0` before spawning immediately, reviving services whose
+   once dependencies failed (marked FAILED) indefinitely — violating
+   `requires=` order and rendering cancellation a no-op log.
+   This path also serves as a retry handler for once services whose initial
+   fork() failed (need_respawn): once services never respawn, so without this
+   they remained stalled in STOPPED state forever. */
 static void respawn_services(void)
 {
     if (shutting_down) return;
@@ -1262,7 +1259,7 @@ static void respawn_services(void)
         if (svc->pid > 0 || svc->state == SVC_STATE_DONE || svc->state == SVC_STATE_FAILED)
             continue;
         if (!svc->respawn && !svc->need_respawn)
-            continue;   /* belum pernah dicoba: itu tugas spawn_eligible_services() */
+            continue;   /* not yet attempted: handled by spawn_eligible_services() */
 
         const char *failed_dep = NULL;
         int ret = deps_satisfied(svc, &failed_dep);
@@ -1273,11 +1270,11 @@ static void respawn_services(void)
             continue;
         }
         if (ret == 0) {
-            /* Dependensi belum terpenuhi: tidak ada yang perlu dicoba lagi,
-               jadi need_respawn di-clear. Kalau dibiarkan, respawn_pending()
-               membuat ppoll bangun 10x/detik selamanya tanpa pernah ada
-               kemajuan — dan layanan ini toh akan dinilai ulang oleh
-               spawn_eligible_services() pada iterasi berikutnya. */
+            /* Dependencies not yet satisfied: nothing further to attempt,
+               so clear need_respawn. Otherwise, respawn_pending() wakes ppoll
+               10 times/second indefinitely without making progress — and this
+               service will be re-evaluated by spawn_eligible_services() on the
+               next iteration regardless. */
             svc->need_respawn = 0;
             continue;
         }
@@ -1285,8 +1282,8 @@ static void respawn_services(void)
     }
 }
 
-/* Ada layanan yang menunggu timer respawn_delay? Kalau ada, ppoll dipanggil
-   dengan timeout 100 ms; kalau tidak, NULL (blokir sampai sinyal/fd). */
+/* Are any services waiting on respawn_delay timer? If so, ppoll uses 100 ms
+   timeout; otherwise NULL (blocks until signal or fd event). */
 static int respawn_pending(void)
 {
     for (int i = 0; i < num_services; i++)
@@ -1295,12 +1292,11 @@ static int respawn_pending(void)
     return 0;
 }
 
-/* Timeout ppoll untuk housekeeping loop utama:
-   - 100 ms bila ada respawn tertunda (timer respawn_delay/backoff);
-   - 1 detik bila ada layanan once yang sedang berjalan, supaya
-     enforce_once_timeout() tetap dijalankan walau ppoll akan selamanya
-     blokir (tanpa sinyal/fd baru);
-   - NULL (blokir penuh) bila tidak ada housekeeping yang tertunda. */
+/* ppoll timeout calculation for main loop housekeeping:
+   - 100 ms if respawn pending (respawn_delay / backoff timer);
+   - 1 second if once service running, ensuring enforce_once_timeout()
+     executes even if ppoll would otherwise block indefinitely;
+   - NULL (full block) when no housekeeping is pending. */
 static struct timespec *compute_poll_timeout(struct timespec *ts)
 {
     if (respawn_pending()) {
@@ -1319,10 +1315,10 @@ static struct timespec *compute_poll_timeout(struct timespec *ts)
     return NULL;
 }
 
-/* T8D: batalkan semua layanan (transitif) yang bergantung pada layanan yang
-   gagal. Penutupan transitif dijalankan sampai titik tetap supaya dependen
-   dari dependen ikut batal, bukan hanya satu level. Layanan yang masih
-   berjalan (pid > 0) dibiarkan — itu tugas shutdown. */
+/* T8D: transitively cancel all services dependent on a failed service.
+   Transitive closure runs to a fixed point ensuring indirect dependents
+   are cancelled as well. Currently running services (pid > 0) are left intact
+   for shutdown handling. */
 static void cancel_dependents(void)
 {
     int changed = 1;
@@ -1349,10 +1345,10 @@ static void cancel_dependents(void)
     }
 }
 
-/* T8D: layanan once yang berjalan melewati batas timeout-nya dinyatakan
-   gagal (fail-closed). Default ONCE_START_TIMEOUT (30 detik), atau ditentukan
-   lewat opsi :timeout=. Opsi :timeout=0 / none menonaktifkan timeout.
-   Prosesnya dihentikan dan semua dependen yang menunggunya dibatalkan. */
+/* T8D: once services exceeding their timeout threshold are marked failed
+   (fail-closed). Default ONCE_START_TIMEOUT (30 seconds), or configured via
+   :timeout= option. Setting :timeout=0 / none disables timeout enforcement.
+   The process is killed and all waiting dependents are cancelled. */
 static void enforce_once_timeout(void)
 {
     if (shutting_down) return;
@@ -1375,12 +1371,12 @@ static void enforce_once_timeout(void)
     }
 }
 
-/* Baca SEMUA output layanan yang tertunda di /run/log.fifo dan teruskan ke
-   stderr + log init. Dipakai event loop DAN shutdown_all(): tanpa itu, pesan
-   terakhir dari layanan yang menuruti SIGTERM (mis. "bye!") tidak akan pernah
-   terbaca, karena loop utama sudah tidak men-drain FIFO selama shutdown.
-   Dibatasi maksimal 64 iterasi per panggilan agar tidak memonopoli CPU dan
-   menahan penanganan sinyal di ppoll. */
+/* Read ALL pending service output from /run/log.fifo and forward to
+   stderr + init log. Used by the event loop AND shutdown_all(): otherwise,
+   final log messages emitted by services shutting down on SIGTERM (e.g. "bye!")
+   would never be captured since the main loop stops draining FIFO during shutdown.
+   Capped at 64 iterations per invocation to prevent CPU monopolization and
+   avoid delaying ppoll signal handling. */
 static void drain_log_fifo(void)
 {
     if (g_log_fifo_fd < 0) return;
@@ -1388,7 +1384,7 @@ static void drain_log_fifo(void)
     for (int i = 0; i < 64; i++) {
         char log_buf[1024];
         ssize_t n = read(g_log_fifo_fd, log_buf, sizeof(log_buf) - 1);
-        if (n <= 0) return;   /* EAGAIN (kosong) atau EOF */
+        if (n <= 0) return;   /* EAGAIN (empty) or EOF */
         log_buf[n] = 0;
 
         char time_buf[32]; time_t now = time(NULL);
@@ -1401,9 +1397,9 @@ static void drain_log_fifo(void)
 }
 
 
-/* Kirim sinyal ke seluruh grup proses layanan (lewat pgid yang disimpan,
-   BUKAN pid leader: leader bisa sudah mati sementara grupnya masih hidup —
-   audit SANE-01), dan coba cgroup.kill bila SIGKILL. */
+/* Send signal to entire service process group (via recorded pgid,
+   NOT leader pid: leader may have exited while child processes remain active —
+   audit SANE-01), and invoke cgroup.kill when signal is SIGKILL. */
 static void kill_service_group(const service_t *svc, int sig)
 {
     if (svc->pgid > 0) {
@@ -1416,10 +1412,10 @@ static void kill_service_group(const service_t *svc, int sig)
     if (sig == SIGKILL) cgroup_kill_service(svc->name);
 }
 
-/* Masih adakah yang hidup dari layanan ini? Leader (pid) ATAU siapa pun di
-   grup prosesnya. Grup yang sudah kosong terdeteksi lewat kill(-pgid, 0)
-   yang gagal ESRCH; pgid lalu dibersihkan supaya tidak ada sinyal nyasar ke
-   grup lain bila nomor itu kelak didaur ulang kernel. */
+/* Is any process in this service still alive? Leader (pid) OR any process
+   in its process group. Empty groups are detected via kill(-pgid, 0) failing
+   with ESRCH; pgid is then cleared to avoid misdirected signals if the PID
+   is later recycled by the kernel. */
 static int service_still_alive(service_t *svc)
 {
     if (svc->pid > 0) return 1;
@@ -1430,10 +1426,10 @@ static int service_still_alive(service_t *svc)
     return 0;
 }
 
-/* T8E: tutup filesystem sebelum reboot. Remount / read-only dulu supaya tidak
-   ada lagi penulisan ke rootfs, lalu lepas entri fstab yang dicatat
-   mount_fstab() dengan MNT_DETACH (aman bila masih ada proses memakainya).
-   Kegagalan di-log dan tidak menggagalkan shutdown. */
+/* T8E: prepare filesystems before reboot. Remount / read-only first to prevent
+   further writes to the rootfs, then detach fstab entries recorded by
+   mount_fstab() with MNT_DETACH (safe even if processes still reference them).
+   Failures are logged and do not abort shutdown. */
 static void prepare_filesystems(void)
 {
     if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
@@ -1454,15 +1450,15 @@ static void prepare_filesystems(void)
 /* ---------- shutdown ---------- */
 static void shutdown_all(int reboot_cmd, int force)
 {
-    shutting_down = 1;   /* tandai shutdown: respawn dinonaktifkan (fix bug shutdown) */
+    shutting_down = 1;   /* mark shutdown in progress: respawning disabled */
 
     if (force) {
         init_log("FORCE shutdown (cmd=%d)", reboot_cmd);
         for (int i = 0; i < num_services; i++) {
-            /* Probe dulu (menutup catatan review PR #2): service_still_alive()
-               membersihkan pgid basi layanan yang sudah lama selesai, supaya
-               SIGKILL tidak nyasar ke grup lain yang nomornya didaur ulang.
-               Layanan yang lolos dari grupnya tetap dijangkau cgroup.kill. */
+            /* Probe first (addressing PR #2 review note): service_still_alive()
+               cleans up stale pgids from services that exited earlier, preventing
+               SIGKILL from targeting recycled process groups.
+               Processes escaping their group are still terminated by cgroup.kill. */
             if (service_still_alive(&services[i]))
                 kill_service_group(&services[i], SIGKILL);
             else
@@ -1477,34 +1473,32 @@ static void shutdown_all(int reboot_cmd, int force)
 
     init_log("graceful shutdown (cmd=%d)", reboot_cmd);
     for (int i = 0; i < num_services; i++) {
-        /* Probe sebelum memberi sinyal (sama seperti jalur force di atas):
-           pgid basi dibersihkan lebih dulu, baru grup yang benar-benar
-           masih hidup menerima SIGTERM. */
+        /* Probe before signaling (same as force shutdown path above):
+           stale pgids are pruned first, ensuring only genuinely active
+           groups receive SIGTERM. */
         if (service_still_alive(&services[i]))
             kill_service_group(&services[i], SIGTERM);
     }
 
     for (int i = 0; i < 50; i++) {
         int alive = 0;
-        /* Probe SETIAP layanan, jangan berhenti di yang pertama hidup: hanya
-           service_still_alive() yang membersihkan pgid basi (:681). Dengan
-           break dini, layanan yang indeksnya setelah layanan hidup tidak
-           pernah ter-probe pada pass terakhir, jadi pgid kadaluarsanya
-           bertahan sampai SIGKILL di bawah dan bisa mengenai grup proses lain
-           yang nomornya sudah didaur ulang kernel. */
+        /* Probe EVERY service, do not break on the first active one: only
+           service_still_alive() clears stale pgids. Breaking early would leave
+           services after an active one unprobed on the final pass, allowing
+           stale pgids to persist into the SIGKILL sweep below and hit recycled
+           process groups. */
         for (int j = 0; j < num_services; j++)
             if (service_still_alive(&services[j])) alive = 1;
         if (!alive) break;
         reap_zombies();
-        drain_log_fifo();   /* pesan terakhir layanan sebelum mati (mis. "bye!") */
+        drain_log_fifo();   /* capture last logs before death (e.g. "bye!") */
         usleep(100000);
     }
 
     for (int i = 0; i < num_services; i++) {
-        /* Probe sekali lagi sebelum SIGKILL, sama seperti jalur force dan
-           jalur SIGTERM di atas: grup bisa saja baru mati setelah pass
-           terakhir. Layanan yang grupnya sudah kosong hanya perlu
-           cgroup.kill — SIGKILL lewat pgid basi justru berbahaya. */
+        /* Probe once more before SIGKILL, matching force and SIGTERM paths:
+           groups may have exited after the last pass. Services with empty groups
+           only require cgroup.kill — signaling stale pgids with SIGKILL is dangerous. */
         if (service_still_alive(&services[i])) {
             kill_service_group(&services[i], SIGKILL);
         } else {
@@ -1521,41 +1515,41 @@ static void shutdown_all(int reboot_cmd, int force)
 }
 
 /* ---------- setup IPC (FIXED: O_RDWR) ---------- */
-/* T8B: O_CLOEXEC wajib pada fd kontrol PID 1 agar tidak bocor ke proses
-   layanan (SANE-06-01). O_RDWR menjaga FIFO selalu punya pembaca. */
+/* T8B: O_CLOEXEC mandatory on PID 1 control fds to prevent leaks to child
+   services (SANE-06-01). O_RDWR ensures the FIFO always has an active reader. */
 static int setup_initctl(void) { mkfifo("/run/initctl", 0600); return open("/run/initctl", O_RDWR | O_NONBLOCK | O_CLOEXEC); }
 static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/run/log.fifo", O_RDWR | O_NONBLOCK | O_CLOEXEC); }
 
-/* ---------- /etc/fstab (FITUR BARU) ---------- */
+/* ---------- /etc/fstab ---------- */
 #ifndef FSTAB_PATH
 #define FSTAB_PATH "/etc/fstab"
 #endif
 
 #ifndef MS_LAZYTIME
-#define MS_LAZYTIME (1U << 25)   /* kernel >= 4.0; glibc lama belum tentu punya */
+#define MS_LAZYTIME (1U << 25)   /* kernel >= 4.0; missing in older glibc headers */
 #endif
 
-/* Klasifikasikan opsi fstab dalam satu lintasan (audit SANE-02, diperluas
-   mengikuti review PR #2):
-     1. Flag VFS (ro, noatime, lazytime, ...) -> nilai balik sebagai MS_*
-        flags untuk argumen ke-4 mount(). Pasangan peniadanya (rw, exec,
-        suid, dev, async, atime, diratime) MEMBERSIHKAN bit lawannya, dan
-        "user"/"users"/"owner"/"group" memasang flag implikasi mount(8) —
-        semua diproses kiri-ke-kanan sehingga token belakangan menang.
-     2. Opsi userspace fstab murni (_netdev, nofail, x-*, comment=*, ...) ->
-        wewenang mount(8)/systemd, BUKAN kernel: dicatat lalu diabaikan,
-        tidak pernah diteruskan sebagai data.
-     3. "noauto" -> entri dilewati seluruhnya (*skip_reason = SKIP_NOAUTO),
-        seperti perilaku `mount -a` saat boot.
-     4. "bind"/"rbind" -> TIDAK didukung: entri dilewati dengan alasan
-        (*skip_reason = SKIP_BIND) yang dicatat eksplisit oleh pemanggil.
-        Bind mengubah semantik kolom pertama fstab menjadi path sumber,
-        sedangkan ninit memperlakukannya sebagai label/device filesystem;
-        mendukungnya setengah-setengah hanya menghasilkan kegagalan senyap.
-     5. Selainnya -> opsi khas filesystem (size=, mode=, uid=, ...), disalin
-        ke `data` untuk argumen ke-5 mount().
-   Token flag TIDAK boleh ikut terbawa ke data: parser opsi filesystem yang
-   ketat (ext4, tmpfs) menolak opsi data tak dikenal dengan EINVAL. */
+/* Classify fstab options in a single pass (audit SANE-02, expanded
+   following PR #2 review):
+     1. VFS flags (ro, noatime, lazytime, ...) -> returned as MS_* flags
+        for 4th argument of mount(). Inverse counterparts (rw, exec,
+        suid, dev, async, atime, diratime) CLEAR opposing bits, and
+        "user"/"users"/"owner"/"group" apply mount(8) implied flags —
+        all processed left-to-right so later tokens take precedence.
+     2. Pure userspace fstab options (_netdev, nofail, x-*, comment=*, ...) ->
+        handled by mount(8)/systemd, NOT kernel: logged then ignored,
+        never passed along as filesystem data.
+     3. "noauto" -> entry is skipped entirely (*skip_reason = SKIP_NOAUTO),
+        matching standard `mount -a` boot behavior.
+     4. "bind"/"rbind" -> NOT supported: entry skipped with explicit reason
+        (*skip_reason = SKIP_BIND) logged by caller.
+        Bind mounts change first-column fstab semantics into a source path,
+        whereas ninit treats it as a device node/filesystem label; partial
+        support leads to silent mount failures.
+     5. Other tokens -> filesystem-specific data options (size=, mode=, uid=, ...),
+        copied to `data` for 5th argument of mount().
+   Flag tokens MUST NOT leak into data buffer: strict filesystem option
+   parsers (ext4, tmpfs) reject unknown data options with EINVAL. */
 #define SKIP_NONE   0
 #define SKIP_NOAUTO 1
 #define SKIP_BIND   2
@@ -1568,10 +1562,10 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
     if (skip_reason) *skip_reason = SKIP_NONE;
     if (!opts) return 0;
 
-    /* Token diproses KIRI KE KANAN seperti mount(8): token peniada
-       membersihkan bit lawannya (ro lalu rw berakhir rw), dan "user"
-       memasang implikasinya yang bisa dibatalkan token sesudahnya
-       (user,exec berakhir exec) — review PR #2 butir 1 & 2. */
+    /* Tokens processed LEFT TO RIGHT matching mount(8): negating tokens
+       clear opposing bits (ro then rw ends up rw), and "user"
+       applies implications that can be overridden by subsequent tokens
+       (user,exec ends up exec) — PR #2 review items 1 & 2. */
     for (tok = strtok(opts, ","); tok; tok = strtok(NULL, ",")) {
         if (!strcmp(tok, "defaults")) continue;
         else if (!strcmp(tok, "rw"))          flags &= ~MS_RDONLY;
@@ -1596,13 +1590,13 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
         else if (!strcmp(tok, "nodiratime"))  flags |= MS_NODIRATIME;
         else if (!strcmp(tok, "lazytime"))    flags |= MS_LAZYTIME;
         else if (!strcmp(tok, "user") || !strcmp(tok, "users")) {
-            /* mount(8): user/users mengimplikasikan noexec+nosuid+nodev
-               (bisa dibatalkan token exec/suid/dev sesudahnya). */
+            /* mount(8): user/users implies noexec+nosuid+nodev
+               (can be overridden by subsequent exec/suid/dev tokens). */
             flags |= MS_NOEXEC | MS_NOSUID | MS_NODEV;
             init_log("fstab: option '%s' applies noexec,nosuid,nodev", tok);
         }
         else if (!strcmp(tok, "owner") || !strcmp(tok, "group")) {
-            /* mount(8): owner/group mengimplikasikan nosuid+nodev. */
+            /* mount(8): owner/group implies nosuid+nodev. */
             flags |= MS_NOSUID | MS_NODEV;
             init_log("fstab: option '%s' applies nosuid,nodev", tok);
         }
@@ -1622,29 +1616,27 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
             }
         }
     }
-    /* MS_BIND tidak punya token peniada: sekali bind/rbind (termasuk dalam
-       kombinasi seperti remount,bind) muncul, entri ini tidak didukung dan
-       dilewati — keputusannya di sini, di parser, supaya pemanggil bisa
-       melewatinya SEBELUM mountpoint dibuat (tidak ada direktori hantu
-       untuk entri yang tidak pernah di-mount). */
+    /* MS_BIND has no negating token: once bind/rbind (including combinations
+       like remount,bind) appears, the entry is unsupported and skipped —
+       decided here in the parser so callers skip BEFORE creating mountpoints
+       (preventing phantom directories for unmounted entries). */
     if ((flags & MS_BIND) && skip_reason && *skip_reason == SKIP_NONE)
         *skip_reason = SKIP_BIND;
     return flags;
 }
 
-/* Buat direktori beserta seluruh induknya (mkdir -p), mode 0755 untuk tiap
-   direktori yang BARU dibuat (di-chmod eksplisit supaya hasilnya tidak
-   bergantung umask warisan PID 1; kegagalan chmod menggagalkan entri).
-   Seluruh path DIPINDAI DI MUKA: komponen "." dan ".." ditolak sebelum
-   direktori apa pun dibuat, supaya penolakan tidak meninggalkan direktori
-   hantu (fstab juga tidak boleh diam-diam menormalisasi path ke tempat
-   lain). Komponen yang sudah ada harus direktori: diperiksa dengan stat()
-   yang MENGIKUTI symlink — symlink ke direktori diterima, symlink ke file
-   / komponen berupa file biasa ditolak dengan log jelas (tanpa cek ini,
-   mkdir EEXIST akan lolos dan mount() gagal ENOTDIR jauh dari
-   penyebabnya). Path harus absolut dan muat di buffer (tidak ada
-   pemotongan diam-diam). Mengembalikan 0 bila mountpoint siap, -1 bila
-   entri harus dilewati. */
+/* Create directory and parent hierarchy (mkdir -p), mode 0755 for each
+   NEWLY created directory (explicit chmod applied so permissions do not
+   depend on inherited PID 1 umask; chmod failure aborts entry).
+   Entire path is PRE-SCANNED: "." and ".." components are rejected before
+   creating any directories, preventing phantom directories on failure
+   (fstab entries must not silently normalize to unexpected paths).
+   Existing components must be directories: verified using stat() which
+   FOLLOWS symlinks — symlinks to directories are accepted, symlinks to files
+   or regular file components are rejected with clear diagnostic logs (without
+   this, mkdir EEXIST would pass and mount() would fail with ENOTDIR far from
+   the root cause). Path must be absolute and fit in buffer (no silent truncation).
+   Returns 0 when mountpoint is ready, -1 if entry should be skipped. */
 static int mkdir_p(const char *path)
 {
     char buf[MAX_LINE];
@@ -1658,7 +1650,7 @@ static int mkdir_p(const char *path)
         return -1;
     }
 
-    /* Pra-pindai komponen: tolak "." / ".." sebelum mkdir pertama. */
+    /* Pre-scan components: reject "." / ".." before first mkdir call. */
     for (const char *s = path; *s; ) {
         while (*s == '/') s++;
         const char *e = s;
@@ -1675,9 +1667,9 @@ static int mkdir_p(const char *path)
 
     memcpy(buf, path, len + 1);
 
-    /* Berjalan komponen demi komponen; potongan kosong (slash ganda,
-       trailing slash, dan "/" itu sendiri) berakhir sebagai direktori
-       yang sudah ada dan lolos lewat jalur EEXIST + stat di bawah. */
+    /* Iterate component-by-component; empty segments (double slashes,
+       trailing slash, and "/" itself) resolve to existing directories
+       and pass via EEXIST + stat check below. */
     for (char *p = buf + 1; ; p++) {
         if (*p != '/' && *p != '\0') continue;
         char save = *p;
@@ -1707,20 +1699,18 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
-/* Dekode escape oktal fstab di tempat, mengikuti getmntent(3)/mount(8):
-   backslash diikuti TEPAT tiga digit oktal (\040 spasi, \011 tab, \012
-   newline, \134 backslash, dan \ooo lain) menjadi satu byte; urutan selain
-   itu dibiarkan apa adanya. Hasil dekode tidak pernah lebih panjang dari
-   sumbernya, jadi aman dilakukan in-place. Diterapkan pada field device
-   dan mountpoint SEBELUM validasi lain (pra-pindai mkdir_p, cek duplikat),
-   supaya semua pemeriksaan bekerja pada path yang sebenarnya — mis.
-   \056\056 yang terdekode menjadi ".." tetap ditolak pra-pindai mkdir_p.
-   Tanpa dekode ini (temuan PR3-C1), path berisi spasi dibuat sebagai
-   direktori bernama harfiah "spa\040ce" dan di-mount di sana: berhasil,
-   tapi diam-diam menyimpang dari mount -a. Field opsi TIDAK didekode:
-   tokennya dipisah koma oleh parse_mount_flags(), dan koma hasil dekode
-   (\054) akan mengubah makna pemisahan itu; path berisi spasi — kasus
-   nyata temuan ini — hidup di device/mountpoint. */
+/* Decode octal escape sequences in fstab in-place, following getmntent(3)/mount(8):
+   backslash followed by EXACTLY three octal digits (\040 space, \011 tab, \012
+   newline, \134 backslash, and other \ooo) decodes to a single byte; other
+   sequences are left intact. Decoded output is never longer than input,
+   making in-place transformation safe. Applied to device and mountpoint fields
+   BEFORE other validations (mkdir_p pre-scan, duplicate check), ensuring all
+   checks operate on true paths — e.g. \056\056 decoding to ".." is still caught
+   by mkdir_p pre-scan. Without decoding (finding PR3-C1), paths with spaces
+   created literal directories like "spa\040ce", deviating silently from mount -a.
+   Options field is NOT decoded: tokens are comma-separated by parse_mount_flags(),
+   and decoded commas (\054) would alter token boundary semantics; spaces in paths
+   live in device/mountpoint. */
 static void unescape_fstab_field(char *s)
 {
     char *r = s, *w = s;
@@ -1736,9 +1726,9 @@ static void unescape_fstab_field(char *s)
     *w = '\0';
 }
 
-/* Dua mountpoint dianggap sama bila identik setelah slash di ujung
-   diabaikan ("/mnt/x/" dan "/mnt/x" adalah direktori yang sama; "/"
-   tetap "/"). Dipakai cek duplikat mount_fstab. */
+/* Two mountpoints are identical if equivalent after ignoring trailing slashes
+   ("/mnt/x/" and "/mnt/x" are the same directory; "/" remains "/").
+   Used for mount_fstab duplicate checking. */
 static int same_mountpoint(const char *a, const char *b)
 {
     size_t la = strlen(a), lb = strlen(b);
@@ -1747,7 +1737,7 @@ static int same_mountpoint(const char *a, const char *b)
     return la == lb && strncmp(a, b, la) == 0;
 }
 
-/* Format: <device> <mountpoint> <fstype> <options> [dump] [pass]; baris '#' diabaikan */
+/* Format: <device> <mountpoint> <fstype> <options> [dump] [pass]; '#' lines ignored */
 static void mount_fstab(void)
 {
     FILE *f = fopen(FSTAB_PATH, "r");
@@ -1756,15 +1746,14 @@ static void mount_fstab(void)
         return;
     }
 
-    /* Mountpoint yang SUDAH berhasil di-mount entri sebelumnya pada
-       lintasan ini (temuan PR3-C2): mount(2) menumpuk mount duplikat
-       diam-diam, dan opsi mount teratas menutupi proteksi mount di
-       bawahnya (nosuid bisa hilang tanpa jejak). Entri duplikat kini
-       dilewati dan dicatat. Hanya mount yang BERHASIL yang dicatat, jadi
-       kegagalan entri pertama tidak menghalangi mountpoint yang sama
-       dicoba lagi oleh entri berikutnya. Catatan ini juga dipakai
-       prepare_filesystems() saat shutdown (T8E). */
-    /* g_seen_mnt/g_seen_cnt didefinisikan di scope file (T8E). */
+    /* Mountpoints ALREADY successfully mounted by an earlier entry during
+       this pass (finding PR3-C2): mount(2) silently stacks duplicate mounts,
+       where top mount options shadow underlying protections (nosuid lost
+       without warning). Duplicate entries are now skipped and logged. Only
+       SUCCESSFUL mounts are tracked, ensuring first-entry failures do not
+       prevent subsequent valid entries from mounting to the same mountpoint.
+       This tracking is also used by prepare_filesystems() at shutdown (T8E). */
+    /* g_seen_mnt/g_seen_cnt defined at file scope (T8E). */
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
@@ -1787,25 +1776,25 @@ static void mount_fstab(void)
             continue;
         }
 
-        /* Escape oktal didekode sebelum pemrosesan lain apa pun (lihat
-           unescape_fstab_field): log, mkdir, cek duplikat, dan mount()
-           semuanya melihat path yang sebenarnya. */
+        /* Octal escapes decoded prior to any subsequent processing (see
+           unescape_fstab_field): logs, mkdir, duplicate checks, and mount()
+           all observe true filesystem paths. */
         unescape_fstab_field(dev);
         unescape_fstab_field(mnt);
 
-        /* Opsi dipisahkan SATU kali oleh parse_mount_flags() dari salinan
-           string (strtok merusak string aslinya): token flag menjadi MS_*
-           flags (arg ke-4) dan token non-flag menjadi data khas filesystem
-           (arg ke-5). Token flag TIDAK boleh ikut terbawa ke data — parser
-           opsi ext4/tmpfs menolaknya dengan EINVAL (audit SANE-02). */
+        /* Options parsed ONCE by parse_mount_flags() from a string copy
+           (strtok modifies original string in-place): flag tokens become MS_*
+           flags (arg 4) and non-flag tokens become filesystem-specific data
+           (arg 5). Flag tokens MUST NOT leak into data — strict option parsers
+           (ext4/tmpfs) reject unknown data options with EINVAL (audit SANE-02). */
         char flagbuf[MAX_LINE];
         char databuf[MAX_LINE] = "";
         snprintf(flagbuf, sizeof(flagbuf), "%s", opts ? opts : "");
         int skip_reason = SKIP_NONE;
         unsigned long flags = parse_mount_flags(flagbuf, databuf, sizeof(databuf), &skip_reason);
-        /* Keputusan lewati diputuskan parser dan dievaluasi di sini,
-           SEBELUM mountpoint dibuat: entri yang dilewati tidak meninggalkan
-           direktori hantu di rootfs. */
+        /* Skip decisions determined by parser and evaluated here,
+           BEFORE mountpoints are created: skipped entries do not leave
+           phantom directories on rootfs. */
         if (skip_reason == SKIP_NOAUTO) {
             init_log("fstab: %s -> %s skipped (noauto option)", dev, mnt);
             continue;
@@ -1815,9 +1804,9 @@ static void mount_fstab(void)
             continue;
         }
 
-        /* Duplikat diperiksa setelah keputusan parser, sebelum mkdir:
-           entri yang dilewati tidak meninggalkan direktori hantu, sama
-           seperti noauto/bind. */
+        /* Duplicate check runs after parser skip decision, before mkdir:
+           skipped entries do not leave phantom directories, identical to
+           noauto/bind handling. */
         int is_dup = 0;
         for (int i = 0; i < g_seen_cnt; i++)
             if (same_mountpoint(g_seen_mnt[i], mnt)) { is_dup = 1; break; }
@@ -1844,21 +1833,21 @@ static void mount_fstab(void)
 }
 
 /* ---------- rescue mode ----------
-   Satu-satunya jalan keluar bila init tidak bisa memulai boot dengan benar.
-   Tiga hal yang wajib terjadi di sini:
+   The sole fallback path when init cannot proceed with normal boot.
+   Three mandatory requirements:
 
-     1. Signal mask PID 1 dikosongkan. main() memblokir SIGINT/SIGTERM/SIGCHLD/
-        SIGUSR1/SIGUSR2 untuk ppoll; tanpa reset, rescue shell mewarisi mask itu
-        dan Ctrl+C di shell darurat tidak akan pernah sampai (SIGINT tertahan).
-        spawn_service() melakukan hal yang sama untuk anak layanan.
-     2. Disposisi SIGPIPE di-reset ke SIG_DFL. main() memasang signal(SIGPIPE, SIG_IGN)
-        untuk PID 1; tanpa reset, shell darurat mewarisi SIG_IGN sehingga utilitas
-        pipeline shell (yes | head -n 1) gagal rusak.
-     3. execl() menggantikan proses PID 1 ini dengan /bin/sh. Kalau gagal (mis.
-        /bin/sh tidak ada di rootfs), proses keluar dengan status 1 -- JANGAN
-        kembali ke alur boot dengan state yang sudah tidak valid.
+     1. PID 1 signal mask is cleared. main() blocks SIGINT/SIGTERM/SIGCHLD/
+        SIGUSR1/SIGUSR2 for ppoll; without a reset, the rescue shell inherits
+        this mask and Ctrl+C in emergency shell is ignored (SIGINT blocked).
+        spawn_service() performs identical mask clearing for child services.
+     2. SIGPIPE disposition reset to SIG_DFL. main() configures signal(SIGPIPE, SIG_IGN)
+        for PID 1; without a reset, emergency shell inherits SIG_IGN breaking
+        standard pipeline tools (yes | head -n 1).
+     3. execl() replaces PID 1 with /bin/sh. If execl fails (e.g. /bin/sh missing
+        from rootfs), process exits with status 1 -- NEVER return to boot flow
+        with an invalid internal state.
 
-   Fungsi ini tidak pernah kembali. */
+   This function never returns. */
 static void enter_rescue_mode(const char *reason)
 {
     sigset_t empty;
@@ -1872,10 +1861,10 @@ static void enter_rescue_mode(const char *reason)
     init_log("Entering rescue mode (shell).");
     signal(SIGPIPE, SIG_DFL);
 
-    /* T8B: lepaskan fd kontrol PID 1 sebelum exec (SANE-06-01). Flag
-       O_CLOEXEC sudah dipasang di sisi induk; penutupan eksplisit ini
-       menutupi fd yang dibuka sebelum flag itu ada dan menutupi jalur
-       rescue yang dipanggil sebelum setup_initctl()/setup_log_fifo(). */
+    /* T8B: release PID 1 control fds before exec (SANE-06-01).
+       O_CLOEXEC flag is set on parent fds; this explicit close covers fds
+       opened before flags were present and covers rescue invocations prior
+       to setup_initctl()/setup_log_fifo(). */
     if (initctl_fd >= 0)    close(initctl_fd);
     if (g_log_fifo_fd >= 0) close(g_log_fifo_fd);
     if (log_file_fd >= 0)   close(log_file_fd);
@@ -1899,7 +1888,7 @@ int main(int argc, char **argv)
     sigaddset(&block, SIGCHLD); sigaddset(&block, SIGTERM); sigaddset(&block, SIGINT);
     sigaddset(&block, SIGUSR1); sigaddset(&block, SIGUSR2);
     sigprocmask(SIG_BLOCK, &block, &orig);
-    sigemptyset(&orig);   /* paksa ppoll meng-unblock SEMUA sinyal (termasuk mask warisan induk) */
+    sigemptyset(&orig);   /* force ppoll to unblock ALL signals (including inherited mask) */
 
     struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_sigchld; sigaction(SIGCHLD, &sa, NULL);
@@ -1917,18 +1906,18 @@ int main(int argc, char **argv)
 
     set_hostname();
 
-    /* Tanpa config yang terbaca, boot tidak punya rencana sama sekali; jangan
-       lanjut dengan nol layanan dan mengaku "siap". */
+    /* Without a valid readable config, boot has no blueprint; never
+       proceed with zero services and claim "ready". */
     const char *conf = (argc > 1) ? argv[1] : "/etc/init.conf";
     if (parse_config(conf) < 0)
         enter_rescue_mode("Config failed to read/parse!");
 
-    /* Dipanggil tepat setelah parse_config(): dependensi harus menunjuk layanan
-       yang ada. Bila ada yang hilang, sistem diserahkan ke rescue shell. */
+    /* Invoked immediately after parse_config(): dependencies must point to valid
+       services. If any are missing, system hands control to rescue shell. */
     if (validate_dependencies() < 0)
         enter_rescue_mode("Invalid dependencies!");
 
-    /* Panggil sort, jika return -1 (cycle), jangan spawn apa-apa */
+    /* Invoke topological sort; if -1 (cycle detected), abort and enter rescue */
     if (num_services > 0 && sort_services() < 0)
         enter_rescue_mode("Cycle detected!");
 
@@ -1940,7 +1929,7 @@ int main(int argc, char **argv)
 
     init_log("main loop ready");
 
-    /* FIXED: Susun array fds secara dinamis */
+    /* Dynamically configure fds array */
     struct pollfd fds[2];
     int nfds = 0;
     
@@ -1957,23 +1946,23 @@ int main(int argc, char **argv)
     } else init_log("Warning: log_fifo_fd invalid");
 
     for (;;) {
-        /* FIXED: Gunakan nfds yang dinamis, ppoll dengan mask orig.
-           Timeout housekeeping: 100 ms bila ada respawn tertunda, atau
-           1 detik bila ada layanan once yang berjalan (supaya
-           enforce_once_timeout() tetap jalan tanpa menunggu sinyal). */
+        /* Dynamically configure nfds, ppoll using orig mask.
+           Housekeeping timeout: 100 ms if respawn pending, or
+           1 second if once service running (so enforce_once_timeout()
+           executes without waiting for signals). */
         struct timespec ts;
         struct timespec *pto = compute_poll_timeout(&ts);
 
         int ret = ppoll(fds, nfds, pto, &orig);
-        int perr = errno;   /* simpan segera: errno mudah berubah oleh panggilan lain */
+        int perr = errno;   /* capture immediately: errno easily modified by subsequent calls */
         if (ret < 0 && perr != EINTR) {
             init_log("ppoll error: %s", strerror(perr));
-            usleep(100000); /* jeda 100ms cegah log spam bila terjadi error berulang */
+            usleep(100000); /* 100ms throttle to prevent log flooding on repeated errors */
             continue;
         }
 
-        /* 1. Cek Sinyal: shutdown DIPRIORITASKAN sebelum reap_zombies()/respawn,
-           supaya SIGTERM yang datang bersamaan SIGCHLD tidak tertunda. */
+        /* 1. Check Signals: shutdown is PRIORITIZED before reap_zombies()/respawn,
+           ensuring SIGTERM arriving alongside SIGCHLD is handled immediately. */
         if (sigterm_flag) { sigterm_flag = 0; shutdown_all(RB_POWER_OFF, 0); }
         if (sigint_flag ) { sigint_flag  = 0; shutdown_all(RB_AUTOBOOT,   0); }
         if (sigusr1_flag) { sigusr1_flag = 0; shutdown_all(RB_POWER_OFF, 1); }
@@ -1984,7 +1973,7 @@ int main(int argc, char **argv)
             spawn_eligible_services();
         }
 
-        /* 2. Cek fd yang aktif */
+        /* 2. Check active file descriptors */
         for (int i = 0; i < nfds; i++) {
             if (!(fds[i].revents & POLLIN)) continue;
 
@@ -1994,15 +1983,15 @@ int main(int argc, char **argv)
                 if (n > 0) {
                     cmd[n] = 0;
 
-                    /* Baca PER BARIS: satu penulisan bisa memuat beberapa perintah
-                       (printf 'poweroff\nreboot\n' > /run/initctl). Versi lama
-                       memotong buffer di newline pertama, jadi perintah kedua dan
-                       seterusnya hilang tanpa jejak -- bahkan tidak tercatat log.
-                       Perintah penutup tidak pernah kembali dari shutdown_all(),
-                       jadi praktis hanya baris pertama yang benar-benar jalan. */
+                    /* Process LINE-BY-LINE: a single write may contain multiple commands
+                       (e.g. printf 'poweroff\nreboot\n' > /run/initctl). Older versions
+                       truncated the buffer at the first newline, silently discarding
+                       subsequent commands without logging them.
+                       Since terminal commands never return from shutdown_all(),
+                       only the first valid line takes effect. */
                     for (char *line = strtok(cmd, "\n"); line; line = strtok(NULL, "\n")) {
                         char *cmdline = trim(line);
-                        if (*cmdline == 0) continue;   /* abaikan baris kosong */
+                        if (*cmdline == 0) continue;   /* ignore empty lines */
                         init_log("initctl cmd: '%s'", cmdline);
                         if (!strcmp(cmdline, "poweroff")) shutdown_all(RB_POWER_OFF, 0);
                         else if (!strcmp(cmdline, "reboot")) shutdown_all(RB_AUTOBOOT, 0);
@@ -2016,9 +2005,9 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Akhir loop: housekeeping timeout layanan once, lalu proses layanan
-           yang respawn-nya tertunda. Juga terpanggil saat ppoll timeout
-           (ret == 0) -> timer merespawn tanpa sleep(). */
+        /* End of loop: once service timeout housekeeping, followed by processing
+           services with pending respawns. Also triggered on ppoll timeout
+           (ret == 0) -> timer-driven respawn without blocking sleep(). */
         enforce_once_timeout();
         respawn_services();
         spawn_eligible_services();
