@@ -59,12 +59,121 @@ for t in unshare chroot timeout grep mktemp; do
 done
 $SUDO true 2>/dev/null || fail "root or passwordless sudo required (unshare + chroot)"
 
-CG=/sys/fs/cgroup/ninit-spawnfail-$$
+RUN_ID="ninit-spawnfail-$$-$(date +%s%N 2>/dev/null || date +%s)"
+SUITE_CG="/sys/fs/cgroup/$RUN_ID"
+SUITE_CG_BASE="$SUITE_CG/ninit"
+if [ -e "$SUITE_CG" ]; then
+	fail "cgroup collision: path '$SUITE_CG' already exists before test starts"
+fi
+$SUDO mkdir "$SUITE_CG" || fail "failed to create isolation root '$SUITE_CG'"
+SUITE_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$SUITE_CG" 2>/dev/null || true)
+[ -n "$SUITE_CG_DEV_INO" ] || fail "failed to read dev:ino for '$SUITE_CG'"
+
+SCENARIO3_CG="/sys/fs/cgroup/ninit-spawnfail-limit-$$-$(date +%s%N 2>/dev/null || date +%s)"
+SCENARIO3_CG_DEV_INO=""
+
 ROOTS=""
 LOGS=""
 HELPERS=""
 INNER=$(mktemp /tmp/ninit-spawnfail-inner.XXXXXX)
+
+is_test_process() {
+	p=$1
+	[ -n "$p" ] && [ -d "/proc/$p" ] || return 1
+	if [ -n "${SUITE_CG:-}" ] && [ -d "$SUITE_CG" ]; then
+		p_cg_path=""
+		if [ -r "/proc/$p/cgroup" ]; then
+			p_cg_path=$(sed -n 's/^0::\([^[:space:]]*\).*$/\1/p' "/proc/$p/cgroup" 2>/dev/null | head -n 1)
+		fi
+		[ -n "$p_cg_path" ] || return 1
+		case "/sys/fs/cgroup$p_cg_path" in
+			"$SUITE_CG"|"$SUITE_CG"/*|"${SCENARIO3_CG:-}"|"${SCENARIO3_CG:-}"/*) ;;
+			*) return 1 ;;
+		esac
+		[ -d "/sys/fs/cgroup$p_cg_path" ] || return 1
+	else
+		return 1
+	fi
+	p_root=$($SUDO readlink /proc/"$p"/root 2>/dev/null || true)
+	[ -n "$p_root" ] || return 1
+	for r in ${ROOTS:-}; do
+		case "$p_root" in
+			"$r"|"$r"/*|"$r (deleted)"|"$r/"*) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+clean_suite_cgroup() {
+	cg_target="${1:-}"
+	expected_dev_ino="${2:-}"
+	[ -n "$cg_target" ] || return 0
+	[ -d "$cg_target" ] || return 0
+	if [ -L "$cg_target" ]; then
+		printf 'SECURITY: %s is a symlink, cleanup aborted!\n' "$cg_target" >&2
+		return 1
+	fi
+	if [ -n "$expected_dev_ino" ]; then
+		cur_ino=$($SUDO stat -c '%d:%i' "$cg_target" 2>/dev/null || true)
+		if [ "$cur_ino" != "$expected_dev_ino" ]; then
+			printf 'SECURITY: %s dev:ino changed (expected %s, got %s)!\n' "$cg_target" "$expected_dev_ino" "$cur_ino" >&2
+			return 1
+		fi
+	fi
+
+	kill_ok=0
+	if [ -f "$cg_target/cgroup.kill" ]; then
+		echo 1 | $SUDO tee "$cg_target/cgroup.kill" >/dev/null 2>&1 || true
+		waited=0
+		while [ "$waited" -lt 20 ]; do
+			has_proc=0
+			set -f
+			for pf in $(find "$cg_target" -type f -name "cgroup.procs" 2>/dev/null); do
+				procs=$($SUDO cat "$pf" 2>/dev/null || true)
+				for p in $procs; do
+					[ -n "$p" ] && { has_proc=1; break; }
+				done
+				[ "$has_proc" -eq 1 ] && break
+			done
+			set +f
+			[ "$has_proc" -eq 0 ] && { kill_ok=1; break; }
+			sleep 0.05
+			waited=$((waited + 1))
+		done
+	fi
+
+	if [ "$kill_ok" -ne 1 ]; then
+		set -f
+		for pf in $(find "$cg_target" -type f -name "cgroup.procs" 2>/dev/null); do
+			procs=$($SUDO cat "$pf" 2>/dev/null || true)
+			for p in $procs; do
+				if is_test_process "$p"; then
+					$SUDO kill -9 "$p" 2>/dev/null || true
+				fi
+			done
+		done
+		set +f
+	fi
+
+	find "$cg_target" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || {
+		sleep 0.1
+		find "$cg_target" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || true
+	}
+
+	$SUDO rmdir "$cg_target" 2>/dev/null || {
+		sleep 0.1
+		$SUDO rmdir "$cg_target" 2>/dev/null || true
+	}
+}
+
+clean_suite_leaves() {
+	[ -n "${SUITE_CG:-}" ] && [ -d "$SUITE_CG" ] || return 0
+	find "$SUITE_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || true
+}
+
 cleanup() {
+	clean_suite_cgroup "${SCENARIO3_CG:-}" "${SCENARIO3_CG_DEV_INO:-}" || printf 'WARN: clean SCENARIO3_CG failed\n' >&2
+	clean_suite_cgroup "${SUITE_CG:-}" "${SUITE_CG_DEV_INO:-}" || printf 'WARN: clean_suite_cgroup failed (status %d), continuing...\n' $? >&2
 	for d in ${ROOTS:-}; do
 		$SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
@@ -72,11 +181,6 @@ cleanup() {
 	for f in ${LOGS:-}; do rm -f "$f"; done
 	for h in ${HELPERS:-}; do rm -f "$h"; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
-	# Clean up ONLY the scenario 3 dedicated cgroup (a per-PID unique name).
-	# Never touch the /sys/fs/cgroup/ninit belonging to another host workload.
-	if [ -d "$CG" ]; then
-		$SUDO rmdir "$CG" 2>/dev/null || true
-	fi
 }
 trap cleanup EXIT INT TERM
 
@@ -123,12 +227,14 @@ boot_guest() {
 	cat > "$INNER" <<EOI
 #!/bin/sh
 mount -t proc proc $root/proc
+export NINIT_CGROUP_BASE="$SUITE_CG_BASE"
 $move
 exec chroot $root /ninit
 EOI
 	$SUDO chmod 755 "$INNER"
 	$SUDO sh -c "timeout -s KILL $((secs + 3)) unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private /bin/sh $INNER" || true
+	clean_suite_leaves
 }
 
 printf '== test binary : %s\n' "$BIN"
@@ -144,6 +250,8 @@ ROOTS="$ROOTS $R1"
 LOGS="$LOGS $L1"
 printf 'boot:once:exit 3\napp:respawn:exit 0:requires=boot\n' > "$R1/etc/init.conf"
 boot_guest "$R1" "$WAIT1" "" >"$L1" 2>&1
+check_in  "cgroup base path overridden ($SUITE_CG_BASE)" "$L1" \
+	"cgroup: base path overridden: $SUITE_CG_BASE"
 check_in  "boot ran then failed (exit status=0x300)" "$L1" \
 	'boot (pid .* exit status=0x300'
 check_in  "app cancelled because the dependency failed" "$L1" \
@@ -192,8 +300,11 @@ printf '\n== Scenario 3: fork() failure on a once service (pids.max=1) ==\n'
 pids_ok=0
 if [ -r /sys/fs/cgroup/cgroup.controllers ] \
    && $SUDO grep -qw pids /sys/fs/cgroup/cgroup.controllers 2>/dev/null \
-   && $SUDO mkdir -p "$CG" 2>/dev/null && [ -e "$CG/pids.max" ]; then
-	printf '1\n' | $SUDO tee "$CG/pids.max" >/dev/null && pids_ok=1
+   && $SUDO mkdir "$SCENARIO3_CG" 2>/dev/null; then
+	SCENARIO3_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$SCENARIO3_CG" 2>/dev/null || true)
+	if [ -e "$SCENARIO3_CG/pids.max" ] && printf '1\n' | $SUDO tee "$SCENARIO3_CG/pids.max" >/dev/null; then
+		pids_ok=1
+	fi
 fi
 
 if [ "$pids_ok" -ne 1 ]; then
@@ -204,7 +315,7 @@ else
 	ROOTS="$ROOTS $R3"
 	LOGS="$LOGS $L3"
 	printf 'boot:once:exit 0\napp:respawn:exit 0:requires=boot\n' > "$R3/etc/init.conf"
-	boot_guest "$R3" "$WAIT3" "$CG" >"$L3" 2>&1
+	boot_guest "$R3" "$WAIT3" "$SCENARIO3_CG" >"$L3" 2>&1
 
 	check_in  "event loop still entered (no busy-loop)" "$L3" 'main loop ready'
 	check_in  "fork() failure logged for boot" "$L3" \
