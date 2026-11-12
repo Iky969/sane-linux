@@ -3,7 +3,8 @@
 #   make            build static binary ./ninit  (gcc -static -O2 -Wall)
 #   make test       test PID 1 in temporary chroot: smoke test + SIGTERM test
 #                   + config test + spawn failure paths + cgroup v2 limits
-#                   and respawn lifecycle (requires root/sudo), then run-qemu.sh
+#                   + respawn cleanup / generation counter reset
+#                   (requires root/sudo), then run-qemu.sh
 #                   harness verification via log fixtures (without root/QEMU)
 #   make rootfs     build minimal distro rootfs + initramfs (static busybox,
 #                   ninit as /sbin/init; see doc/distro-builder.md)
@@ -29,14 +30,13 @@ all: $(BIN)
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $<
 
+TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-config.sh \
+                scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
+                scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh
+
 test: $(BIN)
 	@PRE_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
-	sh ./scripts/smoke-test.sh && \
-	sh ./scripts/test-sigterm.sh && \
-	sh ./scripts/test-config.sh && \
-	sh ./scripts/test-qemu-report.sh && \
-	sh ./scripts/test-spawn-failure.sh && \
-	sh ./scripts/test-cgroup-limits.sh && \
+	for t in $(TEST_SCRIPTS); do sh ./$$t || exit 1; done; \
 	POST_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
 	if [ "$$PRE_CGROUPS" != "$$POST_CGROUPS" ]; then \
 		echo "FAIL: new lingering cgroups detected in /sys/fs/cgroup/ninit*:" >&2; \
