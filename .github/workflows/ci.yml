@@ -66,6 +66,12 @@ jobs:
       - name: cgroup v2 resource limits & respawn orphan cleanup
         run: sudo sh ./scripts/test-cgroup-limits.sh
 
+      - name: Respawn cleanup & grandchild containment (T12)
+        run: sudo sh ./scripts/test-respawn-cleanup.sh
+
+      - name: State machine formalization & telemetry (T10/T11/T13)
+        run: sudo sh ./scripts/test-state-machine.sh
+
       - name: Build with zero warnings (-Wall -Werror)
         run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
 
