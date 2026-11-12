@@ -456,13 +456,35 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     return 0;
 }
 
-/* Remove service cgroup directory when service stops */
+/* Remove the service leaf cgroup when the service stops (T14).
+   Sequence: cgroup.kill (sweep every process in the leaf) -> bounded poll
+   until cgroup.procs is empty -> rmdir. The empty-check is what makes the
+   rmdir deterministic: rmdir on a cgroup with live processes fails with
+   EBUSY. Failures are logged as warnings and never abort PID 1 (a leaking
+   leaf is recoverable on the next boot; a crashed init is not). */
 static void cleanup_cgroup(const char *svc_name)
 {
     if (!cgroup_name_safe(svc_name)) return;
-    cgroup_kill_service(svc_name);
-    char dir[256];
+
+    char dir[256], procs[320];
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
+    snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
+
+    cgroup_kill_service(svc_name);
+
+    /* cgroup.kill is asynchronous: wait (bounded, no unbounded sleep loop)
+       until the kernel has reaped every process from the leaf before
+       attempting rmdir. */
+    for (int i = 0; i < 50; i++) {
+        FILE *fp = fopen(procs, "r");
+        if (!fp) break;              /* leaf already gone */
+        int p, n = 0;
+        while (fscanf(fp, "%d", &p) == 1) n++;
+        fclose(fp);
+        if (n == 0) break;
+        usleep(10000);
+    }
+
     for (int i = 0; i < 20; i++) {
         if (rmdir(dir) == 0) {
             init_log("cgroup: cleaned up '%s'", svc_name);
@@ -470,15 +492,15 @@ static void cleanup_cgroup(const char *svc_name)
         }
         if (errno != EBUSY) {
             if (errno != ENOENT) {
-                init_log("cgroup: rmdir %s failed: %s", dir, strerror(errno));
+                init_log("Warning: cgroup rmdir %s failed: %s (leaf may leak)",
+                         dir, strerror(errno));
             }
             return;
         }
         usleep(5000);
     }
-    if (errno != ENOENT) {
-        init_log("cgroup: rmdir %s failed: %s", dir, strerror(errno));
-    }
+    init_log("Warning: cgroup rmdir %s failed: %s (leaf may leak)",
+             dir, strerror(errno));
 }
 
 /* ---------- config parser (FIXED: Robust) ---------- */
@@ -944,6 +966,18 @@ static int spawn_service(service_t *svc)
         return 0;
     }
 
+    /* T12: the respawn delay has elapsed (or a once-service fork is being
+       retried). Flush every process still attached to the service cgroup
+       BEFORE the new generation is forked, so orphans/grandchildren from the
+       previous generation can never survive into the new one. cgroup.kill
+       sweeps the whole leaf; the kill inside setup_cgroup() afterwards is
+       defense in depth. Skipped on the very first spawn (last_start == 0):
+       there is no previous generation to flush. */
+    if (svc->last_start) {
+        init_log("%s: flushing cgroup before respawn", svc->name);
+        cgroup_kill_service(svc->name);
+    }
+
     int sync_pipe[2] = { -1, -1 };
     int has_sync = 1;
     if (pipe2(sync_pipe, O_CLOEXEC) < 0) {
@@ -1103,6 +1137,21 @@ static int spawn_service(service_t *svc)
     return 1;
 }
 
+/* T12: Reset the respawn generation counters of a service that is stopped or
+   disabled. A service must never inherit the crash-loop backoff of a previous
+   run: the next start begins with a clean generation (crash_count=0,
+   respawn_delay=RESPAWN_DELAY). The reset is logged so the lifecycle stays
+   auditable. Called on shutdown (service stopped) and when a service is
+   disabled (marked FAILED: crash-loop, dependency failure, once timeout). */
+static void reset_respawn_counters(service_t *svc)
+{
+    if (!svc) return;
+    svc->crash_count   = 0;
+    svc->respawn_delay = RESPAWN_DELAY;
+    init_log("%s: respawn counters reset (generation=0, crash_count=0, respawn_delay=%d)",
+             svc->name, svc->respawn_delay);
+}
+
 static void reap_zombies(void)
 {
     int status; pid_t pid;
@@ -1161,6 +1210,7 @@ static void reap_zombies(void)
                                          services[i].name, services[i].crash_count);
                                 services[i].state = SVC_STATE_FAILED;
                                 services[i].need_respawn = 0;
+                                reset_respawn_counters(&services[i]);
                             } else {
                                 init_log("%s: crash-loop #%d, respawn delay increased to %d seconds",
                                          services[i].name, services[i].crash_count,
@@ -1231,6 +1281,7 @@ static void spawn_eligible_services(void)
             if (ret < 0) {
                 init_log("service '%s' cancelled: dependency '%s' failed", svc->name, failed_dep);
                 svc->state = SVC_STATE_FAILED;
+                reset_respawn_counters(svc);
                 progress = 1;
             } else if (ret == 1) {
                 /* Only mark progress if spawn_service made actual state changes.
@@ -1267,6 +1318,7 @@ static void respawn_services(void)
             init_log("service '%s' cancelled: dependency '%s' failed", svc->name, failed_dep);
             svc->state = SVC_STATE_FAILED;
             svc->need_respawn = 0;
+            reset_respawn_counters(svc);
             continue;
         }
         if (ret == 0) {
@@ -1337,6 +1389,7 @@ static void cancel_dependents(void)
                     init_log("service '%s' cancelled: dependency '%s' failed",
                              svc->name, token);
                     svc->state = SVC_STATE_FAILED;
+                    reset_respawn_counters(svc);
                     changed = 1;
                     break;
                 }
@@ -1365,6 +1418,7 @@ static void enforce_once_timeout(void)
                  svc->name, svc->timeout);
         svc->state = SVC_STATE_FAILED;
         svc->need_respawn = 0;
+        reset_respawn_counters(svc);
         if (svc->pid > 0)
             kill_service_group(svc, SIGKILL);
         cancel_dependents();
@@ -1463,6 +1517,9 @@ static void shutdown_all(int reboot_cmd, int force)
                 kill_service_group(&services[i], SIGKILL);
             else
                 cgroup_kill_service(services[i].name);
+            /* T12: the service is stopped: reset its generation counters so a
+               future start never inherits this run's crash-loop backoff. */
+            reset_respawn_counters(&services[i]);
             cleanup_cgroup(services[i].name);
         }
         rmdir(CGROUP_BASE);
@@ -1505,6 +1562,9 @@ static void shutdown_all(int reboot_cmd, int force)
             init_log("%s: process group already dead, SIGKILL skipped", services[i].name);
             cgroup_kill_service(services[i].name);
         }
+        /* T12: the service is stopped: reset its generation counters so a
+           future start never inherits this run's crash-loop backoff. */
+        reset_respawn_counters(&services[i]);
         cleanup_cgroup(services[i].name);
     }
     rmdir(CGROUP_BASE);
