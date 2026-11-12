@@ -1,58 +1,58 @@
 #!/bin/sh
-# test-cgroup-limits.sh -- pengujian cgroup v2 resource limits (memory, cpu, pids)
-# dan pembersihan siklus hidup orphan saat respawn layanan.
+# test-cgroup-limits.sh -- cgroup v2 resource limit tests (memory, cpu, pids)
+# and orphan lifecycle cleanup when a service respawns.
 #
-# Kenapa suite ini ada: Requirement R4 menuntut suite pengujian otomatis untuk
-# memverifikasi bahwa:
-#   1. memory_max membatasi alokasi berlebih dan memicu OOM kill deterministik
+# Why this suite exists: Requirement R4 demands an automated test suite to
+# verify that:
+#   1. memory_max limits overallocation and triggers a deterministic OOM kill
 #      (exit status 0x9 / 137).
-#   2. pids_max membatasi fork berlebih dan menolak proses baru deterministik
-#      dengan EAGAIN (Resource temporarily unavailable).
-#   3. cgroup_kill_service membersihkan proses anak/orphan yang ditinggalkan
-#      oleh pemimpin layanan respawn sebelum generasi baru dihidupkan.
-#   4. Konfigurasi leaf cgroup (memory.max, cpu.max, pids.max) tertulis dengan
-#      benar ke hierarki cgroup v2 layanan dan mendukung urutan opsi bebas.
-#   5. Validasi parser menerima format limit valid dan menolak format rusak
-#      (malformed) dengan log peringatan informatif tanpa crash PID 1.
-#   6. Penulisan subtree control mentoleransi environment nested/container
-#      dan partial subtree control tanpa menggagalkan boot.
-#   7. Interaksi PR #9: layanan once dengan pids_max=1 yang mengalami fork EAGAIN
-#      mencoba ulang hingga batas MAX_SPAWN_RETRY (3x), transisi ke FAILED,
-#      dan membatalkan layanan dependen deterministik.
-#   8. Pembersihan siklus hidup orphan pada layanan once (cgroup_kill_service
-#      sebelum rmdir) menyapu bersih proses anak orphan sebelum rmdir leaf cgroup.
-#   9. Descendant escape test dengan fast double-fork + setsid daemonize
-#      workload, memastikan seluruh proses turunan berada di leaf cgroup.procs
-#      via T1 handshake dan cgroup_kill_service menyapu bersih seluruh pohon
-#      proses tanpa sisa (LINGERING_ESCAPE_ORPHANS=0). Pembersihan juga
-#      diverifikasi dari sisi cgroup: cgroup.events (populated 0) dan
-#      cgroup.procs kosong SEBELUM rmdir leaf.
-#  10. Batas resource bertingkat (multi-tier hierarchical limits):
+#   2. pids_max limits excessive forks and deterministically rejects new
+#      processes with EAGAIN (Resource temporarily unavailable).
+#   3. cgroup_kill_service cleans up the child/orphan processes left behind by
+#      a respawn service's leader before the new generation is started.
+#   4. The leaf cgroup configuration (memory.max, cpu.max, pids.max) is written
+#      correctly to the service's cgroup v2 hierarchy and supports free option order.
+#   5. Parser validation accepts valid limit formats and rejects broken
+#      (malformed) ones with an informative warning log, without crashing PID 1.
+#   6. Subtree control writing tolerates a nested/container environment and
+#      partial subtree control without breaking the boot.
+#   7. PR #9 interaction: a once service with pids_max=1 that hits fork EAGAIN
+#      retries up to MAX_SPAWN_RETRY (3x), transitions to FAILED, and
+#      deterministically cancels its dependent services.
+#   8. Orphan lifecycle cleanup on a once service (cgroup_kill_service before
+#      rmdir) sweeps the orphan child processes clean before the leaf rmdir.
+#   9. Descendant escape test with a fast double-fork + setsid daemonize
+#      workload, ensuring every descendant process is in the leaf cgroup.procs
+#      via the T1 handshake and cgroup_kill_service sweeps the whole process
+#      tree with no leftovers (LINGERING_ESCAPE_ORPHANS=0). Cleanup is also
+#      verified from the cgroup side: cgroup.events (populated 0) and an empty
+#      cgroup.procs BEFORE the leaf rmdir.
+#  10. Multi-tier hierarchical resource limits:
 #      - 10A: Hierarchical pids.max nested fork rejection with EAGAIN
 #             (NESTED_EAGAIN_CONFIRMED depth=3).
-#      - 10B: Cumulative parallel memory.max deterministic OOM: leader
-#             mengorkestrasi 3 worker x 12MB (36MB > limit 32MB) sehingga
-#             OOM killer mematikan worker; kontrol 2 worker x 12MB (24MB)
-#             lolos tanpa OOM. Leader tidak mengalokasi besar dan tidak
-#             memanggil raise(SIGKILL).
-#  11. Fallback fail-open saat cgroup v2 tidak tersedia:
-#      - Deteksi kegagalan mount /sys/fs/cgroup dan pencatatan log fail-open aktif.
-#      - Peringatan batas resource yang diabaikan.
-#      - Eksekusi layanan tetap berjalan normal melalui handshake pre-exec.
-#      - Fallback kill(-pgid) pada layanan once saat leader mati, memastikan
-#        proses latar belakang (orphan) disapu bersih saat cgroup tidak aktif.
+#      - 10B: Cumulative parallel memory.max deterministic OOM: the leader
+#             orchestrates 3 workers x 12MB (36MB > 32MB limit) so the OOM
+#             killer kills a worker; the control of 2 workers x 12MB (24MB)
+#             passes without OOM. The leader does not allocate large amounts
+#             and does not call raise(SIGKILL).
+#  11. Fail-open fallback when cgroup v2 is unavailable:
+#      - Detect the /sys/fs/cgroup mount failure and log the active fail-open.
+#      - Warn about the ignored resource limits.
+#      - Service execution still runs normally through the pre-exec handshake.
+#      - The kill(-pgid) fallback on a once service when the leader dies,
+#        ensuring background (orphan) processes are swept clean with no cgroup.
 #
-# Pemakaian:
-#   sudo sh ./scripts/test-cgroup-limits.sh      # atau: make test
+# Usage:
+#   sudo sh ./scripts/test-cgroup-limits.sh      # or: make test
 #
-# Variabel lingkungan:
-#   BIN=./ninit              biner yang diuji
-#   BUSYBOX=/bin/busybox     busybox statis (apt-get install busybox-static)
-#   WAIT1..WAIT11            jendela waktu observasi tiap skenario (detik)
+# Environment variables:
+#   BIN=./ninit              binary under test
+#   BUSYBOX=/bin/busybox     static busybox (apt-get install busybox-static)
+#   WAIT1..WAIT11            observation time window per scenario (seconds)
 #
-# Catatan: suite ini menggunakan unshare dengan `--mount --propagation private`
-# dan `mount -t proc` manual (bukan `--mount-proc`), konsisten dengan konvensi
-# repo untuk menghindari penolakan EINVAL pada kernel tertentu.
+# Note: this suite uses unshare with `--mount --propagation private` and a
+# manual `mount -t proc` (not `--mount-proc`), consistent with the repo
+# convention to avoid EINVAL rejections on certain kernels.
 
 set -eu
 
@@ -74,21 +74,21 @@ WAIT11=${WAIT11:-6}
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
-fail() { printf 'GAGAL: %s\n' "$1" >&2; exit 1; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
-[ -x "$BIN" ] || fail "biner '$BIN' tidak ditemukan/tidak executable (jalankan: make)"
-[ -f "$BUSYBOX" ] || fail "busybox statis tidak ada di '$BUSYBOX' (apt-get install busybox-static)"
+[ -x "$BIN" ] || fail "binary '$BIN' not found/not executable (run: make)"
+[ -f "$BUSYBOX" ] || fail "static busybox missing at '$BUSYBOX' (apt-get install busybox-static)"
 for t in unshare chroot timeout grep mktemp; do
-	command -v "$t" >/dev/null 2>&1 || fail "perkakas '$t' tidak ditemukan"
+	command -v "$t" >/dev/null 2>&1 || fail "tool '$t' not found"
 done
-$SUDO true 2>/dev/null || fail "butuh root atau sudo tanpa password (unshare + chroot)"
+$SUDO true 2>/dev/null || fail "root or passwordless sudo required (unshare + chroot)"
 
-# Safety guard: suite ini menulis cgroup.kill dan rmdir di /sys/fs/cgroup/ninit.
-# Jika PID 1 host adalah ninit, suite ini akan membunuh inisialisasi host
-# (kernel panic). Abort sebelum menyentuh cgroup host apa pun.
+# Safety guard: this suite writes cgroup.kill and rmdir under /sys/fs/cgroup/ninit.
+# If the host's PID 1 is ninit, this suite would kill the host's init
+# (kernel panic). Abort before touching any host cgroup.
 pid1_comm=$(cat /proc/1/comm 2>/dev/null || true)
 if [ "$pid1_comm" = "ninit" ]; then
-	fail "PID 1 host adalah 'ninit' -- suite dilarang dijalankan pada host hidup (guard isolasi host)"
+	fail "the host's PID 1 is 'ninit' -- this suite is forbidden on a live host (host isolation guard)"
 fi
 
 CG_CONTROLLERS="/sys/fs/cgroup/cgroup.controllers"
@@ -108,20 +108,20 @@ LOGS=""
 HELPERS=""
 CG_DYNAMIC=""
 
-# Snapshot keberadaan /sys/fs/cgroup/ninit di host sebelum pengujian dimulai
+# Snapshot the existence of /sys/fs/cgroup/ninit on the host before testing starts
 HOST_NINIT_PREEXISTED=0
 [ -d /sys/fs/cgroup/ninit ] && HOST_NINIT_PREEXISTED=1
 
-# Sentinel Guard: cgroup eksternal independen di host untuk membuktikan
-# secara deterministik bahwa test suite TIDAK PERNAH menyentuh cgroup di luar RUN_CG.
+# Sentinel Guard: an independent external cgroup on the host to prove
+# deterministically that the test suite NEVER touches a cgroup outside RUN_CG.
 EXTERNAL_GUARD_CG="/sys/fs/cgroup/ninit-ext-guard-$$"
 if [ -e "$EXTERNAL_GUARD_CG" ]; then
-	fail "sentinel guard cgroup '$EXTERNAL_GUARD_CG' sudah ada (collision)"
+	fail "sentinel guard cgroup '$EXTERNAL_GUARD_CG' already exists (collision)"
 fi
-$SUDO mkdir "$EXTERNAL_GUARD_CG" || fail "gagal membuat sentinel guard cgroup"
+$SUDO mkdir "$EXTERNAL_GUARD_CG" || fail "failed to create the sentinel guard cgroup"
 
 # -----------------------------------------------------------------------------
-# 1. Isolasi $RUN_CG (Root Eksklusif Test) & Verifikasi Identitas Inode
+# 1. $RUN_CG isolation (Test Exclusive Root) & inode identity verification
 # -----------------------------------------------------------------------------
 RUN_ID="ninit-test-$$-$(date +%s%N 2>/dev/null || date +%s)"
 RUN_CG="/sys/fs/cgroup/$RUN_ID"
@@ -129,31 +129,31 @@ RUN_CG_BASE="$RUN_CG/ninit"
 NINIT_BASE="$RUN_CG_BASE"
 TEST_TRACKED_LEAVES=""
 
-# Poin 8: TEST_LEAVES murni sebagai daftar ekspektasi assertion (bukan sweep host)
+# Point 8: TEST_LEAVES is purely an assertion expectation list (not a host sweep)
 TEST_LEAVES="mem_test pids_test leak limits_audit valid_svc bad_mem1 bad_mem2 bad_mem3
 bad_cpu1 bad_cpu2 bad_cpu3 bad_pid1 bad_pid2 bad_pid3 stopper svc_nested boot_pr9 app_dep
 orphan_maker checker escape_svc pids_tree mem_cumul failopen_svc"
 
-# Poin 2: Strict mkdir tanpa -p, abort on collision
+# Point 2: Strict mkdir without -p, abort on collision
 if [ -e "$RUN_CG" ]; then
-	fail "cgroup collision: path '$RUN_CG' sudah ada sebelum test dimulai (abort)"
+	fail "cgroup collision: path '$RUN_CG' already exists before the test starts (abort)"
 fi
 
-$SUDO mkdir "$RUN_CG" || fail "gagal membuat isolasi root cgroup '$RUN_CG'"
+$SUDO mkdir "$RUN_CG" || fail "failed to create the cgroup isolation root '$RUN_CG'"
 
-# Poin 3: Catat identitas dev:ino tepat setelah pembuatan untuk proteksi TOCTOU/symlink
+# Point 3: Record the dev:ino identity right after creation for TOCTOU/symlink protection
 RUN_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$RUN_CG" 2>/dev/null || true)
-[ -n "$RUN_CG_DEV_INO" ] || fail "gagal membaca dev:ino untuk '$RUN_CG'"
+[ -n "$RUN_CG_DEV_INO" ] || fail "failed to read dev:ino for '$RUN_CG'"
 
-# Aktifkan controller memory, pids, cpu di $RUN_CG
+# Enable the memory, pids, cpu controllers on $RUN_CG
 for c in memory pids cpu; do
 	if grep -qw "$c" /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
 		echo "+$c" | $SUDO tee "$RUN_CG/cgroup.subtree_control" >/dev/null 2>&1 || true
 	fi
 done
 
-# Buat base cgroup layanan ninit di bawah $RUN_CG
-$SUDO mkdir "$RUN_CG_BASE" || fail "gagal membuat base cgroup '$RUN_CG_BASE'"
+# Create the ninit service base cgroup under $RUN_CG
+$SUDO mkdir "$RUN_CG_BASE" || fail "failed to create the base cgroup '$RUN_CG_BASE'"
 for c in memory pids cpu; do
 	if grep -qw "$c" /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
 		echo "+$c" | $SUDO tee "$RUN_CG_BASE/cgroup.subtree_control" >/dev/null 2>&1 || true
@@ -162,18 +162,18 @@ done
 
 INNER=$(mktemp /tmp/ninit-cginner.XXXXXX)
 
-# Verifikasi kepemilikan proses: membuktikan apakah proses dengan PID $1
-# berjalan di dalam cgroup isolasi test ($RUN_CG) DAN di dalam salah satu
-# root guest test ($ROOTS). Fail-closed: PID yang mati/tidak ada, cgroup
-# di luar RUN_CG, atau root di luar $ROOTS semuanya DITOLAK (return 1).
+# Process ownership verification: proves whether the process with PID $1 runs
+# inside the test isolation cgroup ($RUN_CG) AND inside one of the test guest
+# roots ($ROOTS). Fail-closed: a dead/missing PID, a cgroup outside RUN_CG, or
+# a root outside $ROOTS are all REJECTED (return 1).
 is_test_process() {
 	p=$1
-	# PID reuse guard: /proc/$p yang hilang TIDAK BOLEH dianggap milik test.
-	# Kondisi ini return 1 (fail-closed), bukan return 0.
+	# PID reuse guard: a missing /proc/$p must NOT be considered part of the test.
+	# This condition returns 1 (fail-closed), not 0.
 	[ -n "$p" ] && [ -d "/proc/$p" ] || return 1
 
-	# Verifikasi cgroup membership (cgroup v2, format "0::$path"):
-	# /sys/fs/cgroup$path harus berada di dalam atau turunan dari $RUN_CG.
+	# Verify cgroup membership (cgroup v2, format "0::$path"):
+	# /sys/fs/cgroup$path must be inside or a descendant of $RUN_CG.
 	if [ -n "${RUN_CG:-}" ] && [ -d "$RUN_CG" ]; then
 		p_cg_path=""
 		if [ -r "/proc/$p/cgroup" ]; then
@@ -192,7 +192,7 @@ is_test_process() {
 		return 1
 	fi
 
-	# Verifikasi chroot root: /proc/$p/root harus di bawah salah satu $ROOTS.
+	# Verify the chroot root: /proc/$p/root must be under one of $ROOTS.
 	p_root=$($SUDO readlink /proc/"$p"/root 2>/dev/null || true)
 	[ -n "$p_root" ] || return 1
 	for r in ${ROOTS:-}; do
@@ -205,32 +205,31 @@ is_test_process() {
 	return 1
 }
 
-# Poin 5 & 6: Cleanup parent-first cgroup.kill, lalu depth-first rmdir
+# Point 5 & 6: Parent-first cgroup.kill cleanup, then depth-first rmdir
 clean_run_cgroup() {
-	# Poin 4: Guard ${RUN_CG:-} dan ${RUN_CG_DEV_INO:-} aman pada semua fase setup
+	# Point 4: The ${RUN_CG:-} and ${RUN_CG_DEV_INO:-} guards are safe in every setup phase
 	[ -n "${RUN_CG:-}" ] || return 0
 	[ -n "${RUN_CG_DEV_INO:-}" ] || return 0
 	[ -d "$RUN_CG" ] || return 0
 
-	# Poin 1 & 3: Pastikan path bukan symlink dan identitas inode tidak berubah
+	# Point 1 & 3: Ensure the path is not a symlink and the inode identity is unchanged
 	if [ -L "$RUN_CG" ]; then
-		printf 'SECURITY: %s adalah symlink! Operasi pembersihan dibatalkan.\n' "$RUN_CG" >&2
+		printf 'SECURITY: %s is a symlink! The cleanup operation is aborted.\n' "$RUN_CG" >&2
 		return 1
 	fi
 	cur_dev_ino=$($SUDO stat -c '%d:%i' "$RUN_CG" 2>/dev/null || true)
 	if [ "$cur_dev_ino" != "$RUN_CG_DEV_INO" ]; then
-		printf 'SECURITY: dev:ino %s berubah (awal: %s, sekarang: %s)! Operasi dibatalkan.\n' 			"$RUN_CG" "$RUN_CG_DEV_INO" "$cur_dev_ino" >&2
+		printf 'SECURITY: dev:ino %s changed (initial: %s, now: %s)! Operation aborted.\n' 			"$RUN_CG" "$RUN_CG_DEV_INO" "$cur_dev_ino" >&2
 		return 1
 	fi
 
-	# Poin 5: Jalur cgroup.kill (kernel >= 5.14) -- bunuh SEMUA proses di
-	# seluruh subtree $RUN_CG sekaligus. Jika cgroup.kill tersedia DAN berhasil
-	# mengosongkan cgroup.procs di bawah $RUN_CG, pemindaian fallback manual
-	# TIDAK PERNAH dijalankan.
+	# Point 5: The cgroup.kill path (kernel >= 5.14) -- kill ALL processes in the
+	# whole $RUN_CG subtree at once. If cgroup.kill is available AND succeeds in
+	# emptying the cgroup.procs under $RUN_CG, the manual fallback scan is NEVER run.
 	kill_ok=0
 	if [ -f "$RUN_CG/cgroup.kill" ]; then
 		echo 1 | $SUDO tee "$RUN_CG/cgroup.kill" >/dev/null 2>&1 || true
-		# Tunggu cgroup.procs di bawah $RUN_CG menjadi kosong (polling <= ~1s).
+		# Wait for the cgroup.procs under $RUN_CG to become empty (polling <= ~1s).
 		waited=0
 		while [ "$waited" -lt 20 ]; do
 			remaining=0
@@ -246,8 +245,8 @@ clean_run_cgroup() {
 		done
 	fi
 
-	# Fallback (kernel < 5.14 atau cgroup.kill gagal mengosongkan proses):
-	# telusuri cgroup.procs di bawah $RUN_CG dan bunuh hanya proses milik test.
+	# Fallback (kernel < 5.14 or cgroup.kill failed to empty the processes):
+	# scan the cgroup.procs under $RUN_CG and kill only test-owned processes.
 	if [ "$kill_ok" -ne 1 ]; then
 		for pfile in $(find "$RUN_CG" -type f -name "cgroup.procs" 2>/dev/null); do
 			procs=$($SUDO cat "$pfile" 2>/dev/null || true)
@@ -259,7 +258,7 @@ clean_run_cgroup() {
 		done
 	fi
 
-	# Poin 6: rmdir depth-first strictly di dalam batasan $RUN_CG
+	# Point 6: Depth-first rmdir strictly within the $RUN_CG boundary
 	find "$RUN_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || {
 		sleep 0.1
 		find "$RUN_CG" -depth -mindepth 1 -type d -exec $SUDO rmdir {} + 2>/dev/null || true
@@ -272,12 +271,12 @@ clean_run_cgroup() {
 }
 
 cleanup() {
-	# 1. Bersihkan hierarki cgroup isolasi test.
-	# Trap safety: kegagalan dev:ino / inode TIDAK BOLEH membatalkan seluruh
-	# trap via set -e. Tahap pembersihan resource lain tetap dieksekusi.
-	clean_run_cgroup || printf 'WARN: clean_run_cgroup gagal (status %d), melanjutkan pembersihan resource lain...\n' $? >&2
+	# 1. Clean up the test isolation cgroup hierarchy.
+	# Trap safety: a dev:ino / inode failure must NOT abort the whole trap via
+	# set -e. The other resource cleanup stages still run.
+	clean_run_cgroup || printf 'WARN: clean_run_cgroup failed (status %d), continuing with the other resource cleanup...\n' $? >&2
 
-	# 2. Unmount dan bersihkan direktori guest test
+	# 2. Unmount and clean up the test guest directories
 	for d in ${ROOTS:-}; do
 		$SUDO umount -R "$d" 2>/dev/null || $SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d" 2>/dev/null || true
@@ -286,7 +285,7 @@ cleanup() {
 	for h in ${HELPERS:-}; do rm -f "$h" 2>/dev/null || true; done
 	$SUDO rm -f "$INNER" 2>/dev/null || true
 
-	# 3. Bersihkan cgroup dinamis/ephemeral tambahan
+	# 3. Clean up the additional dynamic/ephemeral cgroups
 	for cg in ${CG_DYNAMIC:-}; do
 		if [ -d "$cg" ] && [ ! -L "$cg" ]; then
 			if [ -f "$cg/cgroup.kill" ]; then
@@ -296,7 +295,7 @@ cleanup() {
 		fi
 	done
 
-	# 4. Bersihkan sentinel guard jika masih ada
+	# 4. Clean up the sentinel guard if it still exists
 	if [ -n "${EXTERNAL_GUARD_CG:-}" ] && [ -d "$EXTERNAL_GUARD_CG" ] && [ ! -L "$EXTERNAL_GUARD_CG" ]; then
 		$SUDO rmdir "$EXTERNAL_GUARD_CG" 2>/dev/null || true
 	fi
@@ -305,8 +304,8 @@ trap cleanup EXIT INT TERM
 
 fail_count=0
 ok()   { printf '  [ OK ]   %s\n' "$1"; }
-bad()  { printf '  [GAGAL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
-skip() { printf '  [ -- ]   %s\n' "$1"; }
+bad()  { printf '  [FAIL] %s\n' "$1"; fail_count=$((fail_count + 1)); }
+skip() { printf '  [SKIP]   %s\n' "$1"; }
 check_in()  { if grep -q "$3" "$2" 2>/dev/null; then ok "$1"; else bad "$1"; fi; }
 absent_in() { if grep -q "$3" "$2" 2>/dev/null; then bad "$1"; else ok "$1"; fi; }
 before_in() {
@@ -336,7 +335,7 @@ new_log() {
 boot_guest() {
 	root=$1; secs=$2; cg=${3:-}; extra_setup=${4:-}
 
-	# Daftarkan leaf cgroup dari init.conf ke TEST_TRACKED_LEAVES
+	# Register the cgroup leaves from init.conf into TEST_TRACKED_LEAVES
 	if [ -f "$root/etc/init.conf" ]; then
 		while IFS= read -r line || [ -n "$line" ]; do
 			case "$line" in
@@ -369,7 +368,7 @@ EOI
 		--mount --propagation private /bin/sh $INNER" || true
 }
 
-# Siapkan biner bantuan statis untuk alokasi memori berlebih dan pengujian fork
+# Prepare static helper binaries for overallocation and fork tests
 HOG_BIN=""
 FORK_BIN=""
 ESCAPE_BIN=""
@@ -393,8 +392,8 @@ if command -v gcc >/dev/null 2>&1; then
 #include <string.h>
 #include <unistd.h>
 int main(void) {
-    /* Alokasikan secara agresif tanpa jeda agar melampaui batas memory.max
-       (16M) dan langsung memicu OOM killer secara deterministik */
+    /* Allocate aggressively without a pause so the memory.max limit (16M) is
+       exceeded and the OOM killer is triggered deterministically */
     for (int i = 0; i < 256; i++) {
         void *p = malloc(1024 * 1024);
         if (!p) return 1;
@@ -446,11 +445,11 @@ EOF
 
 int main(void) {
     /* =========================================================================
-     * INSTRUKSI PERTAMA (SEBELUM FORK):
-     * Baca /proc/self/cgroup dan verifikasi bahwa proses SUDAH berada di leaf
-     * cgroup (/ninit/... atau escape_svc).
-     * Biner tanpa handshake melihat cgroup root (0::/) -> GAGAL deterministik.
-     * Biner dengan handshake T1 dijamin sudah berada di leaf -> LULUS.
+     * FIRST INSTRUCTION (BEFORE FORK):
+     * Read /proc/self/cgroup and verify that the process is ALREADY in a leaf
+     * cgroup (/ninit/... or escape_svc).
+     * A binary without the handshake sees the root cgroup (0::/) -> deterministic FAIL.
+     * A binary with the T1 handshake is guaranteed to be in the leaf -> PASS.
      * ========================================================================= */
     int in_leaf = 0;
     char cgroup_line[256] = {0};
@@ -466,14 +465,14 @@ int main(void) {
     }
 
     if (!in_leaf) {
-        /* Biner tanpa handshake: cgroup root / belum di leaf cgroup -> GAGAL */
+        /* Binary without the handshake: root cgroup / not yet in a leaf cgroup -> FAIL */
         FILE *fa = fopen("/var/escape_audit.txt", "w");
         if (fa) {
             fprintf(fa, "PRE_FORK_LEAF_CGROUP=0\nFAILED_REASON=not_in_leaf_cgroup\n");
             fflush(fa);
             fclose(fa);
         }
-        return 1; /* Keluar segera, tidak ada fork anak atau cucu */
+        return 1; /* Exit immediately, no child or grandchild fork */
     }
 
     pid_t leader_pid = getpid();
@@ -482,7 +481,7 @@ int main(void) {
     pid_t child = fork();
     if (child < 0) return 1;
     if (child > 0) {
-        /* Leader: tunggu hingga cucu selesai menulis bukti audit, lalu exit 0 */
+        /* Leader: wait until the grandchild finishes writing the audit evidence, then exit 0 */
         int waited = 0;
         while (access("/var/escape_audit.txt", F_OK) != 0 && waited < 40) {
             usleep(50000);
@@ -582,9 +581,9 @@ int main(void) {
             FILE *f3 = fopen("/var/pids_tree_audit.txt", "a");
             if (f3) { fprintf(f3, "GEN3_PID=%d\n", getpid()); fflush(f3); fclose(f3); }
 
-            /* Kuota cgroup pids_max=3.
-               Saat ini ada 3 proses: p1 (leader), p2 (child), p3 (grandchild).
-               Grandchild (depth 3) mencoba fork Great-grandchild (Gen 4). */
+            /* The cgroup pids_max=3 quota.
+               There are currently 3 processes: p1 (leader), p2 (child), p3 (grandchild).
+               The grandchild (depth 3) tries to fork a great-grandchild (Gen 4). */
             errno = 0;
             pid_t p4 = fork();
             FILE *f4 = fopen("/var/pids_tree_audit.txt", "a");
@@ -642,12 +641,12 @@ static void auditf(const char *fmt, ...) {
     audit_msg(buf);
 }
 
-/* Fork seorang worker yang mengalokasi dan MENYENTUH WORKER_MB MB.
-   Penulisan volatile per halaman wajib: tanpa itu gcc -O2 mengubah
-   malloc+memset menjadi alokasi lazim (calloc) yang tidak pernah menagih
-   halaman, sehingga batas kumulatif tidak pernah terlampaui.
-   adj menaikkan oom_score_adj worker supaya kernel memilih worker
-   (bukan leader) sebagai korban OOM saat kuota terlampaui. */
+/* Fork a worker that allocates and TOUCHES WORKER_MB MB.
+   Volatile per-page writes are mandatory: without them gcc -O2 turns
+   malloc+memset into a lazy (calloc) allocation that never charges the pages,
+   so the cumulative limit is never exceeded.
+   adj raises the worker's oom_score_adj so the kernel picks the worker
+   (not the leader) as the OOM victim when the quota is exceeded. */
 static pid_t spawn_worker(int id, const char *tag, int adj) {
     pid_t p = fork();
     if (p < 0) return -1;
@@ -664,7 +663,7 @@ static pid_t spawn_worker(int id, const char *tag, int adj) {
             m[sz - 1] = 0x5A;
         }
         auditf("%s_WORKER%d_ALLOCATED_12M\n", tag, id);
-        /* Tahan memori sampai OOM killer atau leader menghentikan worker. */
+        /* Hold the memory until the OOM killer or the leader stops the worker. */
         for (;;) sleep(60);
         _exit(0);
     }
@@ -697,21 +696,21 @@ static int child_alive(pid_t pid) {
 }
 
 int main(void) {
-    /* Lindungi leader agar tidak menjadi korban OOM killer kernel.
-       Hanya proses worker anak yang boleh dipilih sebagai target OOM. */
+    /* Protect the leader so it does not become the kernel OOM killer's victim.
+       Only child worker processes may be chosen as OOM targets. */
     int oom_fd = open("/proc/self/oom_score_adj", O_WRONLY);
     if (oom_fd >= 0) {
         dprintf(oom_fd, "-1000\n");
         close(oom_fd);
     }
 
-    /* ---- Fase kontrol (anti-hampa): 2 worker x 12MB = 24MB < 32MB.
-       Keduanya harus bertahan tanpa OOM killer. ---- */
+    /* ---- Control phase (anti-vacuous): 2 workers x 12MB = 24MB < 32MB.
+       Both must survive without the OOM killer. ---- */
     pid_t c1 = spawn_worker(1, "CONTROL", 1000);
     pid_t c2 = spawn_worker(2, "CONTROL", 1000);
     int c1_ok = wait_for_marker("CONTROL_WORKER1_ALLOCATED_12M", 2000);
     int c2_ok = wait_for_marker("CONTROL_WORKER2_ALLOCATED_12M", 2000);
-    usleep(500000); /* jendela pengamatan: OOM killer tidak boleh menembak */
+    usleep(500000); /* observation window: the OOM killer must not fire */
     int c1_alive = child_alive(c1);
     int c2_alive = child_alive(c2);
     if (c1_ok && c2_ok && c1_alive && c2_alive)
@@ -719,16 +718,16 @@ int main(void) {
     else
         audit_msg("CONTROL_2_WORKERS_NO_OOM=0\n");
 
-    /* Bersihkan worker kontrol sebelum fase uji. */
+    /* Clean up the control workers before the test phase. */
     if (c1 > 0) { kill(c1, SIGKILL); waitpid(c1, NULL, 0); }
     if (c2 > 0) { kill(c2, SIGKILL); waitpid(c2, NULL, 0); }
-    usleep(100000); /* beri jeda waktu kernel me-reclaim halaman cgroup */
+    usleep(100000); /* give the kernel time to reclaim the cgroup pages */
 
-    /* ---- Fase uji: 3 worker x 12MB = 36MB > 32MB.
-       Spawn worker 1 & 2 secara bertahap untuk memastikan keduanya memegang
-       24MB secara paralel tanpa OOM sebelum worker 3 mendorong akumulasi
-       melampaui kuota 32MB. OOM killer kernel harus mematikan worker;
-       leader TIDAK mengalokasi memori besar dan TIDAK memanggil raise(SIGKILL). ---- */
+    /* ---- Test phase: 3 workers x 12MB = 36MB > 32MB.
+       Spawn workers 1 & 2 gradually to ensure both hold 24MB in parallel
+       without OOM before worker 3 pushes the accumulation past the 32MB quota.
+       The kernel OOM killer must kill a worker; the leader does NOT allocate
+       large amounts and does NOT call raise(SIGKILL). ---- */
     audit_msg("TEST_WORKERS_FORKED=3\n");
     pid_t w[3];
     w[0] = spawn_worker(1, "TEST", 1000);
@@ -755,7 +754,7 @@ int main(void) {
     auditf("WORKER_KILLED_BY_OOM=%d\n", oom_kills > 0);
     auditf("OOM_KILLED_WORKERS=%d\n", oom_kills);
 
-    /* Sapu bersih sisa worker sebelum leader keluar (leader bertahan hidup). */
+    /* Sweep the remaining workers before the leader exits (the leader survives). */
     for (int i = 0; i < 3; i++) {
         if (w[i] > 0) {
             if (waitpid(w[i], &st, WNOHANG) == 0)
@@ -770,16 +769,16 @@ EOF
 	gcc -static -O2 "$CUMUL_MEM_SRC" -o "$CUMUL_MEM_BIN" 2>/dev/null || CUMUL_MEM_BIN=""
 fi
 
-printf '== biner uji : %s\n' "$BIN"
+printf '== test binary : %s\n' "$BIN"
 
-# ------------------------------------------------------------- Skenario 1
-# Batas Memori (memory.max) & Deterministic OOM Killer
-# Layanan dibatasi memory_max=16M. Workload mengalokasikan dan menyentuh memori
-# hingga melebihi batas. Kernel cgroup v2 memicu OOM killer (SIGKILL, exit 0x9).
-# Init PID 1 menangani exit status=0x9 tanpa crash dan membersihkan leaf cgroup.
-printf '\n== Skenario 1: Batas memori (memory_max=16M) & deterministic OOM ==\n'
+# ------------------------------------------------------------- Scenario 1
+# Memory limit (memory.max) & deterministic OOM killer
+# The service is limited to memory_max=16M. The workload allocates and touches
+# memory past the limit. The cgroup v2 kernel triggers the OOM killer (SIGKILL, exit 0x9).
+# Init PID 1 handles exit status=0x9 without crashing and cleans up the leaf cgroup.
+printf '\n== Scenario 1: memory limit (memory_max=16M) & deterministic OOM ==\n'
 if [ "$has_cg2" -ne 1 ] || [ "$has_mem" -ne 1 ] || [ -z "$HOG_BIN" ]; then
-	skip "skenario 1 dilewati: cgroup v2 + controller memory tidak tersedia atau gcc tidak ada"
+	skip "scenario 1 skipped: cgroup v2 + memory controller unavailable or gcc missing"
 else
 	R1=$(new_root sleep)
 	L1=$(new_log)
@@ -790,24 +789,24 @@ else
 		> "$R1/etc/init.conf"
 	boot_guest "$R1" "$WAIT1" >"$L1" 2>&1
 
-	check_in  "konfigurasi limit memory.max diterapkan" "$L1" \
+	check_in  "memory.max limit configuration applied" "$L1" \
 		"cgroup: 'mem_test' memory.max = 16M"
-	check_in  "layanan mem_test dihentikan deterministik oleh OOM (exit status=0x9)" "$L1" \
+	check_in  "mem_test service deterministically stopped by OOM (exit status=0x9)" "$L1" \
 		'mem_test (pid .* exit status=0x9'
-	check_in  "leaf cgroup dibersihkan setelah OOM" "$L1" \
-		"cgroup: dibersihkan 'mem_test'"
-	check_in  "event loop tetap jalan dan shutdown bersih" "$L1" \
+	check_in  "leaf cgroup cleaned up after OOM" "$L1" \
+		"cgroup: cleaned up 'mem_test'"
+	check_in  "event loop keeps running and shutdown is clean" "$L1" \
 		'graceful shutdown'
 fi
 
-# ------------------------------------------------------------- Skenario 2
-# Batas PIDs (pids.max) & Deterministic Fork EAGAIN
-# Layanan dibatasi pids_max=5. Proses induk melakukan loop fork anak proses.
-# Setelah proses di dalam cgroup mencapai 5, panggilan fork() berikutnya
-# deterministik ditolak dengan EAGAIN (Resource temporarily unavailable).
-printf '\n== Skenario 2: Batas proses (pids_max=5) & deterministic fork EAGAIN ==\n'
+# ------------------------------------------------------------- Scenario 2
+# PIDs limit (pids.max) & deterministic fork EAGAIN
+# The service is limited to pids_max=5. The parent process loops forking children.
+# Once the processes inside the cgroup reach 5, the next fork() call is
+# deterministically rejected with EAGAIN (Resource temporarily unavailable).
+printf '\n== Scenario 2: process limit (pids_max=5) & deterministic fork EAGAIN ==\n'
 if [ "$has_cg2" -ne 1 ] || [ "$has_pids" -ne 1 ] || [ -z "$FORK_BIN" ]; then
-	skip "skenario 2 dilewati: cgroup v2 + controller pids tidak tersedia atau gcc tidak ada"
+	skip "scenario 2 skipped: cgroup v2 + pids controller unavailable or gcc missing"
 else
 	R2=$(new_root sleep)
 	L2=$(new_log)
@@ -818,24 +817,24 @@ else
 		> "$R2/etc/init.conf"
 	boot_guest "$R2" "$WAIT2" >"$L2" 2>&1
 
-	check_in  "konfigurasi limit pids.max diterapkan" "$L2" \
+	check_in  "pids.max limit configuration applied" "$L2" \
 		"cgroup: 'pids_test' pids.max = 5"
-	check_in  "fork melebihi batas ditolak deterministik dengan EAGAIN" "$R2/var/pids_audit.txt" \
+	check_in  "fork past the limit deterministically rejected with EAGAIN" "$R2/var/pids_audit.txt" \
 		'EAGAIN_CONFIRMED count=4'
-	check_in  "leaf cgroup dibersihkan setelah selesai" "$L2" \
-		"cgroup: dibersihkan 'pids_test'"
-	check_in  "event loop tetap jalan dan shutdown bersih" "$L2" \
+	check_in  "leaf cgroup cleaned up after completion" "$L2" \
+		"cgroup: cleaned up 'pids_test'"
+	check_in  "event loop keeps running and shutdown is clean" "$L2" \
 		'graceful shutdown'
 fi
 
-# ------------------------------------------------------------- Skenario 3
-# Pembersihan Siklus Hidup saat Respawn (Lifecycle Orphan Clean Sweep)
-# Layanan respawn membuat proses anak di background (`sleep 300 &`) lalu
-# pemimpin keluar. `cgroup_kill_service` harus menyapu bersih seluruh proses
-# anak/orphan sebelum generasi baru dihidupkan pada jeda RESPAWN_DELAY.
-printf '\n== Skenario 3: Pembersihan orphan saat respawn (cgroup_kill_service) ==\n'
+# ------------------------------------------------------------- Scenario 3
+# Lifecycle cleanup on respawn (lifecycle orphan clean sweep)
+# The respawn service creates background child processes (`sleep 300 &`) and then
+# the leader exits. `cgroup_kill_service` must sweep all child/orphan processes
+# clean before the new generation is started after the RESPAWN_DELAY pause.
+printf '\n== Scenario 3: orphan cleanup on respawn (cgroup_kill_service) ==\n'
 if [ "$has_cg2" -ne 1 ]; then
-	skip "skenario 3 dilewati: cgroup v2 tidak tersedia"
+	skip "scenario 3 skipped: cgroup v2 unavailable"
 else
 	R3=$(new_root sleep)
 	L3=$(new_log)
@@ -850,7 +849,7 @@ if [ ! -f /var/gen1_started ]; then
     /bin/sleep 0.2
     exit 0
 else
-    # Generasi 2: periksa apakah ada proses sleep orphan dari Gen 1 yang bertahan
+    # Generation 2: check whether any orphan sleep process from Gen 1 survived
     touch /var/gen2_started
     lingering=0
     for d in /proc/[0-9]*; do
@@ -867,29 +866,30 @@ EOF
 	printf 'leak:respawn:/bin/sh /bin/leak.sh\n' > "$R3/etc/init.conf"
 	boot_guest "$R3" "$WAIT3" >"$L3" 2>&1
 
-	check_in  "layanan leak generasi 1 dijalankan" "$L3" \
+	check_in  "generation 1 leak service ran" "$L3" \
 		"started leak (pid "
-	check_in  "respawn generasi 1 ditunda timer" "$L3" \
-		'leak: respawn ditunda'
+	check_in  "generation 1 respawn delayed by the timer" "$L3" \
+		'leak: respawn delayed'
 	if [ -f "$R3/var/gen2_started" ]; then
-		ok "layanan leak generasi 2 berhasil dijalankan kembali"
+		ok "generation 2 leak service successfully restarted"
 	else
-		bad "layanan leak generasi 2 berhasil dijalankan kembali"
+		bad "generation 2 leak service successfully restarted"
 	fi
-	check_in  "orphan generasi 1 disapu bersih tanpa sisa (LINGERING_ORPHANS=0)" "$R3/var/leak_audit.txt" \
+	check_in  "generation 1 orphans swept clean with no leftovers (LINGERING_ORPHANS=0)" "$R3/var/leak_audit.txt" \
 		'LINGERING_ORPHANS=0'
-	check_in  "leaf cgroup dibersihkan saat shutdown" "$L3" \
-		"cgroup: dibersihkan 'leak'"
+	check_in  "leaf cgroup cleaned up at shutdown" "$L3" \
+		"cgroup: cleaned up 'leak'"
 fi
 
-# ------------------------------------------------------------- Skenario 4
-# Verifikasi Leaf Cgroup (memory.max, cpu.max, pids.max) & Urutan Opsi Bebas
-# Memverifikasi bahwa nilai konfigurasi tertulis langsung ke filesystem cgroup
-# pada leaf node layanan, dan opsi konfigurasi diproses secara benar meskipun
-# urutan tag dibalik (:pids_max=...:cpu_max=...:memory_max=...).
-printf '\n== Skenario 4: Verifikasi nilai leaf cgroup & urutan opsi bebas ==\n'
+# ------------------------------------------------------------- Scenario 4
+# Leaf cgroup verification (memory.max, cpu.max, pids.max) & free option order
+# Verifies that the configuration values are written directly to the cgroup
+# filesystem at the service leaf node, and that the configuration options are
+# processed correctly even when the tag order is reversed
+# (:pids_max=...:cpu_max=...:memory_max=...).
+printf '\n== Scenario 4: leaf cgroup values & free option order ==\n'
 if [ "$has_cg2" -ne 1 ]; then
-	skip "skenario 4 dilewati: cgroup v2 tidak tersedia"
+	skip "scenario 4 skipped: cgroup v2 unavailable"
 else
 	R4=$(new_root cat sleep)
 	L4=$(new_log)
@@ -899,57 +899,57 @@ else
 		"$RUN_CG_BASE" "$RUN_CG_BASE" "$RUN_CG_BASE" > "$R4/etc/init.conf"
 	boot_guest "$R4" "$WAIT4" >"$L4" 2>&1
 
-	check_in "konfigurasi memory.max tercatat di log" "$L4" \
+	check_in "memory.max configuration logged" "$L4" \
 		"cgroup: 'limits_audit' memory.max = 32M"
-	check_in "konfigurasi cpu.max tercatat di log" "$L4" \
+	check_in "cpu.max configuration logged" "$L4" \
 		"cgroup: 'limits_audit' cpu.max = 50000 100000"
-	check_in "konfigurasi pids.max tercatat di log" "$L4" \
+	check_in "pids.max configuration logged" "$L4" \
 		"cgroup: 'limits_audit' pids.max = 20"
 	if [ "$has_mem" -eq 1 ]; then
-		check_in "nilai leaf memory.max terbaca 32M (33554432 byte)" "$R4/var/mem.val" \
+		check_in "leaf memory.max value reads 32M (33554432 bytes)" "$R4/var/mem.val" \
 			'33554432'
 	else
-		skip "pembacaan leaf memory.max dilewati: controller memory tidak aktif"
+		skip "leaf memory.max read skipped: memory controller not active"
 	fi
 	if [ "$has_cpu" -eq 1 ]; then
-		check_in "nilai leaf cpu.max terbaca 50000 100000" "$R4/var/cpu.val" \
+		check_in "leaf cpu.max value reads 50000 100000" "$R4/var/cpu.val" \
 			'50000 100000'
 	else
-		skip "pembacaan leaf cpu.max dilewati: controller cpu tidak aktif"
+		skip "leaf cpu.max read skipped: cpu controller not active"
 	fi
 	if [ "$has_pids" -eq 1 ]; then
-		check_in "nilai leaf pids.max terbaca 20" "$R4/var/pids.val" \
+		check_in "leaf pids.max value reads 20" "$R4/var/pids.val" \
 			'20'
 	else
-		skip "pembacaan leaf pids.max dilewati: controller pids tidak aktif"
+		skip "leaf pids.max read skipped: pids controller not active"
 	fi
-	check_in "leaf cgroup dibersihkan setelah selesai" "$L4" \
-		"cgroup: dibersihkan 'limits_audit'"
+	check_in "leaf cgroup cleaned up after completion" "$L4" \
+		"cgroup: cleaned up 'limits_audit'"
 fi
 
-# ------------------------------------------------------------- Skenario 5
-# Validasi Parser Limit Resource (Valid vs Invalid/Malformed)
-# Memverifikasi bahwa parser menerima format limit yang valid (memory_max,
-# cpu_max, pids_max) dan menolak nilai rusak/malformed dengan log peringatan
-# tanpa menyebabkan crash pada PID 1.
-printf '\n== Skenario 5: Validasi parser batas resource (valid vs malformed) ==\n'
+# ------------------------------------------------------------- Scenario 5
+# Resource limit parser validation (valid vs invalid/malformed)
+# Verifies that the parser accepts valid limit formats (memory_max, cpu_max,
+# pids_max) and rejects broken/malformed values with a warning log, without
+# causing PID 1 to crash.
+printf '\n== Scenario 5: resource limit parser validation (valid vs malformed) ==\n'
 R5=$(new_root sleep true)
 L5=$(new_log)
 ROOTS="$ROOTS $R5"
 LOGS="$LOGS $L5"
 
 cat > "$R5/etc/init.conf" << 'EOF'
-# Layanan dengan opsi valid
+# Service with valid options
 valid_svc:once:/bin/sh -c "echo VALID_OK > /var/valid.txt":memory_max=64M:cpu_max=50000 100000:pids_max=25
-# Layanan dengan opsi memory_max rusak (suffix invalid, huruf acak, angka negatif)
+# Service with a broken memory_max option (invalid suffix, random letters, negative number)
 bad_mem1:once:/bin/true:memory_max=64MB
 bad_mem2:once:/bin/true:memory_max=-100M
 bad_mem3:once:/bin/true:memory_max=corrupted!@#
-# Layanan dengan opsi cpu_max rusak (non-numerik, spasi berlebih, format token salah)
+# Service with a broken cpu_max option (non-numeric, extra spaces, wrong token format)
 bad_cpu1:once:/bin/true:cpu_max=invalid 100000
 bad_cpu2:once:/bin/true:cpu_max=50000  100000
 bad_cpu3:once:/bin/true:cpu_max=50000
-# Layanan dengan opsi pids_max rusak (angka negatif, karakter non-numerik, nol)
+# Service with a broken pids_max option (negative number, non-numeric characters, zero)
 bad_pid1:once:/bin/true:pids_max=-5
 bad_pid2:once:/bin/true:pids_max=invalid
 bad_pid3:once:/bin/true:pids_max=0
@@ -959,30 +959,30 @@ EOF
 
 boot_guest "$R5" "$WAIT5" >"$L5" 2>&1
 
-check_in  "peringatan memory_max invalid dicatat di log" "$L5" \
-	"memory_max '64MB' tidak valid"
-check_in  "peringatan cpu_max invalid dicatat di log" "$L5" \
-	"cpu_max 'invalid 100000' tidak valid"
-check_in  "peringatan pids_max invalid dicatat di log" "$L5" \
-	"pids_max '-5' tidak valid"
-check_in  "layanan dengan limit valid tetap berjalan normal" "$R5/var/valid.txt" \
+check_in  "invalid memory_max warning logged" "$L5" \
+	"invalid memory_max '64MB'"
+check_in  "invalid cpu_max warning logged" "$L5" \
+	"invalid cpu_max 'invalid 100000'"
+check_in  "invalid pids_max warning logged" "$L5" \
+	"invalid pids_max '-5'"
+check_in  "service with valid limits still runs normally" "$R5/var/valid.txt" \
 	'VALID_OK'
-check_in  "limit valid diterapkan ke leaf cgroup" "$L5" \
+check_in  "valid limit applied to the leaf cgroup" "$L5" \
 	"cgroup: 'valid_svc' memory.max = 64M"
-absent_in "limit memory_max rusak TIDAK pernah diterapkan" "$L5" \
+absent_in "broken memory_max limit was NEVER applied" "$L5" \
 	"memory.max = 64MB"
-absent_in "limit cpu_max rusak TIDAK pernah diterapkan" "$L5" \
+absent_in "broken cpu_max limit was NEVER applied" "$L5" \
 	"cpu.max = invalid"
-absent_in "limit pids_max rusak TIDAK pernah diterapkan" "$L5" \
+absent_in "broken pids_max limit was NEVER applied" "$L5" \
 	"pids.max = -5"
-check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L5" \
+check_in  "event loop stays stable and shutdown is clean" "$L5" \
 	'graceful shutdown'
 
-# ------------------------------------------------------------- Skenario 6
-# Toleransi Environment Subtree Cgroup (Nested / Partial Subtree Control)
-# Memverifikasi bahwa penulisan subtree control yang gagal atau berstatus
-# partial di environment nested/container tidak menggagalkan booting ninit.
-printf '\n== Skenario 6: Toleransi environment root cgroup (nested / partial) ==\n'
+# ------------------------------------------------------------- Scenario 6
+# Subtree control environment tolerance (nested / partial subtree control)
+# Verifies that failed or partial subtree control writes in a nested/container
+# environment do not break ninit's boot.
+printf '\n== Scenario 6: cgroup root environment tolerance (nested / partial) ==\n'
 R6=$(new_root sleep)
 L6=$(new_log)
 ROOTS="$ROOTS $R6"
@@ -992,26 +992,27 @@ cat > "$R6/etc/init.conf" << 'EOF'
 svc_nested:once:/bin/sh -c "echo NESTED_OK > /var/nested.txt && echo poweroff > /run/initctl":pids_max=10
 EOF
 
-# Siapkan lingkungan nested cgroup tiruan dengan subtree_control read-only pada tmpfs
+# Prepare a simulated nested cgroup environment with a read-only subtree_control on tmpfs
 setup_r6="mount -t sysfs sysfs $R6/sys; mkdir -p $R6/sys/fs/cgroup; mount -t tmpfs tmpfs $R6/sys/fs/cgroup; touch $R6/sys/fs/cgroup/cgroup.controllers; echo pids > $R6/sys/fs/cgroup/cgroup.controllers; touch $R6/sys/fs/cgroup/cgroup.subtree_control; mount -o remount,ro $R6/sys/fs/cgroup;"
 
 boot_guest "$R6" "$WAIT6" "" "$setup_r6" >"$L6" 2>&1
 
-check_in  "kegagalan buka/tulis subtree_control ditoleransi dengan log" "$L6" \
-	'buka .*subtree_control gagal'
-check_in  "toleransi nested/container tercatat di log" "$L6" \
-	'toleransi nested/container'
-check_in  "layanan berhasil di-spawn meskipun subtree_control terhambat" "$R6/var/nested.txt" \
+check_in  "subtree_control open/write failure tolerated with a log" "$L6" \
+	'open .*subtree_control failed'
+check_in  "nested/container tolerant recorded in the log" "$L6" \
+	'nested/container tolerant'
+check_in  "service spawned successfully despite the blocked subtree_control" "$R6/var/nested.txt" \
 	'NESTED_OK'
-check_in  "sistem masuk ke main loop dan shutdown bersih" "$L6" \
+check_in  "system enters the main loop and shutdown is clean" "$L6" \
 	'graceful shutdown'
 
-# ------------------------------------------------------------- Skenario 7
-# Interaksi PR #9: Layanan 'once' dengan pids_max=1 fork EAGAIN -> FAILED -> Batalkan Dependen
-# Memverifikasi bahwa cgroup resource exhaustion pada proses init memicu fork EAGAIN
-# deterministik, layanan tipe 'once' mencoba ulang hingga MAX_SPAWN_RETRY (3x),
-# lalu bertransisi ke state FAILED, dan membatalkan layanan dependen deterministik.
-printf '\n== Skenario 7: Interaksi PR #9 (once + pids.max=1 fork EAGAIN -> FAILED) ==\n'
+# ------------------------------------------------------------- Scenario 7
+# PR #9 interaction: a 'once' service with pids_max=1 fork EAGAIN -> FAILED -> cancel dependents
+# Verifies that cgroup resource exhaustion on the init process triggers a
+# deterministic fork EAGAIN, the 'once' service retries up to MAX_SPAWN_RETRY (3x),
+# then transitions to the FAILED state, and deterministically cancels its
+# dependent services.
+printf '\n== Scenario 7: PR #9 interaction (once + pids.max=1 fork EAGAIN -> FAILED) ==\n'
 CG_PR9=""
 pids_available=0
 if [ "$has_cg2" -eq 1 ] && [ "$has_pids" -eq 1 ]; then
@@ -1023,7 +1024,7 @@ if [ "$has_cg2" -eq 1 ] && [ "$has_pids" -eq 1 ]; then
 fi
 
 if [ "$pids_available" -ne 1 ]; then
-	skip "skenario 7 dilewati: cgroup v2 + controller pids tidak tersedia atau gagal disiapkan"
+	skip "scenario 7 skipped: cgroup v2 + pids controller unavailable or failed to prepare"
 else
 	R7=$(new_root)
 	L7=$(new_log)
@@ -1033,30 +1034,30 @@ else
 	printf 'boot_pr9:once:exit 0\napp_dep:respawn:exit 0:requires=boot_pr9\n' > "$R7/etc/init.conf"
 	boot_guest "$R7" "$WAIT7" "$CG_PR9" >"$L7" 2>&1
 
-	check_in  "event loop tetap masuk dan responsif" "$L7" 'main loop siap'
-	check_in  "kegagalan fork() terdeteksi karena cgroup pids habis" "$L7" \
+	check_in  "event loop still entered and responsive" "$L7" 'main loop ready'
+	check_in  "fork() failure detected because the cgroup pids are exhausted" "$L7" \
 		'fork boot_pr9: Resource temporarily unavailable'
-	check_in  "layanan once mencoba ulang hingga batas lalu dinyatakan gagal" "$L7" \
-		'percobaan, layanan dinyatakan gagal'
-	check_in  "layanan dependen dibatalkan deterministik" "$L7" \
-		"layanan 'app_dep' dibatalkan: dependensi 'boot_pr9' gagal"
-	absent_in "boot_pr9 tidak pernah berhasil di-spawn" "$L7" 'started boot_pr9'
-	absent_in "app_dep tidak pernah di-spawn saat dependensi gagal" "$L7" 'fork app_dep'
+	check_in  "once service retries up to the limit then is marked failed" "$L7" \
+		'attempts, service marked failed'
+	check_in  "dependent service deterministically cancelled" "$L7" \
+		"service 'app_dep' cancelled: dependency 'boot_pr9' failed"
+	absent_in "boot_pr9 never spawned successfully" "$L7" 'started boot_pr9'
+	absent_in "app_dep never spawned when the dependency failed" "$L7" 'fork app_dep'
 	nfork=$(grep -c 'fork boot_pr9' "$L7" 2>/dev/null || true)
 	if [ "${nfork:-0}" -le 3 ]; then
-		ok "jumlah percobaan fork() boot_pr9 terbatas: $nfork (maks 3, tanpa busy-loop)"
+		ok "boot_pr9 fork() attempts limited: $nfork (max 3, no busy-loop)"
 	else
-		bad "percobaan fork() boot_pr9 tidak terbatas: $nfork baris (dugaan busy-loop)"
+		bad "boot_pr9 fork() attempts unbounded: $nfork lines (suspected busy-loop)"
 	fi
 fi
 
-# ------------------------------------------------------------- Skenario 8
-# Pembersihan Siklus Hidup Orphan pada Layanan 'once' (cgroup_kill_service sebelum rmdir)
-# Memverifikasi bahwa proses anak/orphan yang ditinggalkan layanan 'once' disapu bersih
-# via cgroup.kill sebelum pemanggilan rmdir leaf cgroup.
-printf '\n== Skenario 8: Pembersihan orphan pada layanan once sebelum rmdir ==\n'
+# ------------------------------------------------------------- Scenario 8
+# Orphan lifecycle cleanup on a 'once' service (cgroup_kill_service before rmdir)
+# Verifies that the child/orphan processes left by a 'once' service are swept
+# clean via cgroup.kill before the leaf cgroup rmdir call.
+printf '\n== Scenario 8: orphan cleanup on a once service before rmdir ==\n'
 if [ "$has_cg2" -ne 1 ]; then
-	skip "skenario 8 dilewati: cgroup v2 tidak tersedia"
+	skip "scenario 8 skipped: cgroup v2 unavailable"
 else
 	R8=$(new_root sleep grep)
 	L8=$(new_log)
@@ -1095,32 +1096,33 @@ EOF
 
 	boot_guest "$R8" "$WAIT8" >"$L8" 2>&1
 
-	check_in  "layanan orphan_maker dijalankan" "$L8" \
+	check_in  "orphan_maker service ran" "$L8" \
 		'started orphan_maker'
-	check_in  "leaf cgroup orphan_maker berhasil dibersihkan tanpa EBUSY" "$L8" \
-		"cgroup: dibersihkan 'orphan_maker'"
-	absent_in "tidak ada kegagalan rmdir leaf cgroup" "$L8" \
+	check_in  "orphan_maker leaf cgroup cleaned up without EBUSY" "$L8" \
+		"cgroup: cleaned up 'orphan_maker'"
+	absent_in "no leaf cgroup rmdir failure" "$L8" \
 		"Device or resource busy"
-	check_in  "orphan dari layanan once disapu bersih sebelum checker (LINGERING_ONCE_ORPHANS=0)" \
+	check_in  "orphans from the once service swept clean before the checker (LINGERING_ONCE_ORPHANS=0)" \
 		"$R8/var/once_orphan_audit.txt" 'LINGERING_ONCE_ORPHANS=0'
-	before_in "leaf cgroup orphan_maker dibersihkan sebelum graceful shutdown" "$L8" \
-		"cgroup: dibersihkan 'orphan_maker'" 'graceful shutdown'
-	check_in  "event loop tetap jalan dan shutdown bersih" "$L8" \
+	before_in "orphan_maker leaf cgroup cleaned up before graceful shutdown" "$L8" \
+		"cgroup: cleaned up 'orphan_maker'" 'graceful shutdown'
+	check_in  "event loop keeps running and shutdown is clean" "$L8" \
 		'graceful shutdown'
 fi
 
-# ------------------------------------------------------------- Skenario 9
-# Descendant Escape Test (Pre-exec Pipe Handshake Synchronization)
-# Workload adversarial melakukan fast double-fork dan setsid untuk mencoba
-# melepaskan diri dari leaf cgroup.
-# Verifikasi bahwa handshake sinkronisasi parent-child T1 menjamin seluruh
-# proses turunan (anak, cucu, orphan) berada di leaf cgroup.procs yang tepat,
-# dan cgroup_kill_service menyapu bersih seluruh pohon proses (LINGERING_ESCAPE_ORPHANS=0).
-# Pembersihan diverifikasi dua sisi: (a) cgroup.events populated 0 dan
-# cgroup.procs kosong SEBELUM rmdir leaf, (b) scan /proc cmdline tanpa sisa.
-printf '\n== Skenario 9: Descendant escape test & handshake sinkronisasi ==\n'
+# ------------------------------------------------------------- Scenario 9
+# Descendant escape test (pre-exec pipe handshake synchronization)
+# The adversarial workload does a fast double-fork and setsid to try to escape
+# the leaf cgroup.
+# Verifies that the T1 parent-child synchronization handshake guarantees all
+# descendant processes (child, grandchild, orphan) are in the correct leaf
+# cgroup.procs, and cgroup_kill_service sweeps the whole process tree clean
+# (LINGERING_ESCAPE_ORPHANS=0). Cleanup is verified from two sides:
+# (a) cgroup.events populated 0 and cgroup.procs empty BEFORE the leaf rmdir,
+# (b) a /proc cmdline scan with no leftovers.
+printf '\n== Scenario 9: descendant escape test & handshake synchronization ==\n'
 if [ "$has_cg2" -ne 1 ] || [ -z "$ESCAPE_BIN" ]; then
-	skip "skenario 9 dilewati: cgroup v2 tidak tersedia atau gcc tidak ada"
+	skip "scenario 9 skipped: cgroup v2 unavailable or gcc missing"
 else
 	R9=$(new_root sleep grep cut cat awk wc)
 	L9=$(new_log)
@@ -1130,39 +1132,39 @@ else
 	cp "$ESCAPE_BIN" "$R9/bin/escape_workload"
 
 	# -----------------------------------------------------------------
-	# Phase 1: Negative Control Test (Biner Tanpa Handshake -> GAGAL)
+	# Phase 1: Negative control test (Binary Without Handshake -> FAIL)
 	# -----------------------------------------------------------------
-	# Jalankan biner secara langsung di lingkungan root cgroup tanpa handshake T1.
-	# Biner harus mendeteksi ketiadaan leaf cgroup pada instruksi pertama dan exit 1.
+	# Run the binary directly in the root cgroup environment without the T1 handshake.
+	# The binary must detect the absence of a leaf cgroup on its first instruction and exit 1.
 	neg_ret=0
 	$SUDO timeout -s KILL 5 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private /bin/sh -c \
 		"mount -t proc proc '$R9/proc' && chroot '$R9' /bin/escape_workload" >/dev/null 2>&1 || neg_ret=$?
 
 	if [ "$neg_ret" -ne 0 ] && [ -f "$R9/var/escape_audit.txt" ]; then
-		check_in  "uji anti-hampa negatif: biner tanpa handshake melihat cgroup root dan GAGAL deterministik" \
+		check_in  "negative anti-vacuous test: binary without handshake sees the root cgroup and FAILs deterministically" \
 			"$R9/var/escape_audit.txt" 'PRE_FORK_LEAF_CGROUP=0'
-		absent_in "uji anti-hampa negatif: biner tanpa handshake tidak pernah spawn cucu" \
+		absent_in "negative anti-vacuous test: binary without handshake never spawns a grandchild" \
 			"$R9/var/escape_audit.txt" 'GRANDCHILD_ACTIVE=1'
 	else
-		bad "uji anti-hampa negatif: biner tanpa handshake seharusnya gagal, namun lolos (exit=$neg_ret)"
+		bad "negative anti-vacuous test: binary without handshake should fail but passed (exit=$neg_ret)"
 	fi
 	rm -f "$R9/var/escape_audit.txt"
 
 	# -----------------------------------------------------------------
-	# Phase 2: Positive Test (Dengan T1 Handshake di Bawah ninit -> LULUS)
+	# Phase 2: Positive test (With T1 Handshake under ninit -> PASS)
 	# -----------------------------------------------------------------
 	cat > "$R9/bin/check_escape.sh" << 'EOF'
 #!/bin/sh
-# Verifikasi pembersihan dari dua sisi:
-#   (a) cgroup: cgroup.events (populated 0) dan cgroup.procs kosong SEBELUM
-#       rmdir leaf. Leaf sengaja dibiarkan hidup (escape_svc respawn) supaya
-#       state pasca-cgroup_kill_service bisa diamati sebelum ninit menghapusnya
-#       saat shutdown.
-#   (b) /proc: tidak ada proses escape_workload yang masih berjalan.
+# Verify the cleanup from two sides:
+#   (a) cgroup: cgroup.events (populated 0) and cgroup.procs empty BEFORE the
+#       leaf rmdir. The leaf is deliberately left alive (escape_svc respawn) so
+#       the post-cgroup_kill_service state can be observed before ninit removes
+#       it at shutdown.
+#   (b) /proc: no escape_workload process is still running.
 CG="${NINIT_CGROUP_BASE:-/sys/fs/cgroup/ninit}/escape_svc"
 
-# Tunggu workload adversarial menulis bukti audit (cucu sudah aktif).
+# Wait for the adversarial workload to write the audit evidence (grandchild is active).
 waited=0
 while [ ! -f /var/escape_audit.txt ] && [ "$waited" -lt 100 ]; do
     /bin/sleep 0.05
@@ -1174,7 +1176,7 @@ if [ -f /var/escape_audit.txt ]; then
     gc_pid=$(grep '^GRANDCHILD=' /var/escape_audit.txt 2>/dev/null | cut -d= -f2)
 fi
 
-# Tunggu cgroup_kill_service menyapu leaf: populated 0 DAN cgroup.procs kosong.
+# Wait for cgroup_kill_service to sweep the leaf: populated 0 AND cgroup.procs empty.
 populated="unknown"
 nprocs="unknown"
 waited=0
@@ -1192,7 +1194,7 @@ while [ "$waited" -lt 100 ]; do
     waited=$((waited + 1))
 done
 
-# Scan /proc: pastikan tidak ada sisa proses turunan yang lolos.
+# Scan /proc: ensure no escaped descendant processes remain.
 lingering=0
 if [ -n "$gc_pid" ] && [ -d "/proc/$gc_pid" ]; then
     lingering=$((lingering + 1))
@@ -1214,50 +1216,50 @@ EOF
 	chmod 0755 "$R9/bin/check_escape.sh"
 
 	cat > "$R9/etc/init.conf" << 'EOF'
-# escape_svc sengaja 'respawn': saat leader exit, ninit memanggil
-# cgroup_kill_service tetapi BELUM rmdir leaf, sehingga checker bisa
-# memverifikasi cgroup.events (populated 0) dan cgroup.procs kosong
-# SEBELUM rmdir (rmdir leaf terjadi saat shutdown).
+# escape_svc is deliberately 'respawn': when the leader exits, ninit calls
+# cgroup_kill_service but does NOT rmdir the leaf yet, so the checker can
+# verify cgroup.events (populated 0) and cgroup.procs empty BEFORE the rmdir
+# (the leaf rmdir happens at shutdown).
 escape_svc:respawn:/bin/escape_workload
 checker:once:/bin/sh /bin/check_escape.sh
 EOF
 
 	boot_guest "$R9" "$WAIT9" >"$L9" 2>&1
 
-	check_in  "instruksi pertama proses anak memvalidasi keberadaan di leaf cgroup (/ninit/...)" \
+	check_in  "the child process's first instruction validates presence in a leaf cgroup (/ninit/...)" \
 		"$R9/var/escape_audit.txt" 'PRE_FORK_LEAF_CGROUP=1'
-	check_in  "adversary berhasil spawn cucu orphan berkat handshake T1 (anti-hampa positif)" \
+	check_in  "adversary successfully spawns an orphan grandchild thanks to the T1 handshake (positive anti-vacuous)" \
 		"$R9/var/escape_audit.txt" 'GRANDCHILD_ACTIVE=1'
-	check_in  "cucu orphan berada di leaf cgroup.procs berkat handshake T1" \
+	check_in  "orphan grandchild is in the leaf cgroup.procs thanks to the T1 handshake" \
 		"$R9/var/escape_audit.txt" 'IN_CGROUP_PROCS=1'
-	check_in  "cgroup membership cucu berada di leaf escape_svc" \
+	check_in  "grandchild cgroup membership is in the escape_svc leaf" \
 		"$R9/var/escape_audit.txt" 'IN_LEAF_CGROUP=1'
-	check_in  "cgroup_kill_service menyapu bersih seluruh pohon proses turunan (LINGERING_ESCAPE_ORPHANS=0)" \
+	check_in  "cgroup_kill_service sweeps the whole descendant process tree clean (LINGERING_ESCAPE_ORPHANS=0)" \
 		"$R9/var/escape_clean_audit.txt" 'LINGERING_ESCAPE_ORPHANS=0'
-	check_in  "cgroup.events leaf escape_svc populated 0 sebelum rmdir" \
+	check_in  "escape_svc leaf cgroup.events populated 0 before rmdir" \
 		"$R9/var/escape_clean_audit.txt" 'POPULATED=0'
-	check_in  "cgroup.procs leaf escape_svc kosong sebelum rmdir" \
+	check_in  "escape_svc leaf cgroup.procs empty before rmdir" \
 		"$R9/var/escape_clean_audit.txt" 'CGROUP_PROCS=0'
-	check_in  "leaf cgroup escape_svc dibersihkan setelah sweep" "$L9" \
-		"cgroup: dibersihkan 'escape_svc'"
-	absent_in "tidak ada kegagalan rmdir leaf cgroup (EBUSY)" "$L9" \
+	check_in  "escape_svc leaf cgroup cleaned up after the sweep" "$L9" \
+		"cgroup: cleaned up 'escape_svc'"
+	absent_in "no leaf cgroup rmdir failure (EBUSY)" "$L9" \
 		"Device or resource busy"
-	check_in  "event loop tetap jalan dan shutdown bersih" "$L9" \
+	check_in  "event loop keeps running and shutdown is clean" "$L9" \
 		'graceful shutdown'
 fi
 
-# ------------------------------------------------------------- Skenario 10
-# Batas Resource Workload Bertingkat (Multi-tier Hierarchical Limits)
-# Memverifikasi bahwa batas hierarkis cgroup v2 mengikat seluruh subtree:
-# Part 10A: Hierarchical pids.max (leader -> child -> grandchild -> fork ke-4 ditolak EAGAIN)
-# Part 10B: Cumulative parallel memory.max -- leader mengorkestrasi 3 worker x 12MB
-#           (total 36MB > limit 32MB) sehingga OOM killer mematikan worker, plus
-#           kontrol anti-hampa 2 worker x 12MB (24MB) yang lolos tanpa OOM.
-printf '\n== Skenario 10: Batas resource workload bertingkat (hierarki cgroup v2) ==\n'
+# ------------------------------------------------------------- Scenario 10
+# Multi-tier workload resource limits (multi-tier hierarchical limits)
+# Verifies that cgroup v2 hierarchical limits bind the whole subtree:
+# Part 10A: Hierarchical pids.max (leader -> child -> grandchild -> 4th fork rejected EAGAIN)
+# Part 10B: Cumulative parallel memory.max -- the leader orchestrates 3 workers x 12MB
+#           (total 36MB > 32MB limit) so the OOM killer kills a worker, plus the
+#           anti-vacuous control of 2 workers x 12MB (24MB) which passes without OOM.
+printf '\n== Scenario 10: multi-tier workload resource limits (cgroup v2 hierarchy) ==\n'
 
 # 10A: Hierarchical PIDs
 if [ "$has_cg2" -ne 1 ] || [ "$has_pids" -ne 1 ] || [ -z "$FORK_TREE_BIN" ]; then
-	skip "skenario 10A dilewati: cgroup v2 + controller pids tidak tersedia atau gcc tidak ada"
+	skip "scenario 10A skipped: cgroup v2 + pids controller unavailable or gcc missing"
 else
 	R10A=$(new_root sleep)
 	L10A=$(new_log)
@@ -1272,21 +1274,21 @@ EOF
 
 	boot_guest "$R10A" "$WAIT10A" >"$L10A" 2>&1
 
-	check_in  "konfigurasi limit pids.max diterapkan pada hierarki" "$L10A" \
+	check_in  "pids.max limit configuration applied to the hierarchy" "$L10A" \
 		"cgroup: 'pids_tree' pids.max = 3"
-	check_in  "fork cucu ditolak deterministik dengan EAGAIN saat kuota hierarki habis" \
+	check_in  "grandchild fork deterministically rejected with EAGAIN when the hierarchy quota is exhausted" \
 		"$R10A/var/pids_tree_audit.txt" 'NESTED_EAGAIN_CONFIRMED depth=3'
-	absent_in "tidak ada fork yang lolos melebihi batas pids.max" \
+	absent_in "no fork slipped past the pids.max limit" \
 		"$R10A/var/pids_tree_audit.txt" 'UNEXPECTED_FORK_SUCCESS'
-	check_in  "leaf cgroup dibersihkan setelah selesai" "$L10A" \
-		"cgroup: dibersihkan 'pids_tree'"
-	check_in  "event loop tetap jalan dan shutdown bersih" "$L10A" \
+	check_in  "leaf cgroup cleaned up after completion" "$L10A" \
+		"cgroup: cleaned up 'pids_tree'"
+	check_in  "event loop keeps running and shutdown is clean" "$L10A" \
 		'graceful shutdown'
 fi
 
 # 10B: Cumulative Parallel Memory OOM
 if [ "$has_cg2" -ne 1 ] || [ "$has_mem" -ne 1 ] || [ -z "$CUMUL_MEM_BIN" ]; then
-	skip "skenario 10B dilewati: cgroup v2 + controller memory tidak tersedia atau gcc tidak ada"
+	skip "scenario 10B skipped: cgroup v2 + memory controller unavailable or gcc missing"
 else
 	R10B=$(new_root sleep)
 	L10B=$(new_log)
@@ -1301,35 +1303,36 @@ EOF
 
 	boot_guest "$R10B" "$WAIT10B" >"$L10B" 2>&1
 
-	check_in  "konfigurasi limit memory.max kumulatif diterapkan" "$L10B" \
+	check_in  "cumulative memory.max limit configuration applied" "$L10B" \
 		"cgroup: 'mem_cumul' memory.max = 32M"
-	check_in  "kontrol anti-hampa: 2 worker x 12M (24M) lolos tanpa OOM" \
+	check_in  "anti-vacuous control: 2 workers x 12M (24M) pass without OOM" \
 		"$R10B/var/cumul_mem_audit.txt" 'CONTROL_2_WORKERS_NO_OOM=1'
-	check_in  "leader mengorkestrasi 3 worker pada fase uji (total 36M > 32M)" \
+	check_in  "leader orchestrates 3 workers in the test phase (total 36M > 32M)" \
 		"$R10B/var/cumul_mem_audit.txt" 'TEST_WORKERS_FORKED=3'
-	check_in  "minimal 2 worker mengalokasi 12M (akumulasi paralel nyata)" \
+	check_in  "at least 2 workers allocate 12M (real parallel accumulation)" \
 		"$R10B/var/cumul_mem_audit.txt" 'TEST_WORKERS_ALLOCATED=[23]'
-	check_in  "OOM killer mematikan worker (bukti waitpid SIGKILL, bukan self-kill)" \
+	check_in  "OOM killer kills a worker (waitpid SIGKILL evidence, not a self-kill)" \
 		"$R10B/var/cumul_mem_audit.txt" 'WORKER_KILLED_BY_OOM=1'
-	check_in  "leader bertahan hidup dan melaporkan (tidak ada raise(SIGKILL))" \
+	check_in  "leader survives and reports (no raise(SIGKILL))" \
 		"$R10B/var/cumul_mem_audit.txt" 'LEADER_SURVIVED=1'
-	absent_in "tidak ada exit status=0x9 palsu pada leader mem_cumul" "$L10B" \
+	absent_in "no fake exit status=0x9 on the mem_cumul leader" "$L10B" \
 		'mem_cumul (pid .* exit status=0x9'
-	check_in  "leaf cgroup dibersihkan setelah OOM kumulatif" "$L10B" \
-		"cgroup: dibersihkan 'mem_cumul'"
-	check_in  "event loop tetap jalan dan shutdown bersih" "$L10B" \
+	check_in  "leaf cgroup cleaned up after cumulative OOM" "$L10B" \
+		"cgroup: cleaned up 'mem_cumul'"
+	check_in  "event loop keeps running and shutdown is clean" "$L10B" \
 		'graceful shutdown'
 fi
 
-# ------------------------------------------------------------- Skenario 11
-# Fallback Fail-Open saat Cgroup v2 Tidak Tersedia (Mount Cgroup Gagal)
-# Memverifikasi bahwa ketika hierarki cgroup v2 tidak dapat di-mount atau disiapkan:
-# 1. Init mencatat baris fail-open aktif: "cgroup: fail-open aktif untuk ..."
-# 2. Init mencatat warning pengabaian limit: "Warning: batas resource diabaikan pada layanan '...' karena cgroup tidak tersedia"
-# 3. Layanan tetap dieksekusi dengan normal melalui handshake T1
-# 4. Fallback kill(-pgid) pada layanan once membersihkan proses anak orphan di background saat leader mati
-# 5. Init PID 1 melakukan shutdown bersih (graceful shutdown) tanpa crash atau orphan hang
-printf '\n== Skenario 11: Fallback fail-open saat cgroup v2 tidak tersedia ==\n'
+# ------------------------------------------------------------- Scenario 11
+# Fail-open fallback when cgroup v2 is unavailable (cgroup mount fails)
+# Verifies that when the cgroup v2 hierarchy cannot be mounted or prepared:
+# 1. Init logs the active fail-open line: "cgroup: fail-open active for ..."
+# 2. Init logs the limit-ignore warning: "Warning: resource limits ignored on service '...' because cgroup unavailable"
+# 3. Services still execute normally through the T1 handshake
+# 4. The kill(-pgid) fallback on a once service cleans up background orphan
+#    child processes when the leader dies
+# 5. Init PID 1 performs a clean shutdown (graceful shutdown) without crashing or a hung orphan
+printf '\n== Scenario 11: fail-open fallback when cgroup v2 is unavailable ==\n'
 R11=$(new_root sleep grep)
 L11=$(new_log)
 ROOTS="$ROOTS $R11"
@@ -1337,7 +1340,7 @@ LOGS="$LOGS $L11"
 
 cat > "$R11/bin/check_failopen.sh" << 'EOF'
 #!/bin/sh
-# Verifikasi bahwa background orphan (sleep 300) telah disapu bersih oleh fallback kill(-pgid)
+# Verify that the background orphan (sleep 300) has been swept clean by the kill(-pgid) fallback
 lingering=0
 for cmd in /proc/[0-9]*/cmdline; do
     [ -f "$cmd" ] || continue
@@ -1356,29 +1359,29 @@ failopen_svc:once:/bin/sh -c "/bin/sleep 300 & echo FAILOPEN_EXECUTED > /var/fai
 checker:once:/bin/sh /bin/check_failopen.sh:requires=failopen_svc
 EOF
 
-# Siapkan lingkungan tiruan di mana /sys/fs/cgroup berupa berkas biasa pada tmpfs,
-# sehingga pemanggilan mount("cgroup2", "/sys/fs/cgroup", ...) gagal deterministik dengan ENOTDIR
+# Prepare a simulated environment where /sys/fs/cgroup is a regular file on tmpfs,
+# so the mount("cgroup2", "/sys/fs/cgroup", ...) call fails deterministically with ENOTDIR
 setup_r11="mount -t sysfs sysfs $R11/sys; mkdir -p $R11/sys/fs; mount -t tmpfs tmpfs $R11/sys/fs; touch $R11/sys/fs/cgroup;"
 
 boot_guest "$R11" "$WAIT11" "" "$setup_r11" >"$L11" 2>&1
 
-check_in  "kegagalan mount cgroup v2 tercatat di log" "$L11" \
-	'cgroup2: mount /sys/fs/cgroup gagal'
-check_in  "fallback fail-open aktif tercatat di log" "$L11" \
-	"cgroup: fail-open aktif untuk 'failopen_svc'"
-check_in  "warning batas resource diabaikan tercatat di log" "$L11" \
-	"Warning: batas resource diabaikan pada layanan 'failopen_svc' karena cgroup tidak tersedia"
-check_in  "layanan tetap berhasil dieksekusi normal saat cgroup tidak tersedia" \
+check_in  "cgroup v2 mount failure logged" "$L11" \
+	'cgroup2: mount /sys/fs/cgroup failed'
+check_in  "active fail-open fallback logged" "$L11" \
+	"cgroup: fail-open active for 'failopen_svc'"
+check_in  "resource limit ignored warning logged" "$L11" \
+	"Warning: resource limits ignored on service 'failopen_svc' because cgroup unavailable"
+check_in  "service still executes normally when cgroup is unavailable" \
 	"$R11/var/failopen_audit.txt" 'FAILOPEN_EXECUTED'
-check_in  "orphan sleep 300 disapu bersih via fallback kill(-pgid) saat fail-open (LINGERING_FAILOPEN_ORPHANS=0)" \
+check_in  "sleep 300 orphan swept clean via the kill(-pgid) fallback in fail-open (LINGERING_FAILOPEN_ORPHANS=0)" \
 	"$R11/var/failopen_clean_audit.txt" 'LINGERING_FAILOPEN_ORPHANS=0'
-check_in  "event loop tetap berjalan stabil dan shutdown bersih" "$L11" \
+check_in  "event loop stays stable and shutdown is clean" "$L11" \
 	'graceful shutdown'
 
-# ------------------------------------------------------------- Verifikasi Guard & Kasus Ekstrem
-printf '\n== Verifikasi Guard Isolasi & Kasus Ekstrem ==\n'
+# ------------------------------------------------------------- Guard & edge case verification
+printf '\n== Isolation Guard & Edge Case Verification ==\n'
 
-# 1. Assertion TEST_LEAVES: seluruh leaf test di $RUN_CG_BASE tidak bocor
+# 1. TEST_LEAVES assertion: no test leaf in $RUN_CG_BASE leaks
 leaked=""
 for leaf in $TEST_LEAVES; do
 	if [ -d "$RUN_CG_BASE/$leaf" ]; then
@@ -1386,25 +1389,25 @@ for leaf in $TEST_LEAVES; do
 	fi
 done
 if [ -n "$leaked" ]; then
-	bad "kebocoran leaf cgroup milik test:$leaked"
+	bad "test-owned cgroup leaf leak:$leaked"
 else
-	ok "assertion TEST_LEAVES: seluruh leaf test di $RUN_CG_BASE ter-reap bersih"
+	ok "TEST_LEAVES assertion: all test leaves in $RUN_CG_BASE are reaped clean"
 fi
 
-# 2. Perlindungan cgroup eksternal host (sentinel guard)
+# 2. Host external cgroup protection (sentinel guard)
 if [ -d "$EXTERNAL_GUARD_CG" ]; then
-	ok "cgroup host eksternal ($EXTERNAL_GUARD_CG) 100% utuh dan tidak tersentuh"
+	ok "external host cgroup ($EXTERNAL_GUARD_CG) is 100% intact and untouched"
 	$SUDO rmdir "$EXTERNAL_GUARD_CG" 2>/dev/null || true
 else
-	bad "cgroup host eksternal terganggu atau hilang!"
+	bad "external host cgroup is disturbed or missing!"
 fi
 
-# 3. Host /sys/fs/cgroup/ninit tidak pernah disentuh
+# 3. The host /sys/fs/cgroup/ninit is never touched
 if [ "$HOST_NINIT_PREEXISTED" -eq 0 ]; then
 	if [ -d /sys/fs/cgroup/ninit ]; then
-		bad "/sys/fs/cgroup/ninit muncul di host (isolasi jebol)"
+		bad "/sys/fs/cgroup/ninit appeared on the host (isolation broken)"
 	else
-		ok "/sys/fs/cgroup/ninit host tidak pernah dibuat/disentuh (isolasi 100% di $RUN_CG)"
+		ok "host /sys/fs/cgroup/ninit was never created/touched (100% isolation in $RUN_CG)"
 	fi
 fi
 
@@ -1414,12 +1417,12 @@ collision_code=0
 	mkdir "$RUN_CG" 2>/dev/null
 ) || collision_code=$?
 if [ "$collision_code" -ne 0 ]; then
-	ok "guard collision: strict mkdir menolak tabrakan cgroup eksisting (exit=$collision_code)"
+	ok "collision guard: strict mkdir rejects an existing cgroup collision (exit=$collision_code)"
 else
-	bad "guard collision: strict mkdir seharusnya gagal jika direktori sudah ada!"
+	bad "collision guard: strict mkdir should fail if the directory already exists!"
 fi
 
-# 5. Trap safety pada partial setup (RUN_CG kosong / belum dibuat)
+# 5. Trap safety on a partial setup (RUN_CG empty / not yet created)
 partial_trap_ok=1
 (
 	RUN_CG=""
@@ -1427,9 +1430,9 @@ partial_trap_ok=1
 	clean_run_cgroup || exit 1
 ) || partial_trap_ok=0
 if [ "$partial_trap_ok" -eq 1 ]; then
-	ok "guard trap safety: clean_run_cgroup aman dieksekusi saat RUN_CG belum diinisialisasi"
+	ok "trap safety guard: clean_run_cgroup runs safely when RUN_CG is not yet initialized"
 else
-	bad "guard trap safety: clean_run_cgroup melempar error saat setup parsial"
+	bad "trap safety guard: clean_run_cgroup throws an error on a partial setup"
 fi
 
 # 6. Inode identity / symlink tampering detection
@@ -1450,12 +1453,12 @@ tamper_detected=0
 	exit "$tamper_detected"
 ) || tamper_detected=1
 if [ "$tamper_detected" -eq 1 ]; then
-	ok "guard integritas inode: clean_run_cgroup menolak operasi saat dev:ino berubah"
+	ok "inode integrity guard: clean_run_cgroup rejects the operation when dev:ino changes"
 else
-	bad "guard integritas inode: clean_run_cgroup lolos saat dev:ino tidak cocok"
+	bad "inode integrity guard: clean_run_cgroup slips through when dev:ino does not match"
 fi
 
-# 7. Assertion guard PID reuse: PID non-eksisten HARUS ditolak (fail-closed).
+# 7. PID reuse assertion guard: a non-existent PID MUST be rejected (fail-closed).
 pid_reuse_guard=0
 dead_pid=9999999
 if [ -r /proc/sys/kernel/pid_max ]; then
@@ -1463,13 +1466,13 @@ if [ -r /proc/sys/kernel/pid_max ]; then
 fi
 is_test_process "$dead_pid" 2>/dev/null && pid_reuse_guard=1
 if [ "$pid_reuse_guard" -ne 1 ]; then
-	ok "guard PID reuse: is_test_process $dead_pid (PID non-eksisten) ditolak fail-closed (status 1)"
+	ok "PID reuse guard: is_test_process $dead_pid (non-existent PID) rejected fail-closed (status 1)"
 else
-	bad "guard PID reuse: is_test_process $dead_pid (PID non-eksisten) dianggap milik test!"
+	bad "PID reuse guard: is_test_process $dead_pid (non-existent PID) is considered test-owned!"
 fi
 
-# 8. Assertion guard proses eksternal host: proses di luar cgroup/chroot test
-#    HARUS ditolak DAN TIDAK PERNAH dibunuh oleh clean_run_cgroup.
+# 8. Host external process assertion guard: a process outside the test
+#    cgroup/chroot MUST be rejected AND NEVER killed by clean_run_cgroup.
 ext_pid=""
 if command -v sleep >/dev/null 2>&1; then
 	sleep 60 &
@@ -1481,34 +1484,34 @@ if [ -n "$ext_pid" ] && kill -0 "$ext_pid" 2>/dev/null; then
 		ext_rej=1
 	fi
 	if [ "$ext_rej" -ne 1 ]; then
-		ok "guard proses eksternal: is_test_process $ext_pid (proses host di luar cgroup/chroot test) ditolak"
+		ok "external process guard: is_test_process $ext_pid (host process outside the test cgroup/chroot) rejected"
 	else
-		bad "guard proses eksternal: is_test_process $ext_pid keliru menganggap proses host eksternal milik test!"
+		bad "external process guard: is_test_process $ext_pid wrongly considers an external host process test-owned!"
 	fi
 
-	# clean_run_cgroup TIDAK BOLEH membunuh proses host eksternal.
+	# clean_run_cgroup must NOT kill the external host process.
 	clean_run_cgroup >/dev/null 2>&1 || true
 	sleep 0.3
 	if kill -0 "$ext_pid" 2>/dev/null; then
-		ok "guard proses eksternal: clean_run_cgroup tidak membunuh proses host eksternal (pid $ext_pid)"
+		ok "external process guard: clean_run_cgroup does not kill the external host process (pid $ext_pid)"
 	else
-		bad "guard proses eksternal: clean_run_cgroup MEMBUNUH proses host eksternal (pid $ext_pid)!"
+		bad "external process guard: clean_run_cgroup KILLS the external host process (pid $ext_pid)!"
 	fi
 
-	# Hentikan sleep dummy (bukan bagian dari pembersihan test).
+	# Stop the dummy sleep (not part of the test cleanup).
 	kill "$ext_pid" 2>/dev/null || true
 	wait "$ext_pid" 2>/dev/null || true
 else
-	skip "guard proses eksternal dilewati: tidak dapat menjalankan proses dummy host"
+	skip "external process guard skipped: cannot run a dummy host process"
 fi
 
-# ------------------------------------------------------------- Ringkasan
+# ------------------------------------------------------------- Summary
 if [ "$fail_count" -eq 0 ]; then
-	printf '\nHASIL: LULUS (semua pemeriksaan)\n'
+	printf '\nRESULT: PASS (all checks)\n'
 else
-	printf '\nHASIL: GAGAL (%s pemeriksaan)\n' "$fail_count"
+	printf '\nRESULT: FAIL (%s checks)\n' "$fail_count"
 	for l in ${LOGS:-}; do
-		printf '\n-- ekor log %s --\n' "$l"
+		printf '\n-- tail of log %s --\n' "$l"
 		tail -n 15 "$l" | sed 's/^/  | /'
 	done
 	exit 1

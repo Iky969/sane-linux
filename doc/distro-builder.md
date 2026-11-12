@@ -1,54 +1,49 @@
-# Distro builder: rootfs minimal + boot di QEMU
+# Distro Builder: Minimal Rootfs + QEMU Boot
 
-Fase ini membuktikan ninit benar-benar menjadi **PID 1 di dalam mesin**, bukan
-sekadar di `chroot`/namespace: rootfs dibangun dari nol, dibungkus jadi
-initramfs, lalu di-boot oleh QEMU dengan konsol serial.
+*[English](distro-builder.md) | [Bahasa Indonesia](id/distro-builder.md)*
+
+This milestone demonstrates that `ninit` operates as a real **PID 1 inside a complete system**, rather than merely inside a `chroot` or container namespace: a rootfs is built from scratch, packaged into an initramfs, and booted by QEMU with a serial console.
 
 ```bash
 make rootfs          # scripts/build-rootfs.sh -> distro/rootfs + distro/initramfs.cpio.gz
-make qemu            # scripts/run-qemu.sh    -> boot interaktif (Ctrl-A X untuk keluar)
-SECS=5 make qemu     # boot otomatis 5 detik + pemeriksaan penanda + laporan konsol
+make qemu            # scripts/run-qemu.sh     -> interactive boot (Ctrl-A X to exit)
+SECS=5 make qemu     # automated 5-second boot + milestone checks + console report
 ```
 
-## Ringkas alur
+## Workflow Summary
 
-| Tahap | Script | Hasil |
+| Stage | Script | Output |
 |---|---|---|
-| 1 | `scripts/build-rootfs.sh` | unduh + kompilasi BusyBox **statis**, susun `distro/rootfs/`, pasang `ninit` sebagai `/sbin/init`, bungkus jadi `distro/initramfs.cpio.gz` |
-| 2 | `scripts/run-qemu.sh` | siapkan kernel (host, atau unduh Alpine `vmlinuz-virt`), boot QEMU, periksa penanda boot di konsol serial |
+| 1 | `scripts/build-rootfs.sh` | Downloads & compiles static BusyBox, populates `distro/rootfs/`, installs `ninit` as `/sbin/init`, packages into `distro/initramfs.cpio.gz` |
+| 2 | `scripts/run-qemu.sh` | Resolves kernel (host kernel or Alpine `vmlinuz-virt`), boots QEMU, verifies boot milestones on serial console |
 
-## Isi rootfs
+## Rootfs Structure
 
-| Path | Isi | Catatan |
+| Path | Contents | Notes |
 |---|---|---|
-| `/bin/busybox` | BusyBox 1.36.1 statis (`gcc -static`, 401 applet) + symlink applet | `make defconfig` + `CONFIG_STATIC=y` + `CONFIG_TC` dimatikan + `make LDFLAGS=-static` + `make install` |
-| `/bin/sh` | symlink ke `busybox` | wajib: ninit menjalankan setiap layanan lewat `/bin/sh -c` |
-| `/sbin/init` | biner `ninit` (statis) | PID 1 di dalam guest |
-| `/sbin/{poweroff,reboot,halt}` | skrip wrapper → `/run/initctl` | menimpa applet BusyBox yang memakai sinyal berbeda dari tabel ninit |
-| `/etc/init.conf` | `console:respawn:cttyhack /bin/sh -i` | shell interaktif di serial console, nama layanan `console` (lihat “Temuan integrasi”) |
-| `/etc/passwd`, `/etc/group` | `root:x:0:0`, `root:x:0:` | minimal |
-| `/etc/hostname` | `S.A.N.E` | dipakai `set_hostname()` ninit |
-| `/etc/fstab` | hanya komentar | menghindari log `fstab: … tidak ada, dilewati` |
-| `/dev/{console,null,tty}` | node awal (`mknod`) | supaya konsol kernel hidup sejak detik pertama; devtmpfs menyusul |
-| `/proc /sys /dev /run /tmp` | direktori kosong | dipasang otomatis oleh `setup_pseudo_fs()` |
-| `/var/log` | direktori | tempat `ninit.log` |
+| `/bin/busybox` | Static BusyBox 1.36.1 (`gcc -static`, 401 applets) + applet symlinks | Built with `make defconfig` + `CONFIG_STATIC=y` with `CONFIG_TC` disabled + `make LDFLAGS=-static` + `make install` |
+| `/bin/sh` | Symlink to `busybox` | Required: `ninit` executes all service commands via `/bin/sh -c` |
+| `/sbin/init` | Compiled `ninit` binary (static) | Real PID 1 inside the guest |
+| `/sbin/{poweroff,reboot,halt}` | Wrapper scripts writing to `/run/initctl` | Overrides BusyBox applets that send different signals than ninit expects |
+| `/etc/init.conf` | `console:respawn:cttyhack /bin/sh -i` | Interactive shell on serial console, named `console` |
+| `/etc/passwd`, `/etc/group` | `root:x:0:0`, `root:x:0:` | Minimal user/group tables |
+| `/etc/hostname` | `S.A.N.E` | Read by `set_hostname()` during boot |
+| `/etc/fstab` | Commented placeholder | Avoids `fstab: ... does not exist, skipped` warning |
+| `/dev/{console,null,tty}` | Initial device nodes (`mknod`) | Ensures kernel console functions immediately before devtmpfs mounts |
+| `/proc /sys /dev /run /tmp` | Empty mountpoint directories | Mounted automatically by `setup_pseudo_fs()` |
+| `/var/log` | Directory | Destination for `ninit.log` |
 
-Direktori kerja (semuanya di-`.gitignore`): `distro/cache/` (tarball + kernel
-unduhan), `distro/build/` (sumber BusyBox + hasil `make install`),
-`distro/rootfs/`, `distro/initramfs.cpio.gz`, `distro/qemu-console.log`.
+Working directories (all `.gitignore`d): `distro/cache/` (tarballs & downloaded kernels), `distro/build/` (BusyBox source + `make install` tree), `distro/rootfs/`, `distro/initramfs.cpio.gz`, `distro/qemu-console.log`.
 
-## Kernel
+## Kernel Resolution
 
-`scripts/run-qemu.sh` memilih kernel dengan urutan:
+`scripts/run-qemu.sh` resolves the kernel in the following order:
 
-1. `KERNEL=/path/vmlinuz` bila diberikan eksplisit.
-2. `KERNEL_MODE=host` → `/boot/vmlinuz-$(uname -r)` (di sandbox/container `/boot`
-   biasanya kosong).
-3. `KERNEL_MODE=auto` (default) → kernel host bila ada, kalau tidak mengunduh
-   Alpine `vmlinuz-virt` (`ALPINE_BRANCH=v3.20`, `ALPINE_FLAVOR=virt`).
-   Checksum hasil unduhan dicatat di `distro/cache/vmlinuz-*.sha256`.
+1. `KERNEL=/path/vmlinuz` when specified explicitly.
+2. `KERNEL_MODE=host` → `/boot/vmlinuz-$(uname -r)` (often absent in containers/sandboxes).
+3. `KERNEL_MODE=auto` (default) → Host kernel if available; otherwise downloads Alpine `vmlinuz-virt` (`ALPINE_BRANCH=v3.20`, `ALPINE_FLAVOR=virt`). SHA-256 checksums are verified against `distro/cache/vmlinuz-*.sha256`.
 
-## Perintah QEMU
+## QEMU Invocations
 
 ```bash
 qemu-system-x86_64 -m 256 -no-reboot \
@@ -57,48 +52,42 @@ qemu-system-x86_64 -m 256 -no-reboot \
   -append "console=ttyS0 rdinit=/sbin/init init=/sbin/init panic=-1 loglevel=7"
 ```
 
-- Mode **interaktif**: `-nographic` (serial + monitor di stdio).
-- Mode **otomatis** (`SECS=<detik>`): `-display none -serial file:distro/qemu-console.log`
-  supaya konsol guest terekam utuh tanpa bergantung pada TTY, dan proses QEMU
-  dibatasi `timeout`. Setelah boot, `report()` memeriksa:
+- **Interactive Mode**: `-nographic` (multiplexes serial console and QEMU monitor on stdio).
+- **Automated Mode** (`SECS=<seconds>`): `-display none -serial file:distro/qemu-console.log` captures the guest console cleanly without TTY allocation, bounded by `timeout`. Post-boot, `report()` validates:
 
-  | Pemeriksaan | Alasan |
+  | Check | Rationale |
   |---|---|
-  | `ninit start (PID 1)` muncul | init benar-benar jalan sebagai PID 1 |
-  | `main loop siap` muncul (dengan latensi) | parsing config + spawn awal sukses |
-  | `started console` muncul | layanan `init.conf` di-spawn |
-  | **tepat satu PID unik** di `started console (pid N)` | console tidak di-respawn ulang; tiap baris ninit muncul dua kali (`/dev/kmsg` + stderr), jadi dihitung PID uniknya |
-  | **tidak ada `console (pid N) exit status`** | console tidak pernah mati selama jendela boot |
-  | **tidak ada `respawn ditunda`** | tidak ada layanan respawn yang gagal terus |
-  | tidak ada `Kernel panic` | guest tidak mati keras |
+  | `ninit start (PID 1)` appears | Init is running as PID 1 |
+  | `main loop ready` appears (with latency) | Configuration parsed and initial services spawned |
+  | `started console` appears | Service spawned according to `init.conf` |
+  | **Exactly one unique PID** for `started console (pid N)` | Console did not crash-loop or respawn unexpectedly |
+  | **No `console (pid N) exit status`** | Console remained active throughout the boot window |
+  | **No `respawn delayed`** | No failing respawn services |
+  | No `Kernel panic` | Kernel booted and ran stably |
 
-  Empat pemeriksaan terakhir ada karena `started console` ditulis saat *fork*,
-  bukan setelah `exec` berhasil: tanpa itu,
-  `console:respawn:/bin/does-not-exist` tetap LULUS (buktinya di
-  `scripts/test-qemu-report.sh` skenario 2).
-- `-enable-kvm -cpu host` ditambahkan otomatis bila `/dev/kvm` bisa ditulis
-  (di sandbox ini tidak ada, jadi emulasi TCG murni).
+  The last four checks are essential because `started console` is logged at `fork()` time before `exec()` succeeds: without them, an invalid command like `console:respawn:/bin/does-not-exist` would falsely pass (tested in `scripts/test-qemu-report.sh` scenario 2).
+- `-enable-kvm -cpu host` is added automatically if `/dev/kvm` is writable.
 
-## Bukti boot (hasil nyata di sandbox, TCG tanpa KVM)
+## Boot Evidence (Real Sandbox Execution, TCG without KVM)
 
 ```
 [    1.256959] Run /sbin/init as init process
-[2026-10-27 23:55:18] ninit: cgroup2: /sys/fs/cgroup ter-mount
+[2026-10-27 23:55:18] ninit: cgroup2: /sys/fs/cgroup mounted
 [2026-10-27 23:55:18] ninit: === ninit start (PID 1) v1.0.0 ===
 [2026-10-27 23:55:18] ninit: hostname = S.A.N.E
 [2026-10-27 23:55:18] ninit: started console (pid 403)
 ~ #
 [2026-10-27 23:55:18] ninit: cgroup: 'console' (pid 403) -> /sys/fs/cgroup/ninit/console
-[2026-10-27 23:55:18] ninit: main loop siap
+[2026-10-27 23:55:18] ninit: main loop ready
 ```
 
-`main loop siap` muncul **~2,0–2,1 detik** setelah QEMU dijalankan (emulasi TCG).
+`main loop ready` appears **~2.0–2.1 seconds** after QEMU starts (TCG emulation).
 
-Sesi interaktif (perintah diketik ke serial console, dijalankan di dalam guest):
+Interactive session on the serial console:
 
 ```
-~ # echo HALO-DARI-GUEST
-HALO-DARI-GUEST
+~ # echo HELLO-FROM-GUEST
+HELLO-FROM-GUEST
 ~ # cat /etc/hostname
 S.A.N.E
 ~ # kill -TERM 1
@@ -107,110 +96,71 @@ S.A.N.E
 [   10.502328] reboot: Power down
 ```
 
-`1126301404` = `0x4321FEDC` = `RB_POWER_OFF`: jalur graceful shutdown ninit
-bekerja di dalam mesin sungguhan dan QEMU keluar sendiri.
+`1126301404` (`0x4321FEDC` = `RB_POWER_OFF`): `ninit`'s graceful shutdown executes inside the virtual machine, terminating QEMU cleanly.
 
-## Temuan integrasi (yang perlu diketahui)
+## Integration Insights
 
-1. **Layanan mendapat `stdin` `/dev/null`.** `spawn_service()` menyalakan anak
-   dengan `stdin=/dev/null` dan `stdout/stderr=/run/log.fifo`. Jadi
-   `shell:respawn:/bin/sh` polos akan langsung kena EOF, keluar, dan
-   di-respawn setiap 2 detik — bukan menjadi shell konsol. Karena perintah
-   dijalankan lewat `/bin/sh -c`, redireksi di dalam perintah menempelkan shell
-   ke console: `<> /dev/console >&0 2>&0`.
-2. **`cttyhack` untuk job control.** ninit memanggil `setsid()` di anak, sehingga
-   tidak ada controlling tty dan `sh -i` mengeluh
-   `can't access tty; job control turned off`. `cttyhack` membuka
-   `/dev/console`, menjadikannya controlling tty (`TIOCSCTTY`), lalu
-   meneruskan kendali ke shell.
-3. **Tabel sinyal BusyBox ≠ tabel sinyal ninit — sudah diperbaiki wrapper.**
-   Applet `halt`/`poweroff`/`reboot` BusyBox mengirim
-   `SIGUSR1`/`SIGUSR2`/`SIGTERM` ke PID 1, sedangkan ninit memetakan `SIGUSR2`
-   → *force reboot*: mengetik `poweroff` di guest justru **me-reboot** mesin.
-   `scripts/build-rootfs.sh` kini memasang wrapper di `/sbin` yang memakai
-   jalur resmi `/run/initctl`:
+1. **Services receive `/dev/null` on `stdin`.** `spawn_service()` starts children with `stdin=/dev/null` and `stdout/stderr=/run/log.fifo`. Thus, a bare `shell:respawn:/bin/sh` immediately encounters EOF, exits, and respawns every 2 seconds. Because commands run via `/bin/sh -c`, internal redirection connects the interactive console to the TTY: `<> /dev/console >&0 2>&0`.
+2. **`cttyhack` for job control.** `ninit` calls `setsid()` in child processes, detaching controlling terminals and causing `sh -i` to warn `can't access tty; job control turned off`. `cttyhack` opens `/dev/console`, establishes it as the controlling terminal (`TIOCSCTTY`), and hands control to the shell.
+3. **BusyBox signal table mismatch handled via wrappers.**
+   BusyBox `halt`/`poweroff`/`reboot` applets send `SIGUSR1`/`SIGUSR2`/`SIGTERM` to PID 1, whereas `ninit` maps `SIGUSR2` to *force reboot*: typing `poweroff` inside the guest previously caused a reboot. `scripts/build-rootfs.sh` resolves this by installing `/sbin` wrappers that communicate via `/run/initctl`:
 
-   | Perintah di guest | Isi wrapper | Perilaku ninit |
+   | Guest Command | Wrapper Action | ninit Behavior |
    |---|---|---|
-   | `/sbin/poweroff` | `echo poweroff > /run/initctl` | graceful → `RB_POWER_OFF` (matikan) |
-   | `/sbin/reboot` | `echo reboot > /run/initctl` | graceful → `RB_AUTOBOOT` (restart) |
-   | `/sbin/halt` | `echo force-poweroff > /run/initctl` | force → `RB_POWER_OFF` (tanpa grace) |
+   | `/sbin/poweroff` | `echo poweroff > /run/initctl` | Graceful → `RB_POWER_OFF` (power down) |
+   | `/sbin/reboot` | `echo reboot > /run/initctl` | Graceful → `RB_AUTOBOOT` (reboot) |
+   | `/sbin/halt` | `echo force-poweroff > /run/initctl` | Force → `RB_POWER_OFF` (immediate power down) |
 
-   Dua detail yang mudah salah: (a) `/sbin/poweroff` di rootfs adalah **symlink
-   ke `../bin/busybox`**, jadi skrip wajib `rm -f` symlink itu lebih dulu —
-   `cat >` tanpa `rm` menembus symlink dan **merusak biner BusyBox**;
-   (b) alias applet BusyBox di direktori PATH lain dibuang supaya wrapper selalu
-   menang. Jalur sinyal mentah tetap tersedia: `kill -TERM 1` (matikan rapi),
-   `kill -USR1 1` / `kill -USR2 1` (force poweroff / force reboot).
+   Key implementation caveats: (a) `/sbin/poweroff` in rootfs is a **symlink to `../bin/busybox`**, requiring `rm -f` prior to creating the wrapper (overwriting without removal corrupts the BusyBox binary); (b) BusyBox applet aliases in other PATH directories are removed so wrappers take precedence. Raw signals remain available: `kill -TERM 1` (clean shutdown), `kill -USR1 1` / `kill -USR2 1` (force poweroff / force reboot).
+4. **Early serial input before shell readiness can be dropped.** Piping keystrokes into QEMU at t=0 (e.g. `printf ... | run-qemu.sh`) is timing-sensitive: early bytes can be dropped before the console shell finishes startup. Introduce a delay (`sleep 6`) or type directly into an interactive session.
 
-4. **Input serial yang dikirim sebelum shell siap bisa hilang.** Menyalurkan
-   ketikan lewat pipe pada detik ke-0 (mis. `printf … | run-qemu.sh`) tidak
-   andal: byte pertama sering termakan. Beri jeda (`sleep 6`) atau ketik
-   langsung di terminal.
+## Verification: Poweroff vs Reboot in QEMU
 
-## Uji verifikasi: poweroff vs reboot di dalam QEMU
+Commands executed on the serial console after shell readiness:
 
-Perintah diketik di serial console setelah shell siap (input dialirkan dengan
-jeda 6 detik; lihat *Known Limitations* soal input t=0):
-
-| Perintah di guest | Log ninit | Kernel | Hasil |
+| Guest Command | ninit Log | Kernel | Result |
 |---|---|---|---|
 | `command -v poweroff` | — | — | `/sbin/poweroff` (PATH `/sbin:/usr/sbin:/bin:/usr/bin`) |
-| `poweroff` | `initctl cmd: 'poweroff'` → `graceful shutdown (cmd=1126301404)` | `reboot: Power down` | mesin **mati**, 1× boot ninit, QEMU keluar sendiri |
-| `reboot` | `initctl cmd: 'reboot'` → `graceful shutdown (cmd=19088743)` | `Restarting system` → `machine restart` | mesin **restart**: boot ninit kedua muncul (`started console (pid 403)`) |
-| `echo poweroff > /run/initctl` | `initctl cmd: 'poweroff'` → `graceful shutdown` | `reboot: Power down` | mesin mati |
-| `halt` | `initctl cmd: 'force-poweroff'` → `FORCE shutdown (cmd=1126301404)` | `reboot: Power down` | mesin mati segera (tidak menunggu grace) |
+| `poweroff` | `initctl cmd: 'poweroff'` → `graceful shutdown (cmd=1126301404)` | `reboot: Power down` | Machine powers off, 1x ninit boot, QEMU terminates |
+| `reboot` | `initctl cmd: 'reboot'` → `graceful shutdown (cmd=19088743)` | `Restarting system` → `machine restart` | Machine restarts: second ninit boot appears |
+| `echo poweroff > /run/initctl` | `initctl cmd: 'poweroff'` → `graceful shutdown` | `reboot: Power down` | Machine powers off |
+| `halt` | `initctl cmd: 'force-poweroff'` → `FORCE shutdown (cmd=1126301404)` | `reboot: Power down` | Immediate power down without waiting for grace period |
 
-`1126301404` = `0x4321FEDC` = `RB_POWER_OFF`, `19088743` = `0x01234567` =
-`RB_AUTOBOOT`. Uji `reboot` dijalankan dengan `NO_REBOOT=0` supaya QEMU benar-
-benar me-reset mesin; default `-no-reboot` membuat QEMU keluar saat guest minta
-reboot (dipakai uji otomatis).
+`1126301404` (`0x4321FEDC` = `RB_POWER_OFF`), `19088743` (`0x01234567` = `RB_AUTOBOOT`). `reboot` verification requires `NO_REBOOT=0` so QEMU resets instead of exiting on guest reboot.
 
-## Variabel lingkungan
+## Environment Variables
 
-`scripts/build-rootfs.sh`
+### `scripts/build-rootfs.sh`
 
-| Variabel | Default | Arti |
+| Variable | Default | Description |
 |---|---|---|
-| `DISTRO_DIR` | `distro` | direktori kerja |
-| `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / hash resmi | sumber BusyBox (kosongkan `BB_SHA256` untuk melewati verifikasi) |
-| `BUSYBOX_MODE` | `auto` | `auto` \| `source` (wajib kompilasi) \| `prebuilt` (pakai `/bin/busybox` statis). Pada `auto`, unduh/kompilasi/install yang gagal menjatuhkan build ke busybox cadangan; `source` menuntut berhasil. |
-| `BUSYBOX_PREBUILT` | `/bin/busybox` | cadangan bila build dari sumber gagal; hanya biner ini yang dipakai rootfs (pohon `make install` sisa run lama diabaikan) |
-| `BUSYBOX_FORCE` | `0` | `1` = unduh/kompilasi ulang |
-| `NINIT` | `./ninit` | biner yang dipasang sebagai `/sbin/init` |
-| `JOBS` | `nproc` | jumlah job `make` |
-| `EXTRA_INIT_CONF` | (kosong) | berkas yang isinya di-append ke `/etc/init.conf` hasil (dipakai `scripts/test-integration.sh`) |
-| `EXTRA_FSTAB` | (kosong) | berkas yang isinya di-append ke `/etc/fstab` hasil (dipakai `scripts/test-integration.sh`) |
+| `DISTRO_DIR` | `distro` | Build working directory |
+| `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / official hash | BusyBox source details (clear `BB_SHA256` to skip hash verification) |
+| `BUSYBOX_MODE` | `auto` | `auto` \| `source` (enforce source build) \| `prebuilt` (use static `/bin/busybox`). In `auto`, source build failure falls back to prebuilt binary. |
+| `BUSYBOX_PREBUILT` | `/bin/busybox` | Fallback binary if source build fails |
+| `BUSYBOX_FORCE` | `0` | `1` = force clean re-download and re-compilation |
+| `NINIT` | `./ninit` | Binary installed as `/sbin/init` |
+| `JOBS` | `nproc` | Parallel `make` compilation jobs |
+| `EXTRA_INIT_CONF` | *(empty)* | Path to extra config appended to `/etc/init.conf` (used by `scripts/test-integration.sh`) |
+| `EXTRA_FSTAB` | *(empty)* | Path to extra entries appended to `/etc/fstab` (used by `scripts/test-integration.sh`) |
 
-`scripts/run-qemu.sh`
+### `scripts/run-qemu.sh`
 
-| Variabel | Default | Arti |
+| Variable | Default | Description |
 |---|---|---|
-| `SECS` | (kosong) | detik boot otomatis; tanpa ini QEMU interaktif |
-| `KERNEL` / `KERNEL_MODE` | — / `auto` | kernel yang dipakai |
-| `ALPINE_BRANCH` / `ALPINE_FLAVOR` | `v3.20` / `virt` | sumber kernel unduhan |
-| `MEM` | `256` | RAM guest (MB) |
-| `NO_REBOOT` | `1` | `0` = tanpa `-no-reboot`, sehingga reboot guest benar-benar me-reset mesin |
-| `REBUILD` | `0` | `1` = bangun ulang rootfs dulu |
-| `CONSOLE_LOG` | `distro/qemu-console.log` | rekaman konsol serial |
-| `REPORT_ONLY` | `0` | `1` = jangan boot; jalankan `report()` terhadap `CONSOLE_LOG` yang sudah ada (dipakai `scripts/test-qemu-report.sh`; tanpa QEMU/root) |
+| `SECS` | *(empty)* | Automated boot timeout in seconds; interactive if omitted |
+| `KERNEL` / `KERNEL_MODE` | — / `auto` | Kernel selection |
+| `ALPINE_BRANCH` / `ALPINE_FLAVOR` | `v3.20` / `virt` | Alpine kernel download source |
+| `MEM` | `256` | Guest RAM allocation (MB) |
+| `NO_REBOOT` | `1` | `0` = omit `-no-reboot` so guest reboots reset the VM |
+| `REBUILD` | `0` | `1` = rebuild rootfs prior to booting |
+| `CONSOLE_LOG` | `distro/qemu-console.log` | Serial console log destination |
+| `REPORT_ONLY` | `0` | `1` = do not boot; execute `report()` on existing `CONSOLE_LOG` (used by `scripts/test-qemu-report.sh`) |
 
 ## Known Limitations
 
-- **Input serial t=0 tidak andal.** Ketikan yang dialirkan lewat pipe pada detik
-  ke-0 (mis. `printf … | run-qemu.sh`) sering termakan, sehingga perintah tidak
-  pernah sampai ke guest. Beri jeda ~6 detik (`sleep 6`) atau ketik langsung di
-  terminal.
-- **Belum ada `getty`/`login`.** Yang berjalan masih shell konsol langsung
-  (`console:respawn:cttyhack /bin/sh -i`) sebagai root, tanpa autentikasi.
-- **Belum ada persistensi disk.** Hanya initramfs (RAM): tidak ada disk image,
-  `-hda rootfs.img` belum dipakai, semua perubahan hilang saat boot ulang.
-- **Kernel masih pinjam Alpine.** Kernel proyek ini belum dikompilasi sendiri;
-  yang dipakai Alpine `vmlinuz-virt` (v3.20) yang diunduh ke `distro/cache/`.
-- Belum ada manajer paket, jaringan, dan modul kernel; BusyBox dibangun dengan
-  `defconfig` minus applet `tc` (401 applet). `tc` dimatikan karena
-  `networking/tc.c` masih memakai definisi CBQ yang sudah tidak ada di kernel
-  headers terbaru — dengan Ubuntu 24.04 build `defconfig` penuh gagal kompilasi.
-- Job CI `rootfs-distro` membangun rootfs dan mem-boot initramfs di QEMU (TCG,
-  tanpa `/dev/kvm`). Yang masih belum ada: uji interaktif (ketikan ke serial
-  console) dan uji `poweroff`/`reboot` dari dalam guest.
+- **Early serial input (t=0) timing**: Piped input sent before the guest shell finishes initialization can be dropped. Use a ~6 second delay or interact via live terminal.
+- **No `getty`/`login` authentication**: Boots directly into a root console shell (`console:respawn:cttyhack /bin/sh -i`).
+- **Transient RAM disk**: Executes from initramfs; changes do not persist across reboot cycles.
+- **Kernel source**: Defaults to host kernel or precompiled Alpine `vmlinuz-virt` (v3.20) rather than a custom-built minimal kernel.
+- BusyBox is built with `defconfig` minus the `tc` applet (401 applets), avoiding legacy CBQ header compatibility issues on modern kernels.
