@@ -1,139 +1,90 @@
-# S.A.N.E — distro Linux minimal dengan init ninit
+# S.A.N.E — Minimal Linux Distribution with ninit Init System
 
-**S.A.N.E** adalah distro Linux minimal yang dibangun dari nol di repository
-ini. Jantungnya adalah `ninit`, init system kecil (PID 1) dalam satu file C
-tanpa dependensi selain libc: membaca daftar layanan, menjalankan dan
-menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
-`/etc/fstab`, lalu mematikan sistem dengan rapi.
+*[English](README.md) | [Bahasa Indonesia](README.id.md)*
 
-Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
-initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
-[`ninit.c`](ninit.c) (~2027 baris), biner statis, nol warning dengan
-`-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
-responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
+**S.A.N.E** is a minimal Linux distribution built from scratch in this repository.
+At its core is `ninit`, a compact init system (PID 1) written in a single C file
+with zero dependencies beyond libc: it parses service configurations, spawns
+and supervises services, moves processes into cgroup v2 leaves, mounts
+filesystems declared in `/etc/fstab`, and orchestrates clean system shutdown.
+
+This repository contains both components: the S.A.N.E distribution builder
+(BusyBox rootfs + bootable initramfs for QEMU) and the init system source,
+[`ninit.c`](ninit.c) (~2027 lines), strictly static binary compiling with
+zero warnings under `-Wall -Werror`. The event loop is built on `ppoll`,
+keeping init responsive to signals even during rapid service respawn loops.
 
 [![CI](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Fitur
+## Features
 
-- **PID 1 + reaping** semua anak, termasuk proses yatim (orphan) yang diadopsi.
-- **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` dan
-  dependensi `:requires=` (urut topologis DFS tanpa stack overflow, layanan once
-  ditunggu hingga sukses selesai sebelum dependensinya jalan, deteksi
-  siklus, dan dependensi hilang → rescue shell).
-- **Respawn non-blocking**: jeda 2 detik dijalankan lewat timer `ppoll` 100 ms,
-  bukan `sleep()`, sehingga init tidak pernah buta terhadap sinyal.
-- **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
-  `sync()` → `reboot()`; ada varian force untuk mem-bypass grace.
-- **Cgroups v2**: tiap layanan dipindahkan ke leaf `/sys/fs/cgroup/ninit/<nama>`
-  dengan penegakan batas resource (`:memory_max=`, `:cpu_max=`, `:pids_max=`),
-  pencegahan lolos swap (`memory.swap.max=0`), dan pembersihan orphan otomatis
-  (`cgroup.kill`).
-- **`/etc/fstab`**: memasang filesystem dengan flag *dan* opsi data (`size=`,
-  `mode=`, `uid=`, …) diteruskan ke `mount()`; `defaults` dibuang seperti `mount(8)`.
-- **Logging ganda**: `/dev/kmsg`, console, `/var/log/ninit.log`, plus jalur
-  `/run/log.fifo` agar output layanan ikut tercatat dengan prefiks `[service]`.
-- **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
-  `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
-  penulisan tidak saling menelan.
-- **Biner statis** (`gcc -static`): cukup libc, tanpa library tambahan.
+- **PID 1 + Child Reaping**: reaps all terminated child processes, including adopted orphan processes.
+- **Service Configuration (`/etc/init.conf`)**: supports `respawn` and `once` modes with `:requires=` dependencies (DFS topological sort without recursion/stack overflow, `once` services waited on until success before dependents start, cycle detection, and missing dependencies trigger a rescue shell).
+- **Non-blocking Respawn**: a 2-second delay is handled via 100 ms `ppoll` timers instead of blocking `sleep()`, ensuring init never misses signals.
+- **Clean Shutdown**: `SIGTERM`/`SIGINT` → stop services (5-second grace period) → `sync()` → `reboot()`; force variants bypass the grace period for immediate reboot/poweroff.
+- **Cgroups v2**: each service is placed into a leaf `/sys/fs/cgroup/ninit/<name>` with resource limits enforced by the kernel (`:memory_max=`, `:cpu_max=`, `:pids_max=`), swap escape prevention (`memory.swap.max=0`), and automatic orphan cleanup via `cgroup.kill`.
+- **Filesystem Mounting (`/etc/fstab`)**: mounts filesystems with flags and data options (`size=`, `mode=`, `uid=`, ...) forwarded to `mount()`; `defaults` is ignored like in `mount(8)`.
+- **Dual Logging**: outputs to `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus a `/run/log.fifo` path capturing service stdout/stderr with a `[service]` prefix.
+- **IPC (`/run/initctl`)**: line-by-line command handling for `poweroff`, `reboot`, `force-poweroff`, and `force-reboot`, preventing dropped commands on multi-line writes.
+- **Static Binary**: builds cleanly with `gcc -static`, requiring only libc.
 
-### Cgroup v2 — kapabilitas pembatasan resource
+### Cgroup v2 — Resource Limiting Capabilities
 
-Setiap layanan ditempatkan di leaf `/sys/fs/cgroup/ninit/<nama>` dan batas
-berikut ditegakkan kernel **sebelum** proses layanan dijalankan (melalui
-handshake pre-exec):
+Each service is placed in a dedicated leaf cgroup at `/sys/fs/cgroup/ninit/<name>`.
+Limits are enforced by the kernel **before** the service process executes (via a pre-exec synchronization handshake):
 
-| Controller | File cgroup v2 | Opsi `/etc/init.conf` | Dampak bila terlampaui |
+| Controller | Cgroup v2 File | `/etc/init.conf` Option | Impact When Exceeded |
 |---|---|---|---|
-| memory | `memory.max` | `:memory_max=16M` | OOM killer (SIGKILL, exit `0x9`) |
-| memory (swap) | `memory.swap.max` | *(otomatis)* | dipaksa `0` agar batas memory tidak bocor ke swap |
-| cpu | `cpu.max` | `:cpu_max=50000 100000` | kuota CPU `<quota> <period>` (period 100000 µs) |
-| pids | `pids.max` | `:pids_max=50` | `fork()` ditolak dengan `EAGAIN` |
+| memory | `memory.max` | `:memory_max=16M` | OOM killer terminates process (SIGKILL, exit `0x9`) |
+| memory (swap) | `memory.swap.max` | *(automatic)* | Forced to `0` so memory limits cannot leak into swap |
+| cpu | `cpu.max` | `:cpu_max=50000 100000` | CPU quota `<quota> <period>` (default period 100000 µs) |
+| pids | `pids.max` | `:pids_max=50` | `fork()` rejected with `EAGAIN` |
 
-Bila hierarki cgroup v2 tidak tersedia (kernel tanpa `CONFIG_CGROUPS`,
-container/chroot tanpa delegasi controller), ninit mencatat fallback
-*fail-open* dan layanan tetap berjalan tanpa batas — bukan menggagalkan boot.
+If the cgroup v2 hierarchy is unavailable (e.g. kernel without `CONFIG_CGROUPS`, or container/chroot without controller delegation), `ninit` logs a *fail-open* fallback and services continue running without limits rather than failing boot.
 
-## Mulai cepat
+## Quick Start
 
-Butuh `build-essential` dan (untuk uji) `busybox-static`:
+Requires `build-essential` and (for testing) `busybox-static`:
 
 ```bash
-sudo apt-get install build-essential busybox-static
+sudo apt-get install build-essential busybox-static python3
 
-make          # hasilkan biner statis ./ninit
-make test     # smoke test + SIGTERM + config + fixture harness QEMU (tiga pertama butuh root/sudo)
-make rootfs   # rootfs distro minimal + initramfs (busybox statis, ninit PID 1)
-make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
-make clean
+make          # Build static binary ./ninit
+make lint     # Run pattern linter and format string verifier
+make test     # Smoke test + SIGTERM + config + QEMU harness fixture (requires root/sudo for namespaces)
+make rootfs   # Build minimal distro rootfs + initramfs (static BusyBox, ninit as PID 1)
+make qemu     # Boot rootfs in QEMU with serial console (requires qemu-system-x86)
+make clean    # Remove build artifacts
 ```
 
-`make test` menjalankan enam uji otomatis. Lima pertama menyiapkan rootfs
-sementara (busybox sebagai `/bin/sh`) lalu menjalankan ninit sebagai PID 1 di
-PID + mount namespace baru:
+`make test` executes six automated test suites. The first five set up a temporary rootfs (using BusyBox as `/bin/sh`) and run `ninit` as PID 1 in isolated PID and mount namespaces:
 
-- **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
-  (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
-  setelah shutdown, latensi shutdown < 5000 ms (mengirim `SIGTERM`; diukur lewat
-  `sync()` sehingga ambangnya longgar, override lewat `LATENCY_LIMIT_MS`).
-- **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — `SIGTERM` benar-benar
-  *sampai* ke proses layanan: trap-nya jalan, `exit status=0x0` (bukan `0x9`),
-  mask sinyal anak bersih, penutupan terjadi sebelum jendela grace 5 detik.
-- **[`scripts/test-config.sh`](scripts/test-config.sh)** — urut topologis
-  `:requires=` (berlian `a→b,c ; b→c` dan konfigurasi padat 64 layanan → tanpa
-  stack overflow), config tak terbaca / dependensi hilang / siklus → `FATAL` +
-  rescue shell (signal mask-nya kosong, jadi Ctrl+C berfungsi), dan
-  `/run/initctl` dibaca per baris (`poweroff\nreboot` → hanya `poweroff` yang
-  dieksekusi).
-- **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — menjaga
-  pemeriksaan otomatis `run-qemu.sh` tidak longgar: log konsol tempat layanan
-  console mati dan di-respawn ulang (`exit status`, `respawn ditunda`, lebih
-  dari satu PID unik) harus GAGAL, bukan LULUS. Dijalankan terhadap fixture
-  log lewat `REPORT_ONLY=1` — tanpa root dan tanpa QEMU.
-- **[`scripts/test-spawn-failure.sh`](scripts/test-spawn-failure.sh)** — jalur
-  kegagalan spawn: penegakan dependensi di jalur respawn, pencegahan loop fork
-  gagal tak terbatas pada layanan `once`, dan probe keaktifan proses grup
-  sebelum pengiriman `SIGKILL` final.
-- **[`scripts/test-cgroup-limits.sh`](scripts/test-cgroup-limits.sh)** — penegakan
-  batas resource cgroup v2: batasan memori & OOM deterministik (`memory_max`),
-  pembatasan fork (`pids_max`), pembersihan proses orphan saat respawn
-  (`cgroup.kill`), serta verifikasi hierarki leaf cgroup.
-- **[`scripts/test-integration.sh`](scripts/test-integration.sh)** — uji
-  silang-lapisan dengan SATU boot QEMU sungguhan: fstab uji (opsi data, escape
-  oktal, duplikat mountpoint) harus benar-benar ter-mount di kernel dan
-  terlihat dari `/proc/mounts` milik layanan, SEMUA mount selesai sebelum
-  service pertama start, dan harness standar tetap LULUS (`make integration`).
+- **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — Startup banner, event loop readiness (`main loop ready`), service startup, `graceful shutdown`, zero respawns after shutdown, and shutdown latency < 5000 ms.
+- **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — Verifies that `SIGTERM` actually reaches service processes (trap executes, `exit status=0x0` rather than `0x9`, clean child signal mask, shutdown completes before the 5-second grace window expires).
+- **[`scripts/test-config.sh`](scripts/test-config.sh)** — Topological sort of `:requires=` (diamond dependencies `a→b,c ; b→c` and dense configurations up to 64 services without stack overflow), unreadable config / missing dependencies / cycle detection triggering `FATAL` + rescue shell (signal mask cleared so Ctrl+C works), and line-by-line `/run/initctl` reading (`poweroff\nreboot` executes only `poweroff`).
+- **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — Validates the test harness itself: console logs with crashed or respawning console services are strictly flagged as FAIL. Runs against log fixtures via `REPORT_ONLY=1` without requiring root or QEMU.
+- **[`scripts/test-spawn-failure.sh`](scripts/test-spawn-failure.sh)** — Spawn failure paths: dependency cancellation propagation on respawn paths, fork EAGAIN retry limits on `once` services, and process group liveness probing before the final SIGKILL.
+- **[`scripts/test-cgroup-limits.sh`](scripts/test-cgroup-limits.sh)** — Cgroup v2 resource limits: memory limits & deterministic OOM (`memory_max`), process limits (`pids_max`), orphan cleanup on respawn (`cgroup.kill`), and cgroup leaf lifecycle verification.
+- **[`scripts/test-integration.sh`](scripts/test-integration.sh)** — Cross-layer integration with a real QEMU boot: verifies `/etc/fstab` mounts (data options, octal escapes, duplicate mountpoints) visible from `/proc/mounts`, all mounts completed before services start, and full boot verification (`make integration`).
 
-Contoh output dan penjelasan tiap pemeriksaan ada di
-[doc/build-and-test.md](doc/build-and-test.md).
+Detailed outputs and test explanations are available in [doc/build-and-test.md](doc/build-and-test.md).
 
-### Uji akhir: boot sebagai distro di QEMU
+### Distro Boot Verification in QEMU
 
-`make rootfs` membangun rootfs minimal dari nol (BusyBox 1.36.1 statis + `ninit`
-sebagai `/sbin/init`), lalu `make qemu` mem-boot-nya di `qemu-system-x86_64`
-dengan konsol serial:
+`make rootfs` builds a minimal rootfs from scratch (static BusyBox + `ninit` as `/sbin/init`), and `make qemu` boots it in `qemu-system-x86_64` with a serial console:
 
 ```bash
-make rootfs               # unduh + kompilasi busybox statis, susun distro/rootfs, bungkus initramfs
-SECS=5 make qemu          # boot 5 detik, cetak konsol serial + pemeriksaan penanda boot & liveness console
-make qemu                 # mode interaktif (keluar: Ctrl-A X)
+make rootfs               # Assemble distro/rootfs and package initramfs
+SECS=5 make qemu          # Automated 5-second boot, verifies milestones & console liveness
+make qemu                 # Interactive console session (exit with: Ctrl-A X)
 ```
 
-Hasil nyata di sandbox (emulasi TCG tanpa KVM): banner
-`=== ninit start (PID 1) v1.0.0 ===` dan `main loop siap` muncul di konsol
-serial **~1,9–2,1 detik** setelah QEMU dijalankan, shell hidup di konsol
-(`console:respawn:cttyhack /bin/sh -i`), dan di dalam guest `poweroff` benar-benar
-**mematikan** mesin (`reboot: Power down`) sementara `reboot` benar-benar
-**me-restart** (boot ninit kedua terlihat). Applet BusyBox dipetakan ulang lewat
-wrapper `/sbin/{poweroff,reboot,halt}` → `/run/initctl`.
+In sandbox environments (TCG emulation without KVM), the banner `=== ninit start (PID 1) v1.0.0 ===` and `main loop ready` appear on the serial console within **~1.9–2.1 seconds**, a shell starts on the console (`console:respawn:cttyhack /bin/sh -i`), and within the guest `poweroff` cleanly powers off the virtual machine (`reboot: Power down`) while `reboot` restarts cleanly. BusyBox applets are mapped via `/sbin/{poweroff,reboot,halt}` wrappers writing to `/run/initctl`.
 
-Detail (stdin layanan `/dev/null`, `cttyhack`, tabel sinyal BusyBox vs ninit),
-hasil uji, dan *known limitations*-nya ada di
-[doc/distro-builder.md](doc/distro-builder.md).
+See [doc/distro-builder.md](doc/distro-builder.md) for architectural details, signals, and known limitations.
 
-### Uji manual (chroot)
+### Manual Testing (chroot)
 
 ```bash
 mkdir -p /tmp/myrootfs/{proc,sys,dev,run,tmp,etc,var/log,bin}
@@ -146,36 +97,34 @@ sudo timeout -k 5 8 unshare --pid --fork --kill-child=SIGKILL \
      sh -c 'mount -t proc proc /tmp/myrootfs/proc && exec chroot /tmp/myrootfs /ninit'
 ```
 
-Varian `--mount --propagation private` + `mount -t proc` manual dipakai karena
-`unshare --mount-proc=<dir>` ditolak dengan `EINVAL` di sebagian kernel.
+The `--mount --propagation private` + manual `mount -t proc` approach ensures portability across kernels where `unshare --mount-proc` is rejected with `EINVAL`.
 
-## Konfigurasi
+## Configuration
 
-`/etc/init.conf` — satu layanan per baris, `nama:mode:perintah[:requires=a,b][:memory_max=16M][:cpu_max=50000 100000][:pids_max=50][:timeout=60]`:
+### `/etc/init.conf`
+One service per line: `name:mode:command[:requires=a,b][:memory_max=16M][:cpu_max=50000 100000][:pids_max=50][:timeout=60]`
 
 ```
-# layanan wajib: jalankan sekali, jangan respawn
+# Essential service: run once, do not respawn
 logd:once:/bin/sh -c 'exec >/var/log/logd.log 2>&1; ...'
 
-# jaringan: respawn terus, jalan setelah logd siap, dibatasi memori 32M
+# Network service: respawn on exit, depends on logd, memory capped at 32M
 net:respawn:/sbin/dhcpcd -B eth0:requires=logd:memory_max=32M
 
-# daemon aplikasi: kuota CPU 50% dan maks 20 proses
+# Application daemon: 50% CPU quota and maximum 20 processes
 app:respawn:/usr/bin/myapp:cpu_max=50000 100000:pids_max=20
 
-# semua opsi sekaligus: memori 64M, kuota CPU 50%, maks 25 proses
+# All options combined: 64M memory, 50% CPU quota, max 25 processes
 db:respawn:/usr/bin/db:requires=logd:memory_max=64M:cpu_max=50000 100000:pids_max=25
 
-# shell darurat
+# Emergency shell
 tty1:respawn:/bin/sh
 ```
 
-`memory.swap.max` tidak perlu ditulis: ninit memaksa `0` otomatis pada leaf
-setiap layanan yang memakai `:memory_max=`, sehingga batas memory tidak bocor
-ke swap.
+`memory.swap.max` does not need to be specified: `ninit` automatically writes `0` to the leaf cgroup of any service configured with `:memory_max=`, preventing memory limit leaks into swap.
 
-`/etc/fstab` — kolom `device mountpoint type options` (`dump`/`pass` opsional,
-komentar `#` diabaikan):
+### `/etc/fstab`
+Columns: `device mountpoint type options` (`dump`/`pass` optional, `#` comments ignored):
 
 ```
 proc     /proc  proc   rw,nosuid,nodev,noexec
@@ -183,55 +132,49 @@ tmpfs    /run   tmpfs  rw,nosuid,nodev,mode=0755,size=16m
 tmpfs    /tmp   tmpfs  rw,nosuid,nodev,mode=1777,size=64m
 ```
 
-Detail lengkap (grammar, tabel opsi, tabel sinyal, batas 64 layanan) ada di
-[doc/configuration.md](doc/configuration.md).
+Full details (grammar, option tables, signals, and the 64-service limit) are documented in [doc/configuration.md](doc/configuration.md).
 
-## Struktur repository
+## Repository Structure
 
 ```
-ninit.c                  seluruh init system (satu file)
-Makefile                 make / make test / make clean
-scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
-scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
-scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
-scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
-scripts/test-spawn-failure.sh uji dependensi jalur respawn + fork retry limit
-scripts/test-cgroup-limits.sh uji cgroup v2 limits (memory, cpu, pids) & lifecycle
-scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
-scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
-scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda
-                        boot + cek liveness layanan console
-distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
-doc/                     dokumentasi teknis (lihat di bawah)
-.github/workflows/ci.yml CI: build statis, cek statis, smoke test, -Werror,
-                      rootfs + boot QEMU + uji integrasi (job rootfs-distro)
-SECURITY.md              kebijakan keamanan & cara melaporkan kerentanan
-LICENSE                  MIT
+ninit.c                       Complete init system (single C file)
+Makefile                      make / make test / make lint / make clean
+scripts/smoke-test.sh         Automated PID 1 test in isolated chroot + unshare
+scripts/test-sigterm.sh       Verifies SIGTERM delivery to services (not SIGKILL)
+scripts/test-config.sh        Verifies dependency sorting, rescue mode, line-by-line initctl
+scripts/test-qemu-report.sh   Validates run-qemu.sh report() logic against log fixtures
+scripts/test-spawn-failure.sh Tests respawn dependency cancellation & fork retry limits
+scripts/test-cgroup-limits.sh Tests cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-integration.sh   Cross-layer fstab <-> kernel <-> services test via real QEMU boot
+scripts/build-rootfs.sh       Assembles minimal distro rootfs (static BusyBox + ninit)
+scripts/run-qemu.sh           Boots rootfs in QEMU: serial console & milestone verification
+scripts/lint-log-patterns.py  Linter for log strings, assertions, and legacy markers
+scripts/verify-format-strings.py Linter for printf format specifier safety (-Wformat=2)
+distro/                       Distro builder outputs (rootfs/, cache/, initramfs) - gitignored
+doc/                          Technical documentation (see below)
+.github/workflows/ci.yml      CI workflow: static build, linting, tests, QEMU boot
+SECURITY.md                   Security policy and vulnerability disclosure instructions
+LICENSE                       MIT License
 ```
 
-## Dokumentasi
+## Documentation
 
-| Dokumen | Isi |
+| Document | Contents |
 |---|---|
-| [doc/architecture.md](doc/architecture.md) | urutan boot, event loop, sinyal, respawn, shutdown, cgroup, logging |
-| [doc/configuration.md](doc/configuration.md) | format `/etc/init.conf`, `/etc/fstab`, `/run/initctl`, lokasi log |
-| [doc/build-and-test.md](doc/build-and-test.md) | build statis, smoke test, CI, uji manual, troubleshooting |
-| [doc/distro-builder.md](doc/distro-builder.md) | rootfs minimal, initramfs, boot di QEMU, temuan integrasi |
-| [doc/README.md](doc/README.md) | indeks dokumentasi + status & roadmap |
-| [SECURITY.md](SECURITY.md) | model ancaman dan cara melaporkan masalah keamanan |
+| [doc/architecture.md](doc/architecture.md) | Internal architecture: boot sequence, event loop, signals, respawn, shutdown, cgroup, logging |
+| [doc/configuration.md](doc/configuration.md) | Syntax and semantics of `/etc/init.conf`, `/etc/fstab`, `/run/initctl`, and log paths |
+| [doc/build-and-test.md](doc/build-and-test.md) | Static build, test harnesses, CI workflow, manual chroot testing, troubleshooting |
+| [doc/distro-builder.md](doc/distro-builder.md) | Rootfs assembly, initramfs packaging, QEMU headless validation |
+| [doc/glossary-i18n.md](doc/glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
+| [doc/README.md](doc/README.md) | Documentation index, project status, and architectural roadmap |
+| [SECURITY.md](SECURITY.md) | Threat model, operational security boundaries, and vulnerability reporting |
 
 ## Status
 
-Rilis **v1.0.0** (perbaikan reliabilitas terakhir: anti-overflow pada urut
-topologis, validasi dependensi, initctl per baris, dan rescue mode sungguhan
-lewat `enter_rescue_mode()` dengan signal mask yang dikosongkan). Ini proyek
-eksperimental untuk belajar cara kerja init di level OS — belum siap dipakai di
-mesin produksi. Batasan yang diketahui:
-semua layanan berjalan sebagai root (belum ada seccomp/user per layanan; pembatasan
-resource ditangani cgroup v2: memory, cpu, pids), dan ini bukan pengganti
-systemd. Uji selalu di VM/container, dan siapkan jalur pemulihan lebih dulu.
+Current release: **v1.0.0** (reliability hardening: anti-overflow in topological sort, dependency validation, line-by-line initctl processing, and functional rescue shell via `enter_rescue_mode()` with cleared signal masks).
 
-## Lisensi
+This is an experimental educational project designed to explore OS-level init system design. It is not intended as a drop-in replacement for production init systems like systemd. Known limitations: all services run as root (no per-service seccomp or user separation; resource limiting is handled via cgroup v2). Always test within virtual machines or containers with recovery paths configured.
 
-[MIT](LICENSE) © 2026 Iky969. Masalah keamanan: jangan buka issue publik —
-ikuti [SECURITY.md](SECURITY.md).
+## License
+
+[MIT](LICENSE) © 2026 Iky969. Security issues: do not open public issues — please follow [SECURITY.md](SECURITY.md).

@@ -1,94 +1,65 @@
-# Kebijakan Keamanan
+# Security Policy
 
-`ninit` adalah **init system (PID 1) eksperimental** untuk eksperimen build
-distro/OS sendiri. Ia berjalan dengan hak penuh root, jadi bug di sini bisa
-berakibat fatal pada sistem yang memakainya. Dokumen ini menjelaskan cara
-melaporkan masalah keamanan dan apa saja yang termasuk/ tidak termasuk cakupan.
+*[English](SECURITY.md) | [Bahasa Indonesia](SECURITY.id.md)*
 
-## Versi yang didukung
+`ninit` is an **experimental init system (PID 1)** designed for research and custom Linux distribution builds. Because it executes with full root privileges, defects at this layer can have severe system-wide impacts. This document outlines vulnerability reporting procedures, supported versions, and scope boundaries.
 
-| Versi | Didukung |
+## Supported Versions
+
+| Version | Supported |
 |---|---|
-| `main` (rilis terbaru: **v1.0.0**) | ✅ |
-| Commit/tag lama | ❌ (silakan uji ulang di `main` dulu) |
+| `main` (latest release: **v1.0.0**) | ✅ |
+| Older commits/tags | ❌ (please verify against `main` first) |
 
-v1.0.0 adalah rilis pertama yang diberi nomor versi. Perbaikan keamanan hanya
-diterapkan pada `main`.
+Security fixes are committed exclusively to the `main` branch.
 
-## Melaporkan kerentanan
+## Reporting a Vulnerability
 
-**Jangan** buka issue publik untuk masalah keamanan. Gunakan salah satu jalur privat:
+**Do not** open public GitHub issues for security vulnerabilities. Please report through private channels:
 
-1. **GitHub Private Vulnerability Reporting** (disarankan):
-   tab **Security → Report a vulnerability** di
+1. **GitHub Private Vulnerability Reporting** (recommended):
+   Navigate to the **Security → Report a vulnerability** tab at:
    <https://github.com/Iky969/sane-linux/security/advisories/new>.
-2. **Email:** `ryuzarza@gmail.com` dengan subjek `[SECURITY] ninit: <ringkas>`.
+2. **Email**: Contact `ryuzarza@gmail.com` with the subject line `[SECURITY] ninit: <summary>`.
 
-Sertakan bila ada:
+Please include the following information where available:
+- Tested commit/version (`git rev-parse HEAD`) and build invocation (`make` + gcc version),
+- Environment: host Linux distribution, kernel version (`uname -a`), execution context (real bare-metal/VM PID 1 vs. `unshare`/`chroot`/container),
+- Minimal reproduction files: `/etc/init.conf` and/or `/etc/fstab` triggering the issue,
+- Reproduction steps and diagnostic evidence (logs, `readelf`, `strace`, core dumps),
+- Potential impact: boot denial of service, privilege escalation, memory disclosure, mount leaks, etc.
 
-- versi/commit yang diuji (`git rev-parse HEAD`) dan cara build (`make` + versi gcc),
-- lingkungan: distro, kernel (`uname -a`), apakah diuji sebagai PID 1 asli atau
-  di dalam `unshare`/`chroot`/container,
-- isi `/etc/init.conf` dan/atau `/etc/fstab` minimal yang memicu masalah,
-- langkah reproduksi + bukti (log, `readelf`, `strace`, core dump),
-- dampak yang mungkin (DoS boot, eksekusi perintah sebagai root, kebocoran mount, dll).
+This is an independent open-source project without a formal SLA. Reports are typically acknowledged within a few days, and reporter credit will be attributed in release advisories upon request.
 
-Ini proyek hobi tanpa SLA; saya berusaha membalas dalam beberapa hari dan akan
-mencantumkan kredit pelapor di advisory bila diinginkan.
+## Scope
 
-## Cakupan
+**In-Scope** (vulnerabilities that should be reported):
 
-**Termasuk cakupan** (bug yang ingin saya ketahui):
+- Parsing of `/etc/init.conf` (modes, `:requires=`, buffer boundaries) and `/etc/fstab` (flags, data options forwarded to `mount()`): parser bugs, buffer overflows, out-of-bounds reads, or unexpected option elevation into mount flags.
+- Signal handling & event loop: race conditions, signal drop, deadlocks, uncontrolled respawn storms, or unkillable processes preventing shutdown.
+- Process management: PID leaks, zombie accumulation, unintended `execl()` argument passing, or missing child process isolation.
+- Control channels (`/run/initctl` and `/run/log.fifo`): blocking I/O stalling init, non-root access, memory leaks, or FIFO denial of service.
+- Cgroup operations (`/sys/fs/cgroup/ninit/<name>`): path traversal through service names, target cgroup corruption, or failure to cleanup leaf hierarchies.
 
-- Parsing `/etc/init.conf` (mode, `:requires=`, batas panjang) dan `/etc/fstab`
-  (opsi/data yang diteruskan ke `mount()`): salah parse, buffer overflow,
-  pembacaan di luar batas, opsi yang naik menjadi flag `mount()` tak terduga.
-- Pemrosesan sinyal & event loop: race, sinyal hilang, deadlock, respawn tak
-  terkendali, sistem yang tak bisa dimatikan.
-- Manajemen proses: kebocoran pid/zombie, `execl` dengan argumen tak terduga.
-- Jalur `/run/initctl` dan `/run/log.fifo`: pembacaan yang memblokir init,
-  akses oleh non-root, kebocoran isi memori.
-- Penulisan cgroup (`/sys/fs/cgroup/ninit/<nama>`): path traversal lewat nama
-  layanan, salah target cgroup.
+**Out-of-Scope**:
 
-**Di luar cakupan:**
+- Upstream defects in the Linux kernel, BusyBox, glibc, or musl libc.
+- Host sandbox escape, physical hardware access, or cold-boot attacks.
+- Malicious configurations authored by root: users with write access to `/etc/init.conf` or `/etc/fstab` already have root authority.
+- Operational security issues, such as insecure rootfs file permissions, untrusted `/bin/sh` binaries, or weak root passwords.
+- Features not yet implemented (e.g. seccomp filtering, Mandatory Access Control / SELinux labels, user namespaces, cryptographic service signature verification). These represent known architectural limitations rather than security vulnerabilities.
+- Denial of service caused by root-authored services (e.g. intentional respawn flood loops).
 
-- Kernel, busybox, glibc/musl, atau bug sistem operasi induk.
-- Pelarian dari sandbox/container/namespace, akses fisik, cold-boot attack.
-- Konfigurasi yang memang ditulis root: siapa pun yang bisa menulis
-  `/etc/init.conf` atau `/etc/fstab` sudah punya kendali penuh atas sistem.
-- Masalah keamanan operasional, mis. `/bin/sh` di rootfs yang tidak dipercaya,
-  sistem tidak di-`chmod`, kata sandi root lemah.
-- Fitur pengerasan yang memang belum ada (seccomp, MAC/SELinux, user namespace
-  separation, verifikasi tanda tangan service). Ini keterbatasan yang diketahui,
-  bukan kerentanan — silakan usulkan sebagai fitur di issue biasa.
-- DoS oleh layanan yang ditulis root, mis. layanan yang sengaja spam respawn.
+## Threat Model & Operational Security Notes
 
-## Model ancaman & catatan operasional
-
-- `ninit` berjalan sebagai PID 1 dengan UID 0 dan **tanpa** pemisahan hak.
-  Setiap perintah di `/etc/init.conf` dijalankan sebagai `root` via
-  `/bin/sh -c` — konfigurasi init diperlakukan sebagai *trusted input*.
-- `/run` di-mount sebagai `tmpfs` dan FIFO dibuat dengan mode `0600` milik root;
-  hanya root yang bisa mengirim perintah ke `/run/initctl`.
-- Output layanan dibaca dari `/run/log.fifo` dengan mode non-blocking, sehingga
-  layanan tidak bisa memblokir init lewat FD penuh (tetap ada batas buffer
-  kernel — laporan bila hal ini bisa menggantungkan sistem).
-- **Cgroup v2 adalah pembatasan resource, bukan sandbox isolasi proses.**
-  Controller `memory`/`cpu`/`pids` membatasi kuota, tetapi:
-  - Batas **tidak** mengisolasi PID, mount, network, atau filesystem namespace;
-    semua layanan berbagi namespace yang sama dengan PID 1.
-  - Bila controller tidak tersedia (kernel tanpa `CONFIG_CGROUPS`, container
-    tanpa delegasi), ninit membaca *fail-open*: layanan berjalan **tanpa batas**
-    dan hanya dicatat di log. Tidak ada mode fail-closed untuk resource.
-  - Layanan yang menurunkan hak (`setuid`/`setgid`) tetap berada di leaf cgroup
-    yang sama; cgroup v2 **tidak** menegakkan privilege boundary.
-- FD kontrol PID 1 (`/run/initctl`, `/run/log.fifo`, `/var/log/ninit.log`)
-  bertanda `O_CLOEXEC` dan ditutup eksplisit di cabang anak/di rescue shell
-  sebelum `execl()`, sehingga layanan yang menurunkan hak tidak mewarisi handle
-  ke control plane (SANE-06-01).
-- `/dev/kmsg` ditulis oleh init; pada sistem nyata ini berarti log boot masuk ke
-  kernel ring buffer dan bisa terekam di journal/dmesg.
-- Sebelum dipakai di mesin penting: uji dulu di VM/container, siapkan akses serial
-  atau jalur pemulihan, dan jangan menaruh ninit sebagai `/sbin/init` pada mesin
-  produksi.
+- `ninit` runs as PID 1 with UID 0 and **without** privilege dropping. Every service command in `/etc/init.conf` is executed as `root` via `/bin/sh -c` — service configurations are treated as *trusted input*.
+- `/run` is mounted as `tmpfs` and the control FIFO is created with `0600` permissions owned by root; only root processes may dispatch commands to `/run/initctl`.
+- Service output is read from `/run/log.fifo` non-blockingly; runaway services cannot stall init by filling the FIFO buffer.
+- **Cgroup v2 provides resource containment, not a process isolation sandbox.**
+  The `memory`, `cpu`, and `pids` controllers enforce quotas, with the following caveats:
+  - Resource limits **do not** isolate PID, mount, network, or filesystem namespaces; services share namespaces with PID 1 unless isolated by custom wrappers.
+  - If cgroup v2 controllers are unavailable (e.g. kernels lacking `CONFIG_CGROUPS`, or unprivileged containers), `ninit` falls back to *fail-open* mode: services run without limits and warnings are logged. Fail-closed resource gating is not enforced at boot.
+  - Services that drop privileges (`setuid`/`setgid`) remain within the same leaf cgroup; cgroup v2 does not enforce privilege boundaries.
+- Control file descriptors (`/run/initctl`, `/run/log.fifo`, `/var/log/ninit.log`) are marked with `O_CLOEXEC` and closed explicitly in the child branch before `execl()` in `spawn_service()` and in `enter_rescue_mode()`, preventing privilege-dropped child processes from inheriting control handles (SANE-06-01).
+- `/dev/kmsg` is written directly by `ninit`, routing early boot logs into the kernel ring buffer (`dmesg`).
+- Before deploying on hardware: validate configurations within virtual machines or containers, ensure serial console access is available, and verify clean poweroff/reboot behavior.
