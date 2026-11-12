@@ -41,6 +41,13 @@
 #      - Service execution still runs normally through the pre-exec handshake.
 #      - The kill(-pgid) fallback on a once service when the leader dies,
 #        ensuring background (orphan) processes are swept clean with no cgroup.
+# 12. T14: leaf cgroup directory cleanup hygiene -- after a service stops and
+#     its processes are gone, the leaf directory is deterministically removed
+#     (rmdir succeeds after cgroup.kill, no EBUSY; failures log a warning and
+#     never crash PID 1).
+# 13. T14B: controller delegation verification -- the leaf cgroup.controllers
+#     file must list the controllers delegated by the parent subtree
+#     (memory, pids, cpu); an available controller that is missing is a failure.
 #
 # Usage:
 #   sudo sh ./scripts/test-cgroup-limits.sh      # or: make test
@@ -314,6 +321,23 @@ before_in() {
 		ok "$desc"
 	else
 		bad "$desc"
+	fi
+}
+
+# T14B: assert that a controller is present in the leaf cgroup.controllers
+# file. Controllers that are unavailable on the host are skipped (the suite
+# already detects them from /sys/fs/cgroup/cgroup.controllers); an available
+# controller that was NOT delegated down the subtree is a hard failure.
+check_controller() {
+	desc=$1; file=$2; ctrl=$3; avail=$4
+	if [ "$avail" -eq 1 ]; then
+		if grep -qw "$ctrl" "$file" 2>/dev/null; then
+			ok "$desc"
+		else
+			bad "$desc"
+		fi
+	else
+		skip "$desc (controller not available on host)"
 	fi
 }
 
@@ -895,8 +919,8 @@ else
 	L4=$(new_log)
 	ROOTS="$ROOTS $R4"
 	LOGS="$LOGS $L4"
-	printf 'limits_audit:once:/bin/sh -c "cat %s/limits_audit/memory.max > /var/mem.val && cat %s/limits_audit/cpu.max > /var/cpu.val && cat %s/limits_audit/pids.max > /var/pids.val && echo poweroff > /run/initctl":pids_max=20:cpu_max=50000 100000:memory_max=32M\n' \
-		"$RUN_CG_BASE" "$RUN_CG_BASE" "$RUN_CG_BASE" > "$R4/etc/init.conf"
+	printf 'limits_audit:once:/bin/sh -c "cat %s/limits_audit/memory.max > /var/mem.val && cat %s/limits_audit/cpu.max > /var/cpu.val && cat %s/limits_audit/pids.max > /var/pids.val && cat %s/limits_audit/cgroup.controllers > /var/controllers.val && echo poweroff > /run/initctl":pids_max=20:cpu_max=50000 100000:memory_max=32M\n' \
+		"$RUN_CG_BASE" "$RUN_CG_BASE" "$RUN_CG_BASE" "$RUN_CG_BASE" > "$R4/etc/init.conf"
 	boot_guest "$R4" "$WAIT4" >"$L4" 2>&1
 
 	check_in "memory.max configuration logged" "$L4" \
@@ -923,6 +947,14 @@ else
 	else
 		skip "leaf pids.max read skipped: pids controller not active"
 	fi
+	# T14B: controller delegation verification. The parent subtree delegates
+	# +memory +pids +cpu, so the leaf cgroup.controllers file must list them.
+	check_controller "T14B: leaf cgroup.controllers delegates the memory controller" \
+		"$R4/var/controllers.val" memory "$has_mem"
+	check_controller "T14B: leaf cgroup.controllers delegates the pids controller" \
+		"$R4/var/controllers.val" pids "$has_pids"
+	check_controller "T14B: leaf cgroup.controllers delegates the cpu controller" \
+		"$R4/var/controllers.val" cpu "$has_cpu"
 	check_in "leaf cgroup cleaned up after completion" "$L4" \
 		"cgroup: cleaned up 'limits_audit'"
 fi
@@ -1084,6 +1116,13 @@ for cmd in /proc/[0-9]*/cmdline; do
     fi
 done
 echo "LINGERING_ONCE_ORPHANS=$lingering" > /var/once_orphan_audit.txt
+# T14: the leaf cgroup directory must be gone after the once service stopped
+# (rmdir succeeds after cgroup.kill, no EBUSY).
+if [ -d "${NINIT_CGROUP_BASE:-/sys/fs/cgroup/ninit}/orphan_maker" ]; then
+    echo "LEAF_REMOVED=0" >> /var/once_orphan_audit.txt
+else
+    echo "LEAF_REMOVED=1" >> /var/once_orphan_audit.txt
+fi
 echo poweroff > /run/initctl
 exit 0
 EOF
@@ -1104,6 +1143,8 @@ EOF
 		"Device or resource busy"
 	check_in  "orphans from the once service swept clean before the checker (LINGERING_ONCE_ORPHANS=0)" \
 		"$R8/var/once_orphan_audit.txt" 'LINGERING_ONCE_ORPHANS=0'
+	check_in  "T14: leaf cgroup directory removed after the service stopped (LEAF_REMOVED=1)" \
+		"$R8/var/once_orphan_audit.txt" 'LEAF_REMOVED=1'
 	before_in "orphan_maker leaf cgroup cleaned up before graceful shutdown" "$L8" \
 		"cgroup: cleaned up 'orphan_maker'" 'graceful shutdown'
 	check_in  "event loop keeps running and shutdown is clean" "$L8" \
