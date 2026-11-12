@@ -50,12 +50,25 @@
 #ifndef STABLE_RUNTIME
 #define STABLE_RUNTIME     10  /* seconds of stable runtime before backoff is reset */
 #endif
+#ifndef SIGTERM_GRACE_SECS
+#define SIGTERM_GRACE_SECS 5   /* T13: default SIGTERM -> SIGKILL grace window (seconds) */
+#endif
+#ifndef SPAWN_RETRY_BASE_MS
+#define SPAWN_RETRY_BASE_MS 100 /* T11: fork() EAGAIN backoff base: 100/200/400 ms */
+#endif
 
+/* Service lifecycle states (T10). The numeric values are part of the internal
+   contract of svc_transition_allowed(); the relative order of the pre-existing
+   states (STOPPED < RUNNING < DONE < FAILED) is preserved while STARTING (= 1)
+   and STOPPING (= 3) are inserted at their canonical positions.
+   Every write to service_t.state goes through svc_set_state(). */
 typedef enum {
-    SVC_STATE_STOPPED = 0,
-    SVC_STATE_RUNNING,
-    SVC_STATE_DONE,
-    SVC_STATE_FAILED
+    SVC_STATE_STOPPED  = 0,   /* idle: never started, stopped, or waiting to respawn */
+    SVC_STATE_STARTING = 1,   /* spawn sequence in progress (fork / retry backoff) */
+    SVC_STATE_RUNNING  = 2,   /* spawned and tracked via pid/pgid */
+    SVC_STATE_STOPPING = 3,   /* stop requested: SIGTERM sent, grace window running */
+    SVC_STATE_DONE     = 4,   /* once service finished with exit status 0 */
+    SVC_STATE_FAILED   = 5    /* terminal: spawn, exit, timeout, or dependency failure */
 } svc_state_t;
 
 typedef struct {
@@ -76,6 +89,8 @@ typedef struct {
     int         timeout;        /* timeout for once service (seconds); default ONCE_START_TIMEOUT; 0 = disabled */
     char        deps_str[256]; 
     svc_state_t state;
+    int         grace;          /* T13: SIGTERM grace seconds (:grace=N), default SIGTERM_GRACE_SECS */
+    int         sigkill_sent;   /* T13: 1 = SIGKILL already escalated (log/report once) */
     char        memory_max[64];
     char        cpu_max[64];
     char        pids_max[64];
@@ -142,6 +157,127 @@ static char *trim(char *s)
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) s[--n] = 0;
     return s;
+}
+
+/* ---------- timing helpers (T11/T13) ---------- */
+/* Milliseconds from CLOCK_MONOTONIC: immune to wall-clock jumps (the grace
+   window is a duration, not a date). Falls back to time(NULL) seconds if the
+   monotonic clock is unavailable, keeping the window accurate to a second
+   instead of failing outright. */
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (long long)time(NULL) * 1000;
+}
+
+/* Delay that never busy-waits: nanosleep() restarts on EINTR and reuses the
+   remaining time reported back in &ts, so an interrupted sleep still completes
+   in full. Used for the fork() EAGAIN backoff (T11) and the shutdown grace
+   poll (T13) instead of sleep()/usleep(). */
+static void sleep_ms(int ms)
+{
+    struct timespec ts;
+    if (ms <= 0) return;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+        ;
+}
+
+/* ---------- service state machine (T10) ---------- */
+/* "/run/ninit-" (11) + name (<= 127) + ".state" (6) + NUL fits comfortably. */
+#define SVC_STATE_FILE_MAX 160
+
+static const char *svc_state_name(svc_state_t s)
+{
+    switch (s) {
+    case SVC_STATE_STOPPED:  return "STOPPED";
+    case SVC_STATE_STARTING: return "STARTING";
+    case SVC_STATE_RUNNING:  return "RUNNING";
+    case SVC_STATE_STOPPING: return "STOPPING";
+    case SVC_STATE_DONE:     return "DONE";
+    case SVC_STATE_FAILED:   return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+/* Invariant table for service lifecycle edges (T10). Linear paths:
+     STOPPED  -> STARTING -> RUNNING -> STOPPING -> STOPPED
+     STARTING -> STOPPED            (spawn aborted, retry via ppoll timer)
+     STARTING -> FAILED             (fork/pipe failure, retries exhausted)
+     RUNNING  -> DONE               (once service exited with status 0)
+     RUNNING  -> STOPPED            (respawn service: leader exited, timer armed)
+     RUNNING  -> FAILED             (non-zero exit, crash-loop, timeout, cancelled)
+     STOPPING -> STOPPED | DONE | FAILED   (stop observed by the reaper)
+     STOPPED  -> FAILED             (cancelled by a failed dependency)
+     STOPPED  -> STOPPING           (SANE-01: leader exited, group members survive)
+   DONE and FAILED are terminal for one boot: a service never leaves them.
+   Returns 1 when allowed, 0 when the edge is absent from the table — the caller
+   logs a warning and still applies the new state, because an unexpected
+   transition must never be able to freeze or crash PID 1. */
+static int svc_transition_allowed(svc_state_t from, svc_state_t to)
+{
+    if (from == to) return 1;   /* idempotent re-set: no-op, no log */
+
+    switch (from) {
+    case SVC_STATE_STOPPED:
+        return to == SVC_STATE_STARTING || to == SVC_STATE_STOPPING ||
+               to == SVC_STATE_FAILED;
+    case SVC_STATE_STARTING:
+        return to == SVC_STATE_RUNNING  || to == SVC_STATE_STOPPING ||
+               to == SVC_STATE_STOPPED  || to == SVC_STATE_FAILED;
+    case SVC_STATE_RUNNING:
+        return to == SVC_STATE_STOPPING || to == SVC_STATE_STOPPED ||
+               to == SVC_STATE_DONE     || to == SVC_STATE_FAILED;
+    case SVC_STATE_STOPPING:
+        return to == SVC_STATE_STOPPED  || to == SVC_STATE_DONE ||
+               to == SVC_STATE_FAILED;
+    case SVC_STATE_DONE:
+    case SVC_STATE_FAILED:
+        return 0;
+    }
+    return 0;
+}
+
+/* Publish the current state as /run/ninit-<name>.state (T10) so tests and
+   operators can read the lifecycle without parsing the log. Best effort:
+   diagnostic telemetry must never abort PID 1, so failures are logged only.
+   O_CLOEXEC keeps the descriptor out of every service's fd table (SANE-06-01). */
+static void svc_write_state_file(const service_t *svc)
+{
+    char path[SVC_STATE_FILE_MAX];
+    int n = snprintf(path, sizeof(path), "/run/ninit-%s.state", svc->name);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        init_log("Warning: state file path for '%s' too long, not written", svc->name);
+        return;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        init_log("Warning: cannot write state file %s: %s", path, strerror(errno));
+        return;
+    }
+    if (dprintf(fd, "%s\n", svc_state_name(svc->state)) < 0)
+        init_log("Warning: cannot write state file %s: %s", path, strerror(errno));
+    close(fd);
+}
+
+/* The ONLY transition point for service_t.state (T10): validate the edge, log
+   "[ninit] <name>: state <OLD> -> <NEW>" and publish the state file. */
+static void svc_set_state(service_t *svc, svc_state_t new_state)
+{
+    if (!svc) return;
+    if (svc->state == new_state) return;   /* no transition -> no log, no I/O */
+
+    if (!svc_transition_allowed(svc->state, new_state))
+        init_log("Warning: %s: illegal state transition %s -> %s (applied)",
+                 svc->name, svc_state_name(svc->state), svc_state_name(new_state));
+
+    init_log("%s: state %s -> %s", svc->name,
+             svc_state_name(svc->state), svc_state_name(new_state));
+    svc->state = new_state;
+    svc_write_state_file(svc);
 }
 
 /* ---------- signal handlers ---------- */
@@ -313,6 +449,32 @@ static void cgroup_kill_service(const char *name)
         }
         fclose(fp);
     }
+}
+
+/* Deliver `sig` to EVERY process still attached to the service cgroup (T13).
+   cgroup.kill is NOT usable for this: writing to it always delivers SIGKILL, so
+   using it for the polite signal would silently skip the whole grace window and
+   kill services that would have exited cleanly on SIGTERM (scripts/test-sigterm.sh
+   scenario 1 asserts the "bye!" trap does run). The only correct whole-cgroup
+   delivery of a non-fatal signal is walking cgroup.procs: that also reaches
+   processes which called setsid()/setpgid() and therefore miss kill(-pgid).
+   Processes that left the cgroup cannot be reached this way and are covered by
+   kill_service_group()'s pgid path. */
+static void cgroup_signal_service(const char *name, int sig)
+{
+    if (!cgroup_name_safe(name)) return;
+    if (sig == SIGKILL) { cgroup_kill_service(name); return; }
+
+    char procs_path[320];
+    snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
+    FILE *fp = fopen(procs_path, "r");
+    if (!fp) return;   /* no cgroup (fail-open) -> pgid path is the fallback */
+
+    int p;
+    while (fscanf(fp, "%d", &p) == 1) {
+        if (p > 1) kill((pid_t)p, sig);
+    }
+    fclose(fp);
 }
 
 /* Explicit fail-open fallback when cgroup cannot be prepared */
@@ -656,12 +818,14 @@ static int parse_config(const char *path)
         char *cpu_limit = "";
         char *pids_limit = "";
         int timeout_val = ONCE_START_TIMEOUT;
+        int grace_val = SIGTERM_GRACE_SECS;   /* T13: SIGTERM -> SIGKILL grace window */
 
         char *t_req = strstr(cmd, ":requires=");
         char *t_mem = strstr(cmd, ":memory_max=");
         char *t_cpu = strstr(cmd, ":cpu_max=");
         char *t_pid = strstr(cmd, ":pids_max=");
         char *t_tout = strstr(cmd, ":timeout=");
+        char *t_grace = strstr(cmd, ":grace=");
 
         /* Find the earliest occurring tag so commands containing ':' remain intact */
         char *first_tag = NULL;
@@ -670,6 +834,7 @@ static int parse_config(const char *path)
         if (t_cpu && (!first_tag || t_cpu < first_tag)) first_tag = t_cpu;
         if (t_pid && (!first_tag || t_pid < first_tag)) first_tag = t_pid;
         if (t_tout && (!first_tag || t_tout < first_tag)) first_tag = t_tout;
+        if (t_grace && (!first_tag || t_grace < first_tag)) first_tag = t_grace;
 
         if (first_tag) {
             *first_tag = 0; /* Split cmd right before first option tag */
@@ -709,6 +874,28 @@ static int parse_config(const char *path)
                             init_log("Parse err: invalid timeout format '%s' on service '%s', using default %ds",
                                      tout_str, name, ONCE_START_TIMEOUT);
                         }
+                    }
+                } else if (strncmp(scan, "grace=", 6) == 0) {
+                    /* T13: per-service SIGTERM grace window, same validation style
+                       as :timeout= — digits only, bounded, default on rejection.
+                       grace=0 is accepted and means "escalate immediately". */
+                    char *gr_str = trim(scan + 6);
+                    int valid = 1;
+                    if (!*gr_str || strlen(gr_str) > 6) valid = 0;
+                    for (const char *gp = gr_str; *gp; gp++) {
+                        if (!isdigit((unsigned char)*gp)) { valid = 0; break; }
+                    }
+                    if (valid) {
+                        long v = strtol(gr_str, NULL, 10);
+                        if (v >= 0 && v <= 3600) {
+                            grace_val = (int)v;
+                        } else {
+                            init_log("Parse err: grace '%s' out of range (0-3600s) on service '%s', using default %ds",
+                                     gr_str, name, SIGTERM_GRACE_SECS);
+                        }
+                    } else {
+                        init_log("Parse err: invalid grace format '%s' on service '%s', using default %ds",
+                                 gr_str, name, SIGTERM_GRACE_SECS);
                     }
                 } else {
                     init_log("Warning: unknown option '%s' on service '%s'", scan, name);
@@ -809,7 +996,11 @@ static int parse_config(const char *path)
         services[num_services].pid          = 0;
         services[num_services].pgid         = 0;
         services[num_services].last_start   = 0;
-        services[num_services].state        = SVC_STATE_STOPPED;
+        services[num_services].grace        = grace_val;
+        services[num_services].sigkill_sent = 0;
+        /* T10: registration is not a transition (the entry is already STOPPED),
+           so it goes through the same single assignment point as everything else. */
+        svc_set_state(&services[num_services], SVC_STATE_STOPPED);
         num_services++;
     }
     fclose(f);
@@ -978,6 +1169,11 @@ static int spawn_service(service_t *svc)
         cgroup_kill_service(svc->name);
     }
 
+    /* T10: from this point the service is being started; the state leaves the
+       idle STOPPED state so the lifecycle is observable while the spawn
+       sequence (pipe setup, fork, backoff) is running. */
+    svc_set_state(svc, SVC_STATE_STARTING);
+
     int sync_pipe[2] = { -1, -1 };
     int has_sync = 1;
     if (pipe2(sync_pipe, O_CLOEXEC) < 0) {
@@ -989,11 +1185,12 @@ static int spawn_service(service_t *svc)
             if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
                 init_log("%s: failed to create pipe %d times, service marked failed",
                          svc->name, svc->spawn_tries);
-                svc->state = SVC_STATE_FAILED;
+                svc_set_state(svc, SVC_STATE_FAILED);
                 svc->spawn_tries = 0;
                 return 1;
             }
             svc->need_respawn = 1;
+            svc_set_state(svc, SVC_STATE_STOPPED);   /* start aborted, retry later */
             return 0;
         } else {
             /* Fallback pipe() succeeded: explicitly set FD_CLOEXEC.
@@ -1015,11 +1212,12 @@ static int spawn_service(service_t *svc)
                 if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
                     init_log("%s: failed to set CLOEXEC %d times, service marked failed",
                              svc->name, svc->spawn_tries);
-                    svc->state = SVC_STATE_FAILED;
+                    svc_set_state(svc, SVC_STATE_FAILED);
                     svc->spawn_tries = 0;
                     return 1;
                 }
                 svc->need_respawn = 1;
+                svc_set_state(svc, SVC_STATE_STOPPED);   /* start aborted, retry later */
                 return 0;
             }
         }
@@ -1027,29 +1225,54 @@ static int spawn_service(service_t *svc)
 
     svc->need_respawn = 0;
     svc->last_start   = time(NULL);
-    pid_t pid = fork();
-    
+
+    /* T11: fork() with bounded retry + exponential backoff.
+       fork() returns EAGAIN when the kernel cannot allocate a task — RLIMIT_NPROC,
+       a saturated cgroup pids.max (the case scripts/test-spawn-failure.sh scenario 3
+       reproduces), or pid-space exhaustion. That is a transient resource condition:
+       retry it, but never in a busy loop. Attempt 1 is the initial fork(), then up
+       to MAX_SPAWN_RETRY retries sleeping SPAWN_RETRY_BASE_MS << n (100/200/400 ms)
+       with nanosleep(); fork() calls stay bounded by MAX_SPAWN_RETRY + 1. Any other
+       errno is NOT retried: ENOENT/ENOMEM-class errors do not resolve by waiting and
+       retrying them would only delay the terminal failure. */
+    pid_t pid = -1;
+    int   err = 0;
+    for (int attempt = 1; attempt <= MAX_SPAWN_RETRY + 1; attempt++) {
+        pid = fork();
+        if (pid >= 0) break;
+        err = errno;   /* capture before init_log(): open/dprintf modifies errno */
+
+        if (attempt == 1)
+            init_log("fork %s: %s", svc->name, strerror(err));
+        if (err != EAGAIN || attempt > MAX_SPAWN_RETRY)
+            break;
+
+        int delay_ms = SPAWN_RETRY_BASE_MS << (attempt - 1);
+        init_log("spawn: fork() EAGAIN for '%s', retrying in %dms (retry %d/%d)",
+                 svc->name, delay_ms, attempt, MAX_SPAWN_RETRY);
+        sleep_ms(delay_ms);
+    }
+
     if (pid < 0) {
-        int err = errno;   /* capture before init_log(): open/dprintf modifies errno */
         if (has_sync) {
             if (sync_pipe[0] >= 0) close(sync_pipe[0]);
             if (sync_pipe[1] >= 0) close(sync_pipe[1]);
         }
         svc->spawn_tries++;
-        /* Once services are never respawned, so without retry limits, fork()
-           failures would never transition to a terminal state. After
-           MAX_SPAWN_RETRY: mark failed so deps_satisfied() cancels dependent
-           services instead of hanging indefinitely. */
-        if (!svc->respawn && svc->spawn_tries >= MAX_SPAWN_RETRY) {
-            init_log("fork %s: %s (%d attempts, service marked failed)",
-                     svc->name, strerror(err), svc->spawn_tries);
-            svc->state = SVC_STATE_FAILED;
-            svc->spawn_tries = 0;
-            return 1;
-        }
-        init_log("fork %s: %s", svc->name, strerror(err));
-        svc->need_respawn = 1;   /* retry via ppoll timer, not a busy loop */
-        return 0;
+        /* Retries exhausted (or the error is not retryable): release the sync
+           pipe, log the critical failure and reach a terminal state. Once services
+           are never respawned, so without a terminal state they stayed STOPPED
+           forever and their dependents waited without any diagnostic; marking
+           FAILED lets deps_satisfied() cancel them instead. */
+        if (err == EAGAIN)
+            init_log("fork EAGAIN after %d retries for %s: %s",
+                     MAX_SPAWN_RETRY, svc->name, strerror(err));
+        init_log("fork %s: %s (%d attempts, service marked failed)",
+                 svc->name, strerror(err), MAX_SPAWN_RETRY + 1);
+        svc_set_state(svc, SVC_STATE_FAILED);
+        svc->spawn_tries = 0;
+        svc->need_respawn = 0;
+        return 1;
     }
 
     if (pid == 0) {
@@ -1120,8 +1343,9 @@ static int spawn_service(service_t *svc)
 
     svc->pid  = pid;
     svc->pgid = pid;   /* child called setsid(): acts as process group leader */
-    svc->state = SVC_STATE_RUNNING;
+    svc_set_state(svc, SVC_STATE_RUNNING);
     svc->spawn_tries = 0;
+    svc->sigkill_sent = 0;   /* T13: fresh process period, escalation not yet used */
     init_log("started %s (pid %d)", svc->name, pid);
     svc->cgroup_fail_open = setup_cgroup(svc->name, pid);
 
@@ -1170,9 +1394,9 @@ static void reap_zombies(void)
                    shutdown_all() tracks the group via this pgid. */
                 if (!services[i].respawn) {
                     if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-                        services[i].state = SVC_STATE_DONE;
+                        svc_set_state(&services[i], SVC_STATE_DONE);
                     else
-                        services[i].state = SVC_STATE_FAILED;
+                        svc_set_state(&services[i], SVC_STATE_FAILED);
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
                         /* Fallback kill when cgroup fails open: leader exited but runtime
@@ -1182,7 +1406,7 @@ static void reap_zombies(void)
                         cleanup_cgroup(services[i].name);
                     }
                 } else {
-                    services[i].state = SVC_STATE_STOPPED;
+                    svc_set_state(&services[i], SVC_STATE_STOPPED);
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
                         /* Fallback kill when cgroup fails open: leader exited but runtime
@@ -1208,7 +1432,7 @@ static void reap_zombies(void)
                             if (services[i].crash_count >= CRASH_LIMIT) {
                                 init_log("%s: crash-loop detected (%d consecutive failures), service marked failed",
                                          services[i].name, services[i].crash_count);
-                                services[i].state = SVC_STATE_FAILED;
+                                svc_set_state(&services[i], SVC_STATE_FAILED);
                                 services[i].need_respawn = 0;
                                 reset_respawn_counters(&services[i]);
                             } else {
@@ -1280,7 +1504,7 @@ static void spawn_eligible_services(void)
             int ret = deps_satisfied(svc, &failed_dep);
             if (ret < 0) {
                 init_log("service '%s' cancelled: dependency '%s' failed", svc->name, failed_dep);
-                svc->state = SVC_STATE_FAILED;
+                svc_set_state(svc, SVC_STATE_FAILED);
                 reset_respawn_counters(svc);
                 progress = 1;
             } else if (ret == 1) {
@@ -1316,7 +1540,7 @@ static void respawn_services(void)
         int ret = deps_satisfied(svc, &failed_dep);
         if (ret < 0) {
             init_log("service '%s' cancelled: dependency '%s' failed", svc->name, failed_dep);
-            svc->state = SVC_STATE_FAILED;
+            svc_set_state(svc, SVC_STATE_FAILED);
             svc->need_respawn = 0;
             reset_respawn_counters(svc);
             continue;
@@ -1388,7 +1612,7 @@ static void cancel_dependents(void)
                 if (di >= 0 && services[di].state == SVC_STATE_FAILED) {
                     init_log("service '%s' cancelled: dependency '%s' failed",
                              svc->name, token);
-                    svc->state = SVC_STATE_FAILED;
+                    svc_set_state(svc, SVC_STATE_FAILED);
                     reset_respawn_counters(svc);
                     changed = 1;
                     break;
@@ -1416,7 +1640,10 @@ static void enforce_once_timeout(void)
 
         init_log("%s: once service exceeded %d seconds timeout, marked failed",
                  svc->name, svc->timeout);
-        svc->state = SVC_STATE_FAILED;
+        /* T10: a timeout is a stop followed by a failure, so the state travels
+           RUNNING -> STOPPING -> FAILED instead of jumping straight to FAILED. */
+        svc_set_state(svc, SVC_STATE_STOPPING);
+        svc_set_state(svc, SVC_STATE_FAILED);
         svc->need_respawn = 0;
         reset_respawn_counters(svc);
         if (svc->pid > 0)
@@ -1453,7 +1680,10 @@ static void drain_log_fifo(void)
 
 /* Send signal to entire service process group (via recorded pgid,
    NOT leader pid: leader may have exited while child processes remain active —
-   audit SANE-01), and invoke cgroup.kill when signal is SIGKILL. */
+   audit SANE-01), and to the whole cgroup as well: SIGKILL through cgroup.kill,
+   any other signal (T13 SIGTERM) through cgroup_signal_service(). The two paths
+   are complementary — the pgid covers processes that left the cgroup, the cgroup
+   covers processes that left the process group (setsid/setpgid). */
 static void kill_service_group(const service_t *svc, int sig)
 {
     if (svc->pgid > 0) {
@@ -1463,7 +1693,7 @@ static void kill_service_group(const service_t *svc, int sig)
         kill(svc->pid, sig);
     }
 
-    if (sig == SIGKILL) cgroup_kill_service(svc->name);
+    cgroup_signal_service(svc->name, sig);
 }
 
 /* Is any process in this service still alive? Leader (pid) OR any process
@@ -1513,10 +1743,12 @@ static void shutdown_all(int reboot_cmd, int force)
                cleans up stale pgids from services that exited earlier, preventing
                SIGKILL from targeting recycled process groups.
                Processes escaping their group are still terminated by cgroup.kill. */
-            if (service_still_alive(&services[i]))
+            if (service_still_alive(&services[i])) {
+                svc_set_state(&services[i], SVC_STATE_STOPPING);
                 kill_service_group(&services[i], SIGKILL);
-            else
+            } else {
                 cgroup_kill_service(services[i].name);
+            }
             /* T12: the service is stopped: reset its generation counters so a
                future start never inherits this run's crash-loop backoff. */
             reset_respawn_counters(&services[i]);
@@ -1529,38 +1761,77 @@ static void shutdown_all(int reboot_cmd, int force)
     }
 
     init_log("graceful shutdown (cmd=%d)", reboot_cmd);
+
+    /* T13 phase 1 — SIGTERM to every live service, across BOTH its process group
+       and its cgroup: kill_service_group() reaches processes that left the
+       cgroup, the cgroup.procs sweep reaches processes that called setsid()/
+       setpgid() and would otherwise miss kill(-pgid) (SANE-01). cgroup.kill is
+       deliberately NOT used for the polite signal: it only implements SIGKILL and
+       would end the grace window before a well-behaved service could exit
+       (scripts/test-sigterm.sh scenario 1 asserts the trap really runs). */
+    long long grace_t0_ms = monotonic_ms();
     for (int i = 0; i < num_services; i++) {
         /* Probe before signaling (same as force shutdown path above):
            stale pgids are pruned first, ensuring only genuinely active
            groups receive SIGTERM. */
-        if (service_still_alive(&services[i]))
+        if (service_still_alive(&services[i])) {
+            svc_set_state(&services[i], SVC_STATE_STOPPING);
             kill_service_group(&services[i], SIGTERM);
+        }
     }
 
-    for (int i = 0; i < 50; i++) {
-        int alive = 0;
+    /* T13 phase 2 — per-service grace window (:grace=N, default
+       SIGTERM_GRACE_SECS), polled every 100 ms with nanosleep(). A service still
+       alive when its own window expires is escalated to SIGKILL immediately and
+       exactly once ("grace expired, SIGKILL"). The loop ends when nothing is
+       alive, or when every survivor has already been escalated, so the total
+       wait is bounded by the LONGEST configured grace instead of growing with
+       the number of services. */
+    for (;;) {
+        int alive = 0, waiting = 0;
+
+        reap_zombies();
+        drain_log_fifo();   /* capture last logs before death (e.g. "bye!") */
+        long long elapsed_ms = monotonic_ms() - grace_t0_ms;
+
         /* Probe EVERY service, do not break on the first active one: only
            service_still_alive() clears stale pgids. Breaking early would leave
            services after an active one unprobed on the final pass, allowing
            stale pgids to persist into the SIGKILL sweep below and hit recycled
            process groups. */
-        for (int j = 0; j < num_services; j++)
-            if (service_still_alive(&services[j])) alive = 1;
-        if (!alive) break;
-        reap_zombies();
-        drain_log_fifo();   /* capture last logs before death (e.g. "bye!") */
-        usleep(100000);
+        for (int j = 0; j < num_services; j++) {
+            service_t *svc = &services[j];
+            if (!service_still_alive(svc)) continue;
+            alive = 1;
+            if (elapsed_ms >= (long long)svc->grace * 1000) {
+                if (!svc->sigkill_sent) {
+                    svc->sigkill_sent = 1;
+                    init_log("%s: grace expired, SIGKILL", svc->name);
+                    kill_service_group(svc, SIGKILL);
+                }
+            } else {
+                waiting = 1;   /* still inside its grace window: keep polling */
+            }
+        }
+        if (!alive || !waiting) break;
+        sleep_ms(100);
     }
 
     for (int i = 0; i < num_services; i++) {
+        service_t *svc = &services[i];
         /* Probe once more before SIGKILL, matching force and SIGTERM paths:
            groups may have exited after the last pass. Services with empty groups
-           only require cgroup.kill — signaling stale pgids with SIGKILL is dangerous. */
-        if (service_still_alive(&services[i])) {
-            kill_service_group(&services[i], SIGKILL);
+           only require cgroup.kill — signaling stale pgids with SIGKILL is dangerous.
+           A service already escalated when its own grace window expired (T13) is
+           not re-reported as a dead group: its SIGKILL was deliberate, and the
+           "already dead" message would misreport the escalation as a no-op. */
+        if (svc->sigkill_sent) {
+            cgroup_kill_service(svc->name);
+        } else if (service_still_alive(svc)) {
+            kill_service_group(svc, SIGKILL);
         } else {
-            init_log("%s: process group already dead, SIGKILL skipped", services[i].name);
-            cgroup_kill_service(services[i].name);
+            init_log("%s: process group already dead, SIGKILL skipped", svc->name);
+            cgroup_kill_service(svc->name);
         }
         /* T12: the service is stopped: reset its generation counters so a
            future start never inherits this run's crash-loop backoff. */
