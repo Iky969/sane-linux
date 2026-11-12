@@ -13,3 +13,9 @@
 /distro/initramfs.cpio.gz
 /distro/qemu-console.log
 /distro/qemu.log
+
+# dokumen operasional & laporan lokal
+LAPORAN-*.md
+AUDIT-*.md
+PLAN-*.md
+.agents/
