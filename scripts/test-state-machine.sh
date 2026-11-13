@@ -19,7 +19,16 @@
 # Exit: 0 = PASS, 1 = FAIL
 set -eu
 
-BIN=${BIN:-./ninit}
+BIN=${BIN:-}
+if [ -z "$BIN" ]; then
+	if [ -x "./ninit-test" ]; then
+		BIN="./ninit-test"
+	elif [ -x "$SELF_DIR/ninit-test" ]; then
+		BIN="$SELF_DIR/ninit-test"
+	else
+		BIN="./ninit"
+	fi
+fi
 BUSYBOX=${BUSYBOX:-/bin/busybox}
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 [ -x "$BIN" ] || BIN="$SELF_DIR/ninit"

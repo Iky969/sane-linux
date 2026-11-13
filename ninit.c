@@ -8,6 +8,12 @@
  * v1.0.0  : real rescue mode via enter_rescue_mode() (broken config,
  *           missing dependencies, cycles) + signal mask cleared before
  *           execl so Ctrl+C works in emergency shell.
+ * v1.1.0  : cgroup v2 pre-exec handshake, hierarchical resource limits,
+ *           fail-open lifecycle, respawn counter reset + pre-respawn cgroup
+ *           flush, deterministic leaf cleanup, supervised rescue mode (PID 1
+ *           never exits: the emergency shell is forked, reaped and respawned),
+ *           non-blocking fork() EAGAIN retry, cgroup base override gated behind
+ *           -DNINIT_TESTING.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -25,6 +31,7 @@
 #include <time.h>
 #include <poll.h>
 #include <ctype.h>
+#include <sys/ioctl.h>   /* TIOCSCTTY: rescue shell controlling tty (T15) */
 
 #ifndef MAX_SERVICES
 #define MAX_SERVICES    64
@@ -91,6 +98,9 @@ typedef struct {
     svc_state_t state;
     int         grace;          /* T13: SIGTERM grace seconds (:grace=N), default SIGTERM_GRACE_SECS */
     int         sigkill_sent;   /* T13: 1 = SIGKILL already escalated (log/report once) */
+    int         fork_tries;     /* T11: EAGAIN retries used in the current start episode */
+    long long   fork_retry_at;  /* T11: monotonic ms deadline of the next fork() retry; 0 = due/none */
+    int         fork_first_logged; /* T11: 1 = "fork <name>: <errno>" logged for this episode */
     char        memory_max[64];
     char        cpu_max[64];
     char        pids_max[64];
@@ -157,6 +167,23 @@ static char *trim(char *s)
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) s[--n] = 0;
     return s;
+}
+
+/* Split a /run/initctl read buffer into trimmed, non-empty command lines.
+   Pure parsing (no command execution) so the reader can be exercised by the
+   fuzz harness (scripts/fuzz-parsers.sh). Returns the number of lines stored,
+   bounded by max_lines; a line longer than MAX_LINE-1 is copied truncated,
+   matching the fixed-size storage used by the event loop. */
+static int initctl_split_lines(char *buf, char lines[][MAX_LINE], int max_lines)
+{
+    int n = 0;
+    for (char *line = strtok(buf, "\n"); line && n < max_lines; line = strtok(NULL, "\n")) {
+        char *cmdline = trim(line);
+        if (*cmdline == 0) continue;   /* ignore empty lines */
+        snprintf(lines[n], MAX_LINE, "%.*s", (int)MAX_LINE - 1, cmdline);
+        n++;
+    }
+    return n;
 }
 
 /* ---------- timing helpers (T11/T13) ---------- */
@@ -372,12 +399,22 @@ static void set_hostname(void)
 #endif
 #define CGROUP_BASE_PREFIX "/sys/fs/cgroup/"
 
-static char cgroup_base_buf[256];
+#ifdef NINIT_TESTING
+static char cgroup_base_buf[256];   /* storage for the NINIT_CGROUP_BASE override */
+#endif
 static const char *cgroup_base_ptr = NULL;
 
 static const char *get_cgroup_base(void)
 {
     if (cgroup_base_ptr) return cgroup_base_ptr;
+
+#ifdef NINIT_TESTING
+    /* TEST BUILDS ONLY (Makefile target ninit-test). NINIT_CGROUP_BASE lets each
+       suite isolate its cgroups into a per-run subtree instead of the host's
+       /sys/fs/cgroup/ninit. The hook is COMPILED OUT of production binaries so
+       the environment can never redirect cgroup operations: isolation must not
+       depend on what the caller exported. Validation is not relaxed — absolute
+       path, inside /sys/fs/cgroup/, no ".." (SANE-06-02). */
     const char *env = getenv("NINIT_CGROUP_BASE");
     if (env && env[0] == '/' &&
         strncmp(env, CGROUP_BASE_PREFIX, strlen(CGROUP_BASE_PREFIX)) == 0 &&
@@ -391,9 +428,17 @@ static const char *get_cgroup_base(void)
             cgroup_base_buf[--len] = 0;
         cgroup_base_ptr = cgroup_base_buf;
         init_log("cgroup: base path overridden: %s", cgroup_base_ptr);
-    } else {
-        cgroup_base_ptr = CGROUP_BASE_DEFAULT;
+        return cgroup_base_ptr;
     }
+#else
+    /* Production build: the override is not compiled in. Say so out loud if the
+       environment tries anyway, so a mis-built binary is obvious in the log
+       instead of silently ignoring the request. */
+    if (getenv("NINIT_CGROUP_BASE"))
+        init_log("cgroup: NINIT_CGROUP_BASE ignored (binary built without -DNINIT_TESTING)");
+#endif
+
+    cgroup_base_ptr = CGROUP_BASE_DEFAULT;
     return cgroup_base_ptr;
 }
 
@@ -654,15 +699,13 @@ static void cleanup_cgroup(const char *svc_name)
         }
         if (errno != EBUSY) {
             if (errno != ENOENT) {
-                init_log("Warning: cgroup rmdir %s failed: %s (leaf may leak)",
-                         dir, strerror(errno));
+                init_log("cgroup cleanup failed for '%s': %s", svc_name, strerror(errno));
             }
             return;
         }
         usleep(5000);
     }
-    init_log("Warning: cgroup rmdir %s failed: %s (leaf may leak)",
-             dir, strerror(errno));
+    init_log("cgroup cleanup failed for '%s': %s", svc_name, strerror(errno));
 }
 
 /* ---------- config parser (FIXED: Robust) ---------- */
@@ -998,6 +1041,9 @@ static int parse_config(const char *path)
         services[num_services].last_start   = 0;
         services[num_services].grace        = grace_val;
         services[num_services].sigkill_sent = 0;
+        services[num_services].fork_tries   = 0;
+        services[num_services].fork_retry_at = 0;
+        services[num_services].fork_first_logged = 0;
         /* T10: registration is not a transition (the entry is already STOPPED),
            so it goes through the same single assignment point as everything else. */
         svc_set_state(&services[num_services], SVC_STATE_STOPPED);
@@ -1145,11 +1191,22 @@ static int spawn_service(service_t *svc)
 
     time_t now = time(NULL);
 
-    /* Never block event loop with sleep(): if within respawn_delay window,
-       mark need_respawn and let ppoll timeout in main loop act as timer.
-       respawn_delay increases exponentially on crash loops (T8D), rather than
-       staying fixed at RESPAWN_DELAY. */
-    if (svc->last_start && (now - svc->last_start) < svc->respawn_delay) {
+    /* T11: a fork() EAGAIN retry episode is in progress (fork_tries > 0). The
+       monotonic retry deadline OWNS the pacing: respawn_delay must not add its
+       own window on top, or a 100 ms retry would silently wait the full 2 s.
+       need_respawn stays set so respawn_pending() keeps the ppoll tick at 100 ms
+       and nothing ever sleeps inside the spawn path. */
+    if (svc->fork_tries > 0) {
+        if (svc->fork_retry_at && monotonic_ms() < svc->fork_retry_at) {
+            svc->need_respawn = 1;
+            return 0;                   /* not due yet: ppoll wakes us in 100 ms */
+        }
+        svc->fork_retry_at = 0;         /* due: attempt the next fork() now */
+    } else if (svc->last_start && (now - svc->last_start) < svc->respawn_delay) {
+        /* Never block event loop with sleep(): if within respawn_delay window,
+           mark need_respawn and let ppoll timeout in main loop act as timer.
+           respawn_delay increases exponentially on crash loops (T8D), rather than
+           staying fixed at RESPAWN_DELAY. */
         if (!svc->need_respawn)
             init_log("%s: respawn delayed (timer %d seconds, loop unblocked)",
                      svc->name, svc->respawn_delay);
@@ -1226,51 +1283,67 @@ static int spawn_service(service_t *svc)
     svc->need_respawn = 0;
     svc->last_start   = time(NULL);
 
-    /* T11: fork() with bounded retry + exponential backoff.
+    /* T11: exactly ONE fork() attempt per event-loop pass, with a non-blocking
+       exponential-backoff retry.
        fork() returns EAGAIN when the kernel cannot allocate a task — RLIMIT_NPROC,
        a saturated cgroup pids.max (the case scripts/test-spawn-failure.sh scenario 3
-       reproduces), or pid-space exhaustion. That is a transient resource condition:
-       retry it, but never in a busy loop. Attempt 1 is the initial fork(), then up
-       to MAX_SPAWN_RETRY retries sleeping SPAWN_RETRY_BASE_MS << n (100/200/400 ms)
-       with nanosleep(); fork() calls stay bounded by MAX_SPAWN_RETRY + 1. Any other
-       errno is NOT retried: ENOENT/ENOMEM-class errors do not resolve by waiting and
-       retrying them would only delay the terminal failure. */
-    pid_t pid = -1;
+       reproduces), or pid-space exhaustion. That is a transient resource condition,
+       so it is retried with 100/200/400 ms backoff — but PID 1 must never sleep:
+       arming fork_retry_at + need_respawn hands the wait to the existing ppoll
+       timer (compute_poll_timeout() -> 100 ms) and respawn_services() calls back
+       here when the deadline is due. Total fork() calls stay bounded by
+       MAX_SPAWN_RETRY + 1, and a non-EAGAIN errno is terminal immediately
+       (waiting cannot fix ENOENT/ENOMEM-class errors). */
+    pid_t pid = fork();
     int   err = 0;
-    for (int attempt = 1; attempt <= MAX_SPAWN_RETRY + 1; attempt++) {
-        pid = fork();
-        if (pid >= 0) break;
-        err = errno;   /* capture before init_log(): open/dprintf modifies errno */
-
-        if (attempt == 1)
-            init_log("fork %s: %s", svc->name, strerror(err));
-        if (err != EAGAIN || attempt > MAX_SPAWN_RETRY)
-            break;
-
-        int delay_ms = SPAWN_RETRY_BASE_MS << (attempt - 1);
-        init_log("spawn: fork() EAGAIN for '%s', retrying in %dms (retry %d/%d)",
-                 svc->name, delay_ms, attempt, MAX_SPAWN_RETRY);
-        sleep_ms(delay_ms);
-    }
 
     if (pid < 0) {
+        err = errno;   /* capture before init_log(): open/dprintf modifies errno */
         if (has_sync) {
             if (sync_pipe[0] >= 0) close(sync_pipe[0]);
             if (sync_pipe[1] >= 0) close(sync_pipe[1]);
         }
-        svc->spawn_tries++;
+
+        /* One line per start episode: this path now runs once per attempt, and
+           the harness bounds the number of 'fork <name>' lines
+           (test-spawn-failure.sh scenario 3: grep -c 'fork boot' <= 3). */
+        if (!svc->fork_first_logged) {
+            init_log("fork %s: %s", svc->name, strerror(err));
+            svc->fork_first_logged = 1;
+        }
+
+        if (err == EAGAIN && svc->fork_tries < MAX_SPAWN_RETRY) {
+            svc->fork_tries++;
+            int delay_ms = SPAWN_RETRY_BASE_MS << (svc->fork_tries - 1);
+            svc->fork_retry_at = monotonic_ms() + delay_ms;
+            svc->need_respawn  = 1;
+            /* No start has happened yet, so drop the start timestamp: the
+               respawn_delay gate must not add a second delay on top of the retry
+               deadline. The state stays STARTING — the start sequence is still in
+               progress, it is neither RUNNING nor terminal. */
+            svc->last_start = 0;
+            svc_set_state(svc, SVC_STATE_STARTING);
+            init_log("spawn: fork() EAGAIN for '%s', retrying in %dms (retry %d/%d)",
+                     svc->name, delay_ms, svc->fork_tries, MAX_SPAWN_RETRY);
+            return 0;   /* no progress: the ppoll timer drives the retry */
+        }
+
         /* Retries exhausted (or the error is not retryable): release the sync
            pipe, log the critical failure and reach a terminal state. Once services
            are never respawned, so without a terminal state they stayed STOPPED
            forever and their dependents waited without any diagnostic; marking
            FAILED lets deps_satisfied() cancel them instead. */
+        svc->spawn_tries++;
         if (err == EAGAIN)
             init_log("fork EAGAIN after %d retries for %s: %s",
                      MAX_SPAWN_RETRY, svc->name, strerror(err));
         init_log("fork %s: %s (%d attempts, service marked failed)",
                  svc->name, strerror(err), MAX_SPAWN_RETRY + 1);
         svc_set_state(svc, SVC_STATE_FAILED);
-        svc->spawn_tries = 0;
+        svc->spawn_tries  = 0;
+        svc->fork_tries   = 0;
+        svc->fork_retry_at = 0;
+        svc->fork_first_logged = 0;
         svc->need_respawn = 0;
         return 1;
     }
@@ -1346,6 +1419,11 @@ static int spawn_service(service_t *svc)
     svc_set_state(svc, SVC_STATE_RUNNING);
     svc->spawn_tries = 0;
     svc->sigkill_sent = 0;   /* T13: fresh process period, escalation not yet used */
+    /* T11: the start episode succeeded: the next EAGAIN episode starts fresh
+       (full retry budget and its own "fork <name>: <errno>" diagnostic). */
+    svc->fork_tries   = 0;
+    svc->fork_retry_at = 0;
+    svc->fork_first_logged = 0;
     init_log("started %s (pid %d)", svc->name, pid);
     svc->cgroup_fail_open = setup_cgroup(svc->name, pid);
 
@@ -2163,46 +2241,235 @@ static void mount_fstab(void)
     fclose(f);
 }
 
-/* ---------- rescue mode ----------
+/* ---------- supervised rescue mode (T15) ----------
    The sole fallback path when init cannot proceed with normal boot.
-   Three mandatory requirements:
 
-     1. PID 1 signal mask is cleared. main() blocks SIGINT/SIGTERM/SIGCHLD/
-        SIGUSR1/SIGUSR2 for ppoll; without a reset, the rescue shell inherits
-        this mask and Ctrl+C in emergency shell is ignored (SIGINT blocked).
-        spawn_service() performs identical mask clearing for child services.
-     2. SIGPIPE disposition reset to SIG_DFL. main() configures signal(SIGPIPE, SIG_IGN)
-        for PID 1; without a reset, emergency shell inherits SIG_IGN breaking
-        standard pipeline tools (yes | head -n 1).
-     3. execl() replaces PID 1 with /bin/sh. If execl fails (e.g. /bin/sh missing
-        from rootfs), process exits with status 1 -- NEVER return to boot flow
-        with an invalid internal state.
+   PID 1 IS NEVER ALLOWED TO EXIT. An exited PID 1 makes the kernel panic
+   ("Attempted to kill init!"), so the emergency shell is a SUPERVISED CHILD,
+   not a replacement for PID 1. The old implementation execl()'d /bin/sh over
+   PID 1, which made every rescue path a panic path: operator `exit`/Ctrl-D,
+   a shell killed by OOM, or /bin/sh missing from the rootfs (execl fails ->
+   _exit(1)) all killed PID 1.
 
-   This function never returns. */
+   Requirements kept from the execl era, now enforced in the CHILD:
+     1. PID 1's ppoll mask (SIGINT/SIGTERM/SIGCHLD/SIGUSR1/SIGUSR2) must be
+        cleared for the shell, otherwise Ctrl+C never reaches the emergency
+        shell. PID 1 itself keeps the mask: its event loop unblocks signals
+        only for the duration of ppoll().
+     2. SIGPIPE/SIGCHLD are reset to SIG_DFL in the child: PID 1 ignores
+        SIGPIPE, and an inherited SIG_IGN breaks standard pipeline tools
+        (yes | head -n 1).
+     3. PID 1 keeps /run/initctl open (O_CLOEXEC keeps it out of the child), so
+        a supervised rescue can still power the machine off cleanly.
+     4. If the shell cannot run at all, PID 1 logs FATAL and parks in the rescue
+        loop - it never _exit()s.
+
+   enter_rescue_mode() and rescue_loop() never return. */
+
+static int       rescue_active    = 0;
+static pid_t     rescue_shell_pid = -1;
+static int       rescue_spawns    = 0;   /* spawn attempts (successful forks) */
+static long long rescue_spawn_ms  = 0;   /* monotonic_ms() of the last spawn */
+#define MAX_RESCUE_RESPAWN         3
+#define RESCUE_RESPAWN_COOLDOWN_MS 2000
+
+/* Rescue mode can be entered BEFORE main() opens the control fds (a config
+   parse failure happens earlier), so open them here: without /run/initctl the
+   supervised rescue has no clean way to power the machine off (T15). */
+static void ensure_rescue_fds(void)
+{
+    if (initctl_fd < 0)    initctl_fd    = setup_initctl();
+    if (g_log_fifo_fd < 0) g_log_fifo_fd = setup_log_fifo();
+}
+
+/* Best-effort console setup for the shell CHILD. Everything here is fail-open:
+   a namespace test has no /dev/console at all and the shell must still run
+   (only job control is lost), so no failure here may abort the rescue. */
+static void attach_console_ctty(void)
+{
+    int fd = open("/dev/console", O_RDWR | O_NOCTTY);
+    if (fd < 0) return;                     /* no console: nothing to attach */
+    if (isatty(fd)) {
+        if (ioctl(fd, TIOCSCTTY, 1) < 0)
+            { /* not fatal: the shell runs without job control */ }
+        if (tcsetpgrp(fd, getpgrp()) < 0)
+            { /* not fatal: the shell is not the foreground group */ }
+        /* Fill in ONLY descriptors that are not valid yet. An inherited stdin
+           must be preserved: if it is a /dev/null, a pipe or a script, the
+           shell has to read THAT (and hit EOF on it) instead of turning
+           interactive on the console and ignoring its real input. */
+        for (int f = 0; f < 3; f++) {
+            if (f == fd) continue;
+            if (fcntl(f, F_GETFD) < 0 && errno == EBADF) dup2(fd, f);
+        }
+    }
+    if (fd > 2) close(fd);
+}
+
+/* fork() + exec the supervised rescue shell. The child reports its own failures
+   through /dev/kmsg (it must not depend on stdio) and exits; the parent counts
+   the attempt either way and keeps running. */
+static void spawn_rescue_shell(void)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        init_log("rescue: fork() for the rescue shell failed: %s", strerror(errno));
+        rescue_shell_pid = -1;
+        rescue_spawns++;
+        rescue_spawn_ms  = monotonic_ms();
+        return;
+    }
+
+    if (pid == 0) {
+        setsid();                 /* own session: the shell is a session leader */
+        attach_console_ctty();    /* controlling tty for Ctrl-C (best effort) */
+
+        sigset_t empty;
+        sigemptyset(&empty);
+        if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) {
+            /* Fail-closed for the CHILD only: a shell with PID 1's ppoll mask
+               cannot be interrupted. PID 1 stays alive either way. */
+            int kfd = open("/dev/kmsg", O_WRONLY);
+            if (kfd >= 0) {
+                dprintf(kfd, "ninit: rescue shell: sigprocmask failed: %s\n", strerror(errno));
+                close(kfd);
+            }
+            _exit(126);
+        }
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
+
+        execl("/bin/sh", "sh", (char *)NULL);
+
+        /* /bin/sh missing/broken: report it without relying on stdio, then exit.
+           The parent sees a fast exit and never exits itself (no kernel panic). */
+        int kfd = open("/dev/kmsg", O_WRONLY);
+        if (kfd >= 0) {
+            dprintf(kfd, "ninit: FATAL: execl /bin/sh failed: %s\n", strerror(errno));
+            close(kfd);
+        }
+        _exit(127);
+    }
+
+    rescue_shell_pid = pid;
+    rescue_spawns++;
+    rescue_spawn_ms  = monotonic_ms();
+    init_log("rescue shell started (pid %d)", (int)pid);
+}
+
+/* Rescue event loop. PID 1 stays in control: it serves /run/initctl
+   (poweroff/reboot/force-*), drains the service log fifo, reaps the shell and
+   respawns it with a bounded budget, then parks - alive - if the shell is
+   unusable. Never returns. */
+static void rescue_loop(void)
+{
+    struct pollfd fds[2];
+    int nfds = 0;
+    int exhausted = 0;
+
+    if (initctl_fd >= 0) {
+        fds[nfds].fd = initctl_fd; fds[nfds].events = POLLIN; nfds++;
+    } else init_log("Warning: rescue initctl_fd invalid");
+    if (g_log_fifo_fd >= 0) {
+        fds[nfds].fd = g_log_fifo_fd; fds[nfds].events = POLLIN; nfds++;
+    } else init_log("Warning: rescue log_fifo_fd invalid");
+
+    for (;;) {
+        if (!exhausted && rescue_shell_pid <= 0) {
+            if (rescue_spawns < MAX_RESCUE_RESPAWN) {
+                if (monotonic_ms() - rescue_spawn_ms >= RESCUE_RESPAWN_COOLDOWN_MS) {
+                    if (rescue_spawns > 0)
+                        init_log("rescue shell exited; respawning (%d/%d)",
+                                 rescue_spawns + 1, MAX_RESCUE_RESPAWN);
+                    spawn_rescue_shell();
+                }
+                /* else: still cooling down - the 500 ms poll below waits */
+            } else {
+                /* Shell unusable: PID 1 must NOT _exit() (kernel panic). Park in
+                   this loop, keep serving initctl so the operator can still ask
+                   for a clean shutdown, and say exactly that. */
+                init_log("FATAL: rescue shell unavailable after %d attempts (PID 1 stays alive; poweroff via /run/initctl)",
+                         rescue_spawns);
+                exhausted = 1;
+            }
+        }
+
+        /* 500 ms: responsive enough for initctl, never a busy spin. The mask
+           argument keeps signals unblocked inside ppoll, so SIGTERM/SIGINT/
+           SIGCHLD are all handled right here. */
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 500 * 1000 * 1000;
+        sigset_t unblock_all;
+        sigemptyset(&unblock_all);
+        int ret = ppoll(fds, nfds, &ts, &unblock_all);
+        if (ret < 0 && errno != EINTR)
+            init_log("rescue: ppoll error: %s", strerror(errno));
+
+        if (sigterm_flag) { sigterm_flag = 0; shutdown_all(RB_POWER_OFF, 0); }
+        if (sigusr1_flag) { sigusr1_flag = 0; shutdown_all(RB_POWER_OFF, 1); }
+        if (sigusr2_flag) { sigusr2_flag = 0; shutdown_all(RB_AUTOBOOT,   1); }
+        if (sigint_flag) {
+            /* Ctrl-C belongs to the emergency shell now: forward it instead of
+               rebooting PID 1. PID 1 itself stays alive either way. */
+            sigint_flag = 0;
+            if (rescue_shell_pid > 0) kill(rescue_shell_pid, SIGINT);
+        }
+        if (sigchld_flag) {
+            /* WNOHANG + loop: a blocking waitpid() here would freeze the rescue
+               event loop and no initctl command would ever be served. */
+            sigchld_flag = 0;
+            int status;
+            pid_t p;
+            while ((p = waitpid(-1, &status, WNOHANG)) > 0) {
+                if (p == rescue_shell_pid) {
+                    init_log("rescue shell exit status=0x%x", status);
+                    rescue_shell_pid = -1;
+                }
+            }
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            if (!(fds[i].revents & POLLIN)) continue;
+
+            if (fds[i].fd == initctl_fd) {
+                char cmd[256];
+                ssize_t n = read(initctl_fd, cmd, sizeof(cmd) - 1);
+                if (n > 0) {
+                    cmd[n] = 0;
+                    char lines[64][MAX_LINE];
+                    int nl = initctl_split_lines(cmd, lines, 64);
+                    for (int k = 0; k < nl; k++) {
+                        init_log("initctl cmd: '%s'", lines[k]);
+                        if (!strcmp(lines[k], "poweroff")) shutdown_all(RB_POWER_OFF, 0);
+                        else if (!strcmp(lines[k], "reboot")) shutdown_all(RB_AUTOBOOT, 0);
+                        else if (!strcmp(lines[k], "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
+                        else if (!strcmp(lines[k], "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
+                    }
+                }
+            } else if (fds[i].fd == g_log_fifo_fd) {
+                drain_log_fifo();
+            }
+        }
+    }
+}
+
 static void enter_rescue_mode(const char *reason)
 {
-    sigset_t empty;
+    if (rescue_active) return;   /* idempotent: never re-enter the rescue loop */
+    rescue_active = 1;
 
     if (reason) init_log("%s", reason);
-
-    sigemptyset(&empty);
-    if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
-        init_log("Warning: failed to clear signal mask: %s", strerror(errno));
-
     init_log("Entering rescue mode (shell).");
-    signal(SIGPIPE, SIG_DFL);
 
-    /* T8B: release PID 1 control fds before exec (SANE-06-01).
-       O_CLOEXEC flag is set on parent fds; this explicit close covers fds
-       opened before flags were present and covers rescue invocations prior
-       to setup_initctl()/setup_log_fifo(). */
-    if (initctl_fd >= 0)    close(initctl_fd);
-    if (g_log_fifo_fd >= 0) close(g_log_fifo_fd);
-    if (log_file_fd >= 0)   close(log_file_fd);
+    /* Control fds BEFORE supervision: rescue is often entered before main()
+       opened them, and a supervised rescue without /run/initctl could not be
+       powered off cleanly. They stay open in PID 1 (O_CLOEXEC already keeps
+       them out of the shell child), so the old pre-exec close() block is gone. */
+    ensure_rescue_fds();
 
-    execl("/bin/sh", "sh", (char *)NULL);
-    init_log("FATAL: execl /bin/sh failed: %s", strerror(errno));
-    _exit(1);
+    rescue_loop();   /* never returns */
 }
 
 /* ---------- main ---------- */
@@ -2233,7 +2500,7 @@ int main(int argc, char **argv)
     mount_fstab();
     
     log_file_fd = open("/var/log/ninit.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    init_log("=== ninit start (PID 1) v1.0.0 ===");
+    init_log("=== ninit start (PID 1) v1.1.0 ===");
 
     set_hostname();
 
@@ -2242,6 +2509,14 @@ int main(int argc, char **argv)
     const char *conf = (argc > 1) ? argv[1] : "/etc/init.conf";
     if (parse_config(conf) < 0)
         enter_rescue_mode("Config failed to read/parse!");
+
+    /* T16: a config that READS fine but registers zero services is just as
+       blueprint-less as a missing one. Previously this booted into the main
+       loop with no services and no shell, leaving a HALF-DEAD system the
+       operator could not even log into. Every rejected entry (malformed lines,
+       duplicate/over-long/service-name errors) lands here too. */
+    if (num_services == 0)
+        enter_rescue_mode("No services configured or all entries rejected!");
 
     /* Invoked immediately after parse_config(): dependencies must point to valid
        services. If any are missing, system hands control to rescue shell. */
@@ -2320,14 +2595,14 @@ int main(int argc, char **argv)
                        subsequent commands without logging them.
                        Since terminal commands never return from shutdown_all(),
                        only the first valid line takes effect. */
-                    for (char *line = strtok(cmd, "\n"); line; line = strtok(NULL, "\n")) {
-                        char *cmdline = trim(line);
-                        if (*cmdline == 0) continue;   /* ignore empty lines */
-                        init_log("initctl cmd: '%s'", cmdline);
-                        if (!strcmp(cmdline, "poweroff")) shutdown_all(RB_POWER_OFF, 0);
-                        else if (!strcmp(cmdline, "reboot")) shutdown_all(RB_AUTOBOOT, 0);
-                        else if (!strcmp(cmdline, "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
-                        else if (!strcmp(cmdline, "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
+                    char lines[64][MAX_LINE];
+                    int nl = initctl_split_lines(cmd, lines, 64);
+                    for (int k = 0; k < nl; k++) {
+                        init_log("initctl cmd: '%s'", lines[k]);
+                        if (!strcmp(lines[k], "poweroff")) shutdown_all(RB_POWER_OFF, 0);
+                        else if (!strcmp(lines[k], "reboot")) shutdown_all(RB_AUTOBOOT, 0);
+                        else if (!strcmp(lines[k], "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
+                        else if (!strcmp(lines[k], "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
                     }
                 }
             }

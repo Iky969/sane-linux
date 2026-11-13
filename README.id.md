@@ -124,7 +124,7 @@ make qemu                 # mode interaktif (keluar: Ctrl-A X)
 ```
 
 Hasil nyata di sandbox (emulasi TCG tanpa KVM): banner
-`=== ninit start (PID 1) v1.0.0 ===` dan `main loop siap` muncul di konsol
+`=== ninit start (PID 1) v1.1.0 ===` dan `main loop siap` muncul di konsol
 serial **~1,9–2,1 detik** setelah QEMU dijalankan, shell hidup di konsol
 (`console:respawn:cttyhack /bin/sh -i`), dan di dalam guest `poweroff` benar-benar
 **mematikan** mesin (`reboot: Power down`) sementara `reboot` benar-benar
@@ -224,9 +224,11 @@ LICENSE                  MIT
 
 ## Status
 
-Rilis **v1.0.0** (perbaikan reliabilitas terakhir: anti-overflow pada urut
-topologis, validasi dependensi, initctl per baris, dan rescue mode sungguhan
-lewat `enter_rescue_mode()` dengan signal mask yang dikosongkan). Ini proyek
+Rilis **v1.1.0** (kontainment cgroup v2 pre-exec, batas resource hierarkis,
+siklus hidup fail-open, reset counter respawn dengan flush cgroup pra-respawn,
+pembersihan leaf deterministik, plus perbaikan reliabilitas v1.0.0: anti-overflow
+pada urut topologis, validasi dependensi, initctl per baris, dan rescue mode
+sungguhan lewat `enter_rescue_mode()`). Ini proyek
 eksperimental untuk belajar cara kerja init di level OS — belum siap dipakai di
 mesin produksi. Batasan yang diketahui:
 semua layanan berjalan sebagai root (belum ada seccomp/user per layanan; pembatasan

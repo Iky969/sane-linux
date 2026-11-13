@@ -8,7 +8,7 @@
 
 | Version | Supported |
 |---|---|
-| `main` (latest release: **v1.0.0**) | ✅ |
+| `main` (latest release: **v1.1.0**) | ✅ |
 | Older commits/tags | ❌ (please verify against `main` first) |
 
 Security fixes are committed exclusively to the `main` branch.
