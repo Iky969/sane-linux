@@ -1,6 +1,7 @@
 # artefak build (dihasilkan `make`)
 /ninit
 /ninit.exe
+/ninit-test
 
 # core dump dari uji PID 1
 /core

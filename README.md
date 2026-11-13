@@ -80,7 +80,7 @@ SECS=5 make qemu          # Automated 5-second boot, verifies milestones & conso
 make qemu                 # Interactive console session (exit with: Ctrl-A X)
 ```
 
-In sandbox environments (TCG emulation without KVM), the banner `=== ninit start (PID 1) v1.0.0 ===` and `main loop ready` appear on the serial console within **~1.9–2.1 seconds**, a shell starts on the console (`console:respawn:cttyhack /bin/sh -i`), and within the guest `poweroff` cleanly powers off the virtual machine (`reboot: Power down`) while `reboot` restarts cleanly. BusyBox applets are mapped via `/sbin/{poweroff,reboot,halt}` wrappers writing to `/run/initctl`.
+In sandbox environments (TCG emulation without KVM), the banner `=== ninit start (PID 1) v1.1.0 ===` and `main loop ready` appear on the serial console within **~1.9–2.1 seconds**, a shell starts on the console (`console:respawn:cttyhack /bin/sh -i`), and within the guest `poweroff` cleanly powers off the virtual machine (`reboot: Power down`) while `reboot` restarts cleanly. BusyBox applets are mapped via `/sbin/{poweroff,reboot,halt}` wrappers writing to `/run/initctl`.
 
 See [doc/distro-builder.md](doc/distro-builder.md) for architectural details, signals, and known limitations.
 
@@ -171,7 +171,7 @@ LICENSE                       MIT License
 
 ## Status
 
-Current release: **v1.0.0** (reliability hardening: anti-overflow in topological sort, dependency validation, line-by-line initctl processing, and functional rescue shell via `enter_rescue_mode()` with cleared signal masks).
+Current release: **v1.1.0** (cgroup v2 pre-exec containment, hierarchical resource limits, fail-open lifecycle, respawn counter reset with pre-respawn cgroup flush, deterministic leaf cleanup, and the v1.0.0 reliability hardening: anti-overflow topo-sort, dependency validation, line-by-line initctl, rescue shell).
 
 This is an experimental educational project designed to explore OS-level init system design. It is not intended as a drop-in replacement for production init systems like systemd. Known limitations: all services run as root (no per-service seccomp or user separation; resource limiting is handled via cgroup v2). Always test within virtual machines or containers with recovery paths configured.
 

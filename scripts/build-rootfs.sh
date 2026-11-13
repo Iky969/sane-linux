@@ -386,7 +386,7 @@ summary() {
 	info "rootfs     : $ROOTFS"
 	info "initramfs  : $INITRAMFS ($(du -h "$INITRAMFS" | cut -f1), sha256 $(sha256sum "$INITRAMFS" | cut -c1-16)…)"
 	info "busybox    : $(du -h "$ROOTFS/bin/busybox" | cut -f1) statis, $(printf '%s\n' "${APPLET_LIST:-}" | grep -c . ) applet"
-	info "init       : $(ls -l "$ROOTFS/sbin/init" | awk '{print $5" bytes"}') (ninit v1.0.0)"
+	info "init       : $(ls -l "$ROOTFS/sbin/init" | awk '{print $5" bytes"}') (ninit v1.1.0)"
 	info "init.conf  : $(grep -v '^#' "$ROOTFS/etc/init.conf" | grep . | head -n 1)"
 	info "boot in QEMU: sh ./scripts/run-qemu.sh"
 }

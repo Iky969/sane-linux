@@ -39,6 +39,14 @@ The project adheres to [Semantic Versioning](https://semver.org/).
   - All `init_log()` diagnostic messages, rescue shell messages, test assertions, and test scripts migrated to English.
   - All code comments in `ninit.c` translated to English while preserving SANE-01 through SANE-06 security rationale.
 
+### Rescue & Hardening
+- **Supervised Rescue Mode (T15)**: `enter_rescue_mode()` no longer `execl()`s away PID 1. PID 1 forks a supervised `/bin/sh` child, keeps running its own event loop, reaps and bounded-respawns the shell, and still serves `/run/initctl` (`poweroff`/`reboot`) so a rescue session can always be shut down cleanly. A shell exit, a missing `/bin/sh`, or an OOM-killed shell therefore cannot end PID 1 — no `Attempted to kill init!` panic.
+- **Empty / fully-rejected config → rescue (T16)**: a config that yields zero services drops into rescue mode (`No services configured`) instead of parking in a zombie `main loop ready` with no shell and no services.
+- **Build hardening (T20)**: `-fstack-protector-strong` added to the default `CFLAGS`; every syscall return is checked and every internal descriptor is `O_CLOEXEC`.
+- **Parser fuzz harness (T20)**: `tests/fuzz/fuzz_parse.c` + `scripts/fuzz-parsers.sh` exercise the `init.conf`, fstab, and initctl parsers under ASan+UBSan over a deterministic corpus (0/1/1000 lines, raw bytes, no trailing newline, empty/`..` names, cyclic `:requires=`, stacked tags, odd fstab options, multi-line initctl) plus 2000 deterministic LCG mutations. Run with `make fuzz` / `make test-fuzz`.
+- **Kernel panic regression (T21)**: `scripts/test-kernel-panic-specific.sh` is tracked, exposed as `make test-panic`, and wired into CI. It resolves a host or Alpine kernel so it also runs on CI runners, and covers real panic induction (PID 1 exit, missing init), rescue-mode anti-panic, and a clean production boot.
+- **Phase 1 cgroup lifecycle hardening**: pre-exec containment handshake, hierarchical `memory`/`pids`/`cpu` limits, fail-open fallback, respawn counter reset with a pre-respawn `cgroup.kill` flush, and deterministic leaf `rmdir` after `cgroup.procs` drains.
+
 ### Changed
 - Isolated all non-cgroup test suites (`smoke-test`, `test-sigterm`, `test-config`, `test-spawn-failure`) under per-run unique `NINIT_CGROUP_BASE` subtrees with depth-first cleanup traps to guarantee zero host cgroup pollution.
 - Hardened cgroup limits test harness (`test-cgroup-limits.sh`) with anti-vacuous assertions for descendant escapes (Scenario 9) and cumulative multi-process memory OOM (Scenario 10).

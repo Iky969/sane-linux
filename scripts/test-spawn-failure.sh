@@ -343,7 +343,10 @@ fi
 printf '\n== Scenario 4: respawn service crash-loop cancels dependent services ==\n'
 BIN_FAST=$(mktemp /tmp/ninit-fast-bin.XXXXXX)
 HELPERS="$HELPERS $BIN_FAST"
-gcc -static -O2 -Wall -DCRASH_LIMIT=2 -DBACKOFF_MAX=1 ./ninit.c -o "$BIN_FAST"
+# -DNINIT_TESTING is mandatory: this binary is booted with NINIT_CGROUP_BASE, and
+# without the define the guest would fall back to the host's /sys/fs/cgroup/ninit
+# (isolation lost + host hierarchy polluted).
+gcc -static -O2 -Wall -DCRASH_LIMIT=2 -DBACKOFF_MAX=1 -DNINIT_TESTING ./ninit.c -o "$BIN_FAST"
 
 R4=$(new_root sleep)
 L4=$(new_log)

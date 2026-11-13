@@ -79,9 +79,8 @@ seperti di [build-and-test.md](build-and-test.md).
 
 ## Status
 
-Rilis terakhir adalah **v1.0.0** (commit
-`feat: v1.0.0 release - robust topo-sort, validation, and rescue mode`), dan
-banner saat boot mencetak `=== ninit start (PID 1) v1.0.0 ===`.
+Rilis terakhir adalah **v1.1.0**, dan
+banner saat boot mencetak `=== ninit start (PID 1) v1.1.0 ===`.
 
 Putaran reliabilitas terakhir menambahkan: urut topologis yang tidak bisa
 melewati `MAX_SERVICES` (dulu *stack-buffer-overflow*), `validate_dependencies()`
