@@ -11,7 +11,7 @@ melaporkan masalah keamanan dan apa saja yang termasuk/ tidak termasuk cakupan.
 
 | Versi | Didukung |
 |---|---|
-| `main` (rilis terbaru: **v1.0.0**) | ✅ |
+| `main` (rilis terbaru: **v1.1.0**) | ✅ |
 | Commit/tag lama | ❌ (silakan uji ulang di `main` dulu) |
 
 v1.0.0 adalah rilis pertama yang diberi nomor versi. Perbaikan keamanan hanya

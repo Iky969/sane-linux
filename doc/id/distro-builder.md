@@ -86,7 +86,7 @@ qemu-system-x86_64 -m 256 -no-reboot \
 ```
 [    1.256959] Run /sbin/init as init process
 [2026-10-27 23:55:18] ninit: cgroup2: /sys/fs/cgroup ter-mount
-[2026-10-27 23:55:18] ninit: === ninit start (PID 1) v1.0.0 ===
+[2026-10-27 23:55:18] ninit: === ninit start (PID 1) v1.1.0 ===
 [2026-10-27 23:55:18] ninit: hostname = S.A.N.E
 [2026-10-27 23:55:18] ninit: started console (pid 403)
 ~ #

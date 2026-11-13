@@ -26,7 +26,11 @@ jobs:
   build-and-smoke-test:
     runs-on: ubuntu-latest
     env:
-      CFLAGS: "-static -O2 -Wall -Werror"
+      CFLAGS: "-static -O2 -Wall -Werror -fstack-protector-strong"
+      # Suites MUST run the test binary: -DNINIT_TESTING is what compiles in the
+      # NINIT_CGROUP_BASE override. A suite handed the production ./ninit would
+      # silently lose its per-run cgroup isolation and touch the host hierarchy.
+      BIN: "./ninit-test"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -37,6 +41,9 @@ jobs:
 
       - name: Static build
         run: make
+
+      - name: Test build (production flags + -DNINIT_TESTING)
+        run: make ninit-test
 
       - name: Strictly static binary check
         run: |
@@ -72,8 +79,11 @@ jobs:
       - name: State machine formalization & telemetry (T10/T11/T13)
         run: sudo sh ./scripts/test-state-machine.sh
 
+      - name: ASan+UBSan parser fuzz harness
+        run: sh ./scripts/fuzz-parsers.sh
+
       - name: Build with zero warnings (-Wall -Werror)
-        run: make clean && make CFLAGS="-static -O2 -Wall -Werror"
+        run: make clean && make CFLAGS="-static -O2 -Wall -Werror -fstack-protector-strong"
 
   rootfs-distro:
     # scripts/build-rootfs.sh and scripts/run-qemu.sh are not used in the job above,
@@ -82,14 +92,14 @@ jobs:
     # without detection because nothing was building it.
     runs-on: ubuntu-latest
     env:
-      CFLAGS: "-static -O2 -Wall -Werror"
+      CFLAGS: "-static -O2 -Wall -Werror -fstack-protector-strong"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio qemu-system-x86
+          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio qemu-system-x86 curl
 
       - name: rootfs + initramfs from source (BUSYBOX_MODE=auto)
         run: |
@@ -102,3 +112,6 @@ jobs:
 
       - name: Cross-layer integration test fstab <-> kernel <-> services (second QEMU boot)
         run: sudo SECS=40 sh ./scripts/test-integration.sh
+
+      - name: Panic-path regression (QEMU)
+        run: sudo sh ./scripts/test-kernel-panic-specific.sh

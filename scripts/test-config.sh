@@ -9,16 +9,21 @@
 #       again, so stack_top passed MAX_SERVICES -> stack-buffer-overflow in
 #       sort_services() (proven with AddressSanitizer on the old version).
 #   2.  a missing dependency (web:requires=db) -> "FATAL: Dependency ... not
-#       found" + rescue shell, NOT a half-finished boot.
+#       found" + SUPERVISED rescue shell, NOT a half-finished boot. PID 1 stays
+#       alive and the shell is its child (T15).
 #   3a. two commands in one write to /run/initctl (poweroff + reboot):
 #       only the first line is executed.
 #   3b. an unknown command on the first line (status + poweroff): the command on
 #       the second line is NOT lost without a trace (old parsing regression).
-#   4a. an unreadable config -> a real rescue shell (old regression: only logged,
-#       then init "successfully" booted with zero services).
+#   4a. an unreadable config -> a real SUPERVISED rescue shell (old regression:
+#       only logged, then init "successfully" booted with zero services).
+#       Same for a config that parses but registers zero services (T16).
 #   4b. a dependency cycle -> rescue shell, and that shell inherits an EMPTY
 #       signal mask so SIGINT (Ctrl+C) works (old regression: PID 1's ppoll mask
 #       leaked into the emergency shell).
+#   4c. the rescue shell exits (exit/Ctrl-D/EOF) -> PID 1 SURVIVES, records the
+#       exit and respawns the shell. Any execl-based rescue dies here and the
+#       kernel panics with "Attempted to kill init!" (T15).
 #
 # Pemakaian:
 #   sudo sh ./scripts/test-config.sh      # or: make test
@@ -30,10 +35,11 @@
 #
 # Note: same as scripts/smoke-test.sh, this script deliberately does NOT use
 # `unshare --mount-proc=<dir>` (some kernels reject mount propagation changes
-# with EINVAL), and ninit's stdin is pointed at /dev/null so the rescue shell
-# immediately gets EOF and does not hang CI. Exception: scenario 4b provides a
-# fifo stdin held open by `sleep` so the emergency shell lives long enough for
-# its /proc/<pid>/status to be read.
+# with EINVAL). Scenarios that need a LIVE rescue shell to inspect (2, 4a, 4b)
+# provide a fifo stdin held open by `sleep`, because with /dev/null the shell
+# hits EOF at once. That immediate-exit path is itself covered: scenario 4c runs
+# with /dev/null and asserts PID 1 survives the exit and respawns the shell -
+# supervision means an exiting shell can no longer hang or kill CI.
 
 set -eu
 
@@ -231,6 +237,73 @@ stop_init() {
 	clean_suite_leaves
 }
 
+# --- supervised rescue helpers (T15) -----------------------------------------
+# Find the rescue SHELL: a process whose root filesystem is $ROOT and whose
+# argv[0] is "sh". With supervised rescue, PID 1 keeps running /ninit and the
+# shell is its child; the init pid is excluded explicitly so this can never
+# return PID 1 itself. (Under the old execl() implementation PID 1 *was* the
+# shell, which is exactly the behaviour this test now rejects.)
+find_rescue_pid() {
+	for s in /proc/[0-9]*/status; do
+		p=${s#/proc/}; p=${p%/status}
+		r=$(readlink "/proc/$p/root" 2>/dev/null) || continue
+		[ "$r" = "$ROOT" ] || continue
+		[ "$p" = "${INIT_PID:-}" ] && continue
+		c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+		[ "$c" = "sh " ] || continue
+		printf '%s\n' "$p"; return 0
+	done
+	return 1
+}
+
+# Assert supervised rescue: PID 1 alive AND the shell is its child. An exited
+# PID 1 panics the kernel ("Attempted to kill init!"), so "PID 1 still alive"
+# is the core promise of T15. $1 = scenario tag used in the messages.
+assert_supervised_rescue() {
+	tag=$1
+
+	# Resolve PID 1 here (bounded poll), never before the guest has booted:
+	# ninit only exists a moment after run_init returns.
+	if [ -z "${INIT_PID:-}" ]; then
+		j=0
+		while [ "$j" -lt 50 ]; do
+			init_pid=$(find_init_pid || true)
+			[ -n "${init_pid:-}" ] && break
+			sleep 0.1
+			j=$((j + 1))
+		done
+		INIT_PID="${init_pid:-}"
+	fi
+
+	rescue_pid=""
+	i=0
+	while [ "$i" -lt 50 ]; do
+		rescue_pid=$(find_rescue_pid || true)
+		[ -n "$rescue_pid" ] && break
+		sleep 0.1
+		i=$((i + 1))
+	done
+
+	if [ -n "${INIT_PID:-}" ] && kill -0 "$INIT_PID" 2>/dev/null; then
+		ok "$tag: PID 1 (ninit) is STILL ALIVE in rescue mode (no execl replacement)"
+	else
+		bad "$tag: PID 1 is gone after entering rescue mode (kernel panic risk)"
+	fi
+
+	if [ -z "$rescue_pid" ]; then
+		bad "$tag: supervised rescue shell not found (no forked /bin/sh child)"
+		return 0
+	fi
+	ok "$tag: rescue shell child is running (pid $rescue_pid)"
+
+	ppid=$(awk '/^PPid:/ { print $2; exit }' "/proc/$rescue_pid/status" 2>/dev/null || true)
+	if [ -n "${INIT_PID:-}" ] && [ "$ppid" = "$INIT_PID" ]; then
+		ok "$tag: rescue shell is a CHILD of PID 1 (PPid=$ppid), PID 1 supervises it"
+	else
+		bad "$tag: rescue shell PPid=$ppid (expected PID 1 = ${INIT_PID:-?})"
+	fi
+}
+
 printf '== test binary : %s\n' "$BIN"
 printf '== busybox    : %s\n' "$BUSYBOX"
 
@@ -323,14 +396,20 @@ check "event loop running ('main loop ready')" 'main loop ready'
 check_absent "no FATAL (stack overflow/cycle) on a valid configuration" 'FATAL'
 
 # --------------------------------------------------------------- scenario 2
-printf '\n== 2. missing dependency -> rescue shell ==\n'
+printf '\n== 2. missing dependency -> supervised rescue shell ==\n'
 start_root missing
 LOG3="$LOG"
 printf 'web:once:echo web:requires=db\n' > "$ROOT/etc/init.conf"
 
+# A held-open stdin keeps the emergency shell alive long enough to inspect it.
+# (With /dev/null the shell hits EOF instantly and is respawned - that path is
+# scenario 4c.)
+mkfifo "$ROOT/rescue.stdin"
+sleep 15 > "$ROOT/rescue.stdin" &
+HOLDER=$!
+INIT_STDIN="$ROOT/rescue.stdin"
+
 run_init
-init_pid=$(find_init_pid || true)
-INIT_PID="${init_pid:-}"
 if ! wait_for 'rescue mode'; then
 	sed 's/^/  | /' "$LOG"
 	bad "ninit did not report rescue mode for the missing dependency"
@@ -341,17 +420,12 @@ check "init enters rescue mode (shell)" 'Entering rescue mode (shell)'
 check_absent "boot not continued (no 'main loop ready')" 'main loop ready'
 check_absent "problematic service not run" 'ninit: started web'
 
-i=0
-while [ "$i" -lt 50 ]; do
-	if ! kill -0 "$JOB" 2>/dev/null; then break; fi
-	sleep 0.1
-	i=$((i + 1))
-done
-if kill -0 "$JOB" 2>/dev/null; then
-	bad "PID 1 not replaced by the rescue shell (process still alive)"
-else
-	ok "PID 1 replaced by the rescue shell /bin/sh (execl replaces the init process)"
-fi
+# T15: PID 1 supervises the shell instead of being replaced by it.
+assert_supervised_rescue "2"
+
+INIT_STDIN=/dev/null
+kill "$HOLDER" 2>/dev/null || true
+HOLDER=""
 stop_init
 
 # --------------------------------------------------------------- scenario 3
@@ -394,12 +468,15 @@ check "command on the second line really executed" 'graceful shutdown'
 # --------------------------------------------------------------- scenario 4a
 # parse_config() fails (file missing) MUST enter the rescue shell, not continue
 # booting with zero services and then claim "main loop ready".
-printf '\n== 4a. unreadable config -> rescue shell ==\n'
+printf '\n== 4a. unreadable config -> supervised rescue shell ==\n'
 start_root badconf
 LOG6="$LOG"
 # deliberately do not create /etc/init.conf
 INIT_ARGS=/etc/init.conf.missing
-INIT_STDIN=/dev/null
+mkfifo "$ROOT/rescue.stdin"
+sleep 15 > "$ROOT/rescue.stdin" &
+HOLDER=$!
+INIT_STDIN="$ROOT/rescue.stdin"
 run_init
 INIT_ARGS=""
 if ! wait_for 'rescue mode'; then
@@ -411,17 +488,12 @@ check "config failure reported" 'Config failed to read/parse!'
 check "init enters rescue mode (shell)" 'Entering rescue mode (shell)'
 check_absent "boot not continued (no 'main loop ready')" 'main loop ready'
 
-i=0
-while [ "$i" -lt 50 ]; do
-	if ! kill -0 "$JOB" 2>/dev/null; then break; fi
-	sleep 0.1
-	i=$((i + 1))
-done
-if kill -0 "$JOB" 2>/dev/null; then
-	bad "4a: PID 1 not replaced by the rescue shell (process still alive)"
-else
-	ok "4a: PID 1 replaced by the rescue shell /bin/sh"
-fi
+# T15: PID 1 supervises the shell instead of being replaced by it.
+assert_supervised_rescue "4a"
+
+INIT_STDIN=/dev/null
+kill "$HOLDER" 2>/dev/null || true
+HOLDER=""
 stop_init
 
 # --------------------------------------------------------------- scenario 4b
@@ -448,19 +520,10 @@ check "cycle reported as FATAL" 'FATAL: CYCLE DETECTED'
 check "init enters rescue mode (shell)" 'Entering rescue mode (shell)'
 check_absent "boot not continued (no 'main loop ready')" 'main loop ready'
 
-# Find the rescue shell process: the process whose root filesystem is $ROOT and
-# whose argv[0] is "sh" (after execl, the same PID 1 now runs busybox sh).
-find_rescue_pid() {
-	for s in /proc/[0-9]*/status; do
-		p=${s#/proc/}; p=${p%/status}
-		r=$(readlink "/proc/$p/root" 2>/dev/null) || continue
-		[ "$r" = "$ROOT" ] || continue
-		c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
-		[ "$c" = "sh " ] || continue
-		printf '%s\n' "$p"; return 0
-	done
-	return 1
-}
+# find_rescue_pid() is defined once in the shared helpers above (T15): it now
+# locates the FORKED shell child, never PID 1 itself.
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
 
 rescue_pid=""
 i=0
@@ -481,12 +544,55 @@ else
 	else
 		bad "rescue shell inherited a signal mask (SigBlk=$sigblk) -> Ctrl+C does not arrive"
 	fi
+	# T15: the shell is PID 1's child, and PID 1 is still alive behind it.
+	assert_supervised_rescue "4b"
 	$SUDO kill -KILL "$rescue_pid" 2>/dev/null || true
 fi
 
 kill "$HOLDER" 2>/dev/null || true
 HOLDER=""
 INIT_STDIN=/dev/null
+stop_init
+
+# -------------------------------------------------------------- scenario 4c
+# T15/R2: the emergency shell EXITS (operator `exit`/Ctrl-D, or EOF because
+# stdin is /dev/null). PID 1 must survive, record the exit and respawn the
+# shell. The old execl() implementation died here - and an exited PID 1 panics
+# the kernel ("Attempted to kill init!"), which is the regression this locks in.
+printf '\n== 4c. rescue shell exit -> respawn, PID 1 stays alive ==\n'
+start_root rescueexit
+INIT_STDIN=/dev/null
+INIT_ARGS=""
+printf 'web:once:echo web:requires=nope\n' > "$ROOT/etc/init.conf"
+run_init
+
+if ! wait_for 'rescue mode'; then
+	sed 's/^/  | /' "$LOG"
+	bad "4c: ninit did not enter rescue mode"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+check "4c: init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "4c: boot not continued (no 'main loop ready')" 'main loop ready'
+
+if wait_for 'rescue shell exit status=0x0'; then
+	ok "4c: shell exit recorded by PID 1 (rescue shell exit status=0x0)"
+else
+	bad "4c: PID 1 never recorded the rescue shell exit"
+fi
+
+if wait_for 'rescue shell exited; respawning'; then
+	ok "4c: shell respawned under supervision (bounded budget)"
+else
+	bad "4c: no respawn after the shell exited"
+fi
+
+if [ -n "${INIT_PID:-}" ] && kill -0 "$INIT_PID" 2>/dev/null; then
+	ok "4c: PID 1 (ninit) STILL ALIVE after the shell exited (no panic path)"
+else
+	bad "4c: PID 1 is gone after the shell exited (kernel panic risk)"
+fi
+check_absent "4c: no kernel panic message in the ninit log" 'Attempted to kill init'
 stop_init
 
 # -------------------------------------------------------------- scenario 5
