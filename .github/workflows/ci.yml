@@ -56,28 +56,28 @@ jobs:
         run: make lint
 
       - name: Smoke test PID 1 (SIGTERM -> clean shutdown)
-        run: sudo sh ./scripts/smoke-test.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh
 
       - name: SIGTERM delivered to service (not SIGKILL)
-        run: sudo sh ./scripts/test-sigterm.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-sigterm.sh
 
       - name: Dependencies, rescue mode, and line-by-line initctl
-        run: sudo sh ./scripts/test-config.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-config.sh
 
       - name: Verify run-qemu.sh harness (log fixture, no QEMU)
         run: sh ./scripts/test-qemu-report.sh
 
       - name: Spawn failure paths (respawn dependency + fork EAGAIN)
-        run: sudo sh ./scripts/test-spawn-failure.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-spawn-failure.sh
 
       - name: cgroup v2 resource limits & respawn orphan cleanup
-        run: sudo sh ./scripts/test-cgroup-limits.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-cgroup-limits.sh
 
       - name: Respawn cleanup & grandchild containment (T12)
-        run: sudo sh ./scripts/test-respawn-cleanup.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-respawn-cleanup.sh
 
       - name: State machine formalization & telemetry (T10/T11/T13)
-        run: sudo sh ./scripts/test-state-machine.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-state-machine.sh
 
       - name: ASan+UBSan parser fuzz harness
         run: sh ./scripts/fuzz-parsers.sh

@@ -63,7 +63,14 @@
 
 set -eu
 
-BIN=${BIN:-./ninit}
+BIN=${BIN:-}
+if [ -z "$BIN" ]; then
+	if [ -x "./ninit-test" ]; then
+		BIN="./ninit-test"
+	else
+		BIN="./ninit"
+	fi
+fi
 BUSYBOX=${BUSYBOX:-/bin/busybox}
 WAIT1=${WAIT1:-6}
 WAIT2=${WAIT2:-6}
