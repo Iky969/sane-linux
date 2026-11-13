@@ -36,7 +36,14 @@
 
 set -eu
 
-BIN=${BIN:-./ninit}
+BIN=${BIN:-}
+if [ -z "$BIN" ]; then
+	if [ -x "./ninit-test" ]; then
+		BIN="./ninit-test"
+	else
+		BIN="./ninit"
+	fi
+fi
 BUSYBOX=${BUSYBOX:-/bin/busybox}
 READY_TIMEOUT=${READY_TIMEOUT:-10}
 ACK_TIMEOUT=${ACK_TIMEOUT:-12}

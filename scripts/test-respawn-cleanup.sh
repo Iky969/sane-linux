@@ -29,7 +29,14 @@
 
 set -eu
 
-BIN=${BIN:-./ninit}
+BIN=${BIN:-}
+if [ -z "$BIN" ]; then
+	if [ -x "./ninit-test" ]; then
+		BIN="./ninit-test"
+	else
+		BIN="./ninit"
+	fi
+fi
 BUSYBOX=${BUSYBOX:-/bin/busybox}
 WAITA=${WAITA:-10}
 WAITB=${WAITB:-8}
