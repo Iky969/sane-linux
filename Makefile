@@ -107,4 +107,10 @@ image: packages
 test-image:
 	bash ./scripts/test-image-boot.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm image test-image
+test-image-bios:
+	bash ./scripts/test-image-boot.sh --bios
+
+test-image-uefi:
+	bash ./scripts/test-image-boot.sh --uefi
+
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm image test-image test-image-bios test-image-uefi

@@ -87,6 +87,7 @@ need_tool() {
 need_tool sgdisk
 need_tool mkfs.vfat
 need_tool losetup
+need_tool readelf
 
 MKFS_EXT4=""
 if command -v mkfs.ext4 >/dev/null 2>&1; then
@@ -119,6 +120,25 @@ else
     die "limine-bios.sys stage 2 payload not found"
 fi
 
+# Find Limine UEFI payloads (BOOTX64.EFI and BOOTIA32.EFI)
+LIMINE_BOOTX64_EFI=""
+if [ -f "${REPO_ROOT}/distro/cache/BOOTX64.EFI" ]; then
+    LIMINE_BOOTX64_EFI="${REPO_ROOT}/distro/cache/BOOTX64.EFI"
+elif [ -f "${REPO_ROOT}/packages/limine-static/x/usr/share/limine/BOOTX64.EFI" ]; then
+    LIMINE_BOOTX64_EFI="${REPO_ROOT}/packages/limine-static/x/usr/share/limine/BOOTX64.EFI"
+else
+    die "BOOTX64.EFI UEFI payload not found in cache or packages"
+fi
+
+LIMINE_BOOTIA32_EFI=""
+if [ -f "${REPO_ROOT}/distro/cache/BOOTIA32.EFI" ]; then
+    LIMINE_BOOTIA32_EFI="${REPO_ROOT}/distro/cache/BOOTIA32.EFI"
+elif [ -f "${REPO_ROOT}/packages/limine-static/x/usr/share/limine/BOOTIA32.EFI" ]; then
+    LIMINE_BOOTIA32_EFI="${REPO_ROOT}/packages/limine-static/x/usr/share/limine/BOOTIA32.EFI"
+else
+    die "BOOTIA32.EFI UEFI payload not found in cache or packages"
+fi
+
 # Find Kernel binary (bzImage / vmlinuz-virt)
 KERNEL_BIN=""
 if [ -f "${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20" ]; then
@@ -136,9 +156,17 @@ if [ -x "${REPO_ROOT}/distro/rootfs/bin/busybox" ]; then
 elif [ -x "${REPO_ROOT}/packages/busybox/x/bin/busybox" ]; then
     BUSYBOX_BIN="${REPO_ROOT}/packages/busybox/x/bin/busybox"
 elif [ -x "/bin/busybox" ]; then
+    if readelf -l "/bin/busybox" 2>/dev/null | grep -q "INTERP"; then
+        die "Host /bin/busybox fallback is dynamically linked (PT_INTERP detected); static ELF binary required"
+    fi
     BUSYBOX_BIN="/bin/busybox"
 else
     die "Static BusyBox binary not found for initramfs assembly"
+fi
+
+# Strictly verify selected BusyBox binary is a static ELF (no PT_INTERP)
+if readelf -l "$BUSYBOX_BIN" 2>/dev/null | grep -q "INTERP"; then
+    die "Selected BusyBox binary '$BUSYBOX_BIN' is dynamically linked (PT_INTERP detected); static ELF binary required"
 fi
 
 # Ensure kernel storage modules exist in cache
@@ -441,10 +469,16 @@ rm -rf "$INITRAMFS_STAGING"
 INITRAMFS_STAGING=""
 
 # Populate boot partition
-$SUDO cp "$KERNEL_BIN" "$MNT_DIR/boot/bzImage"
-$SUDO cp "$LIMINE_BIOS_SYS" "$MNT_DIR/boot/limine-bios.sys"
+MNT_BOOT="$MNT_DIR/boot"
+$SUDO cp "$KERNEL_BIN" "$MNT_BOOT/bzImage"
+$SUDO cp "$LIMINE_BIOS_SYS" "$MNT_BOOT/limine-bios.sys"
 
-cat <<'EOF' | $SUDO tee "$MNT_DIR/boot/limine.conf" >/dev/null
+# Install UEFI bootloader binaries to ESP standard path
+$SUDO mkdir -p "$MNT_BOOT/EFI/BOOT"
+$SUDO cp "$LIMINE_BOOTX64_EFI" "$MNT_BOOT/EFI/BOOT/BOOTX64.EFI"
+$SUDO cp "$LIMINE_BOOTIA32_EFI" "$MNT_BOOT/EFI/BOOT/BOOTIA32.EFI"
+
+cat <<'EOF' | $SUDO tee "$MNT_BOOT/limine.conf" >/dev/null
 timeout: 0
 serial: yes
 
@@ -454,7 +488,9 @@ serial: yes
     module_path: boot():/initramfs.cpio.gz
     cmdline: console=tty0 console=ttyS0 root=/dev/vda2 rootfstype=ext4 rw quiet panic=-1
 EOF
-$SUDO cp "$MNT_DIR/boot/limine.conf" "$MNT_DIR/boot/limine.cfg"
+$SUDO cp "$MNT_BOOT/limine.conf" "$MNT_BOOT/limine.cfg"
+$SUDO cp "$MNT_BOOT/limine.conf" "$MNT_BOOT/EFI/BOOT/limine.conf"
+$SUDO cp "$MNT_BOOT/limine.conf" "$MNT_BOOT/EFI/BOOT/limine.cfg"
 
 # Unmount and detach loop device cleanly
 log "Step 8/8: Flushing buffers, unmounting and installing Limine bootloader..."
@@ -474,7 +510,7 @@ $LIMINE_BIN bios-install "$OUTPUT_FILE" >/dev/null
 if [ -n "${SUDO_USER:-}" ]; then
     chown "${SUDO_USER}:${SUDO_GID:-$(id -g "$SUDO_USER")}" "$OUTPUT_FILE" 2>/dev/null || true
 fi
-chmod 0666 "$OUTPUT_FILE"
+chmod 0644 "$OUTPUT_FILE"
 
 log "Image successfully created at $OUTPUT_FILE"
 info "Size        : $(du -h "$OUTPUT_FILE" | cut -f1)"

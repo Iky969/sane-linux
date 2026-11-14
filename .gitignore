@@ -16,8 +16,7 @@
 /distro/sane.img
 /distro/qemu-console.log
 /distro/qemu.log
-/distro/qemu-image-console.log
-/distro/qemu-image.log
+/distro/qemu-image*.log
 
 # dokumen operasional & laporan lokal
 LAPORAN-*.md

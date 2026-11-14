@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test-spm.sh -- Adversarial Test Harness for S.A.N.E Package Manager (spm)
 #
-# Validates the 19 core SPM contracts (SPM-35 & Hardening Suite):
+# Validates the 20 core SPM contracts (SPM-35 & Hardening Suite):
 #   1. Fresh install of valid package -> verify files on disk and DB index.
 #   2. Tar-slip attack archive (./x/../../etc/passwd) -> reject with exit 1.
 #   3. Symlink escape attack (./x/usr/bin/evil -> /etc/shadow) -> reject with exit 1.
@@ -21,6 +21,7 @@
 #  17. Destination symlink escape rejection -> parent dir resolving outside target root rejected with exit 1.
 #  18. Fail-closed checksum -> missing manifest, malformed hash, missing file, or ghost checksum rejected with exit 1.
 #  19. Package upgrade obsolete file pruning -> obsolete files and empty dirs pruned bottom-up, DB consistent.
+#  20. Package upgrade rdeps pruning -> dropped dependencies pruned from rdeps and safely removable.
 
 set -euo pipefail
 
@@ -1454,6 +1455,174 @@ test_package_upgrade_obsolete_file_pruning() {
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 20: Package upgrade rdeps pruning
+# -----------------------------------------------------------------------------
+test_package_upgrade_rdeps_pruning() {
+    local tdir="$TEST_TMP/scenario20"
+    local root="$tdir/root"
+    local pkg_dep_a="$tdir/pkg-dep-a-1.0.0-1-x86_64.spm.tar.xz"
+    local pkg_dep_b="$tdir/pkg-dep-b-1.0.0-1-x86_64.spm.tar.xz"
+    local pkg_dep_c="$tdir/pkg-dep-c-1.0.0-1-x86_64.spm.tar.xz"
+    local pkg_app_v1="$tdir/pkg-app-1.0.0-1-x86_64.spm.tar.xz"
+    local pkg_app_v2="$tdir/pkg-app-2.0.0-1-x86_64.spm.tar.xz"
+    local pkg_app_v3="$tdir/pkg-app-3.0.0-1-x86_64.spm.tar.xz"
+    mkdir -p "$root"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1
+
+    # 1. Create two dependency packages: pkg-dep-a and pkg-dep-b
+    python_pkg_helper create_valid "$pkg_dep_a" "pkg-dep-a" "1.0.0" "false" "Dependency A" \
+        "usr/lib/libdepa.so:dep a library content"
+    python_pkg_helper create_valid "$pkg_dep_b" "pkg-dep-b" "1.0.0" "false" "Dependency B" \
+        "usr/lib/libdepb.so:dep b library content"
+
+    # 2. Create pkg-app v1 declaring dependencies on both pkg-dep-a and pkg-dep-b
+    local initial_deps
+    initial_deps="$(printf "pkg-dep-a\npkg-dep-b")"
+    python_pkg_helper create_with_deps "$pkg_app_v1" "pkg-app" "1.0.0" "$initial_deps" \
+        "usr/bin/app-bin:app binary v1"
+
+    # 3. Install initial dependency packages and dependent package v1
+    if ! "$SPM_BIN" install "$pkg_dep_a" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 20" "Failed to install pkg-dep-a"
+        return
+    fi
+    if ! "$SPM_BIN" install "$pkg_dep_b" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 20" "Failed to install pkg-dep-b"
+        return
+    fi
+    if ! "$SPM_BIN" install "$pkg_app_v1" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 20" "Failed to install pkg-app v1"
+        return
+    fi
+
+    # 4. Verify initial reverse dependencies index records pkg-app for both dependencies
+    if [ ! -f "$root/var/lib/spm/rdeps/pkg-dep-a" ] || ! grep -q "pkg-app" "$root/var/lib/spm/rdeps/pkg-dep-a"; then
+        test_fail "Scenario 20" "pkg-app not recorded in rdeps for pkg-dep-a"
+        return
+    fi
+    if [ ! -f "$root/var/lib/spm/rdeps/pkg-dep-b" ] || ! grep -q "pkg-app" "$root/var/lib/spm/rdeps/pkg-dep-b"; then
+        test_fail "Scenario 20" "pkg-app not recorded in rdeps for pkg-dep-b"
+        return
+    fi
+
+    # 5. Verify removal of pkg-dep-a is initially blocked by reverse dependency guard
+    local initial_remove_exit=0
+    "$SPM_BIN" remove "pkg-dep-a" --root "$root" >/dev/null 2>&1 || initial_remove_exit=$?
+    if [ "$initial_remove_exit" -ne 1 ]; then
+        test_fail "Scenario 20" "Expected exit code 1 when removing pkg-dep-a before upgrade, got $initial_remove_exit"
+        return
+    fi
+
+    # 6. Create pkg-app v2 declaring dependency ONLY on pkg-dep-b (dropping pkg-dep-a)
+    python_pkg_helper create_with_deps "$pkg_app_v2" "pkg-app" "2.0.0" "pkg-dep-b" \
+        "usr/bin/app-bin:app binary v2 updated"
+
+    # 7. Upgrade pkg-app to v2
+    if ! "$SPM_BIN" install "$pkg_app_v2" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 20" "Upgrade of pkg-app to v2 failed"
+        return
+    fi
+
+    # 8. Assert binary updated and version upgraded
+    local app_content
+    app_content="$(cat "$root/usr/bin/app-bin" 2>/dev/null || true)"
+    if [ "$app_content" != "app binary v2 updated" ]; then
+        test_fail "Scenario 20" "App binary was not updated after upgrade (got: '$app_content')"
+        return
+    fi
+    local ver_installed
+    ver_installed="$(cat "$root/var/lib/spm/installed/pkg-app/version" 2>/dev/null || true)"
+    if [ "$ver_installed" != "2.0.0-1" ]; then
+        test_fail "Scenario 20" "DB version mismatch (expected 2.0.0-1, got: '$ver_installed')"
+        return
+    fi
+
+    # 9. Assert dropped dependency pkg-dep-a was pruned from rdeps
+    if [ -f "$root/var/lib/spm/rdeps/pkg-dep-a" ] && grep -q "pkg-app" "$root/var/lib/spm/rdeps/pkg-dep-a"; then
+        test_fail "Scenario 20" "Stale reverse dependency record for pkg-dep-a was not pruned!"
+        return
+    fi
+
+    # 10. Assert retained dependency pkg-dep-b is still tracked in rdeps
+    if [ ! -f "$root/var/lib/spm/rdeps/pkg-dep-b" ] || ! grep -q "pkg-app" "$root/var/lib/spm/rdeps/pkg-dep-b"; then
+        test_fail "Scenario 20" "Retained dependency pkg-dep-b was incorrectly removed from rdeps!"
+        return
+    fi
+
+    # 11. Assert dropped dependency pkg-dep-a can now be safely uninstalled without blocking
+    if ! "$SPM_BIN" remove "pkg-dep-a" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 20" "Failed to safely remove dropped dependency pkg-dep-a after upgrade"
+        return
+    fi
+    if [ -f "$root/usr/lib/libdepa.so" ]; then
+        test_fail "Scenario 20" "Dropped dependency file still present on disk after removal"
+        return
+    fi
+    if [ -d "$root/var/lib/spm/installed/pkg-dep-a" ]; then
+        test_fail "Scenario 20" "Dropped dependency still recorded in DB installed/"
+        return
+    fi
+
+    # 12. Assert retained dependency pkg-dep-b is STILL blocked from removal
+    local block_b_exit=0
+    "$SPM_BIN" remove "pkg-dep-b" --root "$root" >/dev/null 2>&1 || block_b_exit=$?
+    if [ "$block_b_exit" -ne 1 ]; then
+        test_fail "Scenario 20" "Expected exit code 1 when removing active dependency pkg-dep-b, got $block_b_exit"
+        return
+    fi
+
+    # 13. Verify transactional rollback of rdeps:
+    # Install pkg-dep-c first
+    python_pkg_helper create_valid "$pkg_dep_c" "pkg-dep-c" "1.0.0" "false" "Dependency C" \
+        "usr/lib/libdepc.so:dep c library content"
+    if ! "$SPM_BIN" install "$pkg_dep_c" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 20" "Failed to install pkg-dep-c"
+        return
+    fi
+
+    # Build v3 package that drops pkg-dep-b and depends on pkg-dep-c
+    python_pkg_helper create_with_deps "$pkg_app_v3" "pkg-app" "3.0.0" "pkg-dep-c" \
+        "usr/bin/app-bin:app binary v3"
+
+    # Force Step 6 DB commit failure by replacing rdeps/pkg-dep-c with a directory
+    rm -f "$root/var/lib/spm/rdeps/pkg-dep-c"
+    mkdir -p "$root/var/lib/spm/rdeps/pkg-dep-c"
+
+    local upgrade_fail_exit=0
+    "$SPM_BIN" install "$pkg_app_v3" --root "$root" >/dev/null 2>&1 || upgrade_fail_exit=$?
+
+    if [ "$upgrade_fail_exit" -ne 1 ]; then
+        test_fail "Scenario 20" "Expected exit code 1 for forced upgrade failure, got $upgrade_fail_exit"
+        return
+    fi
+
+    # After rollback, pkg-dep-b rdeps must be fully restored
+    if [ ! -f "$root/var/lib/spm/rdeps/pkg-dep-b" ] || ! grep -q "pkg-app" "$root/var/lib/spm/rdeps/pkg-dep-b"; then
+        test_fail "Scenario 20" "Transactional rollback failed to restore rdeps for pkg-dep-b"
+        return
+    fi
+
+    # pkg-app must still be at version 2.0.0-1
+    local rollback_ver
+    rollback_ver="$(cat "$root/var/lib/spm/installed/pkg-app/version" 2>/dev/null || true)"
+    if [ "$rollback_ver" != "2.0.0-1" ]; then
+        test_fail "Scenario 20" "DB version mismatch after rollback (expected 2.0.0-1, got: '$rollback_ver')"
+        return
+    fi
+
+    # And removal of pkg-dep-b must STILL be blocked
+    local block_b_post_rollback=0
+    "$SPM_BIN" remove "pkg-dep-b" --root "$root" >/dev/null 2>&1 || block_b_post_rollback=$?
+    if [ "$block_b_post_rollback" -ne 1 ]; then
+        test_fail "Scenario 20" "Expected exit code 1 when removing pkg-dep-b after upgrade rollback, got $block_b_post_rollback"
+        return
+    fi
+
+    test_pass "Scenario 20: Package upgrade rdeps pruning (dropped dependencies pruned and safely uninstalled, retained dependencies protected, rollback restored)"
+}
+
+# -----------------------------------------------------------------------------
 # Main Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -1482,6 +1651,7 @@ main() {
     test_destination_symlink_escape_rejection
     test_fail_closed_checksum
     test_package_upgrade_obsolete_file_pruning
+    test_package_upgrade_rdeps_pruning
 
     printf '\n==================================================\n'
     printf 'SPM Test Suite Summary: %d passed, %d failed\n' "$PASSED_COUNT" "$FAILED_COUNT"

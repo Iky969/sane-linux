@@ -4,5 +4,7 @@ usr/bin/limine
 usr/bin/limine-deploy
 usr/share/
 usr/share/limine/
+usr/share/limine/BOOTIA32.EFI
+usr/share/limine/BOOTX64.EFI
 usr/share/limine/limine-bios.sys
 usr/share/limine/limine-uefi-cd.bin

@@ -916,6 +916,26 @@ cmd_install() {
     local pkg_installed_dir="$INSTALLED_DIR/$pkg_name"
     mkdir -p "$pkg_installed_dir" || rollback_transaction
 
+    # Identify dropped dependencies for package upgrades
+    local dropped_deps_file="$STAGING_DIR/.dropped_deps"
+    rm -f "$dropped_deps_file"
+    touch "$dropped_deps_file"
+    if [ -f "$pkg_installed_dir/depends" ]; then
+        local old_deps_file="$STAGING_DIR/.old_deps"
+        local new_deps_file="$STAGING_DIR/.new_deps"
+        awk '{ for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if (length($i)) print $i } }' "$pkg_installed_dir/depends" | LC_ALL=C sort -u > "$old_deps_file"
+        if [ -f "$STAGING_DIR/.META/depends" ]; then
+            awk '{ for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if (length($i)) print $i } }' "$STAGING_DIR/.META/depends" | LC_ALL=C sort -u > "$new_deps_file"
+        else
+            touch "$new_deps_file"
+        fi
+        comm -23 "$old_deps_file" "$new_deps_file" > "$dropped_deps_file"
+        rm -f "$old_deps_file" "$new_deps_file"
+        if [ -s "$dropped_deps_file" ]; then
+            cp -p "$dropped_deps_file" "$ROLLBACK_JOURNAL/dropped_rdeps" 2>/dev/null || true
+        fi
+    fi
+
     cp -p "$STAGING_DIR/.META/package" "$pkg_installed_dir/package" || rollback_transaction
     cp -p "$STAGING_DIR/.META/sha256" "$pkg_installed_dir/sha256" || rollback_transaction
     [ -f "$STAGING_DIR/.META/depends" ] && cp -p "$STAGING_DIR/.META/depends" "$pkg_installed_dir/depends" || touch "$pkg_installed_dir/depends" || rollback_transaction
@@ -943,6 +963,23 @@ cmd_install() {
     rm -f "$tmp_providers"
 
     # Update reverse dependencies index (rdeps)
+    if [ -s "$dropped_deps_file" ]; then
+        while IFS= read -r dropped_dep || [ -n "$dropped_dep" ]; do
+            dropped_dep="$(echo "$dropped_dep" | tr -d '[:space:]')"
+            [ -n "$dropped_dep" ] || continue
+            local rdep_file="$RDEPS_DIR/$dropped_dep"
+            if [ -f "$rdep_file" ]; then
+                local tmp_rdep="${STAGING_DIR}/.rdep_${dropped_dep}.tmp"
+                awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$rdep_file" > "$tmp_rdep" || rollback_transaction
+                if [ -s "$tmp_rdep" ]; then
+                    mv -f "$tmp_rdep" "$rdep_file" || rollback_transaction
+                else
+                    rm -f "$rdep_file" "$tmp_rdep" || rollback_transaction
+                fi
+            fi
+        done < "$dropped_deps_file"
+    fi
+
     if [ -s "$pkg_installed_dir/depends" ]; then
         while IFS= read -r dep || [ -n "$dep" ]; do
             dep="$(echo "$dep" | tr -d '[:space:]')"

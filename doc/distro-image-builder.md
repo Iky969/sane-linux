@@ -8,14 +8,15 @@ This document specifies the technical architecture, storage layout, bootloader c
 
 ## 1. Architectural Overview
 
-S.A.N.E Linux disk images deliver a production-ready, bootable operating system appliance contained in a single 512 MB raw image. Unlike ephemeral direct-kernel boots (`-kernel` and `-initrd`), the disk image represents a true bare-metal or hypervisor boot pipeline utilizing the Limine BIOS bootloader, a dual-partition GUID Partition Table (GPT), an early initramfs with `switch_root` root pivoting, and the `ninit` userspace init daemon running as PID 1 on persistent storage.
+S.A.N.E Linux disk images deliver a production-ready, bootable operating system appliance contained in a single 512 MB raw image. Unlike ephemeral direct-kernel boots (`-kernel` and `-initrd`), the disk image represents a true bare-metal or hypervisor boot pipeline utilizing the Limine bootloader (BIOS + UEFI), a 3-partition GUID Partition Table (GPT), an early initramfs with `switch_root` root pivoting, and the `ninit` userspace init daemon running as PID 1 on persistent storage.
 
 ```mermaid
 flowchart TD
     subgraph Storage ["Raw Disk Image (sane.img - 512 MB GPT)"]
         MBR["Protective MBR + GPT Header"]
-        P1["Partition 1: ESP / Boot (64 MB FAT32)\n- limine-bios.sys, limine.cfg\n- bzImage (Kernel)\n- initramfs.cpio.gz (switch_root)"]
-        P2["Partition 2: Root Filesystem (448 MB ext4)\n- Packages installed via SPM\n- /bin/busybox, /sbin/ninit\n- /etc/init.conf, /etc/fstab"]
+        P3["Partition 3: BIOS Boot (1007 KiB raw, ef02)\n- Embedded Limine BIOS stage 2 payload"]
+        P1["Partition 1: ESP / Boot (64 MB FAT32, ef00)\n- limine-bios.sys, limine.conf\n- /EFI/BOOT/BOOTX64.EFI, BOOTIA32.EFI\n- bzImage, initramfs.cpio.gz"]
+        P2["Partition 2: Root Filesystem (447 MB ext4, 8300)\n- Packages installed via SPM\n- /bin/busybox, /sbin/ninit\n- /etc/init.conf, /etc/fstab"]
     end
 
     subgraph BootStage ["Boot Pipeline Flow"]
@@ -37,22 +38,26 @@ flowchart TD
 
 ---
 
-## 2. Storage & Partition Layout (Dual-Partition GPT)
+## 2. Storage & Partition Layout (3-Partition GPT Layout)
 
 The disk image is formatted with a standard GUID Partition Table (GPT) to support modern UEFI and legacy BIOS compatibility.
 
 ### 2.1 Partition Table Scheme
 
-| Partition | Start Sector | End Sector | Size | Partition Type | Type GUID | Label | Filesystem | Mountpoint |
-|---|---|---|---|---|---|---|---|---|
-| **1 (ESP / Boot)** | `2048` | `133119` | 64 MB | EFI System (`ef00`) | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` | `SANE_BOOT` | FAT32 (`vfat`) | `/boot` |
-| **2 (Rootfs)** | `133120` | `1048542` | 448 MB | Linux Filesystem (`8300`) | `0FC63DAF-8483-4772-8E79-3D69D8477DE4` | `sane_root` | ext4 | `/` |
+| Partition | Start Sector | End Sector | Size | Partition Type | Type GUID | Label | Filesystem | Mountpoint | Role / Description |
+|---|---|---|---|---|---|---|---|---|---|
+| **1 (ESP / Boot)** | `2048` | `133119` | 64 MB | EFI System (`ef00`) | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` | `SANE_BOOT` | FAT32 (`vfat`) | `/boot` | Standard UEFI boot partition containing `BOOTX64.EFI`, `BOOTIA32.EFI`, Limine configuration (`limine.conf`, `limine.cfg`), kernel `bzImage`, and `initramfs.cpio.gz`. |
+| **2 (Rootfs)** | `133120` | `1048542` | 447 MiB | Linux Filesystem (`8300`) | `0FC63DAF-8483-4772-8E79-3D69D8477DE4` | `sane_root` | ext4 | `/` | Persistent root filesystem hosting all installed base packages, configuration files (`/etc/fstab`, `/etc/init.conf`), and `/sbin/init` (`ninit`). |
+| **3 (BIOS Boot)** | `34` | `2047` | 1007 KiB | BIOS Boot (`ef02`) | `21686148-6449-6E6F-744E-656564454649` | `bios_boot` | None (Raw) | None | Dedicated unformatted raw partition located in the GPT gap (sectors 34–2047) used by Limine (`limine bios-install`) to embed its stage 2 bootloader payload for legacy BIOS booting. |
 
 ### 2.2 Partition 1: ESP / Boot Partition
 - **Filesystem**: FAT32 (`mkfs.vfat -F 32 -n SANE_BOOT`).
 - **Contents**:
   - `limine-bios.sys`: Limine BIOS stage 2 payload.
-  - `limine.cfg`: Bootloader menu and kernel launch configuration.
+  - `limine.conf` / `limine.cfg`: Bootloader menu and kernel launch configuration.
+  - `EFI/BOOT/BOOTX64.EFI`: 64-bit standard UEFI bootloader binary.
+  - `EFI/BOOT/BOOTIA32.EFI`: 32-bit standard UEFI bootloader binary.
+  - `EFI/BOOT/limine.conf`: UEFI bootloader configuration mirror.
   - `bzImage`: Linux kernel binary (Alpine virt kernel or host kernel).
   - `initramfs.cpio.gz`: Early userspace archive containing BusyBox applets and `/init`.
 
@@ -69,6 +74,14 @@ The disk image is formatted with a standard GUID Partition Table (GPT) to suppor
     - `/etc/fstab`: Filesystem mount definitions (`/dev/vda2 / ext4 rw,relatime 0 1`, `/dev/vda1 /boot vfat defaults 0 2`).
     - `/etc/hostname`: Host identity (`S.A.N.E`).
     - `/etc/init.conf`: Service definitions (`console:respawn:/bin/sh`, `sane-hello:once:/usr/bin/sane-hello`).
+
+### 2.4 Partition 3: BIOS Boot Partition (`bios_boot`)
+- **Partition Type**: BIOS Boot Partition (`ef02`, GUID `21686148-6449-6E6F-744E-656564454649`).
+- **Location**: Sectors 34 to 2047 (1007 KiB).
+- **Filesystem**: None (Raw disk sectors).
+- **Role for Limine Stage 2**:
+  On BIOS systems booting from GPT disks, the MBR only provides 446 bytes of executable code in the master boot record (stage 1). Because the GPT specification reserves sector 1 for the primary GPT header and sectors 2 through 33 for the partition entries, bootloader code cannot be blindly written immediately after sector 0 without destroying partition table data. The BIOS Boot Partition provides a safe, standardized unformatted disk area specifically designated for bootloader stage 2 code.
+  During image assembly, `scripts/make-image.sh` allocates Partition 3 across sectors 34–2047 with type `ef02`. When `limine bios-install distro/sane.img` runs, Limine automatically detects this partition and embeds its stage 2 payload into it. On legacy BIOS boots, stage 1 in the protective MBR loads stage 2 from Partition 3, which then initializes disk access to read the FAT32 ESP partition (`boot():/`).
 
 ---
 
@@ -179,30 +192,49 @@ Automated validation verifies that `sane.img` boots completely without human int
 ### 5.1 Invocation
 
 ```bash
-# Direct test execution
+# Run both BIOS and UEFI boot verifications sequentially (default)
 bash scripts/test-image-boot.sh
-
-# Or via Makefile
 make test-image
+
+# Run BIOS boot verification only
+bash scripts/test-image-boot.sh --bios
+make test-image-bios
+
+# Run UEFI boot verification only (requires OVMF firmware)
+bash scripts/test-image-boot.sh --uefi
+make test-image-uefi
 ```
 
 If `distro/sane.img` does not exist, the test harness automatically calls `sudo bash scripts/make-image.sh` to generate the image.
 
 ### 5.2 QEMU Headless Parameters
 
-The test harness runs QEMU in non-interactive headless mode:
+The test harness runs QEMU in non-interactive headless mode for BIOS and UEFI:
 
+**BIOS Mode:**
 ```bash
 qemu-system-x86_64 \
     -drive file=distro/sane.img,format=raw,if=virtio \
-    -m 128M \
-    -serial file:distro/qemu-image-console.log \
+    -m 256M \
+    -serial file:distro/qemu-image-console-bios.log \
     -display none \
     -no-reboot
 ```
 
+**UEFI Mode:**
+```bash
+qemu-system-x86_64 \
+    -bios /usr/share/ovmf/OVMF.fd \
+    -drive file=distro/sane.img,format=raw,if=virtio \
+    -m 256M \
+    -serial file:distro/qemu-image-console-uefi.log \
+    -display none \
+    -no-reboot
+```
+
+- `-bios <path>`: Loads standard OVMF UEFI firmware (auto-detected from host or specified via `--ovmf`).
 - `-drive file=distro/sane.img,format=raw,if=virtio`: Attaches the disk image as a virtual block device (`/dev/vda`).
-- `-m 128M`: Constrains memory to 128 MB to verify S.A.N.E's ultra-low memory footprint.
+- `-m 256M`: Allocates sufficient memory for guest kernel, initramfs, and OVMF runtime page tables.
 - `-serial file:<path>`: Redirects guest serial UART directly to a file descriptor on the host, capturing boot logs synchronously without PTY allocation.
 - `-display none`: Disables graphical window creation.
 - `-no-reboot`: Exits the emulator if the guest triggers reboot or shutdown.

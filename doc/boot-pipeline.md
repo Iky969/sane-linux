@@ -35,12 +35,19 @@ flowchart TD
 
 ## 2. Storage & Partition Layout (GPT)
 
-For installed systems and disk images (`sane.img`), S.A.N.E standardizes on a dual-partition GPT (GUID Partition Table) layout:
+For installed systems and disk images (`sane.img`), S.A.N.E standardizes on a 3-partition GPT (GUID Partition Table) layout:
 
-| Partition | Type GUID | Filesystem | Recommended Size | Mountpoint | Description |
-|---|---|---|---|---|---|
-| **ESP / Boot** | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` (EFI System) | FAT32 (vfat) | 64 MB – 256 MB | `/boot` | Contains Limine boot files, `limine.cfg`, `bzImage`, and `initramfs.cpio.gz`. |
-| **Rootfs** | `0FC63DAF-8483-4772-8E79-3D69D8477DE4` (Linux generic) | ext4 | Remainder (>= 256 MB) | `/` | Contains the persistent root filesystem, packages (`/var/lib/spm`), and userspace. |
+| Partition | Type Code | Type GUID | Filesystem | Recommended Size | Mountpoint | Description |
+|---|---|---|---|---|---|---|
+| **ESP / Boot (Part 1)** | `ef00` | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` (EFI System) | FAT32 (vfat) | 64 MB – 256 MB | `/boot` | Contains Limine boot files (`limine-bios.sys`, `limine.conf`, `limine.cfg`), UEFI binaries (`/EFI/BOOT/BOOTX64.EFI`, `/EFI/BOOT/BOOTIA32.EFI`), `bzImage`, and `initramfs.cpio.gz`. |
+| **Rootfs (Part 2)** | `8300` | `0FC63DAF-8483-4772-8E79-3D69D8477DE4` (Linux generic) | ext4 | Remainder (>= 256 MB) | `/` | Contains the persistent root filesystem, packages (`/var/lib/spm`), and userspace. |
+| **BIOS Boot (Part 3)** | `ef02` | `21686148-6449-6E6F-744E-656564454649` (BIOS boot) | None (Raw) | ~1 MB (sectors 34–2047) | None | Dedicated unformatted partition in the GPT gap used by Limine (`limine bios-install`) to embed its stage 2 bootloader code on BIOS/MBR-booted GPT systems. |
+
+### Role of the BIOS Boot Partition (`bios_boot`, `ef02`)
+
+On traditional MBR-partitioned disks, bootloaders embed stage 2 code in the unpartitioned gap between the MBR (sector 0) and the first partition (typically sector 2048). On GPT disks booted via legacy BIOS, this post-MBR space is occupied by the GPT header (sector 1) and partition entry array (sectors 2–33). To prevent bootloaders from overwriting GPT metadata or relying on filesystem-specific embedding hacks, the GPT specification defines the **BIOS Boot Partition** (`ef02`, GUID `21686148-6449-6E6F-744E-656564454649`).
+
+In S.A.N.E Linux images, Partition 3 occupies sectors 34 to 2047 (1007 KiB). `limine bios-install` identifies this partition and embeds the Limine BIOS stage 2 payload directly into its raw sectors. When booted on legacy BIOS systems, the stage 1 loader in the protective MBR loads stage 2 from Partition 3, which then initializes disk access, reads the FAT32 ESP partition (`boot():`), and executes the boot configuration in `limine.cfg`.
 
 ### Limine Bootloader Configuration (`/boot/limine.cfg`)
 
@@ -55,8 +62,8 @@ VERBOSE: no
     CMDLINE: console=ttyS0 console=tty0 root=PARTUUID=44444444-4444-4444-8888-888888888888 rootfstype=ext4 rw quiet
 ```
 
-- **BIOS Boot**: Installed to MBR/GPT protective header using `limine-bios-install` or `limine-deploy`.
-- **UEFI Boot**: Standard `\EFI\BOOT\BOOTX64.EFI` located on the FAT32 ESP partition.
+- **BIOS Boot**: Stage 1 installed to MBR/GPT protective header and Stage 2 embedded in Partition 3 (`bios_boot`) via `limine bios-install` or `limine-deploy`.
+- **UEFI Boot**: Standard `\EFI\BOOT\BOOTX64.EFI` and `\EFI\BOOT\BOOTIA32.EFI` located on the FAT32 ESP partition (Partition 1).
 
 ---
 
