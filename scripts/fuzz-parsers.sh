@@ -5,7 +5,7 @@
 # Targets (real code):
 #   - parse_config()        : /etc/init.conf parser (mode "config")
 #   - parse_mount_flags()   : /etc/fstab option classifier (mode "fstab")
-#   - initctl_split_lines() : /run/initctl line reader (mode "initctl")
+#   - initctl_parse_stream() : /run/initctl streaming line reader (mode "initctl")
 #   - deterministic LCG mutations through all three (mode "mutate")
 #
 # mount_fstab() itself is NOT executed: it performs real mount(2)/mkdir(2)
@@ -139,7 +139,7 @@ run_case fstab "fstab: over-long option string" "$WORK/f_long"
 run_case fstab "fstab: bind/rbind/remount/user implications" "$WORK/f_flags"
 run_case fstab "fstab: raw hex bytes" "$WORK/f_hex"
 
-# ---- /run/initctl (initctl_split_lines) ----
+# ---- /run/initctl (initctl_parse_stream) ----
 : > "$WORK/i_empty"
 printf 'poweroff\nreboot\n' > "$WORK/i_multi"
 printf '\n\npoweroff\n\nreboot\n\n' > "$WORK/i_blank"

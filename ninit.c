@@ -170,22 +170,69 @@ static char *trim(char *s)
     return s;
 }
 
-/* Split a /run/initctl read buffer into trimmed, non-empty command lines.
-   Pure parsing (no command execution) so the reader can be exercised by the
-   fuzz harness (scripts/fuzz-parsers.sh). Returns the number of lines stored,
-   bounded by max_lines; a line longer than MAX_LINE-1 is copied truncated,
-   matching the fixed-size storage used by the event loop. */
-__attribute__((unused)) static int initctl_split_lines(char *buf, char lines[][MAX_LINE], int max_lines)
+/* Pure streaming buffer parser for /run/initctl commands.
+   Appends chunk of chunk_len bytes to buf (capacity buf_size, current length *buf_len).
+   Replaces embedded NUL bytes with spaces.
+   If an un-delimited line exceeds buf_size - 1, discards it and sets *discarded = 1.
+   Extracts up to max_cmds complete, newline-terminated, trimmed command strings into cmds.
+   Preserves any remaining un-delimited bytes at the start of buf with updated *buf_len.
+   Returns the number of complete commands extracted. */
+static int initctl_parse_stream(char *buf, size_t buf_size, size_t *buf_len,
+                                const char *chunk, size_t chunk_len,
+                                char cmds[][MAX_LINE], int max_cmds,
+                                int *discarded)
 {
-    int n = 0;
-    for (char *line = strtok(buf, "\n"); line && n < max_lines; line = strtok(NULL, "\n")) {
-        char *cmdline = trim(line);
-        if (*cmdline == 0) continue;   /* ignore empty lines */
-        snprintf(lines[n], MAX_LINE, "%.*s", (int)MAX_LINE - 1, cmdline);
-        n++;
+    if (discarded) *discarded = 0;
+    if (!buf || buf_size == 0 || !buf_len) return 0;
+
+    size_t cur = *buf_len;
+    if (cur >= buf_size - 1) {
+        if (discarded) *discarded = 1;
+        cur = 0;
+        buf[0] = '\0';
     }
+
+    if (chunk && chunk_len > 0) {
+        size_t avail = buf_size - 1 - cur;
+        if (chunk_len > avail) {
+            /* Input overflow without newline: discard the overflowing buffer */
+            if (discarded) *discarded = 1;
+            cur = 0;
+            avail = buf_size - 1;
+        }
+        size_t ncopy = chunk_len > avail ? avail : chunk_len;
+        for (size_t k = 0; k < ncopy; k++) {
+            char c = chunk[k];
+            buf[cur + k] = (c == '\0') ? ' ' : c;
+        }
+        cur += ncopy;
+        buf[cur] = '\0';
+    }
+
+    int n = 0;
+    char *start = buf;
+    char *nl;
+    while ((nl = strchr(start, '\n')) != NULL && n < max_cmds) {
+        *nl = '\0';
+        char *cmdline = trim(start);
+        if (*cmdline != '\0') {
+            snprintf(cmds[n], MAX_LINE, "%.*s", (int)MAX_LINE - 1, cmdline);
+            n++;
+        }
+        start = nl + 1;
+    }
+
+    size_t rem = strlen(start);
+    if (rem > 0 && start != buf) {
+        memmove(buf, start, rem);
+    }
+    buf[rem] = '\0';
+    *buf_len = rem;
+
     return n;
 }
+
+
 
 /* ---------- timing helpers (T11/T13) ---------- */
 /* Milliseconds from CLOCK_MONOTONIC: immune to wall-clock jumps (the grace
@@ -316,9 +363,43 @@ static void on_sigusr1(int s) { (void)s; sigusr1_flag = 1; }
 static void on_sigusr2(int s) { (void)s; sigusr2_flag = 1; }
 
 /* ---------- mount helpers ---------- */
+/* Check whether tgt is already a mountpoint (e.g. from initramfs before
+   switch_root) to prevent stacking duplicate mounts or shadowing /run. */
+static int is_mounted(const char *tgt)
+{
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            char dev[256], mnt[256];
+            if (sscanf(line, "%255s %255s", dev, mnt) == 2) {
+                if (!strcmp(mnt, tgt)) {
+                    fclose(fp);
+                    return 1;
+                }
+            }
+        }
+        fclose(fp);
+        return 0;
+    }
+    /* Fallback if /proc is not yet mounted: compare st_dev with parent directory */
+    struct stat st, pst;
+    if (stat(tgt, &st) < 0) return 0;
+    char parent[256];
+    snprintf(parent, sizeof(parent), "%s/..", tgt);
+    if (stat(parent, &pst) < 0) return 0;
+    if (st.st_dev != pst.st_dev || st.st_ino == pst.st_ino)
+        return 1;
+    return 0;
+}
+
 static void try_mount(const char *src, const char *tgt, const char *fstype, unsigned long flags)
 {
     mkdir(tgt, 0755);
+    if (is_mounted(tgt)) {
+        init_log("%s: %s already mounted", fstype, tgt);
+        return;
+    }
     if (mount(src, tgt, fstype, flags, NULL) < 0)
         init_log("mount %s -> %s failed: %s", src, tgt, strerror(errno));
 }
@@ -1971,40 +2052,25 @@ static void process_initctl(void)
     if (initctl_fd < 0) return;
 
     for (int iter = 0; iter < 16; iter++) {
-        if (ic_len >= sizeof(ic_buf) - 1) {
-            init_log("initctl: line exceeds %d bytes, discarded", MAX_LINE - 1);
-            ic_len = 0;
-        }
-        ssize_t n = read(initctl_fd, ic_buf + ic_len, sizeof(ic_buf) - 1 - ic_len);
+        char chunk[MAX_LINE];
+        ssize_t n = read(initctl_fd, chunk, sizeof(chunk));
         if (n <= 0) break;
 
-        for (ssize_t k = 0; k < n; k++) {
-            if (ic_buf[ic_len + (size_t)k] == '\0')
-                ic_buf[ic_len + (size_t)k] = ' ';
-        }
-        ic_len += (size_t)n;
-        ic_buf[ic_len] = '\0';
+        char cmds[16][MAX_LINE];
+        int discarded = 0;
+        int ncmds = initctl_parse_stream(ic_buf, sizeof(ic_buf), &ic_len,
+                                         chunk, (size_t)n,
+                                         cmds, 16, &discarded);
+        if (discarded)
+            init_log("initctl: line exceeds %d bytes, discarded", MAX_LINE - 1);
 
-        char *start = ic_buf;
-        char *nl;
-        while ((nl = strchr(start, '\n')) != NULL) {
-            *nl = '\0';
-            char *cmd = trim(start);
-            if (*cmd != '\0') {
-                init_log("initctl cmd: '%s'", cmd);
-                if (!strcmp(cmd, "poweroff")) shutdown_all(RB_POWER_OFF, 0);
-                else if (!strcmp(cmd, "reboot")) shutdown_all(RB_AUTOBOOT, 0);
-                else if (!strcmp(cmd, "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
-                else if (!strcmp(cmd, "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
-            }
-            start = nl + 1;
+        for (int i = 0; i < ncmds; i++) {
+            init_log("initctl cmd: '%s'", cmds[i]);
+            if (!strcmp(cmds[i], "poweroff")) shutdown_all(RB_POWER_OFF, 0);
+            else if (!strcmp(cmds[i], "reboot")) shutdown_all(RB_AUTOBOOT, 0);
+            else if (!strcmp(cmds[i], "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
+            else if (!strcmp(cmds[i], "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
         }
-
-        size_t rem = strlen(start);
-        if (rem > 0 && start != ic_buf)
-            memmove(ic_buf, start, rem);
-        ic_len = rem;
-        ic_buf[ic_len] = '\0';
     }
 }
 
@@ -2357,7 +2423,13 @@ static int       rescue_spawns    = 0;   /* spawn attempts (successful forks) */
 static long long rescue_spawn_ms  = 0;   /* monotonic_ms() of the last spawn */
 #define MAX_RESCUE_RESPAWN         3
 #define RESCUE_RESPAWN_COOLDOWN_MS 2000
+#ifndef RESCUE_STABLE_MS
+#ifdef NINIT_TESTING
+#define RESCUE_STABLE_MS           2000
+#else
 #define RESCUE_STABLE_MS           10000
+#endif
+#endif
 
 /* Rescue mode can be entered BEFORE main() opens the control fds (a config
    parse failure happens earlier), so open them here: without /run/initctl the

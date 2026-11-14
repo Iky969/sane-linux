@@ -189,6 +189,9 @@ Commands are read **line-by-line**, allowing multi-line writes:
 printf 'poweroff\nreboot\n' > /run/initctl   # First command executes immediately
 ```
 
+> [!NOTE]
+> `/run/initctl` is a streaming line-buffered FIFO. Commands **must be newline-terminated** (e.g. `echo poweroff > /run/initctl` or `printf "poweroff\n" > /run/initctl`). Writing raw bytes without a trailing newline (e.g. `printf "poweroff" > /run/initctl`) will hold the data in the input buffer awaiting a delimiter, and will not take effect until a newline is delivered or the buffer limit (255 bytes) is reached.
+
 Empty lines and trailing whitespace/`\r` are ignored. Unrecognized commands are logged.
 
 ## Hostname

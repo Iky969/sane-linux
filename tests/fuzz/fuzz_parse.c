@@ -10,7 +10,7 @@
  * Modes:
  *   config  <file>            -> parse_config(file)
  *   fstab   <file>            -> parse_mount_flags(file contents)
- *   initctl <file>            -> initctl_split_lines(file contents)
+ *   initctl <file>            -> initctl_parse_stream(file contents)
  *   mutate  <seed> <iters>    -> deterministic LCG mutations through all three
  *
  * Exit code is always 0 unless the driver itself is misused; sanitizer
@@ -74,9 +74,14 @@ int main(int argc, char **argv)
             int skip = SKIP_NONE;
             parse_mount_flags(buf, data, sizeof(data), &skip);
 
-            /* initctl line reader (pure) */
-            static char lines[64][MAX_LINE];
-            initctl_split_lines(buf, lines, 64);
+            /* initctl streaming parser (pure real code) */
+            char sbuf[MAX_LINE];
+            sbuf[0] = '\0';
+            size_t slen = 0;
+            char cmds[16][MAX_LINE];
+            int disc = 0;
+            initctl_parse_stream(sbuf, sizeof(sbuf), &slen,
+                                 buf, (size_t)len, cmds, 16, &disc);
 
             /* init.conf parser (file-backed) */
             FILE *mf = fopen(tmp, "wb");
@@ -105,8 +110,18 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(mode, "initctl") == 0) {
-        static char lines[64][MAX_LINE];
-        initctl_split_lines(buf, lines, 64);
+        /* Fuzz streaming parser directly in chunks to exercise buffer boundary */
+        char sbuf[MAX_LINE];
+        sbuf[0] = '\0';
+        size_t slen = 0;
+        char cmds[64][MAX_LINE];
+        int disc = 0;
+        size_t chunk_sz = 37; /* prime chunk size to test split lines */
+        for (size_t off = 0; off < n; off += chunk_sz) {
+            size_t c_len = (n - off < chunk_sz) ? (n - off) : chunk_sz;
+            initctl_parse_stream(sbuf, sizeof(sbuf), &slen,
+                                 buf + off, c_len, cmds, 64, &disc);
+        }
         return 0;
     }
     return 0;

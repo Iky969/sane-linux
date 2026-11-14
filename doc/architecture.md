@@ -79,7 +79,7 @@ for (;;) {
 Key architectural points:
 - `ppoll` utilizes `orig` (initialized with `sigemptyset()`), ensuring signals like `SIGTERM` are unblocked while awaiting events regardless of masks inherited from the kernel.
 - `errno` is captured into `perr` immediately after `ppoll()` to prevent subsequent logging routines from clobbering the error state.
-- Commands arriving via `/run/initctl` are processed **line-by-line** (`strtok(cmd, "\n")`), trimming trailing whitespace and ignoring empty lines. A termination command triggers `shutdown_all()` immediately.
+- Commands arriving via `/run/initctl` are processed **line-by-line** by the streaming parser `initctl_parse_stream()`. Trailing whitespace and `\r` are trimmed, and empty lines are ignored. Because `/run/initctl` uses a streaming line buffer, commands **must be newline-terminated** (e.g. `echo poweroff > /run/initctl` or `printf "poweroff\n" > /run/initctl`). Partial writes without a newline are buffered until a `\n` arrives, or discarded if the line exceeds 255 bytes (`MAX_LINE - 1`). A valid termination command triggers `shutdown_all()` immediately.
 
 ## Service Management
 

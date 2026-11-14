@@ -316,6 +316,12 @@ else
 	ok "service not forcibly killed with SIGKILL"
 fi
 
+if grep -q 'Device or resource busy' "$LOG"; then
+	bad "shutdown failed with EBUSY (open file descriptor on rootfs)"
+else
+	ok "shutdown remount does not fail with EBUSY (log fd closed cleanly)"
+fi
+
 if [ -n "$ack_ms" ] && [ "$ack_ms" -lt 4000 ]; then
 	ok "service shutdown before the grace window: ${ack_ms}ms (grace = 5000ms)"
 elif [ -n "$ack_ms" ]; then

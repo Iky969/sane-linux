@@ -602,6 +602,36 @@ fi
 check_absent "4c: no kernel panic message in the ninit log" 'Attempted to kill init'
 stop_init
 
+# -------------------------------------------------------------- scenario 4d
+# Stable rescue shell (ran >= RESCUE_STABLE_MS) resets the respawn budget.
+printf '\n== 4d. stable rescue shell -> budget reset ==\n'
+start_root rescuestable
+mkfifo "$ROOT/rescue.stdin"
+# Hold stdin open for 3 seconds then exit cleanly (RESCUE_STABLE_MS is 2s in NINIT_TESTING)
+( sleep 3; echo "exit" ) > "$ROOT/rescue.stdin" &
+HOLDER=$!
+INIT_STDIN="$ROOT/rescue.stdin"
+printf 'web:once:echo web:requires=nope\n' > "$ROOT/etc/init.conf"
+run_init
+
+if ! wait_for 'rescue mode'; then
+	sed 's/^/  | /' "$LOG"
+	bad "4d: ninit did not enter rescue mode"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+
+if wait_for 'respawn budget reset'; then
+	ok "4d: rescue shell stable run reset the respawn budget"
+else
+	bad "4d: respawn budget was not reset after stable execution"
+fi
+
+kill "$HOLDER" 2>/dev/null || true
+HOLDER=""
+INIT_STDIN=/dev/null
+stop_init
+
 # -------------------------------------------------------------- scenario 5
 printf '\n== 5. over-long string rejection (name, command, dependency) ==\n'
 start_root trunc
