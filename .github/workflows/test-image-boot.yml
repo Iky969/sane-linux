@@ -26,6 +26,7 @@ jobs:
           make
           sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
+          sudo chown -R $(id -u):$(id -g) distro/
 
       - name: Build base SPM packages
         run: make packages

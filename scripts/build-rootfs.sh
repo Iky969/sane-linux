@@ -431,3 +431,7 @@ install_ninit
 write_etc
 pack_initramfs
 summary
+
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+	chown -R "$SUDO_USER:$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")" "$DISTRO_DIR" 2>/dev/null || true
+fi
