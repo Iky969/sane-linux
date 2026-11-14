@@ -892,33 +892,67 @@ static int validate_pids_max(const char *s)
     return 1;
 }
 
+/* Helper: Safe tokenizer that preserves empty fields (unlike strtok).
+   Extracts next field delimited by ':' and advances string pointer. */
+static char *next_colon_field(char **p)
+{
+    if (!p || !*p) return NULL;
+    char *start = *p;
+    char *colon = strchr(start, ':');
+    if (colon) {
+        *colon = '\0';
+        *p = colon + 1;
+    } else {
+        *p = NULL;
+    }
+    return start;
+}
+
+/* Helper: Strict numeric ID validation for UID/GID.
+   Requires: non-empty, all decimal digits, valid numeric range, no trailing characters.
+   Explicitly accepts 0 only when str consists exclusively of valid digits (e.g. "0"). */
+static int parse_numeric_id(const char *str, unsigned long *out_val)
+{
+    if (!str || *str == '\0') return -1;
+    for (const char *p = str; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return -1;
+    }
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long val = strtoul(str, &endptr, 10);
+    if (errno != 0 || endptr == str || *endptr != '\0') return -1;
+    if (val > (unsigned long)(uid_t)-1) return -1;
+    *out_val = val;
+    return 0;
+}
+
 static int lookup_user(const char *name_or_uid, uid_t *out_uid, gid_t *out_gid)
 {
     if (!name_or_uid || !*name_or_uid) return -1;
-    int is_num = 1;
-    for (const char *p = name_or_uid; *p; p++) {
-        if (!isdigit((unsigned char)*p)) { is_num = 0; break; }
-    }
-    if (is_num) {
-        char *endptr = NULL;
-        errno = 0;
-        unsigned long u = strtoul(name_or_uid, &endptr, 10);
-        if (endptr == name_or_uid || *endptr != 0 || errno != 0) return -1;
+
+    unsigned long u = 0;
+    if (parse_numeric_id(name_or_uid, &u) == 0) {
         *out_uid = (uid_t)u;
         *out_gid = (gid_t)u;
+
         FILE *f = fopen("/etc/passwd", "r");
         if (f) {
             char buf[MAX_LINE];
             while (fgets(buf, sizeof(buf), f)) {
                 buf[strcspn(buf, "\n")] = 0;
-                char *u_name = strtok(buf, ":");
-                char *u_pwd  = strtok(NULL, ":");
-                char *u_uid  = strtok(NULL, ":");
-                char *u_gid  = strtok(NULL, ":");
+                char *ptr = buf;
+                char *u_name = next_colon_field(&ptr);
+                char *u_pwd  = next_colon_field(&ptr);
+                char *u_uid  = next_colon_field(&ptr);
+                char *u_gid  = next_colon_field(&ptr);
+
                 if (u_name && u_pwd && u_uid && u_gid) {
-                    if ((uid_t)strtoul(u_uid, NULL, 10) == (uid_t)u) {
-                        *out_gid = (gid_t)strtoul(u_gid, NULL, 10);
-                        break;
+                    unsigned long rec_uid = 0, rec_gid = 0;
+                    if (parse_numeric_id(u_uid, &rec_uid) == 0 && rec_uid == u) {
+                        if (parse_numeric_id(u_gid, &rec_gid) == 0) {
+                            *out_gid = (gid_t)rec_gid;
+                            break;
+                        }
                     }
                 }
             }
@@ -926,22 +960,30 @@ static int lookup_user(const char *name_or_uid, uid_t *out_uid, gid_t *out_gid)
         }
         return 0;
     }
+
     FILE *f = fopen("/etc/passwd", "r");
     if (!f) return -1;
+
     char buf[MAX_LINE];
     int found = 0;
     while (fgets(buf, sizeof(buf), f)) {
         buf[strcspn(buf, "\n")] = 0;
-        char *u_name = strtok(buf, ":");
-        char *u_pwd  = strtok(NULL, ":");
-        char *u_uid  = strtok(NULL, ":");
-        char *u_gid  = strtok(NULL, ":");
-        if (u_name && u_pwd && u_uid && u_gid) {
+        char *ptr = buf;
+        char *u_name = next_colon_field(&ptr);
+        char *u_pwd  = next_colon_field(&ptr);
+        char *u_uid  = next_colon_field(&ptr);
+        char *u_gid  = next_colon_field(&ptr);
+
+        if (u_name && *u_name && u_pwd && u_uid && u_gid) {
             if (strcmp(u_name, name_or_uid) == 0) {
-                *out_uid = (uid_t)strtoul(u_uid, NULL, 10);
-                *out_gid = (gid_t)strtoul(u_gid, NULL, 10);
-                found = 1;
-                break;
+                unsigned long parsed_uid = 0, parsed_gid = 0;
+                if (parse_numeric_id(u_uid, &parsed_uid) == 0 &&
+                    parse_numeric_id(u_gid, &parsed_gid) == 0) {
+                    *out_uid = (uid_t)parsed_uid;
+                    *out_gid = (gid_t)parsed_gid;
+                    found = 1;
+                    break;
+                }
             }
         }
     }
@@ -952,32 +994,33 @@ static int lookup_user(const char *name_or_uid, uid_t *out_uid, gid_t *out_gid)
 static int lookup_group(const char *name_or_gid, gid_t *out_gid)
 {
     if (!name_or_gid || !*name_or_gid) return -1;
-    int is_num = 1;
-    for (const char *p = name_or_gid; *p; p++) {
-        if (!isdigit((unsigned char)*p)) { is_num = 0; break; }
-    }
-    if (is_num) {
-        char *endptr = NULL;
-        errno = 0;
-        unsigned long g = strtoul(name_or_gid, &endptr, 10);
-        if (endptr == name_or_gid || *endptr != 0 || errno != 0) return -1;
+
+    unsigned long g = 0;
+    if (parse_numeric_id(name_or_gid, &g) == 0) {
         *out_gid = (gid_t)g;
         return 0;
     }
+
     FILE *f = fopen("/etc/group", "r");
     if (!f) return -1;
+
     char buf[MAX_LINE];
     int found = 0;
     while (fgets(buf, sizeof(buf), f)) {
         buf[strcspn(buf, "\n")] = 0;
-        char *g_name = strtok(buf, ":");
-        char *g_pwd  = strtok(NULL, ":");
-        char *g_gid  = strtok(NULL, ":");
-        if (g_name && g_pwd && g_gid) {
+        char *ptr = buf;
+        char *g_name = next_colon_field(&ptr);
+        char *g_pwd  = next_colon_field(&ptr);
+        char *g_gid  = next_colon_field(&ptr);
+
+        if (g_name && *g_name && g_pwd && g_gid) {
             if (strcmp(g_name, name_or_gid) == 0) {
-                *out_gid = (gid_t)strtoul(g_gid, NULL, 10);
-                found = 1;
-                break;
+                unsigned long parsed_gid = 0;
+                if (parse_numeric_id(g_gid, &parsed_gid) == 0) {
+                    *out_gid = (gid_t)parsed_gid;
+                    found = 1;
+                    break;
+                }
             }
         }
     }

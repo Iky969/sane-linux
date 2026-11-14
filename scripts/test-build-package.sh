@@ -632,6 +632,50 @@ EOF
     test_pass "BusyBox static ELF verification & dynamic binary rejection (fail-closed)"
 }
 
+test_disk_tools_static_elf() {
+    local tdir="$TEST_TMP/disk_tools_elf_test"
+    local odir="$tdir/out"
+    mkdir -p "$tdir" "$odir"
+
+    local dt_script="$REPO_ROOT/packages/disk-tools/build.sh"
+    if [ ! -x "$dt_script" ]; then
+        test_fail "disk-tools ELF verification" "packages/disk-tools/build.sh not found or not executable"
+        return
+    fi
+
+    # Case A: Dynamic binary rejection
+    local mock_pkg="$tdir/mock-disk-tools"
+    cp -r "$REPO_ROOT/packages/disk-tools" "$mock_pkg"
+    cat > "$tdir/dyn.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+    gcc "$tdir/dyn.c" -o "$mock_pkg/x/usr/sbin/sgdisk"
+
+    if (cd "$mock_pkg" && bash ./build.sh "$odir") >/dev/null 2>&1; then
+        test_fail "disk-tools ELF verification" "disk-tools builder accepted dynamically linked binary"
+        return
+    fi
+
+    # Case B: Non-ELF script rejection
+    cat > "$mock_pkg/x/usr/sbin/sgdisk" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod 755 "$mock_pkg/x/usr/sbin/sgdisk"
+    if (cd "$mock_pkg" && bash ./build.sh "$odir") >/dev/null 2>&1; then
+        test_fail "disk-tools ELF verification" "disk-tools builder accepted non-ELF script"
+        return
+    fi
+
+    # Case C: Valid static binaries in tree
+    if ! "$dt_script" "$odir" >/dev/null 2>&1; then
+        test_fail "disk-tools ELF verification" "disk-tools builder rejected repository static binaries"
+        return
+    fi
+
+    test_pass "disk-tools static ELF verification & dynamic binary rejection (fail-closed)"
+}
+
 # -----------------------------------------------------------------------------
 # Runner
 # -----------------------------------------------------------------------------
@@ -648,6 +692,7 @@ main() {
     test_gzip_compression
     test_recipe_build
     test_busybox_static_elf
+    test_disk_tools_static_elf
 
     printf '\n=== Test Summary: %d passed, %d failed ===\n' "$PASSED_COUNT" "$FAILED_COUNT"
     if [ "$FAILED_COUNT" -gt 0 ]; then

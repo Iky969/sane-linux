@@ -1036,6 +1036,9 @@ cat > "$ROOT/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
 daemon:x:1:1:daemon:/usr/sbin:/bin/sh
 nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+emptyuser::1000:1000::/home/emptyuser:/bin/sh
+bad_empty_uid:x::1001::/home:/bin/sh
+bad_nonnum_uid:x:abc:1001::/home:/bin/sh
 EOF
 
 cat > "$ROOT/etc/group" <<'EOF'
@@ -1043,15 +1046,23 @@ root:x:0:
 daemon:x:1:
 nogroup:x:65534:
 customgrp:x:5000:
+emptygrp::2000:
+bad_empty_gid:x::
+bad_nonnum_gid:x:xyz:
 EOF
 
 cat > "$ROOT/etc/init.conf" <<'EOF'
 u_name:once:/bin/sh -c "/bin/id -u > /var/u_name.txt && /bin/id -g > /var/g_name.txt":user=nobody:group=nogroup
 u_uid:once:/bin/sh -c "/bin/id -u > /var/u_uid.txt && /bin/id -g > /var/g_uid.txt":user=1234:group=5678
 u_cust:once:/bin/sh -c "/bin/id -u > /var/u_cust.txt && /bin/id -g > /var/g_cust.txt":user=daemon:group=customgrp
+u_empty:once:/bin/sh -c "/bin/id -u > /var/u_empty.txt && /bin/id -g > /var/g_empty.txt":user=emptyuser:group=emptygrp
 bad_user:once:/bin/sh -c "echo FAIL > /var/bad_user.txt":user=nonexistentuser999
 bad_grp:once:/bin/sh -c "echo FAIL > /var/bad_grp.txt":user=nobody:group=nonexistentgrp999
-stopper:once:/bin/sh -c "/bin/sleep 1 && echo poweroff > /run/initctl":requires=u_name,u_uid,u_cust
+bad_empty_u:once:/bin/sh -c "echo FAIL > /var/bad_empty_u.txt":user=bad_empty_uid
+bad_nonnum_u:once:/bin/sh -c "echo FAIL > /var/bad_nonnum_u.txt":user=bad_nonnum_uid
+bad_empty_g:once:/bin/sh -c "echo FAIL > /var/bad_empty_g.txt":user=nobody:group=bad_empty_gid
+bad_nonnum_g:once:/bin/sh -c "echo FAIL > /var/bad_nonnum_g.txt":user=nobody:group=bad_nonnum_gid
+stopper:once:/bin/sh -c "/bin/sleep 1 && echo poweroff > /run/initctl":requires=u_name,u_uid,u_cust,u_empty
 EOF
 
 run_init
@@ -1096,6 +1107,18 @@ else
 	bad "u_cust failed to drop to group customgrp"
 fi
 
+if [ -f "$ROOT/var/u_empty.txt" ] && [ "$(cat "$ROOT/var/u_empty.txt")" = "1000" ]; then
+	ok "u_empty dropped to user emptyuser (UID 1000) with empty password/gecos field"
+else
+	bad "u_empty failed to drop to user emptyuser (expected UID 1000)"
+fi
+
+if [ -f "$ROOT/var/g_empty.txt" ] && [ "$(cat "$ROOT/var/g_empty.txt")" = "2000" ]; then
+	ok "u_empty dropped to group emptygrp (GID 2000) with empty password field"
+else
+	bad "u_empty failed to drop to group emptygrp (expected GID 2000)"
+fi
+
 if [ ! -f "$ROOT/var/bad_user.txt" ]; then
 	ok "service with invalid user rejected fail-closed"
 else
@@ -1108,8 +1131,36 @@ else
 	bad "service with invalid group was executed"
 fi
 
+if [ ! -f "$ROOT/var/bad_empty_u.txt" ]; then
+	ok "service with empty UID in passwd rejected fail-closed"
+else
+	bad "service with empty UID in passwd was executed"
+fi
+
+if [ ! -f "$ROOT/var/bad_nonnum_u.txt" ]; then
+	ok "service with non-numeric UID in passwd rejected fail-closed"
+else
+	bad "service with non-numeric UID in passwd was executed"
+fi
+
+if [ ! -f "$ROOT/var/bad_empty_g.txt" ]; then
+	ok "service with empty GID in group rejected fail-closed"
+else
+	bad "service with empty GID in group was executed"
+fi
+
+if [ ! -f "$ROOT/var/bad_nonnum_g.txt" ]; then
+	ok "service with non-numeric GID in group rejected fail-closed"
+else
+	bad "service with non-numeric GID in group was executed"
+fi
+
 check "invalid user rejected log recorded" "Parse err: user 'nonexistentuser999' on service 'bad_user' could not be resolved, entry rejected"
 check "invalid group rejected log recorded" "Parse err: group 'nonexistentgrp999' on service 'bad_grp' could not be resolved, entry rejected"
+check "empty UID rejected log recorded" "Parse err: user 'bad_empty_uid' on service 'bad_empty_u' could not be resolved, entry rejected"
+check "non-numeric UID rejected log recorded" "Parse err: user 'bad_nonnum_uid' on service 'bad_nonnum_u' could not be resolved, entry rejected"
+check "empty GID rejected log recorded" "Parse err: group 'bad_empty_gid' on service 'bad_empty_g' could not be resolved, entry rejected"
+check "non-numeric GID rejected log recorded" "Parse err: group 'bad_nonnum_gid' on service 'bad_nonnum_g' could not be resolved, entry rejected"
 
 # ------------------------------------------------------------- scenario 16
 printf '\n== 16. sane-ctl CLI & service lifecycle control (FEAT-63) ==\n'

@@ -1,29 +1,29 @@
 linux: Loading kernel `boot():/bzImage`...
 linux: Loading module `boot():/initramfs.cpio.gz`...
 switch_root: pivoting to /dev/vda2
-[2026-11-14 16:49:25] ninit: proc: /proc already mounted
-[2026-11-14 16:49:25] ninit: sysfs: /sys already mounted
-[2026-11-14 16:49:25] ninit: devtmpfs: /dev already mounted
-[2026-11-14 16:49:25] ninit: tmpfs: /run already mounted
-[2026-11-14 16:49:25] ninit: cgroup2: /sys/fs/cgroup mounted
-[2026-11-14 16:49:25] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
-[2026-11-14 16:49:25] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
-[2026-11-14 16:49:25] ninit: === ninit start (PID 1) v1.1.0 ===
-[2026-11-14 16:49:25] ninit: hostname = S.A.N.E
-[2026-11-14 16:49:25] ninit: console: state STOPPED -> STARTING
-[2026-11-14 16:49:25] ninit: console: state STARTING -> RUNNING
-[2026-11-14 16:49:25] ninit: started console (pid 458)
-[2026-11-14 16:49:25] ninit: cgroup: 'console' (pid 458) -> /sys/fs/cgroup/ninit/console
-[2026-11-14 16:49:25] ninit: hello: state STOPPED -> STARTING
-[2026-11-14 16:49:25] ninit: hello: state STARTING -> RUNNING
-[2026-11-14 16:49:25] ninit: started hello (pid 459)
-[2026-11-14 16:49:25] ninit: cgroup: 'hello' (pid 459) -> /sys/fs/cgroup/ninit/hello
-[2026-11-14 16:49:25] ninit: main loop ready
-[2026-11-14 16:49:25] ninit: console (pid 458) exit status=0x0
-[2026-11-14 16:49:25] ninit: console: state RUNNING -> STOPPED
-[2026-11-14 16:49:25] ninit: console: crash-loop #1, respawn delay increased to 4 seconds
-[2026-11-14 16:49:25] ninit: console: respawn delayed (timer 4 seconds, loop unblocked)
-[2026-11-14 16:49:25] [service] Hello from S.A.N.E Linux!
-[2026-11-14 16:49:25] ninit: hello (pid 459) exit status=0x0
-[2026-11-14 16:49:25] ninit: hello: state RUNNING -> DONE
-[2026-11-14 16:49:25] ninit: cgroup: cleaned up 'hello'
+[2026-11-14 19:15:47] ninit: proc: /proc already mounted
+[2026-11-14 19:15:47] ninit: sysfs: /sys already mounted
+[2026-11-14 19:15:47] ninit: devtmpfs: /dev already mounted
+[2026-11-14 19:15:47] ninit: tmpfs: /run already mounted
+[2026-11-14 19:15:47] ninit: cgroup2: /sys/fs/cgroup mounted
+[2026-11-14 19:15:47] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
+[2026-11-14 19:15:47] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
+[2026-11-14 19:15:47] ninit: === ninit start (PID 1) v1.1.0 ===
+[2026-11-14 19:15:47] ninit: hostname = S.A.N.E
+[2026-11-14 19:15:47] ninit: console: state STOPPED -> STARTING
+[2026-11-14 19:15:47] ninit: console: state STARTING -> RUNNING
+[2026-11-14 19:15:47] ninit: started console (pid 515)
+[2026-11-14 19:15:47] ninit: cgroup: 'console' (pid 515) -> /sys/fs/cgroup/ninit/console
+[2026-11-14 19:15:47] ninit: hello: state STOPPED -> STARTING
+[2026-11-14 19:15:47] ninit: hello: state STARTING -> RUNNING
+[2026-11-14 19:15:47] ninit: started hello (pid 516)
+[2026-11-14 19:15:47] ninit: cgroup: 'hello' (pid 516) -> /sys/fs/cgroup/ninit/hello
+[2026-11-14 19:15:47] ninit: main loop ready
+
+
+BusyBox v1.37.0 (Ubuntu 1:1.37.0-7ubuntu1) built-in shell (ash)
+Enter 'help' for a list of built-in commands.
+
+[2026-11-14 19:15:47] [service] Hello from S.A.N.E Linux!
+[2026-11-14 19:15:47] ninit: hello (pid 516) exit status=0x0
+[2026-11-14 19:15:48] ninit: hello: state RUNNING -> DONE
