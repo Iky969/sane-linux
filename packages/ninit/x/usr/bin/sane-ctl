@@ -1,0 +1,81 @@
+#!/bin/sh
+# sane-ctl -- S.A.N.E init control CLI (FEAT-63)
+set -eu
+
+INITCTL="/run/initctl"
+
+usage() {
+    printf 'Usage: sane-ctl <status|stop|start|restart|poweroff|reboot> [service]\n' >&2
+    exit 1
+}
+
+send_cmd() {
+    cmd="$1"
+    if [ ! -p "$INITCTL" ] && [ ! -e "$INITCTL" ]; then
+        printf 'sane-ctl: control fifo %s not found\n' "$INITCTL" >&2
+        exit 1
+    fi
+    printf '%s\n' "$cmd" > "$INITCTL"
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || usage
+
+case "$cmd" in
+    status)
+        target="${2:-}"
+        if [ -n "$target" ]; then
+            state_file="/run/ninit-${target}.state"
+            if [ -f "$state_file" ]; then
+                cat "$state_file"
+            else
+                printf 'sane-ctl: service '\''%s'\'' state not found\n' "$target" >&2
+                exit 1
+            fi
+        else
+            found=0
+            for f in /run/ninit-*.state; do
+                if [ -f "$f" ]; then
+                    found=1
+                    svc="${f#/run/ninit-}"
+                    svc="${svc%.state}"
+                    st="$(cat "$f" 2>/dev/null || echo "UNKNOWN")"
+                    printf '%-20s %s\n' "$svc" "$st"
+                fi
+            done
+            if [ "$found" -eq 0 ]; then
+                printf 'No services registered\n'
+            fi
+        fi
+        ;;
+    stop)
+        target="${2:-}"
+        [ -n "$target" ] || { printf 'Usage: sane-ctl stop <name>\n' >&2; exit 1; }
+        send_cmd "stop $target"
+        ;;
+    start)
+        target="${2:-}"
+        [ -n "$target" ] || { printf 'Usage: sane-ctl start <name>\n' >&2; exit 1; }
+        send_cmd "start $target"
+        ;;
+    restart)
+        target="${2:-}"
+        [ -n "$target" ] || { printf 'Usage: sane-ctl restart <name>\n' >&2; exit 1; }
+        send_cmd "restart $target"
+        ;;
+    poweroff)
+        send_cmd "poweroff"
+        ;;
+    reboot)
+        send_cmd "reboot"
+        ;;
+    force-poweroff)
+        send_cmd "force-poweroff"
+        ;;
+    force-reboot)
+        send_cmd "force-reboot"
+        ;;
+    *)
+        usage
+        ;;
+esac

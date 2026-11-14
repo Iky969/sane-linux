@@ -43,6 +43,9 @@
 
 set -eu
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
 BIN=${BIN:-}
 if [ -z "$BIN" ]; then
 	if [ -x "./ninit-test" ]; then
@@ -197,6 +200,7 @@ trap cleanup EXIT INT TERM
 # Prepare a separate test rootfs for each scenario ($1 = test name/tag).
 start_root() {
 	ROOT=$(mktemp -d "/tmp/ninit-$1.XXXXXX")
+	chmod 0755 "$ROOT"
 	LOG=$(mktemp "/tmp/ninit-$1-log.XXXXXX")
 	ROOTS="$ROOTS $ROOT"
 	LOGS="$LOGS $LOG"
@@ -210,7 +214,7 @@ start_root() {
 run_init() {
 	(
 		$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
-			--mount --propagation private \
+			--mount --propagation private ${TEST_UNSHARE_OPTS:-} \
 			sh -c "umask ${TEST_UMASK:-0022}; mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit ${INIT_ARGS:-}" \
 			>"$LOG" 2>&1 <"$INIT_STDIN"
 	) &
@@ -1015,6 +1019,254 @@ dup_opts=$(mount_opts /mnt/dup)
 if has_opt nosuid "$dup_opts"; then ok "guest: the first entry's protection (nosuid) is NOT overridden by the duplicate ($dup_opts)"; else bad "guest: the first entry's nosuid is lost (opts: '$dup_opts')"; fi
 if grep -qF ' /mnt/spa\040ce ' "$ROOT/var/mounts.txt"; then ok "guest: the mount path with a space is recorded in /proc/mounts"; else bad "guest: the mount path with a space is not recorded"; fi
 
+# ------------------------------------------------------------- scenario 15
+printf '\n== 15. privilege dropping (:user= and :group=) (FEAT-62) ==\n'
+start_root privdrop
+LOG18="$LOG"
+mkdir -p "$ROOT/bin" "$ROOT/var" "$ROOT/usr/bin"
+chmod 0777 "$ROOT/var"
+chmod 1777 "$ROOT/tmp"
+for a in id cat sleep echo; do
+	cp "$BUSYBOX" "$ROOT/bin/$a"
+	chmod 0755 "$ROOT/bin/$a"
+done
+chmod 0755 "$ROOT/bin/sh"
+
+cat > "$ROOT/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+daemon:x:1:1:daemon:/usr/sbin:/bin/sh
+nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+EOF
+
+cat > "$ROOT/etc/group" <<'EOF'
+root:x:0:
+daemon:x:1:
+nogroup:x:65534:
+customgrp:x:5000:
+EOF
+
+cat > "$ROOT/etc/init.conf" <<'EOF'
+u_name:once:/bin/sh -c "/bin/id -u > /var/u_name.txt && /bin/id -g > /var/g_name.txt":user=nobody:group=nogroup
+u_uid:once:/bin/sh -c "/bin/id -u > /var/u_uid.txt && /bin/id -g > /var/g_uid.txt":user=1234:group=5678
+u_cust:once:/bin/sh -c "/bin/id -u > /var/u_cust.txt && /bin/id -g > /var/g_cust.txt":user=daemon:group=customgrp
+bad_user:once:/bin/sh -c "echo FAIL > /var/bad_user.txt":user=nonexistentuser999
+bad_grp:once:/bin/sh -c "echo FAIL > /var/bad_grp.txt":user=nobody:group=nonexistentgrp999
+stopper:once:/bin/sh -c "/bin/sleep 1 && echo poweroff > /run/initctl":requires=u_name,u_uid,u_cust
+EOF
+
+run_init
+wait_for 'graceful shutdown' || true
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+if [ -f "$ROOT/var/u_name.txt" ] && [ "$(cat "$ROOT/var/u_name.txt")" = "65534" ]; then
+	ok "u_name dropped to user nobody (UID 65534)"
+else
+	bad "u_name failed to drop to user nobody"
+fi
+
+if [ -f "$ROOT/var/g_name.txt" ] && [ "$(cat "$ROOT/var/g_name.txt")" = "65534" ]; then
+	ok "u_name dropped to group nogroup (GID 65534)"
+else
+	bad "u_name failed to drop to group nogroup"
+fi
+
+if [ -f "$ROOT/var/u_uid.txt" ] && [ "$(cat "$ROOT/var/u_uid.txt")" = "1234" ]; then
+	ok "u_uid dropped to numeric UID 1234"
+else
+	bad "u_uid failed to drop to numeric UID 1234"
+fi
+
+if [ -f "$ROOT/var/g_uid.txt" ] && [ "$(cat "$ROOT/var/g_uid.txt")" = "5678" ]; then
+	ok "u_uid dropped to numeric GID 5678"
+else
+	bad "u_uid failed to drop to numeric GID 5678"
+fi
+
+if [ -f "$ROOT/var/u_cust.txt" ] && [ "$(cat "$ROOT/var/u_cust.txt")" = "1" ]; then
+	ok "u_cust dropped to user daemon (UID 1)"
+else
+	bad "u_cust failed to drop to user daemon"
+fi
+
+if [ -f "$ROOT/var/g_cust.txt" ] && [ "$(cat "$ROOT/var/g_cust.txt")" = "5000" ]; then
+	ok "u_cust dropped to group customgrp (GID 5000)"
+else
+	bad "u_cust failed to drop to group customgrp"
+fi
+
+if [ ! -f "$ROOT/var/bad_user.txt" ]; then
+	ok "service with invalid user rejected fail-closed"
+else
+	bad "service with invalid user was executed"
+fi
+
+if [ ! -f "$ROOT/var/bad_grp.txt" ]; then
+	ok "service with invalid group rejected fail-closed"
+else
+	bad "service with invalid group was executed"
+fi
+
+check "invalid user rejected log recorded" "Parse err: user 'nonexistentuser999' on service 'bad_user' could not be resolved, entry rejected"
+check "invalid group rejected log recorded" "Parse err: group 'nonexistentgrp999' on service 'bad_grp' could not be resolved, entry rejected"
+
+# ------------------------------------------------------------- scenario 16
+printf '\n== 16. sane-ctl CLI & service lifecycle control (FEAT-63) ==\n'
+start_root sanectl
+LOG19="$LOG"
+mkdir -p "$ROOT/bin" "$ROOT/var" "$ROOT/usr/bin"
+for a in id cat sleep echo; do
+	cp "$BUSYBOX" "$ROOT/bin/$a"
+done
+cp "$REPO_ROOT/packages/ninit/x/usr/bin/sane-ctl" "$ROOT/usr/bin/sane-ctl"
+chmod 0755 "$ROOT/usr/bin/sane-ctl"
+
+cat > "$ROOT/test_ctl.sh" <<'EOFCTL'
+#!/bin/sh
+set -e
+st1=$(/usr/bin/sane-ctl status worker)
+echo "ST1=$st1" > /var/ctl.txt
+
+/usr/bin/sane-ctl stop worker
+i=0
+while [ "$i" -lt 30 ]; do
+	st=$(/usr/bin/sane-ctl status worker 2>/dev/null || true)
+	[ "$st" = "STOPPED" ] && break
+	sleep 0.1
+	i=$((i + 1))
+done
+st2=$(/usr/bin/sane-ctl status worker)
+echo "ST2=$st2" >> /var/ctl.txt
+
+/usr/bin/sane-ctl start worker
+i=0
+while [ "$i" -lt 30 ]; do
+	st=$(/usr/bin/sane-ctl status worker 2>/dev/null || true)
+	[ "$st" = "RUNNING" ] && break
+	sleep 0.1
+	i=$((i + 1))
+done
+st3=$(/usr/bin/sane-ctl status worker)
+echo "ST3=$st3" >> /var/ctl.txt
+
+/usr/bin/sane-ctl restart worker
+i=0
+while [ "$i" -lt 30 ]; do
+	st=$(/usr/bin/sane-ctl status worker 2>/dev/null || true)
+	[ "$st" = "RUNNING" ] && break
+	sleep 0.1
+	i=$((i + 1))
+done
+st4=$(/usr/bin/sane-ctl status worker)
+echo "ST4=$st4" >> /var/ctl.txt
+
+/usr/bin/sane-ctl status > /var/all.txt
+/usr/bin/sane-ctl poweroff
+EOFCTL
+chmod 0755 "$ROOT/test_ctl.sh"
+
+cat > "$ROOT/etc/init.conf" <<'EOF'
+worker:respawn:/bin/sleep 60
+tester:once:/bin/sh /test_ctl.sh:requires=worker
+EOF
+
+run_init
+wait_for 'graceful shutdown' || true
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+if [ -f "$ROOT/var/ctl.txt" ]; then
+	if grep -q 'ST1=RUNNING' "$ROOT/var/ctl.txt"; then
+		ok "sane-ctl status worker = RUNNING initially"
+	else
+		bad "sane-ctl status worker initially not RUNNING"
+	fi
+	if grep -q 'ST2=STOPPED' "$ROOT/var/ctl.txt"; then
+		ok "sane-ctl stop worker -> STOPPED"
+	else
+		bad "sane-ctl stop worker did not transition to STOPPED"
+	fi
+	if grep -q 'ST3=RUNNING' "$ROOT/var/ctl.txt"; then
+		ok "sane-ctl start worker -> RUNNING"
+	else
+		bad "sane-ctl start worker did not transition to RUNNING"
+	fi
+	if grep -q 'ST4=RUNNING' "$ROOT/var/ctl.txt"; then
+		ok "sane-ctl restart worker -> RUNNING"
+	else
+		bad "sane-ctl restart worker did not transition to RUNNING"
+	fi
+else
+	bad "test_ctl.sh did not generate /var/ctl.txt"
+fi
+
+if [ -f "$ROOT/var/all.txt" ] && grep -q 'worker' "$ROOT/var/all.txt"; then
+	ok "sane-ctl status lists all services"
+else
+	bad "sane-ctl status failed to list services"
+fi
+
+check "initctl cmd stop logged" "initctl cmd: 'stop worker'"
+check "initctl cmd start logged" "initctl cmd: 'start worker'"
+check "initctl cmd restart logged" "initctl cmd: 'restart worker'"
+check "initctl cmd poweroff logged" "initctl cmd: 'poweroff'"
+
+# ------------------------------------------------------------- scenario 17
+printf '\n== 17. sane-net & udhcpc default.script verification (FEAT-64) ==\n'
+start_root sanenet
+LOG20="$LOG"
+mkdir -p "$ROOT/bin" "$ROOT/var" "$ROOT/usr/bin" "$ROOT/usr/share/udhcpc" "$ROOT/etc"
+for a in id cat sleep echo ip; do
+	cp "$BUSYBOX" "$ROOT/bin/$a"
+done
+cp "$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" "$ROOT/usr/bin/sane-net"
+chmod 0755 "$ROOT/usr/bin/sane-net"
+cp "$REPO_ROOT/packages/busybox/x/usr/share/udhcpc/default.script" "$ROOT/usr/share/udhcpc/default.script"
+chmod 0755 "$ROOT/usr/share/udhcpc/default.script"
+
+cat > "$ROOT/test_net.sh" <<'EOFNET'
+#!/bin/sh
+set -e
+/usr/bin/sane-net static lo 127.0.0.99/32 127.0.0.1 8.8.8.8
+if grep -q 'nameserver 8.8.8.8' /etc/resolv.conf; then
+	echo "NET_DNS=OK" > /var/net.txt
+fi
+
+interface=lo ip=127.0.0.100 subnet=32 router=127.0.0.1 dns="1.1.1.1 8.8.4.4" \
+	/usr/share/udhcpc/default.script bound
+if grep -q 'nameserver 1.1.1.1' /etc/resolv.conf && grep -q 'nameserver 8.8.4.4' /etc/resolv.conf; then
+	echo "DHCP_DNS=OK" >> /var/net.txt
+fi
+echo poweroff > /run/initctl
+EOFNET
+chmod 0755 "$ROOT/test_net.sh"
+
+cat > "$ROOT/etc/init.conf" <<'EOF'
+nettest:once:/bin/sh /test_net.sh
+EOF
+
+TEST_UNSHARE_OPTS="-n"
+run_init
+wait_for 'graceful shutdown' || true
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+TEST_UNSHARE_OPTS=""
+
+if [ -f "$ROOT/var/net.txt" ] && grep -q 'NET_DNS=OK' "$ROOT/var/net.txt"; then
+	ok "sane-net static configured interface and DNS in /etc/resolv.conf"
+else
+	bad "sane-net static failed"
+fi
+
+if [ -f "$ROOT/var/net.txt" ] && grep -q 'DHCP_DNS=OK' "$ROOT/var/net.txt"; then
+	ok "udhcpc default.script bound event applied DNS to /etc/resolv.conf"
+else
+	bad "udhcpc default.script failed"
+fi
+
 # --------------------------------------------------------------- summary
 printf '\n== log 1a (dependency order) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -1051,6 +1303,12 @@ printf '\n== log 13 (fstab: recursive mkdir + bind rejected) ==\n'
 sed 's/^/  | /' "$LOG16"
 printf '\n== log 14 (fstab: octal escape + duplicate) ==\n'
 sed 's/^/  | /' "$LOG17"
+printf '\n== log 15 (privilege dropping) ==\n'
+sed 's/^/  | /' "$LOG18"
+printf '\n== log 16 (sane-ctl) ==\n'
+sed 's/^/  | /' "$LOG19"
+printf '\n== log 17 (sane-net) ==\n'
+sed 's/^/  | /' "$LOG20"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nRESULT: PASS (all checks)\n'

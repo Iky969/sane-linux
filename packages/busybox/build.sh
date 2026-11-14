@@ -50,7 +50,8 @@ if ! is_static_elf "$BB_BIN"; then
     exit 1
 fi
 
-mkdir -p "$OUT_DIR" "$PKG_DIR/x/bin" "$PKG_DIR/x/sbin"
+mkdir -p "$OUT_DIR" "$PKG_DIR/x/bin" "$PKG_DIR/x/sbin" "$PKG_DIR/x/usr/share/udhcpc"
+[ -f "$PKG_DIR/x/usr/share/udhcpc/default.script" ] && chmod 0755 "$PKG_DIR/x/usr/share/udhcpc/default.script"
 
 install -m 0755 "$BB_BIN" "$PKG_DIR/x/bin/busybox"
 
