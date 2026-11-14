@@ -1,0 +1,6 @@
+name=ninit
+version=1.1.0
+release=1
+arch=x86_64
+description=S.A.N.E minimal PID 1 init daemon and control wrappers
+base=true

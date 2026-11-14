@@ -15,6 +15,8 @@
 #   make test-panic  kernel-panic regression suite (QEMU; requires root + qemu)
 #   make fuzz       ASan+UBSan fuzz harness for config/fstab/initctl parsers
 #   make lint       run python linter on log patterns, markers, and format specifiers
+#   make packages   build all base S.A.N.E distro packages (.spm.tar.xz)
+#   make test-pkg   run package builder test suite
 #   make clean      remove built binary
 #   make clean-distro remove distro build artifacts
 #
@@ -83,11 +85,17 @@ clean:
 	rm -f $(BIN) $(TESTBIN)
 
 clean-distro:
-	rm -rf distro/rootfs distro/build distro/cache distro/initramfs.cpio.gz \
+	rm -rf distro/rootfs distro/build distro/cache distro/packages distro/initramfs.cpio.gz \
 	       distro/qemu-console.log distro/qemu.log
 
 lint:
 	python3 ./scripts/lint-log-patterns.py
 	python3 ./scripts/verify-format-strings.py
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint
+packages: $(BIN)
+	bash ./packages/build-all.sh
+
+test-pkg:
+	bash ./scripts/test-build-package.sh
+
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg

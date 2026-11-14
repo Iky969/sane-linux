@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stop the machine immediately (force poweroff, services are SIGKILLed at once).
+echo force-poweroff > /run/initctl

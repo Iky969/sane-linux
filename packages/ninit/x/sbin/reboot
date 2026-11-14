@@ -1,0 +1,3 @@
+#!/bin/sh
+# Reboot the machine cleanly through /run/initctl.
+echo reboot > /run/initctl

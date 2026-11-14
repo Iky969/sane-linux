@@ -162,7 +162,7 @@ flowchart TD
 
 ## Phase 2: S.A.N.E Package Format & Packaging Tooling [P1 - Packaging]
 
-- [ ] **PKG-20: Package Format Specification (`doc/package-format.md`)**
+- [x] **PKG-20: Package Format Specification (`doc/package-format.md`)**
   - **Component:** Documentation / Specification
   - **Owner:** Planner & Coder
   - **Target Files:** `doc/package-format.md`
@@ -190,7 +190,7 @@ flowchart TD
       - **Anti-Traversal Extraction Guard:** During package extraction (`spm`), `spm` MUST NEVER follow existing symlinks or extract through symlinks pointing outside the target root directory (use `O_NOFOLLOW` / `symlink(2)` directly).
   - **Acceptance Criteria:** `doc/package-format.md` committed and ratified.
 
-- [ ] **PKG-21: Package Builder Tool (`scripts/build-package.sh`)**
+- [x] **PKG-21: Package Builder Tool (`scripts/build-package.sh`)**
   - **Component:** Packaging CLI
   - **Owner:** Worker 1 | Audit: Reviewer
   - **Target Files:** `scripts/build-package.sh`, `scripts/test-build-package.sh`
@@ -211,7 +211,7 @@ flowchart TD
     tar -tf /tmp/sample-pkg-0.1.0-x86_64.spm.tar.xz
     ```
 
-- [ ] **PKG-22: Base Distro Packages Construction (`packages/*`)**
+- [x] **PKG-22: Base Distro Packages Construction (`packages/*`)**
   - **Component:** Distro Packaging Blueprints
   - **Owner:** Worker 1
   - **Target Files:** `packages/busybox/`, `packages/ninit/`, `packages/kernel/`, `packages/limine-static/`, `packages/sane-hello/`
@@ -223,7 +223,7 @@ flowchart TD
     - `sane-hello`: Minimal user testing package (`base=false`).
   - **Acceptance Criteria:** All packages successfully build to `.spm.tar.xz` with zero warnings.
 
-- [ ] **PKG-23: Boot Pipeline & Initramfs `switch_root` Architecture**
+- [x] **PKG-23: Boot Pipeline & Initramfs `switch_root` Architecture**
   - **Component:** Core Architecture / Boot Sequence
   - **Target Files:** `doc/boot-pipeline.md`, `distro/rootfs/`
   - **Objective:** Formalize the boot sequence: Limine bootloader -> kernel `bzImage` + initramfs -> mount root partition (ext4) -> clean `switch_root` to `/sbin/init` (`ninit`). Verify that `try_mount` preserves pre-mounted `/run` and filesystems across `switch_root`.

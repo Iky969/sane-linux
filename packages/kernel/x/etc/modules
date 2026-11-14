@@ -1,0 +1,5 @@
+# /etc/modules -- Core kernel modules for S.A.N.E Linux
+ext4
+virtio_pci
+virtio_net
+virtio_blk

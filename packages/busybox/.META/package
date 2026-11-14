@@ -1,0 +1,6 @@
+name=busybox
+version=1.36.1
+release=1
+arch=x86_64
+description=Static BusyBox 1.36.1 multi-call binary and core applets
+base=true

@@ -1,0 +1,4 @@
+usr/bin/limine
+usr/bin/limine-deploy
+usr/share/limine/limine-bios.sys
+usr/share/limine/limine-uefi-cd.bin

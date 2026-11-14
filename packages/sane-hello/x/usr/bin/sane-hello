@@ -1,0 +1,3 @@
+#!/bin/sh
+# S.A.N.E Linux Hello World utility
+echo "Hello from S.A.N.E Linux!"

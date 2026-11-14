@@ -1,0 +1,6 @@
+name=limine-static
+version=7.20.1
+release=1
+arch=x86_64
+description=Static Limine bootloader binaries and deployment utilities for guest installer
+base=true

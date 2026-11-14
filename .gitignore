@@ -11,6 +11,7 @@
 /distro/rootfs/
 /distro/build/
 /distro/cache/
+/distro/packages/
 /distro/initramfs.cpio.gz
 /distro/qemu-console.log
 /distro/qemu.log

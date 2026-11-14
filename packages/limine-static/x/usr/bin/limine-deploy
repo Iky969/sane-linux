@@ -1,0 +1,10 @@
+#!/bin/sh
+# Deploy Limine bootloader to MBR/GPT disk device
+if [ -x /usr/bin/limine ]; then
+    exec /usr/bin/limine bios-install "$@"
+elif [ -x "$(dirname "$0")/limine" ]; then
+    exec "$(dirname "$0")/limine" bios-install "$@"
+else
+    echo "ERROR: limine binary not found" >&2
+    exit 1
+fi

@@ -12,6 +12,8 @@ For a high-level overview, quick start guide, and configuration examples, see th
 | [configuration.md](configuration.md) | Syntax and semantics of `/etc/init.conf`, `/etc/fstab`, signal tables, `/run/initctl`, log locations |
 | [build-and-test.md](build-and-test.md) | Static build, PID 1 smoke tests, CI workflow, manual `unshare`/`chroot` testing, troubleshooting |
 | [distro-builder.md](distro-builder.md) | Minimal rootfs + initramfs assembly and QEMU headless validation |
+| [boot-pipeline.md](boot-pipeline.md) | Boot pipeline, GPT layout, Limine bootloader, and initramfs `switch_root` handoff |
+| [package-format.md](package-format.md) | S.A.N.E package manager container specification (`.spm.tar.xz`), metadata, and symlink rules |
 | [glossary-i18n.md](glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
 | [../SECURITY.md](../SECURITY.md) | Security policy and vulnerability disclosure procedures |
 | [../LICENSE](../LICENSE) | MIT License |

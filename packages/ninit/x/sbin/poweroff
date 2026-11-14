@@ -1,0 +1,3 @@
+#!/bin/sh
+# Shut the machine down cleanly (5 second grace) through /run/initctl.
+echo poweroff > /run/initctl

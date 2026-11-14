@@ -1,0 +1,6 @@
+name=kernel
+version=6.6.134
+release=1
+arch=x86_64
+description=Production Linux kernel bzImage and core module configuration
+base=true

@@ -1,0 +1,6 @@
+name=sane-hello
+version=0.1.0
+release=1
+arch=x86_64
+description=Minimal test package for S.A.N.E Linux
+base=false
