@@ -30,7 +30,11 @@ else
     KERNEL_SRC="$TMP_KERNEL"
 fi
 
-install -m 0644 "$KERNEL_SRC" "$PKG_DIR/x/boot/vmlinuz-virt"
+if [ "$KERNEL_SRC" != "$PKG_DIR/x/boot/vmlinuz-virt" ]; then
+    install -m 0644 "$KERNEL_SRC" "$PKG_DIR/x/boot/vmlinuz-virt"
+else
+    chmod 0644 "$PKG_DIR/x/boot/vmlinuz-virt"
+fi
 ln -sf vmlinuz-virt "$PKG_DIR/x/boot/vmlinuz"
 ln -sf vmlinuz-virt "$PKG_DIR/x/boot/bzImage"
 
