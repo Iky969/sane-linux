@@ -10,7 +10,7 @@ filesystems declared in `/etc/fstab`, and orchestrates clean system shutdown.
 
 This repository contains both components: the S.A.N.E distribution builder
 (BusyBox rootfs + bootable initramfs for QEMU) and the init system source,
-[`ninit.c`](ninit.c) (~2027 lines), strictly static binary compiling with
+[`ninit.c`](ninit.c) (±2750 lines), strictly static binary compiling with
 zero warnings under `-Wall -Werror`. The event loop is built on `ppoll`,
 keeping init responsive to signals even during rapid service respawn loops.
 
