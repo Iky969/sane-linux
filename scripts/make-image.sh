@@ -145,8 +145,18 @@ if [ -f "${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20" ]; then
     KERNEL_BIN="${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20"
 elif [ -f "${REPO_ROOT}/packages/kernel/x/boot/bzImage" ]; then
     KERNEL_BIN="${REPO_ROOT}/packages/kernel/x/boot/bzImage"
+    if [ ! -f "${CACHE_DIR}/vmlinuz-virt-v3.20" ] && [ -f "${REPO_ROOT}/packages/kernel/x/boot/vmlinuz-virt" ]; then
+        mkdir -p "$CACHE_DIR"
+        cp "${REPO_ROOT}/packages/kernel/x/boot/vmlinuz-virt" "${CACHE_DIR}/vmlinuz-virt-v3.20"
+    fi
 else
-    die "Kernel binary (bzImage / vmlinuz-virt) not found"
+    log "Kernel binary not found. Downloading Alpine netboot kernel (v3.20)..."
+    mkdir -p "$CACHE_DIR"
+    curl -fL -s --retry 3 --connect-timeout 15 -o "${CACHE_DIR}/vmlinuz-virt-v3.20.part" \
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/vmlinuz-virt" \
+        || die "Failed to download Alpine netboot kernel (v3.20)"
+    mv "${CACHE_DIR}/vmlinuz-virt-v3.20.part" "${CACHE_DIR}/vmlinuz-virt-v3.20"
+    KERNEL_BIN="${CACHE_DIR}/vmlinuz-virt-v3.20"
 fi
 
 # Find Static BusyBox binary (for initramfs switch_root)
@@ -198,6 +208,12 @@ if [ ! -d "$MODULES_STAGING" ] || [ -z "$(find "$MODULES_STAGING" -name "nls_utf
         "modules/*/kernel/fs/nls/nls_cp437.ko" \
         "modules/*/kernel/fs/nls/nls_iso8859-1.ko" \
         "modules/*/kernel/fs/nls/nls_utf8.ko" >/dev/null
+fi
+
+# Ensure cache is populated before calling packages/build-all.sh
+mkdir -p "$CACHE_DIR"
+if [ ! -f "${CACHE_DIR}/vmlinuz-virt-v3.20" ] && [ -n "$KERNEL_BIN" ] && [ -f "$KERNEL_BIN" ]; then
+    cp "$KERNEL_BIN" "${CACHE_DIR}/vmlinuz-virt-v3.20"
 fi
 
 # Ensure base SPM packages exist

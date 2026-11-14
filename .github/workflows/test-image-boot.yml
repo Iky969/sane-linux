@@ -27,11 +27,14 @@ jobs:
           sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
 
+      - name: Build base SPM packages
+        run: make packages
+
       - name: Build raw GPT disk image
         run: sudo bash scripts/make-image.sh --output distro/sane.img
 
       - name: Dual-boot headless QEMU verification (BIOS + UEFI)
-        run: sudo bash scripts/test-image-boot.sh --all
+        run: sudo bash scripts/test-image-boot.sh --all --timeout 30
 
       - name: Upload boot logs
         if: always()
