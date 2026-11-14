@@ -376,7 +376,11 @@ pack_initramfs() {
 		CPIO_CMD="$ROOTFS/bin/busybox cpio"
 	fi
 	# shellcheck disable=SC2016
-	( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc --quiet ) \
+	CPIO_OWNER=
+	if [ "$CPIO_CMD" = "cpio" ] && cpio --help 2>&1 | grep -q -- --owner; then
+		CPIO_OWNER="--owner=+0:+0"
+	fi
+	( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc $CPIO_OWNER --quiet ) \
 		| gzip -9 > "$INITRAMFS" || die "initramfs creation failed"
 	[ -s "$INITRAMFS" ] || die "initramfs is empty"
 }
@@ -391,9 +395,14 @@ summary() {
 	info "boot in QEMU: sh ./scripts/run-qemu.sh"
 }
 
-need gcc "build-essential"
-need make "build-essential"
-need curl
+if [ "$BUSYBOX_MODE" != prebuilt ]; then
+	need gcc "build-essential"
+	need make "build-essential"
+	need curl
+elif [ ! -x "$NINIT" ]; then
+	need gcc "build-essential"
+	need make "build-essential"
+fi
 need tar
 need sha256sum "coreutils"
 need readelf "binutils"

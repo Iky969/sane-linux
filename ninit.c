@@ -124,6 +124,7 @@ static int log_file_fd = -1;
 static int g_log_fifo_fd = -1;  /* read end of /run/log.fifo; also used during shutdown */
 static int initctl_fd = -1;     /* /run/initctl fd; closed before exec */
 static int shutting_down = 0;   /* 1 = shutdown in progress: do not respawn services */
+static pid_t rescue_shell_pid = -1;
 
 /* fstab mountpoints successfully mounted by mount_fstab(); used by
    shutdown_all() to unmount before reboot (T8E). */
@@ -467,10 +468,11 @@ static int cgroup_name_safe(const char *name)
    Called during respawn, leader exit, and shutdown. */
 static void cgroup_kill_service(const char *name)
 {
-    char kill_path[320];
+    if (!cgroup_name_safe(name)) return;
+    char kill_path[512];
     snprintf(kill_path, sizeof(kill_path), "%s/%s/cgroup.kill", CGROUP_BASE, name);
     int fd = open(kill_path, O_WRONLY);
-    int written = -1;
+    ssize_t written = -1;
     if (fd >= 0) {
         written = write(fd, "1\n", 2);
         if (written < 0) {
@@ -482,7 +484,7 @@ static void cgroup_kill_service(const char *name)
 
     /* Fallback for pre-Linux 5.14 or when cgroup.kill write fails:
        read cgroup.procs and send SIGKILL to every listed PID */
-    char procs_path[320];
+    char procs_path[512];
     snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
     FILE *fp = fopen(procs_path, "r");
     if (fp) {
@@ -510,7 +512,7 @@ static void cgroup_signal_service(const char *name, int sig)
     if (!cgroup_name_safe(name)) return;
     if (sig == SIGKILL) { cgroup_kill_service(name); return; }
 
-    char procs_path[320];
+    char procs_path[512];
     snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
     FILE *fp = fopen(procs_path, "r");
     if (!fp) return;   /* no cgroup (fail-open) -> pgid path is the fallback */
@@ -539,7 +541,7 @@ static void cgroup_fail_open(const char *svc_name)
    after successful fork(). Returns 0=ok, 1=fail-open. */
 static int setup_cgroup(const char *svc_name, pid_t pid)
 {
-    char dir[256], procs[320];   /* procs = dir (max 255) + "/cgroup.procs" */
+    char dir[448], procs[512];
     int fd;
 
     if (!cgroup_name_safe(svc_name)) return 1;   /* fail-open: do not touch path */
@@ -551,7 +553,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
         return 1;
     }
     {
-        char subtree_path[320];
+        char subtree_path[512];
         snprintf(subtree_path, sizeof(subtree_path), "%s/cgroup.subtree_control", CGROUP_BASE);
         enable_cgroup_subtree(subtree_path);
     }
@@ -571,7 +573,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
     if (idx >= 0) {
         const service_t *svc = &services[idx];
         if (svc->memory_max[0]) {
-            char path[320];
+            char path[512];
             snprintf(path, sizeof(path), "%s/memory.max", dir);
             int lim_fd = open(path, O_WRONLY);
             if (lim_fd >= 0) {
@@ -600,7 +602,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
             }
         }
         if (svc->cpu_max[0]) {
-            char path[320];
+            char path[512];
             snprintf(path, sizeof(path), "%s/cpu.max", dir);
             int lim_fd = open(path, O_WRONLY);
             if (lim_fd >= 0) {
@@ -619,7 +621,7 @@ static int setup_cgroup(const char *svc_name, pid_t pid)
             }
         }
         if (svc->pids_max[0]) {
-            char path[320];
+            char path[512];
             snprintf(path, sizeof(path), "%s/pids.max", dir);
             int lim_fd = open(path, O_WRONLY);
             if (lim_fd >= 0) {
@@ -673,7 +675,7 @@ static void cleanup_cgroup(const char *svc_name)
 {
     if (!cgroup_name_safe(svc_name)) return;
 
-    char dir[256], procs[320];
+    char dir[448], procs[512];
     snprintf(dir, sizeof(dir), "%s/%s", CGROUP_BASE, svc_name);
     snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
 
@@ -1338,7 +1340,7 @@ static int spawn_service(service_t *svc)
             init_log("fork EAGAIN after %d retries for %s: %s",
                      MAX_SPAWN_RETRY, svc->name, strerror(err));
         init_log("fork %s: %s (%d attempts, service marked failed)",
-                 svc->name, strerror(err), MAX_SPAWN_RETRY + 1);
+                 svc->name, strerror(err), svc->fork_tries + 1);
         svc_set_state(svc, SVC_STATE_FAILED);
         svc->spawn_tries  = 0;
         svc->fork_tries   = 0;
@@ -1784,7 +1786,7 @@ static void kill_service_group(const service_t *svc, int sig)
 static int cgroup_has_procs(const char *name)
 {
     if (!cgroup_name_safe(name)) return 0;
-    char procs_path[320];
+    char procs_path[512];
     snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
     FILE *fp = fopen(procs_path, "r");
     if (!fp) return 0;
@@ -1861,6 +1863,7 @@ static void shutdown_all(int reboot_cmd, int force)
             reset_respawn_counters(&services[i]);
             cleanup_cgroup(services[i].name);
         }
+        if (rescue_shell_pid > 0) kill(rescue_shell_pid, SIGKILL);
         rmdir(CGROUP_BASE);
         reap_zombies(); prepare_filesystems(); sync();
         if (reboot(reboot_cmd) < 0) init_log("reboot(%d) failed: %s", reboot_cmd, strerror(errno));
@@ -1876,6 +1879,7 @@ static void shutdown_all(int reboot_cmd, int force)
        deliberately NOT used for the polite signal: it only implements SIGKILL and
        would end the grace window before a well-behaved service could exit
        (scripts/test-sigterm.sh scenario 1 asserts the trap really runs). */
+    if (rescue_shell_pid > 0) kill(rescue_shell_pid, SIGTERM);
     long long grace_t0_ms = monotonic_ms();
     for (int i = 0; i < num_services; i++) {
         /* Probe before signaling (same as force shutdown path above):
@@ -1945,6 +1949,7 @@ static void shutdown_all(int reboot_cmd, int force)
         reset_respawn_counters(&services[i]);
         cleanup_cgroup(services[i].name);
     }
+    if (rescue_shell_pid > 0) kill(rescue_shell_pid, SIGKILL);
     rmdir(CGROUP_BASE);
     prepare_filesystems();
     sync();
@@ -2051,13 +2056,13 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
        (user,exec ends up exec) — PR #2 review items 1 & 2. */
     for (tok = strtok(opts, ","); tok; tok = strtok(NULL, ",")) {
         if (!strcmp(tok, "defaults")) continue;
-        else if (!strcmp(tok, "rw"))          flags &= ~MS_RDONLY;
-        else if (!strcmp(tok, "async"))       flags &= ~MS_SYNCHRONOUS;
-        else if (!strcmp(tok, "atime"))       flags &= ~(MS_NOATIME | MS_RELATIME | MS_STRICTATIME);
-        else if (!strcmp(tok, "diratime"))    flags &= ~MS_NODIRATIME;
-        else if (!strcmp(tok, "exec"))        flags &= ~MS_NOEXEC;
-        else if (!strcmp(tok, "suid"))        flags &= ~MS_NOSUID;
-        else if (!strcmp(tok, "dev"))         flags &= ~MS_NODEV;
+        else if (!strcmp(tok, "rw"))          flags &= ~(unsigned long)MS_RDONLY;
+        else if (!strcmp(tok, "async"))       flags &= ~(unsigned long)MS_SYNCHRONOUS;
+        else if (!strcmp(tok, "atime"))       flags &= ~(unsigned long)(MS_NOATIME | MS_RELATIME | MS_STRICTATIME);
+        else if (!strcmp(tok, "diratime"))    flags &= ~(unsigned long)MS_NODIRATIME;
+        else if (!strcmp(tok, "exec"))        flags &= ~(unsigned long)MS_NOEXEC;
+        else if (!strcmp(tok, "suid"))        flags &= ~(unsigned long)MS_NOSUID;
+        else if (!strcmp(tok, "dev"))         flags &= ~(unsigned long)MS_NODEV;
         else if (!strcmp(tok, "ro"))          flags |= MS_RDONLY;
         else if (!strcmp(tok, "noexec"))      flags |= MS_NOEXEC;
         else if (!strcmp(tok, "nosuid"))      flags |= MS_NOSUID;
@@ -2067,9 +2072,9 @@ static unsigned long parse_mount_flags(char *opts, char *data, size_t datasz, in
         else if (!strcmp(tok, "remount"))     flags |= MS_REMOUNT;
         else if (!strcmp(tok, "bind"))        flags |= MS_BIND;
         else if (!strcmp(tok, "rbind"))       flags |= MS_BIND | MS_REC;
-        else if (!strcmp(tok, "noatime"))     { flags |= MS_NOATIME;     flags &= ~(MS_RELATIME | MS_STRICTATIME); }
-        else if (!strcmp(tok, "relatime"))    { flags |= MS_RELATIME;    flags &= ~(MS_NOATIME | MS_STRICTATIME); }
-        else if (!strcmp(tok, "strictatime")) { flags |= MS_STRICTATIME; flags &= ~(MS_NOATIME | MS_RELATIME); }
+        else if (!strcmp(tok, "noatime"))     { flags |= MS_NOATIME;     flags &= ~(unsigned long)(MS_RELATIME | MS_STRICTATIME); }
+        else if (!strcmp(tok, "relatime"))    { flags |= MS_RELATIME;    flags &= ~(unsigned long)(MS_NOATIME | MS_STRICTATIME); }
+        else if (!strcmp(tok, "strictatime")) { flags |= MS_STRICTATIME; flags &= ~(unsigned long)(MS_NOATIME | MS_RELATIME); }
         else if (!strcmp(tok, "nodiratime"))  flags |= MS_NODIRATIME;
         else if (!strcmp(tok, "lazytime"))    flags |= MS_LAZYTIME;
         else if (!strcmp(tok, "user") || !strcmp(tok, "users")) {
@@ -2200,8 +2205,13 @@ static void unescape_fstab_field(char *s)
     while (*r) {
         if (r[0] == '\\' && r[1] >= '0' && r[1] <= '7' &&
             r[2] >= '0' && r[2] <= '7' && r[3] >= '0' && r[3] <= '7') {
-            *w++ = (char)((r[1] - '0') * 64 + (r[2] - '0') * 8 + (r[3] - '0'));
-            r += 4;
+            unsigned int val = (unsigned int)((r[1] - '0') * 64 + (r[2] - '0') * 8 + (r[3] - '0'));
+            if (val > 0 && val <= 255) {
+                *w++ = (char)val;
+                r += 4;
+            } else {
+                *w++ = *r++;
+            }
         } else {
             *w++ = *r++;
         }
@@ -2249,13 +2259,15 @@ static void mount_fstab(void)
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == 0) continue;
 
+        char raw_line[MAX_LINE];
+        snprintf(raw_line, sizeof(raw_line), "%s", p);
         char *dev  = strtok(p, " \t");
         char *mnt  = strtok(NULL, " \t");
         char *type = strtok(NULL, " \t");
         char *opts = strtok(NULL, " \t");
 
         if (!dev || !mnt || !type) {
-            init_log("fstab: incomplete line: '%s'", p);
+            init_log("fstab: incomplete line: '%s'", raw_line);
             continue;
         }
 
@@ -2341,7 +2353,6 @@ static void mount_fstab(void)
    enter_rescue_mode() and rescue_loop() never return. */
 
 static int       rescue_active    = 0;
-static pid_t     rescue_shell_pid = -1;
 static int       rescue_spawns    = 0;   /* spawn attempts (successful forks) */
 static long long rescue_spawn_ms  = 0;   /* monotonic_ms() of the last spawn */
 #define MAX_RESCUE_RESPAWN         3
@@ -2478,7 +2489,7 @@ static void rescue_loop(void)
         ts.tv_nsec = 500 * 1000 * 1000;
         sigset_t unblock_all;
         sigemptyset(&unblock_all);
-        int ret = ppoll(fds, nfds, &ts, &unblock_all);
+        int ret = ppoll(fds, (nfds_t)nfds, &ts, &unblock_all);
         if (ret < 0 && errno != EINTR)
             init_log("rescue: ppoll error: %s", strerror(errno));
 
@@ -2626,7 +2637,7 @@ int main(int argc, char **argv)
         struct timespec ts;
         struct timespec *pto = compute_poll_timeout(&ts);
 
-        int ret = ppoll(fds, nfds, pto, &orig);
+        int ret = ppoll(fds, (nfds_t)nfds, pto, &orig);
         int perr = errno;   /* capture immediately: errno easily modified by subsequent calls */
         if (ret < 0 && perr != EINTR) {
             init_log("ppoll error: %s", strerror(perr));

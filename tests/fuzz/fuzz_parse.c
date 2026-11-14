@@ -40,7 +40,7 @@ int main(int argc, char **argv)
         int iters = argc > 3 ? atoi(argv[3]) : 1000;
         static const char *tokens[] = {
             ":", "\n", " ", "\t", "/", "..", ":requires=", ":memory_max=",
-            ":cpu_max=", ":pids_max=", ":timeout=", "respawn", "once",
+            ":cpu_max=", ":pids_max=", ":timeout=", ":grace=", "\\040", "\\000", "\\777", "respawn", "once",
             "rw", "ro", "noauto", "bind", "user", "x-foo", "0", "-1",
             "999999999999999999999", "\x01", "\xff", "a", "srv"
         };
@@ -63,6 +63,11 @@ int main(int argc, char **argv)
                 }
             }
             buf[len] = '\0';
+
+            /* fstab octal unescape (pure, in-place on scratch copy) */
+            char esc[4096];
+            memcpy(esc, buf, (size_t)len + 1);
+            unescape_fstab_field(esc);
 
             /* fstab option classifier (pure) */
             char data[1024];
