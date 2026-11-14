@@ -86,7 +86,7 @@ clean:
 
 clean-distro:
 	rm -rf distro/rootfs distro/build distro/cache distro/packages distro/initramfs.cpio.gz \
-	       distro/qemu-console.log distro/qemu.log
+	       distro/sane.img distro/qemu-console.log distro/qemu.log distro/qemu-image*.log
 
 lint:
 	python3 ./scripts/lint-log-patterns.py
@@ -101,4 +101,10 @@ test-pkg:
 test-spm:
 	bash ./scripts/test-spm.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm
+image: packages
+	sudo bash ./scripts/make-image.sh
+
+test-image:
+	bash ./scripts/test-image-boot.sh
+
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm image test-image
