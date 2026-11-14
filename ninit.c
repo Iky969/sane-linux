@@ -90,7 +90,7 @@ typedef struct {
     int         need_respawn;   /* 1 = waiting for RESPAWN_DELAY window (without blocking loop) */
     int         spawn_tries;    /* consecutive fork() failures; reset to 0 on successful spawn */
     int         cgroup_fail_open; /* 1 = cgroup setup failed, orphan cleanup via kill(-pgid) */
-    time_t      last_start;     /* last spawn timestamp (once timeout & respawn backoff) */
+    long long   last_start;     /* last spawn monotonic_ms() (once timeout & respawn backoff) */
     int         crash_count;    /* consecutive crashes during respawn (start-limit) */
     int         respawn_delay;  /* current respawn delay (seconds, exponential backoff) */
     int         timeout;        /* timeout for once service (seconds); default ONCE_START_TIMEOUT; 0 = disabled */
@@ -174,7 +174,7 @@ static char *trim(char *s)
    fuzz harness (scripts/fuzz-parsers.sh). Returns the number of lines stored,
    bounded by max_lines; a line longer than MAX_LINE-1 is copied truncated,
    matching the fixed-size storage used by the event loop. */
-static int initctl_split_lines(char *buf, char lines[][MAX_LINE], int max_lines)
+__attribute__((unused)) static int initctl_split_lines(char *buf, char lines[][MAX_LINE], int max_lines)
 {
     int n = 0;
     for (char *line = strtok(buf, "\n"); line && n < max_lines; line = strtok(NULL, "\n")) {
@@ -1189,7 +1189,7 @@ static int spawn_service(service_t *svc)
 {
     if (shutting_down) return 0;   /* during shutdown: do not sleep, do not fork */
 
-    time_t now = time(NULL);
+    long long now_ms = monotonic_ms();
 
     /* T11: a fork() EAGAIN retry episode is in progress (fork_tries > 0). The
        monotonic retry deadline OWNS the pacing: respawn_delay must not add its
@@ -1202,7 +1202,7 @@ static int spawn_service(service_t *svc)
             return 0;                   /* not due yet: ppoll wakes us in 100 ms */
         }
         svc->fork_retry_at = 0;         /* due: attempt the next fork() now */
-    } else if (svc->last_start && (now - svc->last_start) < svc->respawn_delay) {
+    } else if (svc->last_start && (now_ms - svc->last_start) < (long long)svc->respawn_delay * 1000) {
         /* Never block event loop with sleep(): if within respawn_delay window,
            mark need_respawn and let ppoll timeout in main loop act as timer.
            respawn_delay increases exponentially on crash loops (T8D), rather than
@@ -1281,7 +1281,7 @@ static int spawn_service(service_t *svc)
     }
 
     svc->need_respawn = 0;
-    svc->last_start   = time(NULL);
+    svc->last_start   = monotonic_ms();
 
     /* T11: exactly ONE fork() attempt per event-loop pass, with a non-blocking
        exponential-backoff retry.
@@ -1372,14 +1372,14 @@ static int spawn_service(service_t *svc)
         signal(SIGPIPE, SIG_DFL);
 
         int fd = open("/dev/null", O_RDONLY);
-        if (fd >= 0) { dup2(fd, 0); close(fd); }
+        if (fd >= 0) { dup2(fd, 0); if (fd > 0) close(fd); }
 
         /* Open FIFO blocking (without O_NONBLOCK) so child stdout/stderr does not return EAGAIN */
         fd = open("/run/log.fifo", O_WRONLY);
-        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
         else {
             fd = open("/dev/console", O_WRONLY);
-            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
         }
 
         /* Synchronization handshake: wait for parent confirmation after cgroup setup finishes */
@@ -1471,10 +1471,13 @@ static void reap_zombies(void)
                    still be alive after leader exits (audit SANE-01).
                    shutdown_all() tracks the group via this pgid. */
                 if (!services[i].respawn) {
-                    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-                        svc_set_state(&services[i], SVC_STATE_DONE);
-                    else
-                        svc_set_state(&services[i], SVC_STATE_FAILED);
+                    if (services[i].state != SVC_STATE_FAILED &&
+                        services[i].state != SVC_STATE_DONE) {
+                        if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+                            svc_set_state(&services[i], SVC_STATE_DONE);
+                        else
+                            svc_set_state(&services[i], SVC_STATE_FAILED);
+                    }
                     if (!shutting_down) {
                         cgroup_kill_service(services[i].name);
                         /* Fallback kill when cgroup fails open: leader exited but runtime
@@ -1501,9 +1504,9 @@ static void reap_zombies(void)
                        failed. Running longer than STABLE_RUNTIME seconds indicates
                        stability: crash count and backoff delay are reset. */
                     if (!shutting_down) {
-                        long lifetime = services[i].last_start
-                                        ? (long)(time(NULL) - services[i].last_start) : 0;
-                        if (lifetime >= 0 && lifetime < RESPAWN_DELAY) {
+                        long long lifetime_ms = services[i].last_start
+                                                ? (monotonic_ms() - services[i].last_start) : 0;
+                        if (lifetime_ms >= 0 && lifetime_ms < (long long)RESPAWN_DELAY * 1000) {
                             services[i].crash_count++;
                             int d = 2 << services[i].crash_count;
                             services[i].respawn_delay = d > BACKOFF_MAX ? BACKOFF_MAX : d;
@@ -1518,7 +1521,7 @@ static void reap_zombies(void)
                                          services[i].name, services[i].crash_count,
                                          services[i].respawn_delay);
                             }
-                        } else if (lifetime > STABLE_RUNTIME) {
+                        } else if (lifetime_ms > (long long)STABLE_RUNTIME * 1000) {
                             services[i].crash_count = 0;
                             services[i].respawn_delay = RESPAWN_DELAY;
                         }
@@ -1708,13 +1711,13 @@ static void enforce_once_timeout(void)
 {
     if (shutting_down) return;
 
-    time_t now = time(NULL);
+    long long now_ms = monotonic_ms();
     for (int i = 0; i < num_services; i++) {
         service_t *svc = &services[i];
         if (svc->respawn) continue;
         if (svc->state != SVC_STATE_RUNNING) continue;
         if (svc->timeout <= 0) continue;
-        if (!svc->last_start || (now - svc->last_start) < svc->timeout) continue;
+        if (!svc->last_start || (now_ms - svc->last_start) < (long long)svc->timeout * 1000) continue;
 
         init_log("%s: once service exceeded %d seconds timeout, marked failed",
                  svc->name, svc->timeout);
@@ -1778,6 +1781,21 @@ static void kill_service_group(const service_t *svc, int sig)
    in its process group. Empty groups are detected via kill(-pgid, 0) failing
    with ESRCH; pgid is then cleared to avoid misdirected signals if the PID
    is later recycled by the kernel. */
+static int cgroup_has_procs(const char *name)
+{
+    if (!cgroup_name_safe(name)) return 0;
+    char procs_path[320];
+    snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_BASE, name);
+    FILE *fp = fopen(procs_path, "r");
+    if (!fp) return 0;
+    int p, found = 0;
+    while (fscanf(fp, "%d", &p) == 1) {
+        if (p > 1) { found = 1; break; }
+    }
+    fclose(fp);
+    return found;
+}
+
 static int service_still_alive(service_t *svc)
 {
     if (svc->pid > 0) return 1;
@@ -1785,6 +1803,7 @@ static int service_still_alive(service_t *svc)
         if (kill(-svc->pgid, 0) == 0 || errno == EPERM) return 1;
         svc->pgid = 0;
     }
+    if (cgroup_has_procs(svc->name)) return 1;
     return 0;
 }
 
@@ -1794,12 +1813,17 @@ static int service_still_alive(service_t *svc)
    Failures are logged and do not abort shutdown. */
 static void prepare_filesystems(void)
 {
-    if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
-        init_log("shutdown: remount / read-only failed: %s", strerror(errno));
-    else
-        init_log("shutdown: / remounted read-only");
+    /* Close /var/log/ninit.log before remounting / read-only: any open
+       writable fd on / causes MS_REMOUNT | MS_RDONLY to fail with EBUSY.
+       init_log() continues to write to /dev/kmsg and stderr. */
+    if (log_file_fd >= 0) {
+        close(log_file_fd);
+        log_file_fd = -1;
+    }
 
-    for (int i = 0; i < g_seen_cnt; i++) {
+    /* Detach fstab mountpoints in reverse mount order before remounting /
+       read-only so nested mounts are unmounted before their parents. */
+    for (int i = g_seen_cnt - 1; i >= 0; i--) {
         if (umount2(g_seen_mnt[i], MNT_DETACH) < 0) {
             if (errno != EINVAL && errno != ENOENT)
                 init_log("shutdown: umount2 %s failed: %s", g_seen_mnt[i], strerror(errno));
@@ -1807,6 +1831,11 @@ static void prepare_filesystems(void)
             init_log("shutdown: umount2 %s ok", g_seen_mnt[i]);
         }
     }
+
+    if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
+        init_log("shutdown: remount / read-only failed: %s", strerror(errno));
+    else
+        init_log("shutdown: / remounted read-only");
 }
 
 /* ---------- shutdown ---------- */
@@ -1926,8 +1955,53 @@ static void shutdown_all(int reboot_cmd, int force)
 /* ---------- setup IPC (FIXED: O_RDWR) ---------- */
 /* T8B: O_CLOEXEC mandatory on PID 1 control fds to prevent leaks to child
    services (SANE-06-01). O_RDWR ensures the FIFO always has an active reader. */
-static int setup_initctl(void) { mkfifo("/run/initctl", 0600); return open("/run/initctl", O_RDWR | O_NONBLOCK | O_CLOEXEC); }
-static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/run/log.fifo", O_RDWR | O_NONBLOCK | O_CLOEXEC); }
+static int setup_initctl(void) { mkfifo("/run/initctl", 0600); return open("/run/initctl", O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW); }
+static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/run/log.fifo", O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW); }
+
+static void process_initctl(void)
+{
+    static char ic_buf[MAX_LINE];
+    static size_t ic_len = 0;
+
+    if (initctl_fd < 0) return;
+
+    for (int iter = 0; iter < 16; iter++) {
+        if (ic_len >= sizeof(ic_buf) - 1) {
+            init_log("initctl: line exceeds %d bytes, discarded", MAX_LINE - 1);
+            ic_len = 0;
+        }
+        ssize_t n = read(initctl_fd, ic_buf + ic_len, sizeof(ic_buf) - 1 - ic_len);
+        if (n <= 0) break;
+
+        for (ssize_t k = 0; k < n; k++) {
+            if (ic_buf[ic_len + (size_t)k] == '\0')
+                ic_buf[ic_len + (size_t)k] = ' ';
+        }
+        ic_len += (size_t)n;
+        ic_buf[ic_len] = '\0';
+
+        char *start = ic_buf;
+        char *nl;
+        while ((nl = strchr(start, '\n')) != NULL) {
+            *nl = '\0';
+            char *cmd = trim(start);
+            if (*cmd != '\0') {
+                init_log("initctl cmd: '%s'", cmd);
+                if (!strcmp(cmd, "poweroff")) shutdown_all(RB_POWER_OFF, 0);
+                else if (!strcmp(cmd, "reboot")) shutdown_all(RB_AUTOBOOT, 0);
+                else if (!strcmp(cmd, "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
+                else if (!strcmp(cmd, "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
+            }
+            start = nl + 1;
+        }
+
+        size_t rem = strlen(start);
+        if (rem > 0 && start != ic_buf)
+            memmove(ic_buf, start, rem);
+        ic_len = rem;
+        ic_buf[ic_len] = '\0';
+    }
+}
 
 /* ---------- /etc/fstab ---------- */
 #ifndef FSTAB_PATH
@@ -2272,6 +2346,7 @@ static int       rescue_spawns    = 0;   /* spawn attempts (successful forks) */
 static long long rescue_spawn_ms  = 0;   /* monotonic_ms() of the last spawn */
 #define MAX_RESCUE_RESPAWN         3
 #define RESCUE_RESPAWN_COOLDOWN_MS 2000
+#define RESCUE_STABLE_MS           10000
 
 /* Rescue mode can be entered BEFORE main() opens the control fds (a config
    parse failure happens earlier), so open them here: without /run/initctl the
@@ -2425,6 +2500,11 @@ static void rescue_loop(void)
             while ((p = waitpid(-1, &status, WNOHANG)) > 0) {
                 if (p == rescue_shell_pid) {
                     init_log("rescue shell exit status=0x%x", status);
+                    if (monotonic_ms() - rescue_spawn_ms >= RESCUE_STABLE_MS) {
+                        rescue_spawns = 0;
+                        init_log("rescue shell ran >= %ds, respawn budget reset",
+                                 RESCUE_STABLE_MS / 1000);
+                    }
                     rescue_shell_pid = -1;
                 }
             }
@@ -2434,20 +2514,7 @@ static void rescue_loop(void)
             if (!(fds[i].revents & POLLIN)) continue;
 
             if (fds[i].fd == initctl_fd) {
-                char cmd[256];
-                ssize_t n = read(initctl_fd, cmd, sizeof(cmd) - 1);
-                if (n > 0) {
-                    cmd[n] = 0;
-                    char lines[64][MAX_LINE];
-                    int nl = initctl_split_lines(cmd, lines, 64);
-                    for (int k = 0; k < nl; k++) {
-                        init_log("initctl cmd: '%s'", lines[k]);
-                        if (!strcmp(lines[k], "poweroff")) shutdown_all(RB_POWER_OFF, 0);
-                        else if (!strcmp(lines[k], "reboot")) shutdown_all(RB_AUTOBOOT, 0);
-                        else if (!strcmp(lines[k], "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
-                        else if (!strcmp(lines[k], "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
-                    }
-                }
+                process_initctl();
             } else if (fds[i].fd == g_log_fifo_fd) {
                 drain_log_fifo();
             }
@@ -2584,27 +2651,7 @@ int main(int argc, char **argv)
             if (!(fds[i].revents & POLLIN)) continue;
 
             if (fds[i].fd == initctl_fd) {
-                char cmd[256];
-                ssize_t n = read(initctl_fd, cmd, sizeof(cmd) - 1);
-                if (n > 0) {
-                    cmd[n] = 0;
-
-                    /* Process LINE-BY-LINE: a single write may contain multiple commands
-                       (e.g. printf 'poweroff\nreboot\n' > /run/initctl). Older versions
-                       truncated the buffer at the first newline, silently discarding
-                       subsequent commands without logging them.
-                       Since terminal commands never return from shutdown_all(),
-                       only the first valid line takes effect. */
-                    char lines[64][MAX_LINE];
-                    int nl = initctl_split_lines(cmd, lines, 64);
-                    for (int k = 0; k < nl; k++) {
-                        init_log("initctl cmd: '%s'", lines[k]);
-                        if (!strcmp(lines[k], "poweroff")) shutdown_all(RB_POWER_OFF, 0);
-                        else if (!strcmp(lines[k], "reboot")) shutdown_all(RB_AUTOBOOT, 0);
-                        else if (!strcmp(lines[k], "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
-                        else if (!strcmp(lines[k], "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
-                    }
-                }
+                process_initctl();
             }
             else if (fds[i].fd == log_fifo_fd) {
                 drain_log_fifo();
