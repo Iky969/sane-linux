@@ -1,0 +1,21 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001HBdsDxe: loading Boot0002 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x4,0x0)
+BdsDxe: starting Boot0002 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x4,0x0)
+[001;001H[001;001H[001;001Hl[001;002Hi[001;003Hn[001;004Hu[001;005Hx[001;006H:[001;007H [001;008HL[001;009Ho[001;010Ha[001;011Hd[001;012Hi[001;013Hn[001;014Hg[001;015H [001;016Hk[001;017He[001;018Hr[001;019Hn[001;020He[001;021Hl[001;022H [001;023H`[001;024Hb[001;025Ho[001;026Ho[001;027Ht[001;028H([001;029H)[001;030H:[001;031H/[001;032Hb[001;033Hz[001;034HI[001;035Hm[001;036Ha[001;037Hg[001;038He[001;039H`[001;040H.[001;041H.[001;042H.[001;043H[001;001H[002;001Hl[002;002Hi[002;003Hn[002;004Hu[002;005Hx[002;006H:[002;007H [002;008HL[002;009Ho[002;010Ha[002;011Hd[002;012Hi[002;013Hn[002;014Hg[002;015H [002;016Hm[002;017Ho[002;018Hd[002;019Hu[002;020Hl[002;021He[002;022H [002;023H`[002;024Hb[002;025Ho[002;026Ho[002;027Ht[002;028H([002;029H)[002;030H:[002;031H/[002;032Hi[002;033Hn[002;034Hi[002;035Ht[002;036Hr[002;037Ha[002;038Hm[002;039Hf[002;040Hs[002;041H.[002;042Hc[002;043Hp[002;044Hi[002;045Ho[002;046H.[002;047Hg[002;048Hz[002;049H`[002;050H.[002;051H.[002;052H.[002;053H[002;001H[003;001Hswitch_root: pivoting to /dev/vda2
+[2026-11-14 14:44:24] ninit: proc: /proc already mounted
+[2026-11-14 14:44:24] ninit: sysfs: /sys already mounted
+[2026-11-14 14:44:24] ninit: devtmpfs: /dev already mounted
+[2026-11-14 14:44:24] ninit: tmpfs: /run already mounted
+[2026-11-14 14:44:24] ninit: cgroup2: /sys/fs/cgroup mounted
+[2026-11-14 14:44:24] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
+[2026-11-14 14:44:24] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
+[2026-11-14 14:44:24] ninit: === ninit start (PID 1) v1.1.0 ===
+[2026-11-14 14:44:24] ninit: hostname = S.A.N.E
+[2026-11-14 14:44:24] ninit: console: state STOPPED -> STARTING
+[2026-11-14 14:44:24] ninit: console: state STARTING -> RUNNING
+[2026-11-14 14:44:24] ninit: started console (pid 455)
+[2026-11-14 14:44:24] ninit: cgroup: 'console' (pid 455) -> /sys/fs/cgroup/ninit/console
+[2026-11-14 14:44:24] ninit: hello: state STOPPED -> STARTING
+[2026-11-14 14:44:24] ninit: hello: state STARTING -> RUNNING
+[2026-11-14 14:44:24] ninit: started hello (pid 456)
+[2026-11-14 14:44:24] ninit: cgroup: 'hello' (pid 456) -> /sys/fs/cgroup/ninit/hello
+[2026-11-14 14:44:24] ninit: main loop ready

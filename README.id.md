@@ -15,6 +15,9 @@ initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
 responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
 [![CI](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml)
+[![Build Image](https://github.com/Iky969/sane-linux/actions/workflows/build-image.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/build-image.yml)
+[![SPM Tests](https://github.com/Iky969/sane-linux/actions/workflows/test-spm.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/test-spm.yml)
+[![Image Boot](https://github.com/Iky969/sane-linux/actions/workflows/test-image-boot.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/test-image-boot.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Fitur

@@ -1,0 +1,51 @@
+name: build-image
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-disk-image:
+    name: Build raw GPT disk image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio curl parted dosfstools mtools e2fsprogs gdisk squashfs-tools
+
+      - name: Build rootfs and initramfs
+        run: |
+          make
+          sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
+          test -s distro/initramfs.cpio.gz
+
+      - name: Build raw GPT disk image
+        run: sudo bash scripts/make-image.sh --output distro/sane.img
+
+      - name: Assert image file existence and 0644 permissions
+        run: |
+          test -f distro/sane.img
+          test -s distro/sane.img
+          img_perms=$(stat -c "%a" distro/sane.img)
+          if [ "$img_perms" != "644" ]; then
+            echo "FAIL: Expected permissions 0644, got $img_perms" >&2
+            exit 1
+          fi
+          echo "OK: distro/sane.img exists with permissions 0644"
+
+      - name: Verify 3 GPT partitions via parted (SANE_BOOT, sane_root, bios_boot)
+        run: |
+          sudo parted -s distro/sane.img print
+          sudo parted -s distro/sane.img print | grep -q "Partition Table: gpt" || { echo "FAIL: Partition table is not GPT"; exit 1; }
+          sudo parted -s distro/sane.img print | grep -q "SANE_BOOT" || { echo "FAIL: Partition SANE_BOOT not found"; exit 1; }
+          sudo parted -s distro/sane.img print | grep -q "sane_root" || { echo "FAIL: Partition sane_root not found"; exit 1; }
+          sudo parted -s distro/sane.img print | grep -q "bios_boot" || { echo "FAIL: Partition bios_boot not found"; exit 1; }
+          echo "OK: All 3 GPT partitions verified via parted"

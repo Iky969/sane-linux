@@ -12,8 +12,9 @@
 #   4. Zero kernel panics (no 'Kernel panic' or 'Attempted to kill init')
 #
 # Return code:
-#   0 = PASS (all markers verified)
-#   1 = FAIL (markers missing or panic detected; dumps full diagnostic log)
+#   0 = PASS (all requested boot modes verified)
+#   1 = FAIL (markers missing or panic detected)
+#   2 = PARTIAL / SKIP (UEFI skipped when --all was requested without OVMF)
 
 set -euo pipefail
 
@@ -90,19 +91,20 @@ need grep "grep"
 
 # Auto-detect standard OVMF firmware file paths
 find_ovmf() {
-    if [ -n "$OVMF_PATH" ] && [ -f "$OVMF_PATH" ]; then
-        echo "$OVMF_PATH"
-        return 0
+    if [ -n "$OVMF_PATH" ]; then
+        if [ -f "$OVMF_PATH" ]; then
+            echo "$OVMF_PATH"
+            return 0
+        fi
+        return 1
     fi
 
     local candidates=(
-        "/usr/share/OVMF/OVMF.fd"
         "/usr/share/ovmf/OVMF.fd"
+        "/usr/share/OVMF/OVMF.fd"
         "/usr/share/qemu/OVMF.fd"
-        "/usr/share/OVMF/OVMF_CODE.fd"
-        "/usr/share/OVMF/OVMF_CODE_4M.fd"
-        "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd"
-        "/usr/share/edk2/ovmf/OVMF_CODE.fd"
+        "/usr/share/edk2-ovmf/x64/OVMF.fd"
+        "/usr/share/edk2/ovmf/OVMF.fd"
     )
 
     for cand in "${candidates[@]}"; do
@@ -115,47 +117,15 @@ find_ovmf() {
     return 1
 }
 
-# Ensure OVMF firmware is aligned to 64KB for QEMU -bios loader compatibility
-prepare_ovmf() {
-    local raw_fd="$1"
-    local fsize
-    fsize=$(stat -c %s "$raw_fd" 2>/dev/null || stat -f %z "$raw_fd" 2>/dev/null || echo 0)
-
-    if [ "$fsize" -gt 0 ] && [ $((fsize % 65536)) -ne 0 ]; then
-        local vars_cand
-        vars_cand="$(dirname "$raw_fd")/OVMF_VARS_4M.fd"
-        local combined_fd="$DISTRO_DIR/ovmf-combined.fd"
-        if [ -f "$vars_cand" ]; then
-            cat "$raw_fd" "$vars_cand" > "$combined_fd"
-            echo "$combined_fd"
-            return 0
-        elif [ -f "/usr/share/ovmf/OVMF.fd" ]; then
-            echo "/usr/share/ovmf/OVMF.fd"
-            return 0
-        else
-            cp "$raw_fd" "$combined_fd"
-            truncate -s 4194304 "$combined_fd" 2>/dev/null || true
-            echo "$combined_fd"
-            return 0
-        fi
-    fi
-
-    echo "$raw_fd"
-    return 0
-}
-
 ACTIVE_OVMF=""
 if [ "$MODE" = "uefi" ] || [ "$MODE" = "all" ]; then
-    DETECTED_OVMF="$(find_ovmf || true)"
-    if [ -z "$DETECTED_OVMF" ]; then
+    ACTIVE_OVMF="$(find_ovmf || true)"
+    if [ -z "$ACTIVE_OVMF" ]; then
         if [ "$MODE" = "uefi" ]; then
             die "OVMF UEFI firmware not found. Please install ovmf (apt-get install -y ovmf) or pass --ovmf <path>"
         else
-            printf 'WARNING: OVMF firmware not detected on host; skipping UEFI boot test.\n'
-            MODE="bios"
+            printf 'WARNING: OVMF firmware not detected on host; UEFI boot test will be SKIPPED.\n\n'
         fi
-    else
-        ACTIVE_OVMF="$(prepare_ovmf "$DETECTED_OVMF")"
     fi
 fi
 
@@ -199,6 +169,27 @@ if [ -w /dev/kvm ] 2>/dev/null; then
 else
     ACCEL_ARGS+=(-cpu max)
 fi
+
+# Test status and milestone tracking variables
+bios_status="NOT RUN"
+bios_details="Test not executed"
+bios_switch_root_ms="N/A"
+bios_banner_ms="N/A"
+bios_ready_ms="N/A"
+bios_service_ms="N/A"
+bios_panic="N/A"
+
+uefi_status="NOT RUN"
+uefi_details="Test not executed"
+uefi_skip_reason=""
+uefi_switch_root_ms="N/A"
+uefi_banner_ms="N/A"
+uefi_ready_ms="N/A"
+uefi_service_ms="N/A"
+uefi_panic="N/A"
+
+OVERALL_RESULT="FAIL"
+FINAL_EXIT_CODE=1
 
 run_boot_test() {
     local target_mode="$1"
@@ -367,11 +358,19 @@ run_boot_test() {
 
     printf '\n'
 
+    local res=0
     if [ "$fail_count" -eq 0 ]; then
         printf '========================================\n'
         printf 'RESULT [%s]: PASS (all boot pipeline markers verified)\n' "$mode_label"
         printf '========================================\n'
-        return 0
+        res=0
+        if [ "$target_mode" = "bios" ]; then
+            bios_status="PASS"
+            bios_details="All boot pipeline markers verified"
+        else
+            uefi_status="PASS"
+            uefi_details="All boot pipeline markers verified"
+        fi
     else
         printf '========================================\n'
         printf 'RESULT [%s]: FAIL (%d milestone checks failed)\n' "$mode_label" "$fail_count"
@@ -386,38 +385,194 @@ run_boot_test() {
             printf '\n-- QEMU Stderr Log (%s) --\n' "$qemu_log" >&2
             sed 's/^/  | /' "$qemu_log" >&2
         fi
-        return 1
+        res=1
+        if [ "$target_mode" = "bios" ]; then
+            bios_status="FAIL"
+            bios_details="${fail_count} milestone checks failed"
+        else
+            uefi_status="FAIL"
+            uefi_details="${fail_count} milestone checks failed"
+        fi
     fi
+
+    if [ "$target_mode" = "bios" ]; then
+        bios_switch_root_ms="$([ "$switch_root_detected" -eq 1 ] && echo "${switch_root_ms} ms" || echo "NOT FOUND (FAIL)")"
+        bios_banner_ms="$([ "$banner_detected" -eq 1 ] && echo "${banner_ms} ms" || echo "NOT FOUND (FAIL)")"
+        bios_ready_ms="$([ "$ready_detected" -eq 1 ] && echo "${ready_ms} ms" || echo "NOT FOUND (FAIL)")"
+        bios_service_ms="$([ "$service_detected" -eq 1 ] && echo "${service_ms} ms" || echo "NOT FOUND (FAIL)")"
+        bios_panic="$([ "$panic_detected" -eq 1 ] && echo "Kernel panic detected (FAIL)" || echo "Zero panics (OK)")"
+    else
+        uefi_switch_root_ms="$([ "$switch_root_detected" -eq 1 ] && echo "${switch_root_ms} ms" || echo "NOT FOUND (FAIL)")"
+        uefi_banner_ms="$([ "$banner_detected" -eq 1 ] && echo "${banner_ms} ms" || echo "NOT FOUND (FAIL)")"
+        uefi_ready_ms="$([ "$ready_detected" -eq 1 ] && echo "${ready_ms} ms" || echo "NOT FOUND (FAIL)")"
+        uefi_service_ms="$([ "$service_detected" -eq 1 ] && echo "${service_ms} ms" || echo "NOT FOUND (FAIL)")"
+        uefi_panic="$([ "$panic_detected" -eq 1 ] && echo "Kernel panic detected (FAIL)" || echo "Zero panics (OK)")"
+    fi
+
+    return "$res"
+}
+
+archive_test_results() {
+    local doc_dir="$REPO_ROOT/doc"
+    local archives_dir="$doc_dir/archives"
+    mkdir -p "$archives_dir"
+
+    # Ensure docs symlink exists
+    if [ ! -e "$REPO_ROOT/docs" ] && [ ! -L "$REPO_ROOT/docs" ]; then
+        ln -sf doc "$REPO_ROOT/docs"
+    fi
+
+    # Archive console logs (always overwrite)
+    local bios_console="$DISTRO_DIR/qemu-image-console-bios.log"
+    local uefi_console="$DISTRO_DIR/qemu-image-console-uefi.log"
+
+    if [ "$bios_status" != "NOT RUN" ] && [ -f "$bios_console" ]; then
+        cp -f "$bios_console" "$archives_dir/qemu-image-console-bios.log"
+    else
+        printf 'BIOS boot test was not executed in this run (mode: %s).\n' "$MODE" > "$archives_dir/qemu-image-console-bios.log"
+    fi
+
+    if [ "$uefi_status" = "SKIP" ]; then
+        printf 'UEFI boot test was SKIPPED: %s\n' "${uefi_skip_reason:-OVMF firmware not detected on host}" > "$archives_dir/qemu-image-console-uefi.log"
+    elif [ "$uefi_status" != "NOT RUN" ] && [ -f "$uefi_console" ]; then
+        cp -f "$uefi_console" "$archives_dir/qemu-image-console-uefi.log"
+    else
+        printf 'UEFI boot test was not executed in this run (mode: %s).\n' "$MODE" > "$archives_dir/qemu-image-console-uefi.log"
+    fi
+
+    # Generate boot-test-report.md (always overwrite)
+    local img_size
+    img_size="$(du -h "$IMAGE_FILE" 2>/dev/null | cut -f1 || echo 'unknown')"
+    local img_bytes
+    img_bytes="$(stat -c %s "$IMAGE_FILE" 2>/dev/null || stat -f %z "$IMAGE_FILE" 2>/dev/null || echo '0')"
+    local test_date
+    test_date="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+    local bios_timings_md
+    if [ "$bios_status" = "NOT RUN" ]; then
+        bios_timings_md="- Test not executed in this run (mode: \`${MODE}\`)"
+    else
+        bios_timings_md="- **switch_root to /dev/vda2**: ${bios_switch_root_ms}
+- **ninit PID 1 startup banner**: ${bios_banner_ms}
+- **ninit main loop ready**: ${bios_ready_ms}
+- **Service execution (sane-hello / console)**: ${bios_service_ms}
+- **Kernel panic check**: ${bios_panic}"
+    fi
+
+    local uefi_timings_md
+    if [ "$uefi_status" = "SKIP" ]; then
+        uefi_timings_md="- **Skip Reason**: ${uefi_skip_reason:-OVMF firmware not detected on host}"
+    elif [ "$uefi_status" = "NOT RUN" ]; then
+        uefi_timings_md="- Test not executed in this run (mode: \`${MODE}\`)"
+    else
+        uefi_timings_md="- **switch_root to /dev/vda2**: ${uefi_switch_root_ms}
+- **ninit PID 1 startup banner**: ${uefi_banner_ms}
+- **ninit main loop ready**: ${uefi_ready_ms}
+- **Service execution (sane-hello / console)**: ${uefi_service_ms}
+- **Kernel panic check**: ${uefi_panic}"
+    fi
+
+    cat > "$archives_dir/boot-test-report.md" <<EOF
+# S.A.N.E Linux Boot Verification Report
+
+- **Timestamp**: ${test_date}
+- **Test Mode**: \`${MODE}\`
+- **Overall Result**: **${OVERALL_RESULT}** (Exit code: ${FINAL_EXIT_CODE})
+- **Disk Image**: \`$(basename "$IMAGE_FILE")\` (${img_size}, ${img_bytes} bytes)
+- **QEMU Acceleration**: \`${ACCEL_ARGS[*]:-TCG default}\`
+- **UEFI Firmware**: \`${ACTIVE_OVMF:-Not detected / None}\`
+
+## Test Summary
+
+| Test Mode | Status | Details |
+| :--- | :--- | :--- |
+| **BIOS Boot** | \`${bios_status}\` | ${bios_details} |
+| **UEFI Boot** | \`${uefi_status}\` | ${uefi_skip_reason:-${uefi_details}} |
+
+## Milestone Check Timings
+
+### BIOS Boot Verification
+- **Status**: \`${bios_status}\`
+${bios_timings_md}
+
+### UEFI Boot Verification
+- **Status**: \`${uefi_status}\`
+${uefi_timings_md}
+
+## Console Logs
+- BIOS Console Log: [\`qemu-image-console-bios.log\`](./qemu-image-console-bios.log)
+- UEFI Console Log: [\`qemu-image-console-uefi.log\`](./qemu-image-console-uefi.log)
+EOF
+
+    printf '== Test report archived to %s/boot-test-report.md ==\n\n' "$archives_dir"
 }
 
 case "$MODE" in
     bios)
-        run_boot_test "bios"
+        if run_boot_test "bios"; then
+            OVERALL_RESULT="PASS"
+            FINAL_EXIT_CODE=0
+        else
+            OVERALL_RESULT="FAIL"
+            FINAL_EXIT_CODE=1
+        fi
+        archive_test_results
+        exit "$FINAL_EXIT_CODE"
         ;;
     uefi)
-        run_boot_test "uefi"
+        if [ -z "$ACTIVE_OVMF" ]; then
+            die "OVMF UEFI firmware not found. Please install ovmf (apt-get install -y ovmf) or pass --ovmf <path>"
+        fi
+        if run_boot_test "uefi"; then
+            OVERALL_RESULT="PASS"
+            FINAL_EXIT_CODE=0
+        else
+            OVERALL_RESULT="FAIL"
+            FINAL_EXIT_CODE=1
+        fi
+        archive_test_results
+        exit "$FINAL_EXIT_CODE"
         ;;
     all)
         printf '==================================================\n'
         printf 'Starting Dual Boot Verification: BIOS and UEFI\n'
         printf '==================================================\n\n'
-        bios_res=0
-        uefi_res=0
-        run_boot_test "bios" || bios_res=1
+        run_boot_test "bios" || true
         printf '\n'
-        run_boot_test "uefi" || uefi_res=1
+        if [ -n "$ACTIVE_OVMF" ]; then
+            run_boot_test "uefi" || true
+        else
+            uefi_status="SKIP"
+            uefi_skip_reason="OVMF firmware not detected on host"
+            uefi_details="SKIP (OVMF firmware not detected on host)"
+            printf '== Skipping Headless Image Boot Test [UEFI] ==\n'
+            printf '   Reason: OVMF firmware not detected on host\n\n'
+        fi
         printf '\n'
         printf '==================================================\n'
         printf 'Dual Boot Summary:\n'
-        printf '  BIOS Boot : %s\n' "$([ $bios_res -eq 0 ] && echo 'PASS' || echo 'FAIL')"
-        printf '  UEFI Boot : %s\n' "$([ $uefi_res -eq 0 ] && echo 'PASS' || echo 'FAIL')"
-        printf '==================================================\n'
-        if [ "$bios_res" -eq 0 ] && [ "$uefi_res" -eq 0 ]; then
-            printf 'RESULT: ALL BOOT MODES PASSED\n'
-            exit 0
+        printf '  BIOS Boot : %s\n' "$bios_status"
+        if [ "$uefi_status" = "SKIP" ]; then
+            printf '  UEFI Boot : SKIP (%s)\n' "$uefi_skip_reason"
         else
-            printf 'RESULT: BOOT VERIFICATION FAILED\n'
-            exit 1
+            printf '  UEFI Boot : %s\n' "$uefi_status"
         fi
+        printf '==================================================\n'
+
+        if [ "$bios_status" = "PASS" ] && [ "$uefi_status" = "PASS" ]; then
+            OVERALL_RESULT="PASS"
+            FINAL_EXIT_CODE=0
+            printf 'RESULT: ALL BOOT MODES PASSED\n'
+        elif [ "$bios_status" = "FAIL" ] || [ "$uefi_status" = "FAIL" ]; then
+            OVERALL_RESULT="FAIL"
+            FINAL_EXIT_CODE=1
+            printf 'RESULT: BOOT VERIFICATION FAILED\n'
+        else
+            OVERALL_RESULT="PARTIAL / SKIP"
+            FINAL_EXIT_CODE=2
+            printf 'RESULT: PARTIAL / SKIP (UEFI boot test was skipped)\n'
+        fi
+        archive_test_results
+        exit "$FINAL_EXIT_CODE"
         ;;
 esac
