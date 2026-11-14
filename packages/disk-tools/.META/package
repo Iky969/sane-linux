@@ -1,0 +1,6 @@
+name=disk-tools
+version=1.0.0
+release=1
+arch=x86_64
+description=Static GPT disk partitioning and filesystem tools (sgdisk, mke2fs, mkfs.fat)
+base=true

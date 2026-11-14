@@ -113,4 +113,7 @@ test-image-bios:
 test-image-uefi:
 	bash ./scripts/test-image-boot.sh --uefi
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm image test-image test-image-bios test-image-uefi
+test-installer installer-test: packages
+	sudo bash ./scripts/test-installer.sh
+
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test
