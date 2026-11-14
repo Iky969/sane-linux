@@ -219,6 +219,7 @@ run_boot_test() {
     fi
     qemu_cmd+=(
         -drive "file=$IMAGE_FILE,format=raw,if=virtio"
+        -snapshot
         -m "$test_mem"
         -serial "file:$console_log"
         -display none

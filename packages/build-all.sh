@@ -14,6 +14,7 @@ PACKAGES=(
     busybox
     kernel
     limine-static
+    disk-tools
 )
 
 printf '=== Building S.A.N.E Distro Packages ===\n'

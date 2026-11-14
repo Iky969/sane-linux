@@ -523,9 +523,12 @@ LOOP_DEV=""
 $LIMINE_BIN bios-install "$OUTPUT_FILE" >/dev/null
 
 # Fix permissions so non-root test harness / user can access the disk image
-if [ -n "${SUDO_USER:-}" ]; then
-    chown "${SUDO_USER}:${SUDO_GID:-$(id -g "$SUDO_USER")}" "$OUTPUT_FILE" 2>/dev/null || true
+REAL_USER="${SUDO_USER:-}"
+if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
+    REAL_USER="$(stat -c '%U' "$REPO_ROOT" 2>/dev/null || id -u)"
 fi
+REAL_GROUP="$(id -g "$REAL_USER" 2>/dev/null || stat -c '%G' "$REPO_ROOT" 2>/dev/null || id -g)"
+chown "${REAL_USER}:${REAL_GROUP}" "$OUTPUT_FILE" 2>/dev/null || true
 chmod 0644 "$OUTPUT_FILE"
 
 log "Image successfully created at $OUTPUT_FILE"
