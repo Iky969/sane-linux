@@ -4,6 +4,9 @@ sbin/init
 sbin/poweroff
 sbin/reboot
 usr/
+usr/bin/
+usr/bin/sane-ctl
+usr/bin/sane-net
 usr/share/
 usr/share/ninit/
 usr/share/ninit/services/

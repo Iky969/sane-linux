@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # scripts/test-spm.sh -- Adversarial Test Harness for S.A.N.E Package Manager (spm)
 #
 # Validates the 20 core SPM contracts (SPM-35 & Hardening Suite):
@@ -23,9 +23,9 @@
 #  19. Package upgrade obsolete file pruning -> obsolete files and empty dirs pruned bottom-up, DB consistent.
 #  20. Package upgrade rdeps pruning -> dropped dependencies pruned from rdeps and safely removable.
 
-set -euo pipefail
+set -eu
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 SPM_BIN="$REPO_ROOT/scripts/spm"
 
 TEST_TMP="$(mktemp -d /tmp/sane-spm-test-XXXXXX)"
@@ -900,8 +900,8 @@ test_concurrency_lock() {
 
     # Acquire an exclusive flock in a subshell background job
     (
-        exec 200>"$lockfile"
-        flock -x 200
+        exec 8>"$lockfile"
+        flock -x 8
         # Signal readiness: lock is held!
         printf 'READY\n' > "$ready_fifo"
         # Wait for release signal
@@ -1424,7 +1424,9 @@ test_package_upgrade_obsolete_file_pruning() {
         test_fail "Scenario 19" "Obsolete data.txt still present in providers index"
         return
     fi
-    if ! grep -q "/usr/bin/tool-b"$'\t'"pkg-upgrade-test" "$root/var/lib/spm/providers" 2>/dev/null; then
+    local tab
+    tab="$(printf '\t')"
+    if ! grep -q "/usr/bin/tool-b${tab}pkg-upgrade-test" "$root/var/lib/spm/providers" 2>/dev/null; then
         test_fail "Scenario 19" "Updated tool-b missing from providers index"
         return
     fi

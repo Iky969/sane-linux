@@ -1,0 +1,40 @@
+#!/bin/sh
+# sane-net -- S.A.N.E minimal network bring-up (FEAT-64)
+set -eu
+
+usage() {
+    printf 'Usage: sane-net dhcp <iface>\n' >&2
+    printf '       sane-net static <iface> <ip/cidr> <gw> [dns]\n' >&2
+    exit 1
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || usage
+
+case "$cmd" in
+    dhcp)
+        iface="${2:-}"
+        [ -n "$iface" ] || { printf 'Error: interface required for dhcp\n' >&2; usage; }
+        ip link set "$iface" up
+        exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" -s /usr/share/udhcpc/default.script
+        ;;
+    static)
+        iface="${2:-}"
+        ip_cidr="${3:-}"
+        gw="${4:-}"
+        dns="${5:-}"
+        [ -n "$iface" ] && [ -n "$ip_cidr" ] && [ -n "$gw" ] || {
+            printf 'Error: iface, ip/cidr, and gw required for static\n' >&2
+            usage
+        }
+        ip link set "$iface" up
+        ip addr add "$ip_cidr" dev "$iface"
+        ip route add default via "$gw"
+        if [ -n "$dns" ]; then
+            printf 'nameserver %s\n' "$dns" > /etc/resolv.conf
+        fi
+        ;;
+    *)
+        usage
+        ;;
+esac

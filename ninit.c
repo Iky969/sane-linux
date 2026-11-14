@@ -32,6 +32,8 @@
 #include <poll.h>
 #include <ctype.h>
 #include <sys/ioctl.h>   /* TIOCSCTTY: rescue shell controlling tty (T15) */
+#include <pwd.h>
+#include <grp.h>
 
 #ifndef MAX_SERVICES
 #define MAX_SERVICES    64
@@ -104,6 +106,11 @@ typedef struct {
     char        memory_max[64];
     char        cpu_max[64];
     char        pids_max[64];
+    uid_t       uid;            /* FEAT-62: privilege dropping */
+    gid_t       gid;
+    int         need_drop;
+    int         manual_stop;    /* FEAT-63: manually stopped via initctl */
+    int         restart_pending;/* FEAT-63: restart requested via initctl */
 } service_t;
 
 static service_t services[MAX_SERVICES];
@@ -311,7 +318,7 @@ static int svc_transition_allowed(svc_state_t from, svc_state_t to)
                to == SVC_STATE_FAILED;
     case SVC_STATE_DONE:
     case SVC_STATE_FAILED:
-        return 0;
+        return to == SVC_STATE_STOPPED  || to == SVC_STATE_STARTING;
     }
     return 0;
 }
@@ -885,6 +892,99 @@ static int validate_pids_max(const char *s)
     return 1;
 }
 
+static int lookup_user(const char *name_or_uid, uid_t *out_uid, gid_t *out_gid)
+{
+    if (!name_or_uid || !*name_or_uid) return -1;
+    int is_num = 1;
+    for (const char *p = name_or_uid; *p; p++) {
+        if (!isdigit((unsigned char)*p)) { is_num = 0; break; }
+    }
+    if (is_num) {
+        char *endptr = NULL;
+        errno = 0;
+        unsigned long u = strtoul(name_or_uid, &endptr, 10);
+        if (endptr == name_or_uid || *endptr != 0 || errno != 0) return -1;
+        *out_uid = (uid_t)u;
+        *out_gid = (gid_t)u;
+        FILE *f = fopen("/etc/passwd", "r");
+        if (f) {
+            char buf[MAX_LINE];
+            while (fgets(buf, sizeof(buf), f)) {
+                buf[strcspn(buf, "\n")] = 0;
+                char *u_name = strtok(buf, ":");
+                char *u_pwd  = strtok(NULL, ":");
+                char *u_uid  = strtok(NULL, ":");
+                char *u_gid  = strtok(NULL, ":");
+                if (u_name && u_pwd && u_uid && u_gid) {
+                    if ((uid_t)strtoul(u_uid, NULL, 10) == (uid_t)u) {
+                        *out_gid = (gid_t)strtoul(u_gid, NULL, 10);
+                        break;
+                    }
+                }
+            }
+            fclose(f);
+        }
+        return 0;
+    }
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return -1;
+    char buf[MAX_LINE];
+    int found = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        buf[strcspn(buf, "\n")] = 0;
+        char *u_name = strtok(buf, ":");
+        char *u_pwd  = strtok(NULL, ":");
+        char *u_uid  = strtok(NULL, ":");
+        char *u_gid  = strtok(NULL, ":");
+        if (u_name && u_pwd && u_uid && u_gid) {
+            if (strcmp(u_name, name_or_uid) == 0) {
+                *out_uid = (uid_t)strtoul(u_uid, NULL, 10);
+                *out_gid = (gid_t)strtoul(u_gid, NULL, 10);
+                found = 1;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+static int lookup_group(const char *name_or_gid, gid_t *out_gid)
+{
+    if (!name_or_gid || !*name_or_gid) return -1;
+    int is_num = 1;
+    for (const char *p = name_or_gid; *p; p++) {
+        if (!isdigit((unsigned char)*p)) { is_num = 0; break; }
+    }
+    if (is_num) {
+        char *endptr = NULL;
+        errno = 0;
+        unsigned long g = strtoul(name_or_gid, &endptr, 10);
+        if (endptr == name_or_gid || *endptr != 0 || errno != 0) return -1;
+        *out_gid = (gid_t)g;
+        return 0;
+    }
+    FILE *f = fopen("/etc/group", "r");
+    if (!f) return -1;
+    char buf[MAX_LINE];
+    int found = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        buf[strcspn(buf, "\n")] = 0;
+        char *g_name = strtok(buf, ":");
+        char *g_pwd  = strtok(NULL, ":");
+        char *g_gid  = strtok(NULL, ":");
+        if (g_name && g_pwd && g_gid) {
+            if (strcmp(g_name, name_or_gid) == 0) {
+                *out_gid = (gid_t)strtoul(g_gid, NULL, 10);
+                found = 1;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return found ? 0 : -1;
+}
+
 static int parse_config(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -938,13 +1038,15 @@ static int parse_config(const char *path)
             continue;
         }
         
-        /* Scan for option tags (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=) */
+        /* Scan for option tags (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group=) */
         char *deps = "";
         char *mem_max = "";
         char *cpu_limit = "";
         char *pids_limit = "";
         int timeout_val = ONCE_START_TIMEOUT;
         int grace_val = SIGTERM_GRACE_SECS;   /* T13: SIGTERM -> SIGKILL grace window */
+        char *user_opt = NULL;
+        char *group_opt = NULL;
 
         char *t_req = strstr(cmd, ":requires=");
         char *t_mem = strstr(cmd, ":memory_max=");
@@ -952,6 +1054,8 @@ static int parse_config(const char *path)
         char *t_pid = strstr(cmd, ":pids_max=");
         char *t_tout = strstr(cmd, ":timeout=");
         char *t_grace = strstr(cmd, ":grace=");
+        char *t_user = strstr(cmd, ":user=");
+        char *t_group = strstr(cmd, ":group=");
 
         /* Find the earliest occurring tag so commands containing ':' remain intact */
         char *first_tag = NULL;
@@ -961,6 +1065,8 @@ static int parse_config(const char *path)
         if (t_pid && (!first_tag || t_pid < first_tag)) first_tag = t_pid;
         if (t_tout && (!first_tag || t_tout < first_tag)) first_tag = t_tout;
         if (t_grace && (!first_tag || t_grace < first_tag)) first_tag = t_grace;
+        if (t_user && (!first_tag || t_user < first_tag)) first_tag = t_user;
+        if (t_group && (!first_tag || t_group < first_tag)) first_tag = t_group;
 
         if (first_tag) {
             *first_tag = 0; /* Split cmd right before first option tag */
@@ -977,6 +1083,10 @@ static int parse_config(const char *path)
                     cpu_limit = trim(scan + 8);
                 } else if (strncmp(scan, "pids_max=", 9) == 0) {
                     pids_limit = trim(scan + 9);
+                } else if (strncmp(scan, "user=", 5) == 0) {
+                    user_opt = trim(scan + 5);
+                } else if (strncmp(scan, "group=", 6) == 0) {
+                    group_opt = trim(scan + 6);
                 } else if (strncmp(scan, "timeout=", 8) == 0) {
                     char *tout_str = trim(scan + 8);
                     if (strcmp(tout_str, "0") == 0 || strcmp(tout_str, "none") == 0 ||
@@ -1061,6 +1171,37 @@ static int parse_config(const char *path)
             init_log("Warning: unknown mode '%s' for '%s'. Default: once", mode, name);
         }
 
+        /* Resolve user / group for privilege dropping (FEAT-62) */
+        uid_t parsed_uid = 0;
+        gid_t parsed_gid = 0;
+        int need_drop = 0;
+
+        if (user_opt) {
+            if (*user_opt == '\0') {
+                init_log("Parse err: empty user option on service '%s', entry rejected", name);
+                continue;
+            }
+            need_drop = 1;
+            if (lookup_user(user_opt, &parsed_uid, &parsed_gid) < 0) {
+                init_log("Parse err: user '%s' on service '%s' could not be resolved, entry rejected",
+                         user_opt, name);
+                continue;
+            }
+        }
+
+        if (group_opt) {
+            if (*group_opt == '\0') {
+                init_log("Parse err: empty group option on service '%s', entry rejected", name);
+                continue;
+            }
+            need_drop = 1;
+            if (lookup_group(group_opt, &parsed_gid) < 0) {
+                init_log("Parse err: group '%s' on service '%s' could not be resolved, entry rejected",
+                         group_opt, name);
+                continue;
+            }
+        }
+
         /* Reject entries where fields exceed buffer limits (audit SANE-03):
            earlier versions only warned and registered TRUNCATED services — names
            could collide with other services, commands could alter semantics, and
@@ -1127,6 +1268,11 @@ static int parse_config(const char *path)
         services[num_services].fork_tries   = 0;
         services[num_services].fork_retry_at = 0;
         services[num_services].fork_first_logged = 0;
+        services[num_services].uid          = parsed_uid;
+        services[num_services].gid          = parsed_gid;
+        services[num_services].need_drop    = need_drop;
+        services[num_services].manual_stop  = 0;
+        services[num_services].restart_pending = 0;
         /* T10: registration is not a transition (the entry is already STOPPED),
            so it goes through the same single assignment point as everything else. */
         svc_set_state(&services[num_services], SVC_STATE_STOPPED);
@@ -1489,6 +1635,12 @@ static int spawn_service(service_t *svc)
         if (g_log_fifo_fd >= 0) close(g_log_fifo_fd);
         if (log_file_fd >= 0)   close(log_file_fd);
 
+        if (svc->need_drop) {
+            if (setgroups(1, &svc->gid) < 0) _exit(126);
+            if (setresgid(svc->gid, svc->gid, svc->gid) < 0) _exit(126);
+            if (setresuid(svc->uid, svc->uid, svc->uid) < 0) _exit(126);
+        }
+
         execl("/bin/sh", "sh", "-c", svc->cmd, (char *)NULL);
         _exit(127);
     }
@@ -1553,6 +1705,32 @@ static void reap_zombies(void)
                 /* pgid INTENTIONALLY preserved: other group members may
                    still be alive after leader exits (audit SANE-01).
                    shutdown_all() tracks the group via this pgid. */
+                if (services[i].restart_pending) {
+                    services[i].restart_pending = 0;
+                    services[i].manual_stop = 0;
+                    if (!shutting_down) {
+                        cgroup_kill_service(services[i].name);
+                        if (services[i].cgroup_fail_open && services[i].pgid > 0)
+                            kill(-services[i].pgid, SIGKILL);
+                        cleanup_cgroup(services[i].name);
+                    }
+                    reset_respawn_counters(&services[i]);
+                    svc_set_state(&services[i], SVC_STATE_STOPPED);
+                    services[i].need_respawn = 1;
+                    continue;
+                }
+                if (services[i].manual_stop) {
+                    svc_set_state(&services[i], SVC_STATE_STOPPED);
+                    if (!shutting_down) {
+                        cgroup_kill_service(services[i].name);
+                        if (services[i].cgroup_fail_open && services[i].pgid > 0)
+                            kill(-services[i].pgid, SIGKILL);
+                        cleanup_cgroup(services[i].name);
+                    }
+                    services[i].need_respawn = 0;
+                    reset_respawn_counters(&services[i]);
+                    continue;
+                }
                 if (!services[i].respawn) {
                     if (services[i].state != SVC_STATE_FAILED &&
                         services[i].state != SVC_STATE_DONE) {
@@ -1659,6 +1837,8 @@ static void spawn_eligible_services(void)
         progress = 0;
         for (int i = 0; i < num_services; i++) {
             service_t *svc = &services[i];
+            if (svc->manual_stop)
+                continue;
             if (svc->pid > 0 || svc->state == SVC_STATE_DONE || svc->state == SVC_STATE_FAILED)
                 continue;
             if (svc->need_respawn)
@@ -1695,6 +1875,8 @@ static void respawn_services(void)
 
     for (int i = 0; i < num_services; i++) {
         service_t *svc = &services[i];
+        if (svc->manual_stop)
+            continue;
         if (svc->pid > 0 || svc->state == SVC_STATE_DONE || svc->state == SVC_STATE_FAILED)
             continue;
         if (!svc->respawn && !svc->need_respawn)
@@ -2044,6 +2226,114 @@ static void shutdown_all(int reboot_cmd, int force)
 static int setup_initctl(void) { mkfifo("/run/initctl", 0600); return open("/run/initctl", O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW); }
 static int setup_log_fifo(void) { mkfifo("/run/log.fifo", 0600); return open("/run/log.fifo", O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW); }
 
+static void initctl_stop_service(const char *name)
+{
+    int idx = find_service(name);
+    if (idx < 0) {
+        init_log("initctl: service '%s' not found", name);
+        return;
+    }
+    service_t *svc = &services[idx];
+    svc->manual_stop = 1;
+    svc->restart_pending = 0;
+    svc->need_respawn = 0;
+    if (service_still_alive(svc)) {
+        init_log("initctl: stopping service '%s' (pid %d)", svc->name, (int)svc->pid);
+        svc_set_state(svc, SVC_STATE_STOPPING);
+        kill_service_group(svc, SIGTERM);
+    } else {
+        svc_set_state(svc, SVC_STATE_STOPPED);
+        cgroup_kill_service(svc->name);
+        cleanup_cgroup(svc->name);
+        init_log("initctl: service '%s' stopped", svc->name);
+    }
+}
+
+static void initctl_start_service(const char *name)
+{
+    int idx = find_service(name);
+    if (idx < 0) {
+        init_log("initctl: service '%s' not found", name);
+        return;
+    }
+    service_t *svc = &services[idx];
+    if (service_still_alive(svc)) {
+        init_log("initctl: service '%s' is already running", svc->name);
+        return;
+    }
+    const char *failed_dep = NULL;
+    int ret = deps_satisfied(svc, &failed_dep);
+    if (ret < 0) {
+        init_log("initctl: service '%s' cannot be started: dependency '%s' failed", svc->name, failed_dep);
+        return;
+    }
+    if (ret == 0) {
+        init_log("initctl: service '%s' cannot be started: dependencies not satisfied", svc->name);
+        return;
+    }
+    svc->manual_stop = 0;
+    svc->restart_pending = 0;
+    svc->need_respawn = 0;
+    reset_respawn_counters(svc);
+    svc_set_state(svc, SVC_STATE_STOPPED);
+    init_log("initctl: starting service '%s'", svc->name);
+    spawn_service(svc);
+}
+
+static void initctl_restart_service(const char *name)
+{
+    int idx = find_service(name);
+    if (idx < 0) {
+        init_log("initctl: service '%s' not found", name);
+        return;
+    }
+    service_t *svc = &services[idx];
+    svc->manual_stop = 0;
+    if (service_still_alive(svc)) {
+        init_log("initctl: restarting service '%s' (pid %d)", svc->name, (int)svc->pid);
+        svc->restart_pending = 1;
+        svc->need_respawn = 1;
+        svc_set_state(svc, SVC_STATE_STOPPING);
+        kill_service_group(svc, SIGTERM);
+    } else {
+        const char *failed_dep = NULL;
+        int ret = deps_satisfied(svc, &failed_dep);
+        if (ret < 0) {
+            init_log("initctl: service '%s' cannot be restarted: dependency '%s' failed", svc->name, failed_dep);
+            return;
+        }
+        if (ret == 0) {
+            init_log("initctl: service '%s' cannot be restarted: dependencies not satisfied", svc->name);
+            return;
+        }
+        svc->restart_pending = 0;
+        svc->need_respawn = 0;
+        reset_respawn_counters(svc);
+        svc_set_state(svc, SVC_STATE_STOPPED);
+        init_log("initctl: starting service '%s'", svc->name);
+        spawn_service(svc);
+    }
+}
+
+static void initctl_status(const char *name)
+{
+    if (name && *name) {
+        int idx = find_service(name);
+        if (idx < 0) {
+            init_log("initctl: service '%s' not found", name);
+            return;
+        }
+        service_t *svc = &services[idx];
+        svc_write_state_file(svc);
+        init_log("initctl: status '%s' is %s (pid %d)", svc->name, svc_state_name(svc->state), (int)svc->pid);
+    } else {
+        for (int i = 0; i < num_services; i++) {
+            svc_write_state_file(&services[i]);
+            init_log("initctl: status '%s' is %s (pid %d)", services[i].name, svc_state_name(services[i].state), (int)services[i].pid);
+        }
+    }
+}
+
 static void process_initctl(void)
 {
     static char ic_buf[MAX_LINE];
@@ -2070,6 +2360,25 @@ static void process_initctl(void)
             else if (!strcmp(cmds[i], "reboot")) shutdown_all(RB_AUTOBOOT, 0);
             else if (!strcmp(cmds[i], "force-poweroff")) shutdown_all(RB_POWER_OFF, 1);
             else if (!strcmp(cmds[i], "force-reboot")) shutdown_all(RB_AUTOBOOT, 1);
+            else if (strncmp(cmds[i], "stop ", 5) == 0) {
+                initctl_stop_service(trim(cmds[i] + 5));
+            } else if (!strcmp(cmds[i], "stop")) {
+                init_log("initctl: missing service name for stop");
+            } else if (strncmp(cmds[i], "start ", 6) == 0) {
+                initctl_start_service(trim(cmds[i] + 6));
+            } else if (!strcmp(cmds[i], "start")) {
+                init_log("initctl: missing service name for start");
+            } else if (strncmp(cmds[i], "restart ", 8) == 0) {
+                initctl_restart_service(trim(cmds[i] + 8));
+            } else if (!strcmp(cmds[i], "restart")) {
+                init_log("initctl: missing service name for restart");
+            } else if (strncmp(cmds[i], "status ", 7) == 0) {
+                initctl_status(trim(cmds[i] + 7));
+            } else if (!strcmp(cmds[i], "status")) {
+                initctl_status("");
+            } else {
+                init_log("initctl: unknown command '%s'", cmds[i]);
+            }
         }
     }
 }

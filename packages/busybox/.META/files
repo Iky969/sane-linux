@@ -71,3 +71,7 @@ sbin/route
 sbin/switch_root
 sbin/sysctl
 sbin/udhcpc
+usr/
+usr/share/
+usr/share/udhcpc/
+usr/share/udhcpc/default.script
