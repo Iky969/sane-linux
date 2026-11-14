@@ -97,15 +97,9 @@ done
 
 # Normalize TARGET_ROOT
 if [ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "/" ]; then
-    # Strip trailing slashes
+    mkdir -p "$TARGET_ROOT"
+    TARGET_ROOT="$(cd "$TARGET_ROOT" && pwd -P)"
     TARGET_ROOT="${TARGET_ROOT%/}"
-    # Resolve absolute path
-    if [[ "$TARGET_ROOT" != /* ]]; then
-        mkdir -p "$TARGET_ROOT"
-        TARGET_ROOT="$(cd "$TARGET_ROOT" && pwd -P)"
-    else
-        mkdir -p "$TARGET_ROOT"
-    fi
 else
     TARGET_ROOT=""
 fi
@@ -121,8 +115,84 @@ LOCK_FILE="${SPM_DB_DIR}/spm.lock"
 # Locking management via flock(1)
 LOCK_FD=9
 CURRENT_STAGING_DIR=""
+CURRENT_PKG_NAME=""
+IN_TRANSACTION=false
+
+do_rollback() {
+    local staging_dir="${1:-$CURRENT_STAGING_DIR}"
+    local pkg="${2:-$CURRENT_PKG_NAME}"
+    [ -n "$staging_dir" ] && [ -d "$staging_dir" ] || return 0
+
+    local rjournal="$staging_dir/.journal"
+    local rbackup="$rjournal/backup"
+    local rcreated="$rjournal/created"
+
+    # Remove newly created files in reverse order
+    if [ -s "$rcreated" ]; then
+        local -a created_lines
+        mapfile -t created_lines < "$rcreated"
+        for (( i=${#created_lines[@]}-1; i>=0; i-- )); do
+            local cfile="${created_lines[i]}"
+            rm -f -- "$cfile" 2>/dev/null || true
+            rmdir "$(dirname "$cfile")" 2>/dev/null || true
+        done
+    fi
+
+    # Restore replaced and obsolete files from backup
+    if [ -d "$rbackup" ]; then
+        while IFS= read -r -d '' bfile; do
+            local brel="${bfile#$rbackup/}"
+            local rdst="${TARGET_ROOT}/$brel"
+            mkdir -p "$(dirname "$rdst")"
+            mv -f "$bfile" "$rdst" 2>/dev/null || true
+        done < <(find "$rbackup" \( -type f -o -type l \) -print0)
+    fi
+
+    # Clean up empty directories from manifest in reverse depth order
+    if [ -f "$staging_dir/.META/files" ]; then
+        while IFS= read -r fline || [ -n "$fline" ]; do
+            if [[ "$fline" == */ ]]; then
+                rmdir "${TARGET_ROOT}/${fline%/}" 2>/dev/null || true
+            fi
+        done < <(LC_ALL=C sort -r "$staging_dir/.META/files")
+    fi
+
+    # Restore database state from snapshot
+    if [ -n "$pkg" ]; then
+        if [ -f "$rjournal/had_installed_pkg" ]; then
+            rm -rf "$INSTALLED_DIR/$pkg"
+            cp -a "$rjournal/installed_pkg" "$INSTALLED_DIR/$pkg" 2>/dev/null || true
+        elif [ -f "$rjournal/no_installed_pkg" ]; then
+            rm -rf "$INSTALLED_DIR/$pkg" 2>/dev/null || true
+        fi
+    fi
+
+    if [ -f "$rjournal/providers" ]; then
+        cp -a "$rjournal/providers" "$PROVIDERS_FILE" 2>/dev/null || true
+    else
+        rm -f "$PROVIDERS_FILE" 2>/dev/null || true
+    fi
+
+    if [ -f "$rjournal/world" ]; then
+        cp -a "$rjournal/world" "$WORLD_FILE" 2>/dev/null || true
+    else
+        rm -f "$WORLD_FILE" 2>/dev/null || true
+    fi
+
+    if [ -d "$rjournal/rdeps" ]; then
+        rm -rf "$RDEPS_DIR"
+        cp -a "$rjournal/rdeps" "$RDEPS_DIR" 2>/dev/null || true
+    else
+        rm -rf "$RDEPS_DIR" 2>/dev/null || true
+    fi
+}
 
 cleanup_all() {
+    if [ "${IN_TRANSACTION:-false}" = true ]; then
+        IN_TRANSACTION=false
+        do_rollback "${CURRENT_STAGING_DIR:-}" "${CURRENT_PKG_NAME:-}"
+    fi
+
     if [ -n "${CURRENT_STAGING_DIR:-}" ] && [ -d "$CURRENT_STAGING_DIR" ]; then
         rm -rf "$CURRENT_STAGING_DIR" 2>/dev/null || true
     fi
@@ -263,6 +333,186 @@ verify_archive_symlinks() {
             verify_symlink_safety "$lpath" "$ltarget"
         fi
     done < <(tar -tvf "$pkg" 2>/dev/null || die "Failed to inspect archive symlinks: $pkg")
+}
+
+# Helper to validate an individual entry in .META/files
+validate_manifest_entry() {
+    local fline="$1"
+    [ -n "$fline" ] || die "Invalid empty entry in .META/files"
+    if [[ "$fline" == /* ]]; then
+        die "Invalid entry in .META/files: leading slash forbidden: $fline"
+    fi
+    if [[ "$fline" == *//* ]]; then
+        die "Invalid entry in .META/files: double slash forbidden: $fline"
+    fi
+    if echo "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
+        die "Path traversal detected in .META/files: $fline"
+    fi
+    if echo "$fline" | grep -qE '(^|/)\.(/|$)'; then
+        die "Invalid dot component detected in .META/files: $fline"
+    fi
+    if ! [[ "$fline" =~ ^[a-zA-Z0-9._/+-]+$ ]]; then
+        die "Invalid characters detected in .META/files: $fline"
+    fi
+}
+
+# Helper to verify 1:1 bidirectional match between .META/files and $STAGING_DIR/x/
+verify_manifest_payload_parity() {
+    local staging_root="$1"
+    local files_manifest="$staging_root/.META/files"
+    local staging_payload="$staging_root/x"
+
+    [ -f "$files_manifest" ] || die "Archive missing metadata manifest .META/files"
+    [ -s "$files_manifest" ] || die "Metadata manifest .META/files is empty"
+    [ -d "$staging_payload" ] || die "Archive missing payload root ./x/"
+
+    while IFS= read -r fline || [ -n "$fline" ]; do
+        validate_manifest_entry "$fline"
+    done < "$files_manifest"
+
+    local manifest_sorted="$staging_root/.manifest_sorted"
+    LC_ALL=C sort "$files_manifest" > "$manifest_sorted"
+
+    # Check for duplicate lines in manifest
+    local dup_entry
+    dup_entry="$(LC_ALL=C uniq -d "$manifest_sorted" | head -n 1)"
+    [ -z "$dup_entry" ] || die "Duplicate entry found in .META/files: $dup_entry"
+
+    local payload_actual="$staging_root/.payload_actual"
+    (
+        cd "$staging_payload"
+        {
+            find . -mindepth 1 -type d | sed 's|^\./||' | sed 's|$|/|'
+            find . -mindepth 1 ! -type d | sed 's|^\./||'
+        } | LC_ALL=C sort > "$payload_actual"
+    )
+
+    if ! cmp -s "$manifest_sorted" "$payload_actual"; then
+        local missing_in_payload
+        missing_in_payload="$(comm -23 "$manifest_sorted" "$payload_actual" | head -n 1)"
+        if [ -n "$missing_in_payload" ]; then
+            die "Payload parity violation: entry in .META/files does not exist in staging payload: $missing_in_payload"
+        fi
+        local unrecorded_in_payload
+        unrecorded_in_payload="$(comm -13 "$manifest_sorted" "$payload_actual" | head -n 1)"
+        if [ -n "$unrecorded_in_payload" ]; then
+            die "Payload parity violation: unrecorded entry in staging payload: $unrecorded_in_payload"
+        fi
+    fi
+}
+
+# Helper to verify SHA-256 checksums with fail-closed semantics and 1:1 match
+verify_payload_checksums() {
+    local staging_root="$1"
+    local sha_manifest="$staging_root/.META/sha256"
+    local staging_payload="$staging_root/x"
+
+    [ -f "$sha_manifest" ] || die "Archive is missing mandatory checksum manifest .META/sha256"
+
+    local payload_reg_files="$staging_root/.payload_reg_files"
+    (
+        cd "$staging_payload"
+        find . -type f | sed 's|^\./||' | LC_ALL=C sort > "$payload_reg_files"
+    )
+
+    local recorded_files="$staging_root/.sha_recorded_files"
+    rm -f "$recorded_files"
+    touch "$recorded_files"
+
+    while IFS= read -r sha_line || [ -n "$sha_line" ]; do
+        [ -n "$sha_line" ] || die "Invalid empty line in .META/sha256"
+
+        if ! [[ "$sha_line" =~ ^([0-9a-fA-F]{64})[[:space:]]+(.+)$ ]]; then
+            die "Malformed checksum entry in .META/sha256: '$sha_line'"
+        fi
+
+        local exp_hash="${BASH_REMATCH[1]}"
+        local exp_rel="${BASH_REMATCH[2]}"
+        exp_hash="$(echo "$exp_hash" | tr '[:upper:]' '[:lower:]')"
+
+        if [[ "$exp_rel" == /* ]] || [[ "$exp_rel" == *//* ]] || echo "$exp_rel" | grep -qE '(^|/)\.\.(/|$)'; then
+            die "Path traversal or invalid path in .META/sha256: '$exp_rel'"
+        fi
+
+        if grep -q -x -F "$exp_rel" "$recorded_files" 2>/dev/null; then
+            die "Duplicate checksum entry in .META/sha256: '$exp_rel'"
+        fi
+        printf '%s\n' "$exp_rel" >> "$recorded_files"
+
+        local staged_file="$staging_payload/$exp_rel"
+        if [ ! -f "$staged_file" ] || [ -L "$staged_file" ]; then
+            die "Checksum entry does not correspond to a regular file in payload: '$exp_rel'"
+        fi
+
+        local calc_hash
+        calc_hash="$(sha256sum "$staged_file" | awk '{print $1}')"
+        if [ "$calc_hash" != "$exp_hash" ]; then
+            die "Checksum mismatch for '$exp_rel': expected $exp_hash, got $calc_hash"
+        fi
+    done < "$sha_manifest"
+
+    LC_ALL=C sort "$recorded_files" -o "$recorded_files"
+    if ! cmp -s "$payload_reg_files" "$recorded_files"; then
+        local missing_in_sha
+        missing_in_sha="$(comm -23 "$payload_reg_files" "$recorded_files" | head -n 1)"
+        if [ -n "$missing_in_sha" ]; then
+            die "Checksum verification failed: regular file missing in .META/sha256: $missing_in_sha"
+        fi
+        local unrecorded_in_payload
+        unrecorded_in_payload="$(comm -13 "$payload_reg_files" "$recorded_files" | head -n 1)"
+        if [ -n "$unrecorded_in_payload" ]; then
+            die "Checksum entry has no corresponding regular file in payload: $unrecorded_in_payload"
+        fi
+    fi
+}
+
+# Helper to guard against destination directory symlink escape attacks
+verify_destination_path_safety() {
+    local rel_entry="$1"
+    local clean_entry="${rel_entry%/}"
+    local rel_dir
+    if [[ "$rel_entry" == */ ]]; then
+        rel_dir="$clean_entry"
+    else
+        rel_dir="$(dirname "$clean_entry")"
+    fi
+    [ "$rel_dir" != "." ] || return 0
+
+    local base_root="${TARGET_ROOT:-/}"
+    local cur_path="$base_root"
+    local canon_root="${TARGET_ROOT:-/}"
+
+    local IFS='/'
+    local -a parts
+    read -ra parts <<< "$rel_dir"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        if [ "$cur_path" = "/" ]; then
+            cur_path="/$part"
+        else
+            cur_path="$cur_path/$part"
+        fi
+
+        if [ -L "$cur_path" ]; then
+            local resolved
+            resolved="$(realpath -q "$cur_path" 2>/dev/null || true)"
+            [ -n "$resolved" ] || die "Destination directory symlink cannot be resolved: $cur_path"
+
+            if [ "$canon_root" != "/" ]; then
+                if [ "$resolved" != "$canon_root" ] && [[ "$resolved" != "$canon_root"/* ]]; then
+                    die "Symlink escape attack: destination directory component '$cur_path' resolves to '$resolved' outside target root '$canon_root'"
+                fi
+            else
+                case "$resolved" in
+                    /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc*|/sys*|/dev*)
+                        die "Symlink escape attack: destination directory component '$cur_path' points to forbidden system target: $resolved"
+                        ;;
+                esac
+            fi
+        elif [ ! -e "$cur_path" ]; then
+            break
+        fi
+    done
 }
 
 # Helper to validate service snippets in staging
@@ -472,9 +722,13 @@ cmd_install() {
     log "Step 3/6: Checking for file collisions against providers index..."
     local files_content
     files_content="$(tar -xOf "$archive_file" ./.META/files 2>/dev/null || die "Archive is missing mandatory .META/files")"
+    [ -n "$files_content" ] || die "Archive metadata .META/files is empty"
 
-    while IFS= read -r fline; do
+    while IFS= read -r fline || [ -n "$fline" ]; do
         [ -n "$fline" ] || continue
+        validate_manifest_entry "$fline"
+        verify_destination_path_safety "$fline"
+
         # Directories are shared, skip providers conflict check
         if [[ "$fline" == */ ]]; then
             local dir_disk_path="${TARGET_ROOT}/${fline%/}"
@@ -518,28 +772,11 @@ cmd_install() {
     [ -d "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; die "Archive missing payload root ./x/"; }
     [ -d "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; die "Archive missing metadata directory ./.META/"; }
 
-    # Cryptographic SHA-256 verification of regular files
-    if [ -f "$STAGING_DIR/.META/sha256" ]; then
-        while IFS= read -r sha_line; do
-            [ -n "$sha_line" ] || continue
-            local exp_hash exp_rel
-            exp_hash="$(echo "$sha_line" | awk '{print $1}')"
-            exp_rel="$(echo "$sha_line" | awk '{print $2}')"
-            local staged_file="$STAGING_DIR/x/$exp_rel"
+    # Bidirectional 1:1 manifest-to-payload parity verification
+    verify_manifest_payload_parity "$STAGING_DIR"
 
-            [ -f "$staged_file" ] || {
-                rm -rf "$STAGING_DIR"
-                die "Checksum verification failed: regular file missing in payload: $exp_rel"
-            }
-
-            local calc_hash
-            calc_hash="$(sha256sum "$staged_file" | awk '{print $1}')"
-            if [ "$calc_hash" != "$exp_hash" ]; then
-                rm -rf "$STAGING_DIR"
-                die "Checksum mismatch for '$exp_rel': expected $exp_hash, got $calc_hash"
-            fi
-        done < "$STAGING_DIR/.META/sha256"
-    fi
+    # Cryptographic SHA-256 verification of regular files (fail-closed, 1:1 match)
+    verify_payload_checksums "$STAGING_DIR"
 
     # Validate declarative ninit service snippets
     validate_service_snippets "$STAGING_DIR" || {
@@ -548,129 +785,186 @@ cmd_install() {
     }
 
     log "Step 5/6: Committing files atomically via rename(2) avoiding ETXTBSY..."
-    local ROLLBACK_BACKUP="$STAGING_DIR/.rollback_backup"
-    local ROLLBACK_CREATED="$STAGING_DIR/.rollback_created"
+    local ROLLBACK_JOURNAL="$STAGING_DIR/.journal"
+    local ROLLBACK_BACKUP="$ROLLBACK_JOURNAL/backup"
+    local ROLLBACK_CREATED="$ROLLBACK_JOURNAL/created"
     mkdir -p "$ROLLBACK_BACKUP"
     touch "$ROLLBACK_CREATED"
 
-    local commit_ok=true
+    # Snapshot DB state for target package before filesystem commit
+    if [ -d "$INSTALLED_DIR/$pkg_name" ]; then
+        cp -a "$INSTALLED_DIR/$pkg_name" "$ROLLBACK_JOURNAL/installed_pkg"
+        touch "$ROLLBACK_JOURNAL/had_installed_pkg"
+    else
+        touch "$ROLLBACK_JOURNAL/no_installed_pkg"
+    fi
+
+    if [ -f "$PROVIDERS_FILE" ]; then
+        cp -a "$PROVIDERS_FILE" "$ROLLBACK_JOURNAL/providers"
+    fi
+    if [ -f "$WORLD_FILE" ]; then
+        cp -a "$WORLD_FILE" "$ROLLBACK_JOURNAL/world"
+    fi
+    if [ -d "$RDEPS_DIR" ]; then
+        cp -a "$RDEPS_DIR" "$ROLLBACK_JOURNAL/rdeps"
+    fi
+
+    CURRENT_PKG_NAME="$pkg_name"
+    IN_TRANSACTION=true
+
+    rollback_transaction() {
+        warn "Commit failed; executing unified atomic rollback..."
+        IN_TRANSACTION=false
+        do_rollback "$STAGING_DIR" "$pkg_name"
+        rm -rf "$STAGING_DIR"
+        CURRENT_STAGING_DIR=""
+        CURRENT_PKG_NAME=""
+        release_lock
+        die "Package deployment failed; unified state rolled back cleanly"
+    }
+
+    # Check for package self-upgrade and obsolete files
+    local is_upgrade=false
+    local old_files_list="$INSTALLED_DIR/$pkg_name/files.list"
+    local obsolete_paths_file="$STAGING_DIR/.obsolete_paths"
+    rm -f "$obsolete_paths_file"
+    touch "$obsolete_paths_file"
+
+    if [ -f "$old_files_list" ]; then
+        is_upgrade=true
+        local old_paths_sorted="$STAGING_DIR/.old_paths_sorted"
+        local new_paths_sorted="$STAGING_DIR/.new_paths_sorted"
+        LC_ALL=C sort "$old_files_list" > "$old_paths_sorted"
+        awk '{ print "/" $0 }' "$STAGING_DIR/.META/files" | LC_ALL=C sort > "$new_paths_sorted"
+        comm -23 "$old_paths_sorted" "$new_paths_sorted" > "$obsolete_paths_file"
+    fi
 
     # 5a. Create target directories
-    while IFS= read -r fline; do
+    while IFS= read -r fline || [ -n "$fline" ]; do
         [ -n "$fline" ] || continue
+        verify_destination_path_safety "$fline"
         if [[ "$fline" == */ ]]; then
             local target_dir="${TARGET_ROOT}/${fline%/}"
             if [ ! -d "$target_dir" ]; then
-                mkdir -p "$target_dir" || { commit_ok=false; break; }
+                mkdir -p "$target_dir" || rollback_transaction
             fi
         fi
     done < "$STAGING_DIR/.META/files"
 
     # 5b. Move files atomically with rename(2)
-    if [ "$commit_ok" = true ]; then
-        while IFS= read -r fline; do
-            [ -n "$fline" ] || continue
-            if [[ "$fline" != */ ]]; then
-                local src_path="$STAGING_DIR/x/$fline"
-                local dst_path="${TARGET_ROOT}/$fline"
-                local dst_dir
-                dst_dir="$(dirname "$dst_path")"
+    while IFS= read -r fline || [ -n "$fline" ]; do
+        [ -n "$fline" ] || continue
+        if [[ "$fline" != */ ]]; then
+            verify_destination_path_safety "$fline"
+            local src_path="$STAGING_DIR/x/$fline"
+            local dst_path="${TARGET_ROOT}/$fline"
+            local dst_dir
+            dst_dir="$(dirname "$dst_path")"
 
-                mkdir -p "$dst_dir" || { commit_ok=false; break; }
+            mkdir -p "$dst_dir" || rollback_transaction
 
-                if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
-                    # Backup existing file for rollback
-                    local bak_path="$ROLLBACK_BACKUP/$fline"
-                    mkdir -p "$(dirname "$bak_path")"
-                    mv -f "$dst_path" "$bak_path" || { commit_ok=false; break; }
-                else
-                    printf '%s\n' "$dst_path" >> "$ROLLBACK_CREATED"
-                fi
-
-                # Atomic replacement via mv (calls rename(2) avoiding ETXTBSY)
-                mv -f "$src_path" "$dst_path" || { commit_ok=false; break; }
+            if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
+                # Backup existing file for rollback
+                local bak_path="$ROLLBACK_BACKUP/$fline"
+                mkdir -p "$(dirname "$bak_path")"
+                mv -f "$dst_path" "$bak_path" || rollback_transaction
+            else
+                printf '%s\n' "$dst_path" >> "$ROLLBACK_CREATED"
             fi
-        done < "$STAGING_DIR/.META/files"
-    fi
 
-    # Handle commit failure and rollback
-    if [ "$commit_ok" != true ]; then
-        warn "Commit failed; executing atomic rollback..."
-        # Remove created files
-        if [ -s "$ROLLBACK_CREATED" ]; then
-            local -a created_lines
-            mapfile -t created_lines < "$ROLLBACK_CREATED"
-            for (( i=${#created_lines[@]}-1; i>=0; i-- )); do
-                local cfile="${created_lines[i]}"
-                rm -f -- "$cfile" 2>/dev/null || true
-                rmdir "$(dirname "$cfile")" 2>/dev/null || true
-            done
+            # Atomic replacement via mv (calls rename(2) avoiding ETXTBSY)
+            mv -f "$src_path" "$dst_path" || rollback_transaction
         fi
-        # Restore backed up files
-        if [ -d "$ROLLBACK_BACKUP" ]; then
-            while IFS= read -r -d '' bfile; do
-                local brel="${bfile#$ROLLBACK_BACKUP/}"
-                local rdst="${TARGET_ROOT}/$brel"
-                mkdir -p "$(dirname "$rdst")"
-                mv -f "$bfile" "$rdst" 2>/dev/null || true
-            done < <(find "$ROLLBACK_BACKUP" -type f -o -type l -print0)
-        fi
-        rm -rf "$STAGING_DIR"
-        release_lock
-        die "Package deployment failed; state rolled back cleanly"
+    done < "$STAGING_DIR/.META/files"
+
+    # 5c. Prune obsolete files from previous version (self-upgrade)
+    if [ "$is_upgrade" = true ] && [ -s "$obsolete_paths_file" ]; then
+        log "Pruning obsolete files from previous package version..."
+        local sorted_obsolete
+        sorted_obsolete="$(awk '{
+            orig = $0
+            p = $0
+            is_dir = (p ~ /\/$/) ? 0 : 1
+            sub(/\/$/, "", p)
+            n = gsub(/\//, "/", p)
+            print n "\t" is_dir "\t" orig
+        }' "$obsolete_paths_file" | sort -k1,1nr -k2,2nr | cut -f3-)"
+
+        while IFS= read -r p || [ -n "$p" ]; do
+            [ -n "$p" ] || continue
+            local is_dir=false
+            [[ "$p" == */ ]] && is_dir=true
+            local clean_p="${p%/}"
+            local dst_path="${TARGET_ROOT}${clean_p}"
+
+            if [ "$is_dir" = true ]; then
+                rmdir "$dst_path" 2>/dev/null || true
+                rmdir "$(dirname "$dst_path")" 2>/dev/null || true
+            else
+                if [ -f "$dst_path" ] || [ -L "$dst_path" ]; then
+                    local rel_bak="${p#/}"
+                    local bak_path="$ROLLBACK_BACKUP/$rel_bak"
+                    mkdir -p "$(dirname "$bak_path")"
+                    mv -f "$dst_path" "$bak_path" || rollback_transaction
+                    rmdir "$(dirname "$dst_path")" 2>/dev/null || true
+                fi
+            fi
+        done <<< "$sorted_obsolete"
     fi
 
     log "Step 6/6: Committing metadata to database..."
     local pkg_installed_dir="$INSTALLED_DIR/$pkg_name"
-    mkdir -p "$pkg_installed_dir"
+    mkdir -p "$pkg_installed_dir" || rollback_transaction
 
-    cp -p "$STAGING_DIR/.META/package" "$pkg_installed_dir/package"
-    [ -f "$STAGING_DIR/.META/sha256" ] && cp -p "$STAGING_DIR/.META/sha256" "$pkg_installed_dir/sha256" || touch "$pkg_installed_dir/sha256"
-    [ -f "$STAGING_DIR/.META/depends" ] && cp -p "$STAGING_DIR/.META/depends" "$pkg_installed_dir/depends" || touch "$pkg_installed_dir/depends"
-    printf '%s-%s\n' "$pkg_version" "$pkg_release" > "$pkg_installed_dir/version"
+    cp -p "$STAGING_DIR/.META/package" "$pkg_installed_dir/package" || rollback_transaction
+    cp -p "$STAGING_DIR/.META/sha256" "$pkg_installed_dir/sha256" || rollback_transaction
+    [ -f "$STAGING_DIR/.META/depends" ] && cp -p "$STAGING_DIR/.META/depends" "$pkg_installed_dir/depends" || touch "$pkg_installed_dir/depends" || rollback_transaction
+    printf '%s-%s\n' "$pkg_version" "$pkg_release" > "$pkg_installed_dir/version" || rollback_transaction
 
     # Write absolute paths into files.list
-    awk '{ print "/" $0 }' "$STAGING_DIR/.META/files" > "$pkg_installed_dir/files.list"
+    awk '{ print "/" $0 }' "$STAGING_DIR/.META/files" > "$pkg_installed_dir/files.list" || rollback_transaction
 
     # Update providers index
-    local tmp_providers="${PROVIDERS_FILE}.tmp.$$"
+    local tmp_providers="${STAGING_DIR}/.providers.tmp"
     if [ -f "$PROVIDERS_FILE" ]; then
-        awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$PROVIDERS_FILE" > "$tmp_providers" || true
+        awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$PROVIDERS_FILE" > "$tmp_providers" || rollback_transaction
     else
-        touch "$tmp_providers"
+        touch "$tmp_providers" || rollback_transaction
     fi
 
-    while IFS= read -r fline; do
+    while IFS= read -r fline || [ -n "$fline" ]; do
         [ -n "$fline" ] || continue
         if [[ "$fline" != */ ]]; then
             printf '/%s\t%s\n' "$fline" "$pkg_name" >> "$tmp_providers"
         fi
     done < "$STAGING_DIR/.META/files"
 
-    LC_ALL=C sort -u "$tmp_providers" -o "$PROVIDERS_FILE"
+    LC_ALL=C sort -u "$tmp_providers" -o "$PROVIDERS_FILE" || rollback_transaction
     rm -f "$tmp_providers"
 
     # Update reverse dependencies index (rdeps)
     if [ -s "$pkg_installed_dir/depends" ]; then
-        while IFS= read -r dep; do
+        while IFS= read -r dep || [ -n "$dep" ]; do
             dep="$(echo "$dep" | tr -d '[:space:]')"
             [ -n "$dep" ] || continue
-            mkdir -p "$RDEPS_DIR"
+            mkdir -p "$RDEPS_DIR" || rollback_transaction
             printf '%s\t%s\n' "$dep" "$pkg_name" >> "$RDEPS_DIR/$dep"
-            LC_ALL=C sort -u "$RDEPS_DIR/$dep" -o "$RDEPS_DIR/$dep"
+            LC_ALL=C sort -u "$RDEPS_DIR/$dep" -o "$RDEPS_DIR/$dep" || rollback_transaction
         done < "$pkg_installed_dir/depends"
     fi
 
     # Update world manifest
-    local tmp_world="${WORLD_FILE}.tmp.$$"
-    [ -f "$WORLD_FILE" ] && cp -p "$WORLD_FILE" "$tmp_world" || touch "$tmp_world"
+    local tmp_world="${STAGING_DIR}/.world.tmp"
+    [ -f "$WORLD_FILE" ] && cp -p "$WORLD_FILE" "$tmp_world" || touch "$tmp_world" || rollback_transaction
     printf '%s\n' "$pkg_name" >> "$tmp_world"
-    LC_ALL=C sort -u "$tmp_world" -o "$WORLD_FILE"
+    LC_ALL=C sort -u "$tmp_world" -o "$WORLD_FILE" || rollback_transaction
     rm -f "$tmp_world"
 
     # Purge staging directory
+    IN_TRANSACTION=false
     rm -rf "$STAGING_DIR"
     CURRENT_STAGING_DIR=""
+    CURRENT_PKG_NAME=""
 
     log "SUCCESS: Installed package '$pkg_name' ($pkg_version-$pkg_release)"
     release_lock

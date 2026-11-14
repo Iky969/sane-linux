@@ -12,11 +12,13 @@ The S.A.N.E Package Manager (`spm`) is a lightweight, standalone, POSIX-complian
 
 ### Core Architectural Tenets
 1. **Offline-First & Self-Contained**: `spm` operates entirely offline without mandatory network repositories or daemon dependencies. Packages are distributed as local cryptographically verified `.spm.tar.xz` (or `.spm.tar.gz`) containers.
-2. **Fail-Closed Atomic Transactions**: Every install transaction executes in isolated staging. Checksums, metadata, dependencies, path security, and declarative service snippets are verified before a single byte touches the target filesystem. Any failure triggers automated rollback, leaving persistent state untouched.
+2. **Fail-Closed Atomic Transactions & Unified Rollback**: Every install transaction executes in isolated staging. Checksums, manifest parity, dependencies, path security, and declarative service snippets are verified before a single byte touches the target filesystem. A unified rollback journal snapshots both filesystem replacements and database state (`installed/<pkg>`, `providers`, `rdeps`, `world`). Any fault during file commit or database update triggers a full transactional rollback restoring both the filesystem and database to their exact pre-transaction state.
 3. **ETXTBSY Immunity (Atomic `rename(2)` Replacement)**: Files and running daemons are deployed strictly using `mv` (atomic `rename(2)` / dentry replacement), completely avoiding in-place `cp` truncation or write operations that produce Linux `ETXTBSY` ("Text file busy") errors.
-4. **Anti-Traversal & Anti-Escape Guard**: Archives are pre-audited prior to extraction. Relative path traversal (`..`), leading slashes (`/`), and escaping symlinks (such as symlinks pointing to `/etc/shadow` or traversing outside the target root) are rejected with immediate failure.
-5. **Safe Bottom-Up Removal (Zero `rm -rf`)**: File deletion traverses in reverse depth order. Directories are pruned exclusively via `rmdir` on empty nodes (`rmdir 2>/dev/null || true`), strictly preventing accidental destruction of shared system directories (`/usr/bin`, `/etc`).
-6. **Declarative Service Integration (No Shell Hooks)**: Packages cannot execute arbitrary pre/post-install shell hooks. Daemons integrate solely via declarative single-line `ninit` service snippets placed under `/usr/share/ninit/services/`.
+4. **Anti-Traversal & Destination Symlink Guard**: Archives and manifests are pre-audited. Relative path traversal (`..`), leading slashes (`/`), double slashes (`//`), invalid characters, escaping symlinks, and existing destination path components resolving outside `TARGET_ROOT` are rejected with immediate failure.
+5. **Strict 1:1 Manifest & Checksum Parity**: Every entry in `.META/files` must bidirectionally match `./x/` payload files, preventing unrecorded payload files or ghost entries. Cryptographic verification mandates `.META/sha256` with 64-character hex digests and an exact 1:1 match for every regular file.
+6. **Package Upgrade Cleanup of Obsolete Files**: On self-upgrade, obsolete files present in the previous package version but omitted from the new version are safely pruned bottom-up and stripped from `providers`, with automatic backup into the rollback journal for rollback protection.
+7. **Safe Bottom-Up Removal (Zero `rm -rf`)**: File deletion traverses in reverse depth order. Directories are pruned exclusively via `rmdir` on empty nodes (`rmdir 2>/dev/null || true`), strictly preventing accidental destruction of shared system directories (`/usr/bin`, `/etc`).
+8. **Declarative Service Integration (No Shell Hooks)**: Packages cannot execute arbitrary pre/post-install shell hooks. Daemons integrate solely via declarative single-line `ninit` service snippets placed under `/usr/share/ninit/services/`.
 
 ---
 
@@ -187,15 +189,31 @@ spm install /distro/packages/sane-hello-0.1.0-1-x86_64.spm.tar.xz [--root <path>
 **Transaction Stages**:
 1. **Archive Security Audit**: Pre-inspects archive member names and symlink targets with `tar -tf` and `tar -tvf` before uncompressing payload. Rejects path traversal (`..`), leading slashes, and escaping symlinks.
 2. **Metadata & Dependency Audit**: Reads `.META/package` and `.META/depends` directly from archive. Validates name syntax, architecture compatibility (`x86_64` or `all`), and verifies all required dependency packages are already present in `/var/lib/spm/installed/`.
-3. **Collision Detection**: Audits payload paths against `/var/lib/spm/providers`:
-   - If a path is already owned by another package: **ABORT (Conflict)**.
-   - If a path exists on disk but is unrecorded in `providers`:
-     - If `base=true`: allowed to claim unowned file (rootfs bootstrap).
-     - If `base=false`: **ABORT (Unowned file collision)**.
-   - If a path is owned by the same package: allowed (idempotent self-upgrade).
-4. **Staging Extraction & Checksum Verification**: Extracts package to ephemeral scratch directory `/var/lib/spm/staging/tx-<pkg>-<pid>/`. Computes SHA-256 for all regular files against `.META/sha256`. Verifies declarative `ninit` service snippets.
-5. **Atomic Commit via `rename(2)`**: Moves files into destination root using `mv -f` (calling `rename(2)` / atomic dentry replacement). Backs up replaced files. If an error occurs, automated rollback deletes newly created files, restores backups, wipes staging, and exits 1.
-6. **Database Commit**: Updates `installed/<pkg>/`, `providers`, `rdeps/`, and `world`. Purges staging tree and releases lock.
+3. **Collision Detection & Destination Symlink Guard**:
+   - Inspects `.META/files` line-by-line: rejects empty entries, leading slashes, double slashes (`//`), path traversal (`..`), dot segments, and invalid characters (`^[a-zA-Z0-9._/+-]+$`).
+   - Deep inspection of all destination directory path components under `TARGET_ROOT`: rejects any path component resolving outside `TARGET_ROOT` via existing filesystem symlinks.
+   - Audits payload paths against `/var/lib/spm/providers`:
+     - If a path is already owned by another package: **ABORT (Conflict)**.
+     - If a path exists on disk but is unrecorded in `providers`:
+       - If `base=true`: allowed to claim unowned file (rootfs bootstrap).
+       - If `base=false`: **ABORT (Unowned file collision)**.
+     - If a path is owned by the same package: allowed (idempotent self-upgrade).
+4. **Staging Extraction, Parity & Checksum Verification**:
+   - Extracts archive to scratch directory `/var/lib/spm/staging/tx-<pkg>-<pid>/`.
+   - **Bidirectional 1:1 Manifest Parity**: Compares `.META/files` against actual entries in `./x/` payload. Rejects ghost entries (in manifest but missing in payload) and unrecorded entries (in payload but missing from manifest). Rejects duplicate entries.
+   - **Fail-Closed SHA-256 Verification**: Mandates `.META/sha256` exists. Validates 64-character hex digests. Enforces exact 1:1 match across all regular files in payload (every regular file must have a checksum, and every checksum must correspond to a regular file).
+   - Validates declarative `ninit` service snippets (single line, no shell metacharacters, no system state or IPC keywords).
+5. **Atomic Commit via `rename(2)` & Obsolete File Pruning**:
+   - **Unified Rollback Journal**: Snapshots pre-install database state (`installed/<pkg>`, `providers`, `rdeps`, `world`) and initializes filesystem rollback records (`created` and `backup`) in `/var/lib/spm/staging/tx-<pkg>-<pid>/.journal/`.
+   - Re-verifies destination directory path components against symlink escapes under `TARGET_ROOT`.
+   - Moves files into destination root using `mv -f` (calling `rename(2)` / atomic dentry replacement). Backs up replaced files into rollback backup.
+   - **Obsolete File Pruning on Self-Upgrade**: Compares old `installed/<pkg>/files.list` against new manifest. Obsolete files absent in the new version are safely moved to the rollback backup (pruned from disk, preserved for rollback), and empty obsolete directories are pruned bottom-up.
+   - **Unified Fault Recovery**: If any failure occurs during file movement or subsequent database commit, automated rollback restores both the filesystem (restoring regular files and symlinks from backup via `find \( -type f -o -type l \) -print0`, purging created files) and database state from the journal.
+6. **Database Commit & Journal Cleanup**:
+   - Updates `installed/<pkg>/` (`package`, `sha256`, `depends`, `version`, `files.list`).
+   - Updates `providers` index: removes all old package entries and registers new payload files.
+   - Updates `rdeps/` reverse dependency index and `world` manifest.
+   - Atomically completes transaction, cleans up staging scratch directory, and releases lock.
 
 ---
 
@@ -275,9 +293,14 @@ flowchart TD
 | Threat Vector | Mitigation Technique | Enforcement Point |
 |---|---|---|
 | **Tar-Slip Directory Traversal** | Pre-extraction inspection of member names with `tar -tf`. Rejection of `..` and leading `/`. | Stage 1 (Pre-extraction) |
-| **Symlink Escape Attack** | Traversal calculation of relative symlinks (`cur_depth >= 0`). Whitelisting of absolute symlink roots (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/usr/lib`, `/usr/share`). Explicit ban on sensitive paths (`/etc/shadow`, `/etc/passwd`, `/proc`, `/sys`, `/dev`, `/root`, `/home`). | Stage 1 (Pre-extraction) |
+| **Manifest Path Traversal & Injection** | Line-by-line validation of `.META/files`: rejection of leading slashes, double slashes (`//`), `..`, dot segments, and characters outside `[a-zA-Z0-9._/+-]`. | Stage 3 (Pre-extraction) & Stage 4 |
+| **Payload Manifest Parity Desync** | Bidirectional 1:1 verification between `.META/files` and extracted `./x/` payload. Rejects ghost manifest entries and unrecorded payload files. | Stage 4 (Staging verification) |
+| **Fail-Closed Checksum Bypass** | Mandatory `.META/sha256` manifest, 64-character hex format validation, and strict 1:1 match for every regular file in payload. | Stage 4 (Staging verification) |
+| **Symlink Escape Attack (Payload)** | Traversal calculation of relative symlinks (`cur_depth >= 0`). Whitelisting of absolute symlink roots (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/usr/lib`, `/usr/share`). Explicit ban on sensitive paths (`/etc/shadow`, `/etc/passwd`, `/proc`, `/sys`, `/dev`, `/root`, `/home`). | Stage 1 (Pre-extraction) |
+| **Destination Directory Symlink Escape** | Deep inspection of all directory path components under `TARGET_ROOT` prior to writing; aborts if any component resolves outside target root. | Stage 3 (Pre-extraction) & Stage 5 |
+| **Package Upgrade File Residue** | Automatic delta analysis between old `files.list` and new manifest; obsolete files are safely pruned bottom-up and stripped from `providers`. | Stage 5 (Commit) & Stage 6 (DB) |
 | **Concurrent Mutation Race** | Kernel `flock(1)` exclusive locks on `/var/lib/spm/spm.lock`. Shared locks for reads. | Lock initialization |
 | **ETXTBSY on Running Daemons** | Atomic replacement via `mv -f` (`rename(2)` dentry replacement) instead of in-place `cp`. | Stage 5 (Commit) |
-| **Mid-Install I/O or Disk Full** | Staged extraction to ephemeral directory with automated rollback restoring backups and removing newly deployed files. | Stage 5 (Rollback handler) |
+| **Mid-Install I/O or DB Failure** | Unified rollback journal snapshotting database state and replaced files. Restores both filesystem (regular files and symlinks via `find \( -type f -o -type l \)`) and database on any error. | Stage 5 & 6 (Rollback handler) |
 | **Supply-Chain Service Hijack** | Ban on executable hooks, restriction to single-line declarative `type:command` service definitions, regex verification, and keyword filtering. | Stage 4 (Staging verification) |
 | **Accidental System Destruction** | Strict bottom-up file removal with `rm -f -- "$path"`. Pruning of directories exclusively via `rmdir` on empty nodes. Zero `rm -rf` on rootfs paths. | Stage 1 (Removal) |
