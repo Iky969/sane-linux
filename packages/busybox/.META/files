@@ -1,3 +1,4 @@
+bin/
 bin/ash
 bin/busybox
 bin/cat
@@ -55,6 +56,7 @@ bin/uniq
 bin/wc
 bin/wget
 bin/xargs
+sbin/
 sbin/fdisk
 sbin/getty
 sbin/ifconfig

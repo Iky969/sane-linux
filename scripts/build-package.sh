@@ -104,15 +104,17 @@ PKG_ARCH="$(get_manifest_val "arch")"
 PKG_RELEASE="$(get_manifest_val "release")"
 PKG_BASE="$(get_manifest_val "base")"
 PKG_DESC="$(get_manifest_val "description")"
+PKG_DEPS="$(get_manifest_val "dependencies")"
 
 [ -n "$PKG_NAME" ] || die "Missing mandatory field 'name' in $MANIFEST"
 [ -n "$PKG_VERSION" ] || die "Missing mandatory field 'version' in $MANIFEST"
 [ -n "$PKG_ARCH" ] || die "Missing mandatory field 'arch' in $MANIFEST"
+[ -n "$PKG_DESC" ] || die "Missing mandatory field 'description' in $MANIFEST"
 
 # Validate field formats
-[[ "$PKG_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "Invalid package name '$PKG_NAME': must be lowercase alphanumeric with hyphens or underscores"
+[[ "$PKG_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Invalid package name '$PKG_NAME': must match ^[a-z0-9][a-z0-9-]*$ (lowercase alphanumeric and hyphens only, underscores rejected)"
 [[ "$PKG_VERSION" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Invalid package version '$PKG_VERSION'"
-[[ "$PKG_ARCH" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Invalid package arch '$PKG_ARCH'"
+[ "$PKG_ARCH" = "x86_64" ] || [ "$PKG_ARCH" = "all" ] || die "Invalid package arch '$PKG_ARCH': must be strictly 'x86_64' or 'all'"
 
 # Handle release field
 if [ -z "$PKG_RELEASE" ]; then
@@ -140,9 +142,12 @@ name=$PKG_NAME
 version=$PKG_VERSION
 release=$PKG_RELEASE
 arch=$PKG_ARCH
-description=${PKG_DESC:-$PKG_NAME package for S.A.N.E Linux}
-base=$PKG_BASE
+description=$PKG_DESC
 EOF
+if [ -n "$PKG_DEPS" ]; then
+    printf 'dependencies=%s\n' "$PKG_DEPS" >> "$MANIFEST.tmp"
+fi
+printf 'base=%s\n' "$PKG_BASE" >> "$MANIFEST.tmp"
 mv -f "$MANIFEST.tmp" "$MANIFEST"
 
 # 3. Path safety audit on staging directory (anti-traversal guard)
@@ -263,14 +268,22 @@ fi
 log "Generating .META/files manifest..."
 (
     cd "$SOURCE_DIR/x"
-    find . ! -type d | sed 's|^\./||' | LC_ALL=C sort > "$SOURCE_DIR/.META/files"
+    {
+        find . -mindepth 1 -type d | sed 's|^\./||' | sed 's|$|/|'
+        find . -mindepth 1 ! -type d | sed 's|^\./||'
+    } | LC_ALL=C sort > "$SOURCE_DIR/.META/files"
 )
 
 # Verify .META/files is clean
 while IFS= read -r fline; do
     [ -n "$fline" ] || continue
-    if [[ "$fline" =~ ^/ ]] || echo "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
+    if [[ "$fline" =~ ^/ ]] || [[ "$fline" =~ // ]] || echo "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
         die "Invalid entry in generated .META/files: $fline"
+    fi
+    if [[ "$fline" == */ ]]; then
+        [ -d "$SOURCE_DIR/x/$fline" ] || die "Directory entry in .META/files does not exist: $fline"
+    else
+        [ -f "$SOURCE_DIR/x/$fline" ] || [ -L "$SOURCE_DIR/x/$fline" ] || die "File entry in .META/files does not exist: $fline"
     fi
 done < "$SOURCE_DIR/.META/files"
 

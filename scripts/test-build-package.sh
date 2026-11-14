@@ -108,12 +108,14 @@ name=det-pkg
 version=2.1.0
 release=1
 arch=x86_64
+description=Determinism test package
 EOF
     cat > "$src2/.META/package" <<'EOF'
 name=det-pkg
 version=2.1.0
 release=1
 arch=x86_64
+description=Determinism test package
 EOF
 
     # Vary file mtime on source files to prove mtime clamping to @0
@@ -150,6 +152,7 @@ test_metadata_generation() {
 name=meta-pkg
 version=1.0.0
 arch=x86_64
+description=Metadata test package
 EOF
 
     "$BUILD_PKG" --source "$tdir/src" --output "$odir" >/dev/null 2>&1
@@ -162,11 +165,43 @@ EOF
         return
     fi
 
-    # Verify .META/files entries
+    # Verify .META/files directory entries end with trailing '/'
+    if ! grep -q "^etc/$" "$files_meta" || \
+       ! grep -q "^usr/$" "$files_meta" || \
+       ! grep -q "^usr/bin/$" "$files_meta"; then
+        test_fail "Metadata generation" ".META/files missing directory entries with trailing '/'"
+        return
+    fi
+
+    # Verify .META/files regular files and symlinks do NOT end with trailing '/'
     if ! grep -q "^etc/tool.conf$" "$files_meta" || \
        ! grep -q "^usr/bin/tool$" "$files_meta" || \
        ! grep -q "^usr/bin/tool-alias$" "$files_meta"; then
-        test_fail "Metadata generation" ".META/files does not contain all payload files"
+        test_fail "Metadata generation" ".META/files missing file or symlink entries"
+        return
+    fi
+
+    # Verify all directory entries in .META/files end with '/' and exist in x/
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        if [[ "$entry" == */ ]]; then
+            if [ ! -d "$tdir/src/x/$entry" ]; then
+                test_fail "Metadata generation" "Entry ending with '/' is not a directory: $entry"
+                return
+            fi
+        else
+            if [ ! -f "$tdir/src/x/$entry" ] && [ ! -L "$tdir/src/x/$entry" ]; then
+                test_fail "Metadata generation" "File entry does not exist: $entry"
+                return
+            fi
+        fi
+    done < "$files_meta"
+
+    # Verify .META/files is sorted with LC_ALL=C
+    local sorted_check
+    sorted_check="$(LC_ALL=C sort "$files_meta")"
+    if [ "$(<"$files_meta")" != "$sorted_check" ]; then
+        test_fail "Metadata generation" ".META/files is not sorted with LC_ALL=C sort"
         return
     fi
 
@@ -176,7 +211,7 @@ EOF
         return
     fi
 
-    test_pass "Metadata auto-generation (.META/files and .META/sha256 verification)"
+    test_pass "Metadata auto-generation (.META/files with trailing '/' directories and .META/sha256)"
 }
 
 # -----------------------------------------------------------------------------
@@ -191,6 +226,7 @@ test_manifest_validation() {
     cat > "$tdir/src/.META/package" <<'EOF'
 version=1.0.0
 arch=x86_64
+description=Test package
 EOF
     if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
         test_fail "Manifest validation" "Build succeeded with missing 'name'"
@@ -201,6 +237,7 @@ EOF
     cat > "$tdir/src/.META/package" <<'EOF'
 name=test-pkg
 arch=x86_64
+description=Test package
 EOF
     if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
         test_fail "Manifest validation" "Build succeeded with missing 'version'"
@@ -211,20 +248,81 @@ EOF
     cat > "$tdir/src/.META/package" <<'EOF'
 name=test-pkg
 version=1.0.0
+description=Test package
 EOF
     if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
         test_fail "Manifest validation" "Build succeeded with missing 'arch'"
         return
     fi
 
-    # Case D: Invalid package name characters
+    # Case D: Invalid package name characters (punctuation/uppercase)
     cat > "$tdir/src/.META/package" <<'EOF'
 name=Test_Pkg!
 version=1.0.0
 arch=x86_64
+description=Test package
 EOF
     if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
         test_fail "Manifest validation" "Build succeeded with invalid package name"
+        return
+    fi
+
+    # Case D1: Reject package name with underscore
+    cat > "$tdir/src/.META/package" <<'EOF'
+name=test_pkg
+version=1.0.0
+arch=x86_64
+description=Test package
+EOF
+    if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
+        test_fail "Manifest validation" "Build succeeded with underscore in package name"
+        return
+    fi
+
+    # Case D2: Reject unsupported arch (e.g. arm64 or i386)
+    cat > "$tdir/src/.META/package" <<'EOF'
+name=test-pkg
+version=1.0.0
+arch=arm64
+description=Test package
+EOF
+    if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
+        test_fail "Manifest validation" "Build succeeded with unsupported arch (arm64)"
+        return
+    fi
+
+    # Case D3: Reject missing description field
+    cat > "$tdir/src/.META/package" <<'EOF'
+name=test-pkg
+version=1.0.0
+arch=x86_64
+EOF
+    if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
+        test_fail "Manifest validation" "Build succeeded with missing description"
+        return
+    fi
+
+    # Case D4: Reject empty description field
+    cat > "$tdir/src/.META/package" <<'EOF'
+name=test-pkg
+version=1.0.0
+arch=x86_64
+description=
+EOF
+    if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
+        test_fail "Manifest validation" "Build succeeded with empty description"
+        return
+    fi
+
+    # Case D5: Accept valid arch=all
+    cat > "$tdir/src/.META/package" <<'EOF'
+name=test-all-arch
+version=1.0.0
+arch=all
+description=Architecture independent package
+EOF
+    if ! "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
+        test_fail "Manifest validation" "Build failed with valid arch=all"
         return
     fi
 
@@ -235,7 +333,7 @@ EOF
         return
     fi
 
-    test_pass "Mandatory manifest fields validation (fail-closed)"
+    test_pass "Mandatory manifest fields validation (name, version, arch, description strictly enforced)"
 }
 
 # -----------------------------------------------------------------------------
@@ -248,6 +346,7 @@ test_missing_payload() {
 name=no-x-pkg
 version=1.0.0
 arch=x86_64
+description=Missing payload test package
 EOF
 
     if "$BUILD_PKG" --source "$tdir/src" --output "$tdir/out" >/dev/null 2>&1; then
@@ -269,6 +368,7 @@ test_base_flag() {
 name=base-pkg
 version=1.0.0
 arch=x86_64
+description=Base package flag test
 base=false
 EOF
 
@@ -295,6 +395,7 @@ test_service_snippets() {
 name=srv-pkg
 version=1.0.0
 arch=x86_64
+description=Service snippet test package
 EOF
 
     # Case A: Valid service snippet
@@ -355,6 +456,7 @@ test_adversarial_rejection() {
 name=adv-pkg
 version=1.0.0
 arch=x86_64
+description=Adversarial security test package
 EOF
 
     # Attack 1: Relative symlink escaping target root
@@ -424,6 +526,7 @@ test_gzip_compression() {
 name=gz-pkg
 version=1.0.0
 arch=x86_64
+description=Gzip compression test package
 EOF
 
     if "$BUILD_PKG" --source "$tdir/src" --output "$odir" --gz >/dev/null 2>&1; then
@@ -482,6 +585,54 @@ test_recipe_build() {
 }
 
 # -----------------------------------------------------------------------------
+# Test 11: Static ELF verification in busybox package builder
+# -----------------------------------------------------------------------------
+test_busybox_static_elf() {
+    local tdir="$TEST_TMP/bb_elf_test"
+    local odir="$tdir/out"
+    mkdir -p "$tdir" "$odir"
+
+    local bb_script="$REPO_ROOT/packages/busybox/build.sh"
+    if [ ! -x "$bb_script" ]; then
+        test_fail "BusyBox ELF verification" "packages/busybox/build.sh not found or not executable"
+        return
+    fi
+
+    # Case A: Dynamic binary rejection (host gcc creates dynamic binary with PT_INTERP)
+    cat > "$tdir/dyn.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+    gcc "$tdir/dyn.c" -o "$tdir/dynamic_bin"
+
+    if BUSYBOX_BIN="$tdir/dynamic_bin" "$bb_script" "$odir" >/dev/null 2>&1; then
+        test_fail "BusyBox ELF verification" "BusyBox builder accepted dynamically linked binary"
+        return
+    fi
+
+    # Case B: Non-ELF executable rejection (shell script)
+    cat > "$tdir/fake_bb.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod 755 "$tdir/fake_bb.sh"
+
+    if BUSYBOX_BIN="$tdir/fake_bb.sh" "$bb_script" "$odir" >/dev/null 2>&1; then
+        test_fail "BusyBox ELF verification" "BusyBox builder accepted non-ELF script"
+        return
+    fi
+
+    # Case C: Valid static binary acceptance (when static busybox exists)
+    if [ -x "/bin/busybox" ]; then
+        if ! BUSYBOX_BIN="/bin/busybox" "$bb_script" "$odir" >/dev/null 2>&1; then
+            test_fail "BusyBox ELF verification" "BusyBox builder rejected valid static /bin/busybox"
+            return
+        fi
+    fi
+
+    test_pass "BusyBox static ELF verification & dynamic binary rejection (fail-closed)"
+}
+
+# -----------------------------------------------------------------------------
 # Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -496,6 +647,7 @@ main() {
     test_adversarial_rejection
     test_gzip_compression
     test_recipe_build
+    test_busybox_static_elf
 
     printf '\n=== Test Summary: %d passed, %d failed ===\n' "$PASSED_COUNT" "$FAILED_COUNT"
     if [ "$FAILED_COUNT" -gt 0 ]; then

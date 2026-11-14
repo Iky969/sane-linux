@@ -1,5 +1,10 @@
+sbin/
 sbin/halt
 sbin/init
 sbin/poweroff
 sbin/reboot
+usr/
+usr/share/
+usr/share/ninit/
+usr/share/ninit/services/
 usr/share/ninit/services/getty.service

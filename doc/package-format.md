@@ -23,7 +23,7 @@ S.A.N.E packages are deterministic tar archives compressed using `xz` (LZMA2) or
 - `busybox-1.36.1-1-x86_64.spm.tar.xz`
 - `ninit-1.1.0-1-x86_64.spm.tar.xz`
 - `sane-hello-0.1.0-1-x86_64.spm.tar.xz`
-- `limine-static-7.20.1-1-x86_64.spm.tar.xz`
+- `limine-static-12.9.6-1-x86_64.spm.tar.xz`
 
 ---
 

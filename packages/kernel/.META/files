@@ -1,4 +1,6 @@
+boot/
 boot/bzImage
 boot/vmlinuz
 boot/vmlinuz-virt
+etc/
 etc/modules

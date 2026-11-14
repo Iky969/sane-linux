@@ -1,2 +1,7 @@
+usr/
+usr/bin/
 usr/bin/sane-hello
+usr/share/
+usr/share/ninit/
+usr/share/ninit/services/
 usr/share/ninit/services/sane-hello.service
