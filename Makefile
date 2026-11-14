@@ -98,4 +98,7 @@ packages: $(BIN)
 test-pkg:
 	bash ./scripts/test-build-package.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg
+test-spm:
+	bash ./scripts/test-spm.sh
+
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm

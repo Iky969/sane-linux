@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+# scripts/spm -- S.A.N.E Package Manager CLI
+#
+# POSIX-compliant, deterministic, offline-first package manager for S.A.N.E Linux.
+# Implements atomic staged installations via rename(2) avoiding ETXTBSY,
+# strict anti-tar-slip & symlink traversal guards, flat-file database tracking,
+# declarative ninit service snippet validation, and safe bottom-up removal.
+#
+# Subcommands:
+#   spm init [--root <path>]
+#   spm list [--root <path>]
+#   spm info <pkg-name> [--root <path>]
+#   spm query <path> [--root <path>]
+#   spm install <pkg.spm.tar.xz> [--root <path>]
+#   spm remove <pkg-name> [--root <path>]
+
+set -euo pipefail
+export LC_ALL=C
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf 'WARNING: %s\n' "$*" >&2
+}
+
+log() {
+    printf '==> %s\n' "$*"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: spm [OPTIONS] <subcommand> [ARGS...]
+
+Subcommands:
+  init                     Initialize the SPM database layout
+  list                     List installed packages (name, version, release, arch, base)
+  info <pkg-name>          Show detailed package metadata and dependencies
+  query <path>             Find which package provides a given file path
+  install <archive>        Install an .spm package atomically with checksum verification
+  remove <pkg-name>        Safely remove a package and clean empty directories bottom-up
+
+Options:
+  -r, --root <path>        Target system root directory (default: /)
+  -h, --help               Show this help message and exit
+  -v, --version            Display spm version
+EOF
+}
+
+TARGET_ROOT=""
+SUBCOMMAND=""
+ARGS=()
+
+# Parse command line arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)
+            [ $# -ge 2 ] || die "Option '--root' requires an argument"
+            TARGET_ROOT="$2"
+            shift 2
+            ;;
+        --root=*)
+            TARGET_ROOT="${1#*=}"
+            shift
+            ;;
+        -r)
+            [ $# -ge 2 ] || die "Option '-r' requires an argument"
+            TARGET_ROOT="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            printf 'spm 1.0.0 (S.A.N.E Package Manager)\n'
+            exit 0
+            ;;
+        init|list|info|query|install|remove)
+            if [ -z "$SUBCOMMAND" ]; then
+                SUBCOMMAND="$1"
+            else
+                ARGS+=("$1")
+            fi
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[ -n "$SUBCOMMAND" ] || { usage >&2; exit 1; }
+
+# Normalize TARGET_ROOT
+if [ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "/" ]; then
+    # Strip trailing slashes
+    TARGET_ROOT="${TARGET_ROOT%/}"
+    # Resolve absolute path
+    if [[ "$TARGET_ROOT" != /* ]]; then
+        mkdir -p "$TARGET_ROOT"
+        TARGET_ROOT="$(cd "$TARGET_ROOT" && pwd -P)"
+    else
+        mkdir -p "$TARGET_ROOT"
+    fi
+else
+    TARGET_ROOT=""
+fi
+
+SPM_DB_DIR="${TARGET_ROOT}/var/lib/spm"
+INSTALLED_DIR="${SPM_DB_DIR}/installed"
+PROVIDERS_FILE="${SPM_DB_DIR}/providers"
+RDEPS_DIR="${SPM_DB_DIR}/rdeps"
+WORLD_FILE="${SPM_DB_DIR}/world"
+STAGING_BASE="${SPM_DB_DIR}/staging"
+LOCK_FILE="${SPM_DB_DIR}/spm.lock"
+
+# Locking management via flock(1)
+LOCK_FD=9
+CURRENT_STAGING_DIR=""
+
+cleanup_all() {
+    if [ -n "${CURRENT_STAGING_DIR:-}" ] && [ -d "$CURRENT_STAGING_DIR" ]; then
+        rm -rf "$CURRENT_STAGING_DIR" 2>/dev/null || true
+    fi
+    release_lock
+}
+trap cleanup_all EXIT INT TERM
+
+acquire_lock() {
+    mkdir -p "$SPM_DB_DIR"
+    touch "$LOCK_FILE"
+    eval "exec ${LOCK_FD}>\"$LOCK_FILE\""
+    if ! flock -n -x $LOCK_FD 2>/dev/null; then
+        log "Waiting for exclusive lock on $LOCK_FILE..."
+        flock -x $LOCK_FD
+    fi
+}
+
+acquire_shared_lock() {
+    mkdir -p "$SPM_DB_DIR"
+    touch "$LOCK_FILE"
+    eval "exec ${LOCK_FD}<\"$LOCK_FILE\""
+    flock -s $LOCK_FD
+}
+
+release_lock() {
+    flock -u $LOCK_FD 2>/dev/null || true
+    eval "exec ${LOCK_FD}>&- 2>/dev/null || true"
+}
+
+# Helper to read key=value manifest
+get_val() {
+    local file="$1"
+    local key="$2"
+    grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d '\r\n' || true
+}
+
+get_val_from_str() {
+    local str="$1"
+    local key="$2"
+    echo "$str" | grep -E "^[[:space:]]*${key}=" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d '\r\n' || true
+}
+
+# Helper to verify archive entries (anti-tar-slip)
+verify_archive_entries() {
+    local pkg="$1"
+    local member
+    while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        # Reject leading slashes
+        if [[ "$member" =~ ^/ ]]; then
+            die "Archive entry has forbidden leading slash: $member"
+        fi
+        # Reject path traversal components
+        if echo "$member" | grep -qE '(^|/)\.\.(/|$)'; then
+            die "Path traversal detected in archive entry: $member"
+        fi
+        # Entries must strictly start with ./.META/ or ./x/
+        if [[ ! "$member" =~ ^\./(\.META|x)(/|$) ]]; then
+            die "Forbidden archive entry outside ./.META/ and ./x/: $member"
+        fi
+    done < <(tar -tf "$pkg" 2>/dev/null || die "Failed to read archive: $pkg")
+}
+
+# Helper to verify symlink safety
+verify_symlink_safety() {
+    local link_path="$1"
+    local link_target="$2"
+
+    # Reject symlinks in .META/
+    if [[ "$link_path" =~ ^\./\.META(/|$) ]]; then
+        die "Symlinks are strictly forbidden in .META directory: $link_path"
+    fi
+
+    local rel_link="${link_path#./x/}"
+
+    # Handle absolute symlink targets
+    if [[ "$link_target" == /* ]]; then
+        # Reject path traversal components in absolute targets
+        if echo "$link_target" | grep -qE '(^|/)\.\.(/|$)'; then
+            die "Path traversal detected in absolute symlink target: $link_path -> $link_target"
+        fi
+        # Forbidden sensitive host paths
+        case "$link_target" in
+            /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc/*|/sys/*|/dev/*|/root/*|/home/*)
+                die "Symlink escape attack: forbidden system target $link_target"
+                ;;
+        esac
+        # Absolute targets must point to standard system root directories
+        case "$link_target" in
+            /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/share/*|/lib/*|/usr/lib/*|/boot/*|/opt/*)
+                return 0
+                ;;
+            *)
+                die "Symlink escape attack: absolute target outside allowed system directories: $link_target"
+                ;;
+        esac
+    fi
+
+    # Handle relative symlink targets: ensure they do not escape ./x/ payload root
+    local dir_part
+    dir_part="$(dirname "$rel_link")"
+    local depth=0
+    if [ "$dir_part" != "." ]; then
+        local IFS='/'
+        local -a addr
+        read -ra addr <<< "$dir_part"
+        depth=${#addr[@]}
+    fi
+
+    local cur_depth=$depth
+    local IFS='/'
+    local -a parts
+    read -ra parts <<< "$link_target"
+    for p in "${parts[@]}"; do
+        if [ "$p" = ".." ]; then
+            cur_depth=$((cur_depth - 1))
+            if [ $cur_depth -lt 0 ]; then
+                die "Relative symlink escapes target payload root: $link_path -> $link_target"
+            fi
+        elif [ -n "$p" ] && [ "$p" != "." ]; then
+            cur_depth=$((cur_depth + 1))
+        fi
+    done
+    return 0
+}
+
+# Helper to inspect all symlinks inside archive
+verify_archive_symlinks() {
+    local pkg="$1"
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # Only parse symlink entries (starting with 'l')
+        [[ "$line" =~ ^l ]] || continue
+        if [[ "$line" =~ ([^[:space:]]+)[[:space:]]-\>[[:space:]](.+)$ ]]; then
+            local lpath="${BASH_REMATCH[1]}"
+            local ltarget="${BASH_REMATCH[2]}"
+            verify_symlink_safety "$lpath" "$ltarget"
+        fi
+    done < <(tar -tvf "$pkg" 2>/dev/null || die "Failed to inspect archive symlinks: $pkg")
+}
+
+# Helper to validate service snippets in staging
+validate_service_snippets() {
+    local staging_root="$1"
+    local service_dir="$staging_root/x/usr/share/ninit/services"
+    [ -d "$service_dir" ] || return 0
+
+    local sfile
+    while IFS= read -r -d '' sfile; do
+        local sname
+        sname="$(basename "$sfile")"
+
+        if [ -L "$sfile" ]; then
+            die "Service snippet must not be a symlink: $sname"
+        fi
+        [ -f "$sfile" ] || die "Service snippet is not a regular file: $sname"
+        [[ "$sname" == *.service ]] || die "Service snippet filename must end in .service: $sname"
+
+        # Enforce non-executable 0644 permissions
+        chmod 0644 "$sfile"
+
+        # Check line count: strictly single line
+        local line_count
+        line_count="$(grep -c '^' "$sfile" || true)"
+        [ "$line_count" -le 1 ] || die "Service snippet must be strictly a single definition line: $sname (found $line_count lines)"
+
+        local content
+        content="$(tr -d '\r\n' < "$sfile")"
+        [ -n "$content" ] || die "Service snippet is empty: $sname"
+
+        # Regex syntax check: (name:)?(once|respawn):<command> [args] [options...]
+        if ! [[ "$content" =~ ^([a-zA-Z0-9_-]+:)?(once|respawn):[a-zA-Z0-9_/.-]+([[:space:]][a-zA-Z0-9_/.-]+)*(:[a-zA-Z0-9_=. -]+)*$ ]]; then
+            die "Invalid service snippet syntax in $sname: must match '[(<name>):](once|respawn):<cmd> [<args>...]'"
+        fi
+
+        # Check forbidden dangerous keywords
+        for forbidden in "/run/initctl" "reboot" "poweroff" "halt" "kill" "signal"; do
+            if echo "$content" | grep -qw "$forbidden"; then
+                die "Forbidden keyword '$forbidden' detected in service snippet: $sname"
+            fi
+        done
+
+        # Check forbidden shell metacharacters
+        if echo "$content" | grep -qE '[|><;&`$]'; then
+            die "Forbidden shell metacharacters detected in service snippet: $sname"
+        fi
+    done < <(find "$service_dir" -mindepth 1 -maxdepth 1 -print0)
+}
+
+# Subcommand: init
+cmd_init() {
+    acquire_lock
+    mkdir -p "$INSTALLED_DIR" "$RDEPS_DIR" "$STAGING_BASE"
+    [ -f "$PROVIDERS_FILE" ] || touch "$PROVIDERS_FILE"
+    [ -f "$WORLD_FILE" ] || touch "$WORLD_FILE"
+    log "Initialized empty SPM database in $SPM_DB_DIR"
+    release_lock
+}
+
+# Subcommand: list
+cmd_list() {
+    acquire_shared_lock
+    if [ -d "$INSTALLED_DIR" ]; then
+        for pdir in "$INSTALLED_DIR"/*; do
+            [ -d "$pdir" ] || continue
+            local pmanifest="$pdir/package"
+            [ -f "$pmanifest" ] || continue
+
+            local name version release arch base
+            name="$(get_val "$pmanifest" "name")"
+            version="$(get_val "$pmanifest" "version")"
+            release="$(get_val "$pmanifest" "release")"
+            arch="$(get_val "$pmanifest" "arch")"
+            base="$(get_val "$pmanifest" "base")"
+            [ -n "$release" ] || release="1"
+
+            printf '%s %s-%s %s base=%s\n' "$name" "$version" "$release" "$arch" "$base"
+        done
+    fi
+    release_lock
+}
+
+# Subcommand: info
+cmd_info() {
+    [ ${#ARGS[@]} -ge 1 ] || die "Missing package name for 'info' subcommand"
+    local pkg_name="${ARGS[0]}"
+
+    acquire_shared_lock
+    local pdir="$INSTALLED_DIR/$pkg_name"
+    local pmanifest="$pdir/package"
+
+    [ -d "$pdir" ] && [ -f "$pmanifest" ] || die "Package '$pkg_name' is not installed"
+
+    local name version release arch description base deps
+    name="$(get_val "$pmanifest" "name")"
+    version="$(get_val "$pmanifest" "version")"
+    release="$(get_val "$pmanifest" "release")"
+    arch="$(get_val "$pmanifest" "arch")"
+    description="$(get_val "$pmanifest" "description")"
+    base="$(get_val "$pmanifest" "base")"
+    deps="$(get_val "$pmanifest" "dependencies")"
+    [ -n "$release" ] || release="1"
+
+    if [ -z "$deps" ] && [ -f "$pdir/depends" ]; then
+        deps="$(tr '\n' ' ' < "$pdir/depends" | sed 's/[[:space:]]*$//')"
+    fi
+    [ -n "$deps" ] || deps="(none)"
+
+    printf 'Name: %s\n' "$name"
+    printf 'Version: %s\n' "$version"
+    printf 'Release: %s\n' "$release"
+    printf 'Architecture: %s\n' "$arch"
+    printf 'Base: %s\n' "$base"
+    printf 'Description: %s\n' "$description"
+    printf 'Dependencies: %s\n' "$deps"
+
+    release_lock
+}
+
+# Subcommand: query
+cmd_query() {
+    [ ${#ARGS[@]} -ge 1 ] || die "Missing file path for 'query' subcommand"
+    local query_path="${ARGS[0]}"
+
+    # Normalize queried path
+    if [ -n "$TARGET_ROOT" ] && [[ "$query_path" == "$TARGET_ROOT"* ]]; then
+        query_path="${query_path#$TARGET_ROOT}"
+    fi
+    [[ "$query_path" == /* ]] || query_path="/$query_path"
+    [ "$query_path" = "/" ] || query_path="${query_path%/}"
+
+    acquire_shared_lock
+    if [ ! -f "$PROVIDERS_FILE" ]; then
+        release_lock
+        die "No package provides $query_path"
+    fi
+
+    local owner_pkg
+    owner_pkg="$(awk -v p="$query_path" -F'\t' '$1 == p { print $2; exit }' "$PROVIDERS_FILE" 2>/dev/null || true)"
+
+    if [ -n "$owner_pkg" ]; then
+        printf '%s is provided by %s\n' "$query_path" "$owner_pkg"
+        release_lock
+    else
+        release_lock
+        die "No package provides $query_path"
+    fi
+}
+
+# Subcommand: install
+cmd_install() {
+    [ ${#ARGS[@]} -ge 1 ] || die "Missing package archive path for 'install' subcommand"
+    local archive_file="${ARGS[0]}"
+
+    [ -f "$archive_file" ] || die "Package archive not found: $archive_file"
+    archive_file="$(cd "$(dirname "$archive_file")" && pwd -P)/$(basename "$archive_file")"
+
+    acquire_lock
+
+    # Ensure DB directories exist
+    mkdir -p "$INSTALLED_DIR" "$RDEPS_DIR" "$STAGING_BASE"
+    [ -f "$PROVIDERS_FILE" ] || touch "$PROVIDERS_FILE"
+    [ -f "$WORLD_FILE" ] || touch "$WORLD_FILE"
+
+    log "Step 1/6: Verifying archive format and security invariants..."
+    verify_archive_entries "$archive_file"
+    verify_archive_symlinks "$archive_file"
+
+    log "Step 2/6: Validating package metadata and dependencies..."
+    local manifest_content
+    manifest_content="$(tar -xOf "$archive_file" ./.META/package 2>/dev/null || die "Archive is missing mandatory .META/package")"
+
+    local pkg_name pkg_version pkg_release pkg_arch pkg_base pkg_desc pkg_deps
+    pkg_name="$(get_val_from_str "$manifest_content" "name")"
+    pkg_version="$(get_val_from_str "$manifest_content" "version")"
+    pkg_release="$(get_val_from_str "$manifest_content" "release")"
+    pkg_arch="$(get_val_from_str "$manifest_content" "arch")"
+    pkg_base="$(get_val_from_str "$manifest_content" "base")"
+    pkg_desc="$(get_val_from_str "$manifest_content" "description")"
+    pkg_deps="$(get_val_from_str "$manifest_content" "dependencies")"
+
+    [ -n "$pkg_name" ] || die "Manifest missing 'name'"
+    [ -n "$pkg_version" ] || die "Manifest missing 'version'"
+    [ -n "$pkg_arch" ] || die "Manifest missing 'arch'"
+    [ -n "$pkg_desc" ] || die "Manifest missing 'description'"
+    [ -n "$pkg_release" ] || pkg_release="1"
+    [ -n "$pkg_base" ] || pkg_base="false"
+
+    [[ "$pkg_name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Invalid package name '$pkg_name'"
+    [ "$pkg_arch" = "x86_64" ] || [ "$pkg_arch" = "all" ] || die "Architecture '$pkg_arch' is not supported (must be 'x86_64' or 'all')"
+    [ "$pkg_base" = "true" ] || [ "$pkg_base" = "false" ] || die "Invalid base flag '$pkg_base' (must be 'true' or 'false')"
+
+    # Check dependencies
+    local deps_content
+    deps_content="$(tar -xOf "$archive_file" ./.META/depends 2>/dev/null || true)"
+    if [ -n "$deps_content" ]; then
+        while IFS= read -r dep; do
+            dep="$(echo "$dep" | tr -d '[:space:]')"
+            [ -n "$dep" ] || continue
+            if [ ! -d "$INSTALLED_DIR/$dep" ]; then
+                die "Missing dependency: package '$dep' is required by '$pkg_name' but not installed"
+            fi
+        done <<< "$deps_content"
+    fi
+
+    log "Step 3/6: Checking for file collisions against providers index..."
+    local files_content
+    files_content="$(tar -xOf "$archive_file" ./.META/files 2>/dev/null || die "Archive is missing mandatory .META/files")"
+
+    while IFS= read -r fline; do
+        [ -n "$fline" ] || continue
+        # Directories are shared, skip providers conflict check
+        if [[ "$fline" == */ ]]; then
+            local dir_disk_path="${TARGET_ROOT}/${fline%/}"
+            if [ -f "$dir_disk_path" ] || [ -L "$dir_disk_path" ]; then
+                die "Conflict: directory '$fline' clashes with existing non-directory on disk: $dir_disk_path"
+            fi
+            continue
+        fi
+
+        local norm_path="/$fline"
+        local disk_path="${TARGET_ROOT}${norm_path}"
+
+        # Check providers index
+        local owner
+        owner="$(awk -v p="$norm_path" -F'\t' '$1 == p { print $2; exit }' "$PROVIDERS_FILE" 2>/dev/null || true)"
+        if [ -n "$owner" ]; then
+            if [ "$owner" != "$pkg_name" ]; then
+                die "File collision: path '$norm_path' is already owned by package '$owner'"
+            fi
+        else
+            # Path unrecorded in providers
+            if [ -e "$disk_path" ] || [ -L "$disk_path" ]; then
+                if [ "$pkg_base" = "true" ]; then
+                    log "Base package '$pkg_name' claiming pre-existing unowned file: $norm_path"
+                else
+                    die "File collision: path '$norm_path' already exists on disk but is unowned"
+                fi
+            fi
+        fi
+    done <<< "$files_content"
+
+    log "Step 4/6: Extracting to scratch staging area and auditing checksums..."
+    local txid="tx-$pkg_name-$$"
+    local STAGING_DIR="${STAGING_BASE}/${txid}"
+    rm -rf "$STAGING_DIR"
+    mkdir -p "$STAGING_DIR"
+    CURRENT_STAGING_DIR="$STAGING_DIR"
+
+    tar -C "$STAGING_DIR" --no-same-owner -xf "$archive_file"
+
+    [ -d "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; die "Archive missing payload root ./x/"; }
+    [ -d "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; die "Archive missing metadata directory ./.META/"; }
+
+    # Cryptographic SHA-256 verification of regular files
+    if [ -f "$STAGING_DIR/.META/sha256" ]; then
+        while IFS= read -r sha_line; do
+            [ -n "$sha_line" ] || continue
+            local exp_hash exp_rel
+            exp_hash="$(echo "$sha_line" | awk '{print $1}')"
+            exp_rel="$(echo "$sha_line" | awk '{print $2}')"
+            local staged_file="$STAGING_DIR/x/$exp_rel"
+
+            [ -f "$staged_file" ] || {
+                rm -rf "$STAGING_DIR"
+                die "Checksum verification failed: regular file missing in payload: $exp_rel"
+            }
+
+            local calc_hash
+            calc_hash="$(sha256sum "$staged_file" | awk '{print $1}')"
+            if [ "$calc_hash" != "$exp_hash" ]; then
+                rm -rf "$STAGING_DIR"
+                die "Checksum mismatch for '$exp_rel': expected $exp_hash, got $calc_hash"
+            fi
+        done < "$STAGING_DIR/.META/sha256"
+    fi
+
+    # Validate declarative ninit service snippets
+    validate_service_snippets "$STAGING_DIR" || {
+        rm -rf "$STAGING_DIR"
+        die "Service snippet validation failed"
+    }
+
+    log "Step 5/6: Committing files atomically via rename(2) avoiding ETXTBSY..."
+    local ROLLBACK_BACKUP="$STAGING_DIR/.rollback_backup"
+    local ROLLBACK_CREATED="$STAGING_DIR/.rollback_created"
+    mkdir -p "$ROLLBACK_BACKUP"
+    touch "$ROLLBACK_CREATED"
+
+    local commit_ok=true
+
+    # 5a. Create target directories
+    while IFS= read -r fline; do
+        [ -n "$fline" ] || continue
+        if [[ "$fline" == */ ]]; then
+            local target_dir="${TARGET_ROOT}/${fline%/}"
+            if [ ! -d "$target_dir" ]; then
+                mkdir -p "$target_dir" || { commit_ok=false; break; }
+            fi
+        fi
+    done < "$STAGING_DIR/.META/files"
+
+    # 5b. Move files atomically with rename(2)
+    if [ "$commit_ok" = true ]; then
+        while IFS= read -r fline; do
+            [ -n "$fline" ] || continue
+            if [[ "$fline" != */ ]]; then
+                local src_path="$STAGING_DIR/x/$fline"
+                local dst_path="${TARGET_ROOT}/$fline"
+                local dst_dir
+                dst_dir="$(dirname "$dst_path")"
+
+                mkdir -p "$dst_dir" || { commit_ok=false; break; }
+
+                if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
+                    # Backup existing file for rollback
+                    local bak_path="$ROLLBACK_BACKUP/$fline"
+                    mkdir -p "$(dirname "$bak_path")"
+                    mv -f "$dst_path" "$bak_path" || { commit_ok=false; break; }
+                else
+                    printf '%s\n' "$dst_path" >> "$ROLLBACK_CREATED"
+                fi
+
+                # Atomic replacement via mv (calls rename(2) avoiding ETXTBSY)
+                mv -f "$src_path" "$dst_path" || { commit_ok=false; break; }
+            fi
+        done < "$STAGING_DIR/.META/files"
+    fi
+
+    # Handle commit failure and rollback
+    if [ "$commit_ok" != true ]; then
+        warn "Commit failed; executing atomic rollback..."
+        # Remove created files
+        if [ -s "$ROLLBACK_CREATED" ]; then
+            local -a created_lines
+            mapfile -t created_lines < "$ROLLBACK_CREATED"
+            for (( i=${#created_lines[@]}-1; i>=0; i-- )); do
+                local cfile="${created_lines[i]}"
+                rm -f -- "$cfile" 2>/dev/null || true
+                rmdir "$(dirname "$cfile")" 2>/dev/null || true
+            done
+        fi
+        # Restore backed up files
+        if [ -d "$ROLLBACK_BACKUP" ]; then
+            while IFS= read -r -d '' bfile; do
+                local brel="${bfile#$ROLLBACK_BACKUP/}"
+                local rdst="${TARGET_ROOT}/$brel"
+                mkdir -p "$(dirname "$rdst")"
+                mv -f "$bfile" "$rdst" 2>/dev/null || true
+            done < <(find "$ROLLBACK_BACKUP" -type f -o -type l -print0)
+        fi
+        rm -rf "$STAGING_DIR"
+        release_lock
+        die "Package deployment failed; state rolled back cleanly"
+    fi
+
+    log "Step 6/6: Committing metadata to database..."
+    local pkg_installed_dir="$INSTALLED_DIR/$pkg_name"
+    mkdir -p "$pkg_installed_dir"
+
+    cp -p "$STAGING_DIR/.META/package" "$pkg_installed_dir/package"
+    [ -f "$STAGING_DIR/.META/sha256" ] && cp -p "$STAGING_DIR/.META/sha256" "$pkg_installed_dir/sha256" || touch "$pkg_installed_dir/sha256"
+    [ -f "$STAGING_DIR/.META/depends" ] && cp -p "$STAGING_DIR/.META/depends" "$pkg_installed_dir/depends" || touch "$pkg_installed_dir/depends"
+    printf '%s-%s\n' "$pkg_version" "$pkg_release" > "$pkg_installed_dir/version"
+
+    # Write absolute paths into files.list
+    awk '{ print "/" $0 }' "$STAGING_DIR/.META/files" > "$pkg_installed_dir/files.list"
+
+    # Update providers index
+    local tmp_providers="${PROVIDERS_FILE}.tmp.$$"
+    if [ -f "$PROVIDERS_FILE" ]; then
+        awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$PROVIDERS_FILE" > "$tmp_providers" || true
+    else
+        touch "$tmp_providers"
+    fi
+
+    while IFS= read -r fline; do
+        [ -n "$fline" ] || continue
+        if [[ "$fline" != */ ]]; then
+            printf '/%s\t%s\n' "$fline" "$pkg_name" >> "$tmp_providers"
+        fi
+    done < "$STAGING_DIR/.META/files"
+
+    LC_ALL=C sort -u "$tmp_providers" -o "$PROVIDERS_FILE"
+    rm -f "$tmp_providers"
+
+    # Update reverse dependencies index (rdeps)
+    if [ -s "$pkg_installed_dir/depends" ]; then
+        while IFS= read -r dep; do
+            dep="$(echo "$dep" | tr -d '[:space:]')"
+            [ -n "$dep" ] || continue
+            mkdir -p "$RDEPS_DIR"
+            printf '%s\t%s\n' "$dep" "$pkg_name" >> "$RDEPS_DIR/$dep"
+            LC_ALL=C sort -u "$RDEPS_DIR/$dep" -o "$RDEPS_DIR/$dep"
+        done < "$pkg_installed_dir/depends"
+    fi
+
+    # Update world manifest
+    local tmp_world="${WORLD_FILE}.tmp.$$"
+    [ -f "$WORLD_FILE" ] && cp -p "$WORLD_FILE" "$tmp_world" || touch "$tmp_world"
+    printf '%s\n' "$pkg_name" >> "$tmp_world"
+    LC_ALL=C sort -u "$tmp_world" -o "$WORLD_FILE"
+    rm -f "$tmp_world"
+
+    # Purge staging directory
+    rm -rf "$STAGING_DIR"
+    CURRENT_STAGING_DIR=""
+
+    log "SUCCESS: Installed package '$pkg_name' ($pkg_version-$pkg_release)"
+    release_lock
+}
+
+# Subcommand: remove
+cmd_remove() {
+    [ ${#ARGS[@]} -ge 1 ] || die "Missing package name for 'remove' subcommand"
+    local pkg_name="${ARGS[0]}"
+
+    acquire_lock
+
+    local pkg_installed_dir="$INSTALLED_DIR/$pkg_name"
+    [ -d "$pkg_installed_dir" ] || {
+        release_lock
+        die "Package '$pkg_name' is not installed"
+    }
+
+    # Check reverse dependencies
+    if [ -f "$RDEPS_DIR/$pkg_name" ] && [ -s "$RDEPS_DIR/$pkg_name" ]; then
+        local dependents
+        dependents="$(awk '{print $NF}' "$RDEPS_DIR/$pkg_name" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+        release_lock
+        die "Cannot remove '$pkg_name': required by dependent package(s): $dependents"
+    fi
+
+    log "Step 1/2: Removing package files bottom-up..."
+    local files_list="$pkg_installed_dir/files.list"
+    if [ -f "$files_list" ]; then
+        # Sort paths in reverse depth order: files before directories, deepest paths first
+        local sorted_paths
+        sorted_paths="$(awk '{
+            orig = $0
+            p = $0
+            is_dir = (p ~ /\/$/) ? 0 : 1
+            sub(/\/$/, "", p)
+            n = gsub(/\//, "/", p)
+            print n "\t" is_dir "\t" orig
+        }' "$files_list" | sort -k1,1nr -k2,2nr | cut -f3-)"
+
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            local is_dir=false
+            [[ "$p" == */ ]] && is_dir=true
+            local clean_p="${p%/}"
+            local dst_path="${TARGET_ROOT}${clean_p}"
+
+            if [ "$is_dir" = true ]; then
+                # Safe bottom-up rmdir on empty directories only (zero rm -rf)
+                rmdir "$dst_path" 2>/dev/null || true
+                rmdir "$(dirname "$dst_path")" 2>/dev/null || true
+            else
+                # Regular file or symlink removal without dereferencing
+                if [ -f "$dst_path" ] || [ -L "$dst_path" ]; then
+                    rm -f -- "$dst_path"
+                    rmdir "$(dirname "$dst_path")" 2>/dev/null || true
+                fi
+            fi
+        done <<< "$sorted_paths"
+    fi
+
+    log "Step 2/2: Cleaning database records..."
+    # Update reverse dependencies index
+    if [ -f "$pkg_installed_dir/depends" ]; then
+        while IFS= read -r dep; do
+            dep="$(echo "$dep" | tr -d '[:space:]')"
+            [ -n "$dep" ] || continue
+            if [ -f "$RDEPS_DIR/$dep" ]; then
+                local tmp_rdep="${RDEPS_DIR}/.${dep}.tmp.$$"
+                awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$RDEPS_DIR/$dep" > "$tmp_rdep" || true
+                if [ -s "$tmp_rdep" ]; then
+                    mv -f "$tmp_rdep" "$RDEPS_DIR/$dep"
+                else
+                    rm -f "$RDEPS_DIR/$dep" "$tmp_rdep"
+                fi
+            fi
+        done < "$pkg_installed_dir/depends"
+    fi
+
+    # Clean providers index
+    if [ -f "$PROVIDERS_FILE" ]; then
+        local tmp_prov="${PROVIDERS_FILE}.tmp.$$"
+        awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$PROVIDERS_FILE" > "$tmp_prov" || true
+        mv -f "$tmp_prov" "$PROVIDERS_FILE"
+    fi
+
+    # Clean world list
+    if [ -f "$WORLD_FILE" ]; then
+        local tmp_world="${WORLD_FILE}.tmp.$$"
+        awk -v pkg="$pkg_name" '$1 != pkg' "$WORLD_FILE" > "$tmp_world" || true
+        mv -f "$tmp_world" "$WORLD_FILE"
+    fi
+
+    # Clean package installation records
+    rm -f "$RDEPS_DIR/$pkg_name" 2>/dev/null || true
+    rm -rf "$pkg_installed_dir"
+
+    log "SUCCESS: Package '$pkg_name' successfully removed"
+    release_lock
+}
+
+# Main dispatcher
+case "$SUBCOMMAND" in
+    init)
+        cmd_init
+        ;;
+    list)
+        cmd_list
+        ;;
+    info)
+        cmd_info
+        ;;
+    query)
+        cmd_query
+        ;;
+    install)
+        cmd_install
+        ;;
+    remove)
+        cmd_remove
+        ;;
+    *)
+        die "Unknown subcommand: $SUBCOMMAND (see --help)"
+        ;;
+esac

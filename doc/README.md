@@ -14,6 +14,8 @@ For a high-level overview, quick start guide, and configuration examples, see th
 | [distro-builder.md](distro-builder.md) | Minimal rootfs + initramfs assembly and QEMU headless validation |
 | [boot-pipeline.md](boot-pipeline.md) | Boot pipeline, GPT layout, Limine bootloader, and initramfs `switch_root` handoff |
 | [package-format.md](package-format.md) | S.A.N.E package manager container specification (`.spm.tar.xz`), metadata, and symlink rules |
+| [package-manager.md](package-manager.md) | S.A.N.E package manager CLI (`spm`), database layout, locking, atomic transactions, and removal |
+| [toolchain-and-rootfs-from-source.md](toolchain-and-rootfs-from-source.md) | Comprehensive guide: hermetic musl toolchain, compiling BusyBox, Linux kernel, ninit, and rootfs assembly |
 | [glossary-i18n.md](glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
 | [../SECURITY.md](../SECURITY.md) | Security policy and vulnerability disclosure procedures |
 | [../LICENSE](../LICENSE) | MIT License |
@@ -45,6 +47,8 @@ scripts/test-cgroup-limits.sh Tests cgroup v2 limits (memory, cpu, pids) & lifec
 scripts/test-integration.sh   Cross-layer fstab <-> kernel <-> services test via real QEMU boot
 scripts/build-rootfs.sh       Assembles minimal distro rootfs (static BusyBox + ninit)
 scripts/run-qemu.sh           Boots rootfs in QEMU: serial console & milestone verification
+scripts/build-package.sh      Deterministic package builder CLI for .spm.tar.xz containers
+scripts/spm                   Standalone S.A.N.E Package Manager CLI
 scripts/lint-log-patterns.py  Linter for log strings, assertions, and legacy markers
 scripts/verify-format-strings.py Linter for printf format specifier safety (-Wformat=2)
 distro/                       Distro builder output directory (rootfs/, cache/, initramfs) - gitignored
