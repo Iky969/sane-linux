@@ -58,7 +58,7 @@ install -m 0755 "$BB_BIN" "$PKG_DIR/x/bin/busybox"
 # Core /bin applets
 BIN_APPLETS=(
     ash cat chmod chown cp cut date dd df dirname dmesg du echo env expr
-    false find grep head hostname id kill ln ls mkdir mknod more mount mv
+    false find grep head hostname id kill ln ls mkdir mknod more mount mv cttyhack
     od printf ps pwd readlink realpath rm rmdir sed seq sh sleep sort stat
     sync tail tar tee touch tr true umount uname uniq wc wget xargs
 )

@@ -32,7 +32,8 @@ die()  { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 TARGET=""
 PACKAGES_DIR=""
 UNATTENDED=0
-PARTUUID="44444444-4444-4444-8888-888888888888"
+PARTUUID_ARG=""
+PARTUUID=""
 INITRAMFS_ARG=""
 KERNEL_ARG=""
 POST_ACTION="none"
@@ -55,7 +56,7 @@ while [ $# -gt 0 ]; do
             ;;
         --partuuid)
             [ $# -ge 2 ] || die "Missing argument for $1"
-            PARTUUID="$2"
+            PARTUUID_ARG="$2"
             shift 2
             ;;
         --initramfs)
@@ -103,6 +104,19 @@ EOF
             ;;
     esac
 done
+
+# Generate unique PARTUUID if not supplied
+if [ -n "$PARTUUID_ARG" ]; then
+    PARTUUID="$PARTUUID_ARG"
+else
+    if [ -f /proc/sys/kernel/random/uuid ]; then
+        PARTUUID=$(cat /proc/sys/kernel/random/uuid | tr 'A-Z' 'a-z')
+    elif command -v uuidgen >/dev/null 2>&1; then
+        PARTUUID=$(uuidgen | tr 'A-Z' 'a-z')
+    else
+        PARTUUID=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -e '16/1 "%02x"' | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
+    fi
+fi
 
 # Root check
 if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
@@ -201,6 +215,89 @@ if [ -z "$PACKAGES_DIR" ]; then
 fi
 
 [ -n "$PACKAGES_DIR" ] && [ -d "$PACKAGES_DIR" ] || die "Packages directory not found. Use --packages-dir <path>"
+
+# Preflight Check 1: Minimum target disk capacity check (minimum 256MB)
+tgt_bytes=0
+if [ -f "/sys/class/block/$TGT_BASE/size" ]; then
+    tgt_sectors=$(cat "/sys/class/block/$TGT_BASE/size" 2>/dev/null || echo 0)
+    tgt_bytes=$((tgt_sectors * 512))
+elif command -v blockdev >/dev/null 2>&1; then
+    tgt_bytes=$(blockdev --getsize64 "$TARGET" 2>/dev/null || echo 0)
+fi
+MIN_DISK_BYTES=268435456  # 256MB
+if [ "$tgt_bytes" -gt 0 ] && [ "$tgt_bytes" -lt "$MIN_DISK_BYTES" ]; then
+    die "Target disk $TARGET is too small ($((tgt_bytes / 1024 / 1024))MB). Minimum required: 256MB ($MIN_DISK_BYTES bytes)"
+fi
+
+# Preflight Check 2: Required base packages existence and archive integrity
+REQUIRED_PKGS="busybox ninit kernel limine-static disk-tools"
+for req in $REQUIRED_PKGS; do
+    pkg_file=$(ls "$PACKAGES_DIR"/$req-*.spm.tar.xz 2>/dev/null | head -n1 || true)
+    [ -n "$pkg_file" ] && [ -f "$pkg_file" ] || die "Preflight: Required package '$req' not found in $PACKAGES_DIR"
+    tar -tJf "$pkg_file" >/dev/null 2>&1 || die "Preflight: Package '$pkg_file' archive is corrupt"
+done
+
+# Preflight Check 3: Kernel payload availability
+PREFLIGHT_KERNEL=""
+if [ -n "$KERNEL_ARG" ] && [ -f "$KERNEL_ARG" ]; then
+    PREFLIGHT_KERNEL="$KERNEL_ARG"
+elif [ -f "/boot/bzImage" ]; then
+    PREFLIGHT_KERNEL="/boot/bzImage"
+elif [ -f "$REPO_ROOT/distro/cache/vmlinuz-virt-v3.20" ]; then
+    PREFLIGHT_KERNEL="$REPO_ROOT/distro/cache/vmlinuz-virt-v3.20"
+elif [ -f "$REPO_ROOT/distro/cache/vmlinuz-virt" ]; then
+    PREFLIGHT_KERNEL="$REPO_ROOT/distro/cache/vmlinuz-virt"
+elif [ -f "$REPO_ROOT/packages/kernel/x/boot/vmlinuz-virt" ]; then
+    PREFLIGHT_KERNEL="$REPO_ROOT/packages/kernel/x/boot/vmlinuz-virt"
+else
+    kpkg=$(ls "$PACKAGES_DIR"/kernel-*.spm.tar.xz 2>/dev/null | head -n1 || true)
+    if [ -n "$kpkg" ] && [ -f "$kpkg" ]; then
+        if tar -tf "$kpkg" 2>/dev/null | grep -qE "x/boot/(bzImage|vmlinuz)"; then
+            PREFLIGHT_KERNEL="package:$kpkg"
+        fi
+    fi
+fi
+[ -n "$PREFLIGHT_KERNEL" ] || die "Preflight: Kernel bzImage payload not found"
+
+# Preflight Check 4: BusyBox binary availability for initramfs
+PREFLIGHT_BB=""
+if [ -x "/bin/busybox" ]; then
+    PREFLIGHT_BB="/bin/busybox"
+elif [ -x "$REPO_ROOT/distro/rootfs/bin/busybox" ]; then
+    PREFLIGHT_BB="$REPO_ROOT/distro/rootfs/bin/busybox"
+elif [ -x "$REPO_ROOT/packages/busybox/x/bin/busybox" ]; then
+    PREFLIGHT_BB="$REPO_ROOT/packages/busybox/x/bin/busybox"
+else
+    bbpkg=$(ls "$PACKAGES_DIR"/busybox-*.spm.tar.xz 2>/dev/null | head -n1 || true)
+    if [ -n "$bbpkg" ] && [ -f "$bbpkg" ]; then
+        if tar -tf "$bbpkg" 2>/dev/null | grep -qE "x/bin/busybox"; then
+            PREFLIGHT_BB="package:$bbpkg"
+        fi
+    fi
+fi
+[ -n "$PREFLIGHT_BB" ] || die "Preflight: BusyBox payload not found for initramfs generation"
+
+# Preflight Check 5: Limine BIOS and mandatory UEFI BOOTX64.EFI payload availability
+PREFLIGHT_LIMINE_SHARE=""
+for cand in \
+    /usr/share/limine \
+    "$REPO_ROOT/packages/limine-static/x/usr/share/limine" \
+    "$REPO_ROOT/distro/cache/limine" \
+    "$REPO_ROOT/distro/cache"; do
+    if [ -f "$cand/limine-bios.sys" ] && [ -f "$cand/BOOTX64.EFI" ]; then
+        PREFLIGHT_LIMINE_SHARE="$cand"
+        break
+    fi
+done
+if [ -z "$PREFLIGHT_LIMINE_SHARE" ]; then
+    lpkg=$(ls "$PACKAGES_DIR"/limine-static-*.spm.tar.xz 2>/dev/null | head -n1 || true)
+    if [ -n "$lpkg" ] && [ -f "$lpkg" ]; then
+        if tar -tf "$lpkg" 2>/dev/null | grep -q "limine-bios.sys" && tar -tf "$lpkg" 2>/dev/null | grep -q "BOOTX64.EFI"; then
+            PREFLIGHT_LIMINE_SHARE="package:$lpkg"
+        fi
+    fi
+fi
+[ -n "$PREFLIGHT_LIMINE_SHARE" ] || die "Preflight: Mandatory Limine payloads (limine-bios.sys and BOOTX64.EFI) not found"
 
 # Track staging directories for clean exit / failure cleanup
 CLEANUP_MOUNTS=""
@@ -322,7 +419,7 @@ EOF
 
 cat <<'EOF' > "$TARGET_ROOT/etc/init.conf"
 # /etc/init.conf -- S.A.N.E Linux service supervision
-console:respawn:/bin/sh
+console:respawn:cttyhack /bin/sh -i
 hello:once:/usr/bin/sane-hello
 EOF
 
@@ -394,7 +491,7 @@ else
     cp "$BB_SRC" "$IR_TMP/bin/busybox"
     chmod 0755 "$IR_TMP/bin/busybox"
 
-    for app in sh ash mount umount mkdir cat sleep echo grep cut ls stat test "[" switch_root mdev findfs blkid insmod; do
+    for app in sh ash mount umount mkdir cat sleep echo grep cut ls stat test "[" switch_root mdev findfs blkid insmod hexdump dd mknod awk; do
         ln -sf /bin/busybox "$IR_TMP/bin/$app"
         ln -sf /bin/busybox "$IR_TMP/sbin/$app"
     done
@@ -430,36 +527,94 @@ for arg in $(cat /proc/cmdline); do
 done
 
 RESOLVED_DEV=""
-if [ -b "$ROOT_DEV" ]; then
-    RESOLVED_DEV="$ROOT_DEV"
-elif echo "$ROOT_DEV" | grep -q "^PARTUUID="; then
-    target_uuid="${ROOT_DEV#PARTUUID=}"
-    for uevent in /sys/class/block/*/uevent; do
-        if grep -qi "PARTUUID=$target_uuid" "$uevent" 2>/dev/null; then
-            devname=$(grep DEVNAME "$uevent" | cut -d= -f2)
-            RESOLVED_DEV="/dev/$devname"
-            break
-        fi
-    done
-fi
-[ -n "$RESOLVED_DEV" ] || RESOLVED_DEV="$ROOT_DEV"
-
 COUNT=0
-while [ ! -b "$RESOLVED_DEV" ] && [ $COUNT -lt 50 ]; do
+while [ -z "$RESOLVED_DEV" ] && [ $COUNT -lt 50 ]; do
+    if [ -b "$ROOT_DEV" ]; then
+        RESOLVED_DEV="$ROOT_DEV"
+        break
+    fi
+    case "$ROOT_DEV" in
+        PARTUUID=*)
+            target_uuid="${ROOT_DEV#PARTUUID=}"
+            # Method 1: Kernel sysfs uevent (for kernels exporting PARTUUID directly)
+            for uevent in /sys/class/block/*/uevent; do
+                [ -f "$uevent" ] || continue
+                if grep -qi "^PARTUUID=$target_uuid" "$uevent" 2>/dev/null; then
+                    devname=$(grep '^DEVNAME=' "$uevent" | cut -d= -f2)
+                    maj=$(grep '^MAJOR=' "$uevent" | cut -d= -f2)
+                    min=$(grep '^MINOR=' "$uevent" | cut -d= -f2)
+                    [ -n "$devname" ] || continue
+                    [ -b "/dev/$devname" ] || mknod "/dev/$devname" b "$maj" "$min" 2>/dev/null || true
+                    if [ -b "/dev/$devname" ]; then
+                        RESOLVED_DEV="/dev/$devname"
+                        break
+                    fi
+                fi
+            done
+            # Method 2: Direct GPT partition table inspection on parent block device
+            if [ -z "$RESOLVED_DEV" ] && command -v hexdump >/dev/null 2>&1 && command -v dd >/dev/null 2>&1; then
+                for duevent in /sys/class/block/*/uevent; do
+                    [ -f "$duevent" ] || continue
+                    if grep -q '^DEVTYPE=disk' "$duevent" 2>/dev/null; then
+                        dname=$(grep '^DEVNAME=' "$duevent" | cut -d= -f2)
+                        dmaj=$(grep '^MAJOR=' "$duevent" | cut -d= -f2)
+                        dmin=$(grep '^MINOR=' "$duevent" | cut -d= -f2)
+                        [ -n "$dname" ] || continue
+                        [ -b "/dev/$dname" ] || mknod "/dev/$dname" b "$dmaj" "$dmin" 2>/dev/null || true
+                        [ -b "/dev/$dname" ] || continue
+                        for puevent in /sys/class/block/*/uevent; do
+                            [ -f "$puevent" ] || continue
+                            if grep -q '^DEVTYPE=partition' "$puevent" 2>/dev/null; then
+                                pname=$(grep '^DEVNAME=' "$puevent" | cut -d= -f2)
+                                pnum=$(grep '^PARTN=' "$puevent" | cut -d= -f2)
+                                pmaj=$(grep '^MAJOR=' "$puevent" | cut -d= -f2)
+                                pmin=$(grep '^MINOR=' "$puevent" | cut -d= -f2)
+                                case "$pname" in
+                                    ${dname}*)
+                                        if [ -n "$pnum" ]; then
+                                            sk=$(( 1024 + (pnum - 1) * 128 + 16 ))
+                                            raw_hex=$(dd if="/dev/$dname" bs=1 skip=$sk count=16 2>/dev/null | hexdump -e '16/1 "%02x "' || true)
+                                            if [ -n "$raw_hex" ]; then
+                                                calc_uuid=$(echo "$raw_hex" | awk '{print $4$3$2$1"-"$6$5"-"$8$7"-"$9$10"-"$11$12$13$14$15$16}')
+                                                if [ -n "$calc_uuid" ] && echo "$calc_uuid" | grep -qi "^${target_uuid}$"; then
+                                                    [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
+                                                    if [ -b "/dev/$pname" ]; then
+                                                        RESOLVED_DEV="/dev/$pname"
+                                                        break 2
+                                                    fi
+                                                fi
+                                            fi
+                                        fi
+                                        ;;
+                                esac
+                            fi
+                        done
+                    fi
+                done
+            fi
+            ;;
+        LABEL=*)
+            if command -v findfs >/dev/null 2>&1; then
+                dev=$(findfs "$ROOT_DEV" 2>/dev/null || true)
+                [ -b "$dev" ] && RESOLVED_DEV="$dev" && break
+            fi
+            ;;
+        UUID=*)
+            if command -v findfs >/dev/null 2>&1; then
+                dev=$(findfs "$ROOT_DEV" 2>/dev/null || true)
+                [ -b "$dev" ] && RESOLVED_DEV="$dev" && break
+            fi
+            ;;
+    esac
+    [ -n "$RESOLVED_DEV" ] && break
     sleep 0.1
     COUNT=$((COUNT + 1))
 done
 
-[ -b "$RESOLVED_DEV" ] || {
-    if [ -b /dev/vda2 ]; then
-        RESOLVED_DEV="/dev/vda2"
-    elif [ -b /dev/sda2 ]; then
-        RESOLVED_DEV="/dev/sda2"
-    else
-        echo "ERROR: Root device $RESOLVED_DEV not found after timeout!"
-        exec /bin/sh
-    fi
-}
+if [ -z "$RESOLVED_DEV" ] || [ ! -b "$RESOLVED_DEV" ]; then
+    echo "ERROR: Root device $ROOT_DEV not found after timeout!"
+    exec /bin/sh
+fi
 
 mount -t ext4 -o rw "$RESOLVED_DEV" /newroot
 mount --move /run /newroot/run
@@ -468,7 +623,7 @@ mount --move /sys /newroot/sys
 mount --move /proc /newroot/proc
 
 echo "switch_root: pivoting to $RESOLVED_DEV"
-exec switch_root /newroot /sbin/init "$@"
+exec switch_root /newroot /sbin/init
 EOF
     chmod 0755 "$IR_TMP/init"
     ( cd "$IR_TMP" && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 > "$TARGET_BOOT/initramfs.cpio.gz" )
@@ -493,9 +648,11 @@ done
 cp "$LIMINE_SHARE/limine-bios.sys" "$TARGET_BOOT/limine-bios.sys"
 mkdir -p "$TARGET_BOOT/EFI/BOOT"
 
-if [ -f "$LIMINE_SHARE/BOOTX64.EFI" ]; then
-    cp "$LIMINE_SHARE/BOOTX64.EFI" "$TARGET_BOOT/EFI/BOOT/BOOTX64.EFI"
-fi
+# Strictly enforce mandatory UEFI payload
+[ -f "$LIMINE_SHARE/BOOTX64.EFI" ] || die "Mandatory UEFI payload BOOTX64.EFI missing in $LIMINE_SHARE"
+cp "$LIMINE_SHARE/BOOTX64.EFI" "$TARGET_BOOT/EFI/BOOT/BOOTX64.EFI"
+info "Installed UEFI payload: $TARGET_BOOT/EFI/BOOT/BOOTX64.EFI"
+
 if [ -f "$LIMINE_SHARE/BOOTIA32.EFI" ]; then
     cp "$LIMINE_SHARE/BOOTIA32.EFI" "$TARGET_BOOT/EFI/BOOT/BOOTIA32.EFI"
 fi
@@ -508,7 +665,7 @@ serial: yes
     protocol: linux
     kernel_path: boot():/bzImage
     module_path: boot():/initramfs.cpio.gz
-    cmdline: console=tty0 console=ttyS0 root=/dev/vda2 rootfstype=ext4 rw quiet panic=-1
+    cmdline: console=tty0 console=ttyS0 root=PARTUUID=$PARTUUID rootfstype=ext4 rw quiet panic=-1
 EOF
 
 cp "$TARGET_BOOT/limine.conf" "$TARGET_BOOT/limine.cfg"
@@ -527,7 +684,7 @@ rm -rf "$TARGET_BOOT" "$TARGET_ROOT"
 sync
 
 log "Installation completed successfully on $TARGET!"
-info "Bootloader : Limine BIOS & UEFI"
+info "Bootloader : Limine BIOS (MBR/GPT) & UEFI (x86_64)"
 info "Rootfs UUID: PARTUUID=$PARTUUID"
 
 case "$POST_ACTION" in

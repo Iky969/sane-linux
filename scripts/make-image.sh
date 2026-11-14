@@ -139,22 +139,40 @@ else
     die "BOOTIA32.EFI UEFI payload not found in cache or packages"
 fi
 
+KERNEL_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/vmlinuz-virt"
+KERNEL_PINNED_SHA256="be523954ad673a78c9cdfd3d473a8d39609f5901adfcc68402c67dc037a64c7e"
+MODLOOP_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/modloop-virt"
+MODLOOP_PINNED_SHA256="a6ed1699b1c8c863fe57543263480ee3835c083b8202251d3919d1817a3c5358"
+PARTUUID="${PARTUUID:-44444444-4444-4444-8888-888888888888}"
+
+verify_file_sha256() {
+    local file="$1"
+    local expected="$2"
+    local actual
+    actual=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || true)
+    [ "$actual" = "$expected" ]
+}
+
 # Find Kernel binary (bzImage / vmlinuz-virt)
 KERNEL_BIN=""
-if [ -f "${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20" ]; then
+if [ -f "${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20" ] && verify_file_sha256 "${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20" "$KERNEL_PINNED_SHA256"; then
     KERNEL_BIN="${REPO_ROOT}/distro/cache/vmlinuz-virt-v3.20"
-elif [ -f "${REPO_ROOT}/packages/kernel/x/boot/bzImage" ]; then
+elif [ -f "${REPO_ROOT}/packages/kernel/x/boot/bzImage" ] && verify_file_sha256 "${REPO_ROOT}/packages/kernel/x/boot/bzImage" "$KERNEL_PINNED_SHA256"; then
     KERNEL_BIN="${REPO_ROOT}/packages/kernel/x/boot/bzImage"
     if [ ! -f "${CACHE_DIR}/vmlinuz-virt-v3.20" ] && [ -f "${REPO_ROOT}/packages/kernel/x/boot/vmlinuz-virt" ]; then
         mkdir -p "$CACHE_DIR"
         cp "${REPO_ROOT}/packages/kernel/x/boot/vmlinuz-virt" "${CACHE_DIR}/vmlinuz-virt-v3.20"
     fi
 else
-    log "Kernel binary not found. Downloading Alpine netboot kernel (v3.20)..."
+    log "Kernel binary not found or checksum mismatch. Downloading Alpine netboot kernel (v3.20 pinned)..."
     mkdir -p "$CACHE_DIR"
     curl -fL -s --retry 3 --connect-timeout 15 -o "${CACHE_DIR}/vmlinuz-virt-v3.20.part" \
-        "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/vmlinuz-virt" \
+        "$KERNEL_PINNED_URL" \
         || die "Failed to download Alpine netboot kernel (v3.20)"
+    if ! verify_file_sha256 "${CACHE_DIR}/vmlinuz-virt-v3.20.part" "$KERNEL_PINNED_SHA256"; then
+        rm -f "${CACHE_DIR}/vmlinuz-virt-v3.20.part"
+        die "SHA256 checksum mismatch for downloaded kernel!"
+    fi
     mv "${CACHE_DIR}/vmlinuz-virt-v3.20.part" "${CACHE_DIR}/vmlinuz-virt-v3.20"
     KERNEL_BIN="${CACHE_DIR}/vmlinuz-virt-v3.20"
 fi
@@ -182,11 +200,15 @@ fi
 # Ensure kernel storage modules exist in cache
 mkdir -p "$CACHE_DIR"
 MODLOOP_VIRT="${CACHE_DIR}/modloop-virt"
-if [ ! -s "$MODLOOP_VIRT" ]; then
-    log "Downloading Alpine modloop-virt for storage drivers (virtio_blk, ext4)..."
+if [ ! -s "$MODLOOP_VIRT" ] || ! verify_file_sha256 "$MODLOOP_VIRT" "$MODLOOP_PINNED_SHA256"; then
+    log "Downloading Alpine modloop-virt for storage drivers (v3.20 pinned)..."
     curl -fL -s --retry 3 --connect-timeout 15 -o "$MODLOOP_VIRT.part" \
-        "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/modloop-virt" \
+        "$MODLOOP_PINNED_URL" \
         || die "Failed to download modloop-virt"
+    if ! verify_file_sha256 "$MODLOOP_VIRT.part" "$MODLOOP_PINNED_SHA256"; then
+        rm -f "$MODLOOP_VIRT.part"
+        die "SHA256 checksum mismatch for downloaded modloop-virt!"
+    fi
     mv "$MODLOOP_VIRT.part" "$MODLOOP_VIRT"
 fi
 
@@ -208,6 +230,16 @@ if [ ! -d "$MODULES_STAGING" ] || [ -z "$(find "$MODULES_STAGING" -name "nls_utf
         "modules/*/kernel/fs/nls/nls_cp437.ko" \
         "modules/*/kernel/fs/nls/nls_iso8859-1.ko" \
         "modules/*/kernel/fs/nls/nls_utf8.ko" >/dev/null
+fi
+
+# Verify kernel version matches module vermagic
+kver=$(strings "$KERNEL_BIN" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+sample_mod=$(find "$MODULES_STAGING" -name "*.ko" 2>/dev/null | head -n1 || true)
+if [ -n "$kver" ] && [ -n "$sample_mod" ] && command -v modinfo >/dev/null 2>&1; then
+    mver=$(modinfo -F vermagic "$sample_mod" 2>/dev/null | awk '{print $1}' || true)
+    if [ -n "$mver" ] && [ "$kver" != "$mver" ]; then
+        die "Kernel version ($kver) does not match module vermagic ($mver)"
+    fi
 fi
 
 # Ensure cache is populated before calling packages/build-all.sh
@@ -344,7 +376,7 @@ EOF
 # Configure /etc/init.conf
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/init.conf" >/dev/null
 # /etc/init.conf -- S.A.N.E Linux service supervision
-console:respawn:/bin/sh
+console:respawn:cttyhack /bin/sh -i
 hello:once:/usr/bin/sane-hello
 EOF
 
@@ -369,7 +401,7 @@ install -m 0755 "$BUSYBOX_BIN" "$INITRAMFS_STAGING/bin/busybox"
 # Symlink core applets in initramfs
 APPLETS=(
     sh ash mount umount mkdir cat sleep echo grep cut ls stat test "["
-    switch_root mdev findfs blkid insmod lsmod modprobe
+    switch_root mdev findfs blkid insmod lsmod modprobe hexdump dd mknod awk
 )
 for applet in "${APPLETS[@]}"; do
     ln -sf /bin/busybox "$INITRAMFS_STAGING/bin/$applet"
@@ -412,55 +444,94 @@ done
 
 # 4. Resolve device path (supporting PARTUUID, UUID, LABEL, or direct device path)
 RESOLVED_DEV=""
-if [ -b "$ROOT_DEV" ]; then
-    RESOLVED_DEV="$ROOT_DEV"
-elif echo "$ROOT_DEV" | grep -q "^PARTUUID="; then
-    target_uuid="${ROOT_DEV#PARTUUID=}"
-    for uevent in /sys/class/block/*/uevent; do
-        if grep -qi "PARTUUID=$target_uuid" "$uevent" 2>/dev/null; then
-            devname=$(grep DEVNAME "$uevent" | cut -d= -f2)
-            RESOLVED_DEV="/dev/$devname"
-            break
-        fi
-    done
-elif echo "$ROOT_DEV" | grep -q "^LABEL="; then
-    if command -v findfs >/dev/null 2>&1; then
-        RESOLVED_DEV=$(findfs "$ROOT_DEV" 2>/dev/null || true)
-    fi
-elif echo "$ROOT_DEV" | grep -q "^UUID="; then
-    if command -v findfs >/dev/null 2>&1; then
-        RESOLVED_DEV=$(findfs "$ROOT_DEV" 2>/dev/null || true)
-    fi
-fi
-[ -n "$RESOLVED_DEV" ] || RESOLVED_DEV="$ROOT_DEV"
-
-# Wait for block device (up to 5 seconds)
 COUNT=0
-while [ ! -b "$RESOLVED_DEV" ] && [ $COUNT -lt 50 ]; do
+while [ -z "$RESOLVED_DEV" ] && [ $COUNT -lt 50 ]; do
+    if [ -b "$ROOT_DEV" ]; then
+        RESOLVED_DEV="$ROOT_DEV"
+        break
+    fi
+    case "$ROOT_DEV" in
+        PARTUUID=*)
+            target_uuid="${ROOT_DEV#PARTUUID=}"
+            # Method 1: Kernel sysfs uevent (for kernels exporting PARTUUID directly)
+            for uevent in /sys/class/block/*/uevent; do
+                [ -f "$uevent" ] || continue
+                if grep -qi "^PARTUUID=$target_uuid" "$uevent" 2>/dev/null; then
+                    devname=$(grep '^DEVNAME=' "$uevent" | cut -d= -f2)
+                    maj=$(grep '^MAJOR=' "$uevent" | cut -d= -f2)
+                    min=$(grep '^MINOR=' "$uevent" | cut -d= -f2)
+                    [ -n "$devname" ] || continue
+                    [ -b "/dev/$devname" ] || mknod "/dev/$devname" b "$maj" "$min" 2>/dev/null || true
+                    if [ -b "/dev/$devname" ]; then
+                        RESOLVED_DEV="/dev/$devname"
+                        break
+                    fi
+                fi
+            done
+            # Method 2: Direct GPT partition table inspection on parent block device
+            if [ -z "$RESOLVED_DEV" ] && command -v hexdump >/dev/null 2>&1 && command -v dd >/dev/null 2>&1; then
+                for duevent in /sys/class/block/*/uevent; do
+                    [ -f "$duevent" ] || continue
+                    if grep -q '^DEVTYPE=disk' "$duevent" 2>/dev/null; then
+                        dname=$(grep '^DEVNAME=' "$duevent" | cut -d= -f2)
+                        dmaj=$(grep '^MAJOR=' "$duevent" | cut -d= -f2)
+                        dmin=$(grep '^MINOR=' "$duevent" | cut -d= -f2)
+                        [ -n "$dname" ] || continue
+                        [ -b "/dev/$dname" ] || mknod "/dev/$dname" b "$dmaj" "$dmin" 2>/dev/null || true
+                        [ -b "/dev/$dname" ] || continue
+                        for puevent in /sys/class/block/*/uevent; do
+                            [ -f "$puevent" ] || continue
+                            if grep -q '^DEVTYPE=partition' "$puevent" 2>/dev/null; then
+                                pname=$(grep '^DEVNAME=' "$puevent" | cut -d= -f2)
+                                pnum=$(grep '^PARTN=' "$puevent" | cut -d= -f2)
+                                pmaj=$(grep '^MAJOR=' "$puevent" | cut -d= -f2)
+                                pmin=$(grep '^MINOR=' "$puevent" | cut -d= -f2)
+                                case "$pname" in
+                                    ${dname}*)
+                                        if [ -n "$pnum" ]; then
+                                            sk=$(( 1024 + (pnum - 1) * 128 + 16 ))
+                                            raw_hex=$(dd if="/dev/$dname" bs=1 skip=$sk count=16 2>/dev/null | hexdump -e '16/1 "%02x "' || true)
+                                            if [ -n "$raw_hex" ]; then
+                                                calc_uuid=$(echo "$raw_hex" | awk '{print $4$3$2$1"-"$6$5"-"$8$7"-"$9$10"-"$11$12$13$14$15$16}')
+                                                if [ -n "$calc_uuid" ] && echo "$calc_uuid" | grep -qi "^${target_uuid}$"; then
+                                                    [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
+                                                    if [ -b "/dev/$pname" ]; then
+                                                        RESOLVED_DEV="/dev/$pname"
+                                                        break 2
+                                                    fi
+                                                fi
+                                            fi
+                                        fi
+                                        ;;
+                                esac
+                            fi
+                        done
+                    fi
+                done
+            fi
+            ;;
+        LABEL=*)
+            if command -v findfs >/dev/null 2>&1; then
+                dev=$(findfs "$ROOT_DEV" 2>/dev/null || true)
+                [ -b "$dev" ] && RESOLVED_DEV="$dev" && break
+            fi
+            ;;
+        UUID=*)
+            if command -v findfs >/dev/null 2>&1; then
+                dev=$(findfs "$ROOT_DEV" 2>/dev/null || true)
+                [ -b "$dev" ] && RESOLVED_DEV="$dev" && break
+            fi
+            ;;
+    esac
+    [ -n "$RESOLVED_DEV" ] && break
     sleep 0.1
     COUNT=$((COUNT + 1))
-    if [ ! -b "$RESOLVED_DEV" ] && echo "$ROOT_DEV" | grep -q "^PARTUUID="; then
-        target_uuid="${ROOT_DEV#PARTUUID=}"
-        for uevent in /sys/class/block/*/uevent; do
-            if grep -qi "PARTUUID=$target_uuid" "$uevent" 2>/dev/null; then
-                devname=$(grep DEVNAME "$uevent" | cut -d= -f2)
-                RESOLVED_DEV="/dev/$devname"
-                break
-            fi
-        done
-    fi
 done
 
-[ -b "$RESOLVED_DEV" ] || {
-    if [ -b /dev/vda2 ]; then
-        RESOLVED_DEV="/dev/vda2"
-    elif [ -b /dev/sda2 ]; then
-        RESOLVED_DEV="/dev/sda2"
-    else
-        echo "ERROR: Root device $RESOLVED_DEV not found after timeout!"
-        exec /bin/sh
-    fi
-}
+if [ -z "$RESOLVED_DEV" ] || [ ! -b "$RESOLVED_DEV" ]; then
+    echo "ERROR: Root device $ROOT_DEV not found after timeout!"
+    exec /bin/sh
+fi
 
 ROOT_DEV="$RESOLVED_DEV"
 
@@ -475,7 +546,7 @@ mount --move /proc /newroot/proc
 
 # 7. Execute switch_root handoff to ninit
 echo "switch_root: pivoting to $ROOT_DEV"
-exec switch_root /newroot /sbin/init "$@"
+exec switch_root /newroot /sbin/init
 EOF
 chmod 0755 "$INITRAMFS_STAGING/init"
 
@@ -494,7 +565,7 @@ $SUDO mkdir -p "$MNT_BOOT/EFI/BOOT"
 $SUDO cp "$LIMINE_BOOTX64_EFI" "$MNT_BOOT/EFI/BOOT/BOOTX64.EFI"
 $SUDO cp "$LIMINE_BOOTIA32_EFI" "$MNT_BOOT/EFI/BOOT/BOOTIA32.EFI"
 
-cat <<'EOF' | $SUDO tee "$MNT_BOOT/limine.conf" >/dev/null
+cat <<EOF | $SUDO tee "$MNT_BOOT/limine.conf" >/dev/null
 timeout: 0
 serial: yes
 
@@ -502,7 +573,7 @@ serial: yes
     protocol: linux
     kernel_path: boot():/bzImage
     module_path: boot():/initramfs.cpio.gz
-    cmdline: console=tty0 console=ttyS0 root=/dev/vda2 rootfstype=ext4 rw quiet panic=-1
+    cmdline: console=tty0 console=ttyS0 root=PARTUUID=$PARTUUID rootfstype=ext4 rw quiet panic=-1
 EOF
 $SUDO cp "$MNT_BOOT/limine.conf" "$MNT_BOOT/limine.cfg"
 $SUDO cp "$MNT_BOOT/limine.conf" "$MNT_BOOT/EFI/BOOT/limine.conf"

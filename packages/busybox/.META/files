@@ -5,6 +5,7 @@ bin/cat
 bin/chmod
 bin/chown
 bin/cp
+bin/cttyhack
 bin/cut
 bin/date
 bin/dd

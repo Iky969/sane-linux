@@ -43,6 +43,7 @@ Subcommands:
   remove <pkg-name>        Safely remove a package and clean empty directories bottom-up
 
 Options:
+  -f, --force              Force removal of packages marked base=true
   -r, --root <path>        Target system root directory (default: /)
   -h, --help               Show this help message and exit
   -v, --version            Display spm version
@@ -51,6 +52,7 @@ EOF
 
 TARGET_ROOT=""
 SUBCOMMAND=""
+FORCE=false
 
 # Parse command line arguments preserving positional args for subcommand
 nargs=$#
@@ -59,6 +61,9 @@ while [ $nargs -gt 0 ]; do
     shift
     nargs=$((nargs - 1))
     case "$arg" in
+        -f|--force)
+            FORCE=true
+            ;;
         --root)
             [ $nargs -ge 1 ] || die "Option '--root' requires an argument"
             TARGET_ROOT="$1"
@@ -222,7 +227,7 @@ acquire_shared_lock() {
 
 release_lock() {
     flock -u $LOCK_FD 2>/dev/null || true
-    eval "exec ${LOCK_FD}>&- 2>/dev/null || true"
+    eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
 }
 
 # Helper to read key=value manifest
@@ -952,10 +957,10 @@ cmd_install() {
                 mkdir -p "$dst_dir" || rollback_transaction
 
                 if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
-                    # Backup existing file for rollback
+                    # Backup existing file for rollback without removing it from dst_path
                     local bak_path="$ROLLBACK_BACKUP/$fline"
                     mkdir -p "$(dirname "$bak_path")"
-                    mv -f "$dst_path" "$bak_path" || rollback_transaction
+                    cp -a "$dst_path" "$bak_path" || rollback_transaction
                 else
                     printf '%s\n' "$dst_path" >> "$ROLLBACK_CREATED"
                 fi
@@ -1108,7 +1113,23 @@ cmd_install() {
 # Subcommand: remove
 cmd_remove() {
     [ $# -ge 1 ] || die "Missing package name for 'remove' subcommand"
-    local pkg_name="$1"
+    local pkg_name=""
+    local force="$FORCE"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--force)
+                force=true
+                shift
+                ;;
+            *)
+                if [ -z "$pkg_name" ]; then
+                    pkg_name="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [ -n "$pkg_name" ] || die "Missing package name for 'remove' subcommand"
 
     acquire_lock
 
@@ -1117,6 +1138,17 @@ cmd_remove() {
         release_lock
         die "Package '$pkg_name' is not installed"
     }
+
+    # Check base package protection
+    local pmanifest="$pkg_installed_dir/package"
+    local is_base="false"
+    if [ -f "$pmanifest" ]; then
+        is_base="$(get_val "$pmanifest" "base")"
+    fi
+    if [ "$is_base" = "true" ] && [ "$force" != true ]; then
+        release_lock
+        die "Cannot remove base system package '$pkg_name' without --force (marked base=true)"
+    fi
 
     # Check reverse dependencies
     if [ -f "$RDEPS_DIR/$pkg_name" ] && [ -s "$RDEPS_DIR/$pkg_name" ]; then

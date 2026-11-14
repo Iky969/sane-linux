@@ -8,10 +8,24 @@ OUT_DIR="${1:-$REPO_ROOT/distro/packages}"
 
 mkdir -p "$OUT_DIR" "$PKG_DIR/x/usr/sbin"
 
-# Verify required static binaries exist in package payload
+command -v readelf >/dev/null 2>&1 || {
+    printf 'ERROR: readelf is required for static ELF verification\n' >&2
+    exit 1
+}
+
+# Verify required static binaries exist and are strictly statically linked ELF
 for bin in sgdisk mke2fs mkfs.fat; do
-    if [ ! -x "$PKG_DIR/x/usr/sbin/$bin" ]; then
-        printf 'ERROR: Required disk tool binary missing or not executable: %s\n' "$PKG_DIR/x/usr/sbin/$bin" >&2
+    bin_path="$PKG_DIR/x/usr/sbin/$bin"
+    if [ ! -x "$bin_path" ]; then
+        printf 'ERROR: Required disk tool binary missing or not executable: %s\n' "$bin_path" >&2
+        exit 1
+    fi
+    if ! readelf -h "$bin_path" >/dev/null 2>&1; then
+        printf 'ERROR: %s is not a valid ELF binary\n' "$bin_path" >&2
+        exit 1
+    fi
+    if readelf -lW "$bin_path" 2>/dev/null | grep -E -q '(^|[[:space:]])INTERP([[:space:]]|$)|PT_INTERP'; then
+        printf 'ERROR: %s contains dynamic INTERP segment (must be statically linked)\n' "$bin_path" >&2
         exit 1
     fi
 done

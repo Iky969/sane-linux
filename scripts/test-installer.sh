@@ -22,6 +22,11 @@ INSTALLER_BIN="$REPO_ROOT/scripts/sane-install.sh"
 
 TIMEOUT_SECS=30
 QUICK_MODE=0
+OVMF_PATH="${OVMF_PATH:-}"
+
+TESTS_PASSED=0
+TESTS_FAILED=0
+TESTS_SKIPPED=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -33,6 +38,10 @@ while [ $# -gt 0 ]; do
             TIMEOUT_SECS="$2"
             shift 2
             ;;
+        --ovmf)
+            OVMF_PATH="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1" >&2
             exit 1
@@ -40,8 +49,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-die()  { printf '\033[31m[FAIL]\033[0m %s\n' "$1" >&2; exit 1; }
-pass() { printf '\033[32m[PASS]\033[0m %s\n' "$1"; }
+die()  { TESTS_FAILED=$((TESTS_FAILED + 1)); printf '\033[31m[FAIL]\033[0m %s\n' "$1" >&2; exit 1; }
+pass() { TESTS_PASSED=$((TESTS_PASSED + 1)); printf '\033[32m[PASS]\033[0m %s\n' "$1"; }
+skip() { TESTS_SKIPPED=$((TESTS_SKIPPED + 1)); printf '\033[33m[SKIP]\033[0m %s\n' "$1"; }
 info() { printf '       %s\n' "$1"; }
 
 [ -x "$INSTALLER_BIN" ] || die "Installer script not executable: $INSTALLER_BIN"
@@ -59,6 +69,8 @@ fi
 
 TEST_IMG="/tmp/sane-test-install-disk.img"
 LOOP_DEV=""
+LOOP_GUARD=""
+MNT_GUARD=""
 MNT_TMP=""
 
 cleanup() {
@@ -67,6 +79,13 @@ cleanup() {
         if mountpoint -q "$MNT_TMP/boot" 2>/dev/null; then umount "$MNT_TMP/boot" 2>/dev/null || true; fi
         if mountpoint -q "$MNT_TMP/root" 2>/dev/null; then umount "$MNT_TMP/root" 2>/dev/null || true; fi
         rm -rf "$MNT_TMP" 2>/dev/null || true
+    fi
+    if [ -n "$MNT_GUARD" ] && [ -d "$MNT_GUARD" ]; then
+        if mountpoint -q "$MNT_GUARD" 2>/dev/null; then umount "$MNT_GUARD" 2>/dev/null || true; fi
+        rm -rf "$MNT_GUARD" 2>/dev/null || true
+    fi
+    if [ -n "$LOOP_GUARD" ] && [ -b "$LOOP_GUARD" ]; then
+        losetup -d "$LOOP_GUARD" 2>/dev/null || true
     fi
     if [ -n "$LOOP_DEV" ] && [ -b "$LOOP_DEV" ]; then
         losetup -d "$LOOP_DEV" 2>/dev/null || true
@@ -104,49 +123,76 @@ fi
 rm -f "$TEST_IMG"
 truncate -s 64M "$TEST_IMG"
 LOOP_GUARD="$(losetup -Pf --show "$TEST_IMG")"
-sgdisk -n 1:2048:0 "$LOOP_GUARD" >/dev/null 2>&1 || true
+[ -n "$LOOP_GUARD" ] && [ -b "$LOOP_GUARD" ] || die "Guard 3: Failed to attach loop device"
+sgdisk -n 1:2048:0 "$LOOP_GUARD" >/dev/null 2>&1 || die "Guard 3: Failed to partition loop device via sgdisk"
 partprobe "$LOOP_GUARD" 2>/dev/null || true
-sleep 0.2
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=3 2>/dev/null || true
 
 PART_GUARD="${LOOP_GUARD}p1"
-if [ -b "$PART_GUARD" ]; then
-    rc=0
-    "$INSTALLER_BIN" --target "$PART_GUARD" --unattended >/dev/null 2>&1 || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        pass "Guard 3: Partition target rejected (must be whole disk)"
-    else
-        losetup -d "$LOOP_GUARD"
-        die "Guard 3: Installer accepted a partition target ($PART_GUARD)"
-    fi
+for _ in $(seq 1 15); do
+    [ -b "$PART_GUARD" ] && break
+    sleep 0.2
+done
+[ -b "$PART_GUARD" ] || die "Guard 3: Partition device $PART_GUARD failed to appear (partition safety guard prerequisite failed)"
+
+rc=0
+"$INSTALLER_BIN" --target "$PART_GUARD" --unattended >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    pass "Guard 3: Partition target rejected (must be whole disk)"
+else
+    die "Guard 3: Installer accepted a partition target ($PART_GUARD)"
 fi
-losetup -d "$LOOP_GUARD"
+losetup -d "$LOOP_GUARD" || die "Guard 3: Failed to detach loop device"
+LOOP_GUARD=""
 rm -f "$TEST_IMG"
 
 # Test 1.4: Mounted target disk rejection
 truncate -s 64M "$TEST_IMG"
 LOOP_GUARD="$(losetup -Pf --show "$TEST_IMG")"
-sgdisk -n 1:2048:0 "$LOOP_GUARD" >/dev/null 2>&1 || true
+[ -n "$LOOP_GUARD" ] && [ -b "$LOOP_GUARD" ] || die "Guard 4: Failed to attach loop device"
+sgdisk -n 1:2048:0 "$LOOP_GUARD" >/dev/null 2>&1 || die "Guard 4: Failed to partition loop device via sgdisk"
 partprobe "$LOOP_GUARD" 2>/dev/null || true
-sleep 0.2
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=3 2>/dev/null || true
+
 PART_GUARD="${LOOP_GUARD}p1"
-if [ -b "$PART_GUARD" ]; then
-    mkfs.ext2 -F "$PART_GUARD" >/dev/null 2>&1 || true
-    MNT_GUARD="$(mktemp -d /tmp/sane-guard-mnt.XXXXXX)"
-    mount "$PART_GUARD" "$MNT_GUARD"
-    
-    rc=0
-    "$INSTALLER_BIN" --target "$LOOP_GUARD" --unattended >/dev/null 2>&1 || rc=$?
-    umount "$MNT_GUARD"
-    rmdir "$MNT_GUARD"
-    if [ "$rc" -ne 0 ]; then
-        pass "Guard 4: Mounted disk/partition target rejected (fail-closed)"
-    else
-        losetup -d "$LOOP_GUARD"
-        die "Guard 4: Installer allowed operating on a mounted disk"
-    fi
+for _ in $(seq 1 15); do
+    [ -b "$PART_GUARD" ] && break
+    sleep 0.2
+done
+[ -b "$PART_GUARD" ] || die "Guard 4: Partition device $PART_GUARD failed to appear (partition safety guard prerequisite failed)"
+
+mkfs.ext2 -F "$PART_GUARD" >/dev/null 2>&1 || die "Guard 4: Failed to format test partition $PART_GUARD"
+MNT_GUARD="$(mktemp -d /tmp/sane-guard-mnt.XXXXXX)"
+mount "$PART_GUARD" "$MNT_GUARD" || die "Guard 4: Failed to mount test partition $PART_GUARD"
+
+rc=0
+"$INSTALLER_BIN" --target "$LOOP_GUARD" --unattended >/dev/null 2>&1 || rc=$?
+umount "$MNT_GUARD" || die "Guard 4: Failed to unmount $MNT_GUARD"
+rmdir "$MNT_GUARD"
+MNT_GUARD=""
+if [ "$rc" -ne 0 ]; then
+    pass "Guard 4: Mounted disk/partition target rejected (fail-closed)"
+else
+    die "Guard 4: Installer allowed operating on a mounted disk"
 fi
-losetup -d "$LOOP_GUARD"
+losetup -d "$LOOP_GUARD" || die "Guard 4: Failed to detach loop device"
+LOOP_GUARD=""
 rm -f "$TEST_IMG"
+
+# Test 1.5: Undersized target disk (<256MB) rejection in preflight
+truncate -s 64M "$TEST_IMG"
+LOOP_GUARD="$(losetup -f --show "$TEST_IMG")"
+[ -n "$LOOP_GUARD" ] && [ -b "$LOOP_GUARD" ] || die "Guard 5: Failed to attach loop device"
+rc=0
+"$INSTALLER_BIN" --target "$LOOP_GUARD" --unattended >/dev/null 2>&1 || rc=$?
+losetup -d "$LOOP_GUARD" || die "Guard 5: Failed to detach loop device"
+LOOP_GUARD=""
+rm -f "$TEST_IMG"
+if [ "$rc" -ne 0 ]; then
+    pass "Guard 5: Undersized target disk (<256MB) rejected during preflight"
+else
+    die "Guard 5: Installer accepted an undersized target disk (<256MB)"
+fi
 
 # -------------------------------------------------------------
 # Test Group 2: End-to-End Installation on Raw Disk
@@ -217,6 +263,20 @@ else
     die "Rootfs /etc/fstab missing PARTUUID entry"
 fi
 
+# Check limine.conf contents
+if grep -q "root=PARTUUID=" "$MNT_TMP/boot/limine.conf"; then
+    pass "Limine bootloader config uses root=PARTUUID= parameter"
+else
+    die "Limine bootloader config missing root=PARTUUID= parameter"
+fi
+
+# Check init.conf contents
+if grep -q "console:respawn:cttyhack /bin/sh -i" "$MNT_TMP/root/etc/init.conf"; then
+    pass "Rootfs /etc/init.conf configured with cttyhack interactive console"
+else
+    die "Rootfs /etc/init.conf missing cttyhack interactive console"
+fi
+
 # Check SPM database records
 spm_installed="$(ls "$MNT_TMP/root/var/lib/spm/installed/" 2>/dev/null || true)"
 if echo "$spm_installed" | grep -q "ninit" && echo "$spm_installed" | grep -q "busybox"; then
@@ -239,7 +299,8 @@ LOOP_DEV=""
 printf '\n%s\n' "--- Group 4: Headless QEMU Boot Verification (INST-51) ---"
 
 if [ "$QUICK_MODE" -eq 1 ]; then
-    info "Quick mode requested; skipping QEMU boot test"
+    skip "QEMU BIOS boot test skipped (--quick mode requested)"
+    skip "QEMU UEFI boot test skipped (--quick mode requested)"
 else
     command -v qemu-system-x86_64 >/dev/null 2>&1 || die "qemu-system-x86_64 required for INST-51 boot test"
 
@@ -321,12 +382,21 @@ else
 
     # 4.2 UEFI Boot Verification if OVMF firmware available
     OVMF_BIN=""
-    for cand in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/qemu/OVMF.fd; do
-        if [ -f "$cand" ]; then
-            OVMF_BIN="$cand"
-            break
-        fi
-    done
+    if [ -n "$OVMF_PATH" ] && [ -f "$OVMF_PATH" ]; then
+        OVMF_BIN="$OVMF_PATH"
+    else
+        for cand in \
+            /usr/share/ovmf/OVMF.fd \
+            /usr/share/OVMF/OVMF.fd \
+            /usr/share/qemu/OVMF.fd \
+            /usr/share/edk2-ovmf/x64/OVMF.fd \
+            /usr/share/edk2/ovmf/OVMF.fd; do
+            if [ -f "$cand" ]; then
+                OVMF_BIN="$cand"
+                break
+            fi
+        done
+    fi
 
     if [ -n "$OVMF_BIN" ]; then
         info "Booting installed disk image in QEMU via Limine UEFI ($OVMF_BIN)..."
@@ -369,17 +439,24 @@ else
         kill -TERM "$QEMU_UEFI_PID" 2>/dev/null || true
         wait "$QEMU_UEFI_PID" 2>/dev/null || true
 
+        if grep -qi "kernel panic" "$CONSOLE_LOG_UEFI"; then
+            die "QEMU UEFI boot detected kernel panic in console log (UEFI test FAIL)"
+        fi
+
         if [ "$uefi_switch_root_ok" -eq 1 ] && [ "$uefi_ninit_ok" -eq 1 ]; then
             pass "QEMU UEFI boot: switch_root and ninit PID 1 started cleanly (UEFI test PASS)"
         else
-            die "QEMU UEFI boot failed: switch_root or ninit ready marker missing"
+            die "QEMU UEFI boot failed: switch_root or ninit ready marker missing (UEFI test FAIL)"
         fi
     else
-        info "Notice: OVMF firmware not detected on host, skipping optional UEFI boot test"
+        skip "QEMU UEFI boot: OVMF firmware not detected on host (UEFI test SKIP)"
     fi
 fi
 
 printf '\n=======================================================\n'
-printf 'All Phase 5 Installer Tests Passed Successfully! (INST-50 & INST-51)\n'
+printf 'Installer Test Summary: %d passed, %d failed, %d skipped\n' "$TESTS_PASSED" "$TESTS_FAILED" "$TESTS_SKIPPED"
 printf '=======================================================\n'
+if [ "$TESTS_FAILED" -gt 0 ]; then
+    exit 1
+fi
 exit 0

@@ -348,6 +348,15 @@ run_boot_test() {
         fail_count=$((fail_count + 1))
     fi
 
+    if grep -qiE "crash-loop.*console|console.*crash-loop|console.*marked failed" "$console_log" 2>/dev/null; then
+        local crash_msg
+        crash_msg=$(grep -iE "crash-loop.*console|console.*crash-loop|console.*marked failed" "$console_log" 2>/dev/null | head -n 1 || echo "console crash-loop")
+        printf '  [FAIL] Console service crash-loop detected: %s\n' "$crash_msg"
+        fail_count=$((fail_count + 1))
+    else
+        printf '  [ OK ]   Console service healthy (zero crash-loops detected)\n'
+    fi
+
     if grep -qiE "Kernel panic|Attempted to kill init" "$console_log" 2>/dev/null || [ "$panic_detected" -eq 1 ]; then
         local panic_line
         panic_line=$(grep -iE "Kernel panic|Attempted to kill init" "$console_log" 2>/dev/null | head -n 1 || echo "Kernel panic")

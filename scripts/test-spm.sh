@@ -1625,6 +1625,72 @@ test_package_upgrade_rdeps_pruning() {
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 21: Base package removal protection & atomic replacement
+# -----------------------------------------------------------------------------
+test_base_package_protection_and_atomic_replacement() {
+    local tdir="$TEST_TMP/scenario21"
+    local root="$tdir/root"
+    mkdir -p "$tdir" "$root"
+
+    local base_pkg_v1="$tdir/base-sys-1.0.0-1-x86_64.spm.tar.xz"
+    local base_pkg_v2="$tdir/base-sys-1.0.1-1-x86_64.spm.tar.xz"
+
+    python_pkg_helper create_valid "$base_pkg_v1" "base-sys" "1.0.0" "true" "Base system package" \
+        "bin/sysinit:v1 binary" "etc/sys.conf:config v1"
+    python_pkg_helper create_valid "$base_pkg_v2" "base-sys" "1.0.1" "true" "Base system package" \
+        "bin/sysinit:v2 binary" "etc/sys.conf:config v2"
+
+    # 1. Install base package v1
+    if ! "$SPM_BIN" install "$base_pkg_v1" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 21" "Failed to install base package v1"
+        return
+    fi
+
+    # 2. Attempt spm remove without --force -> must fail with exit code 1
+    local rem_out
+    rem_out="$("$SPM_BIN" remove "base-sys" --root "$root" 2>&1 || true)"
+    if "$SPM_BIN" remove "base-sys" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 21" "spm remove succeeded on base=true package without --force"
+        return
+    fi
+
+    if ! echo "$rem_out" | grep -qiE "base.*force|Cannot remove base"; then
+        test_fail "Scenario 21" "spm remove output did not mention base package protection / --force: '$rem_out'"
+        return
+    fi
+
+    # Verify files still intact after rejected removal
+    if [ ! -f "$root/bin/sysinit" ]; then
+        test_fail "Scenario 21" "File /bin/sysinit missing after rejected base package removal"
+        return
+    fi
+
+    # 3. Upgrade to v2: verify atomic replacement
+    if ! "$SPM_BIN" install "$base_pkg_v2" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 21" "Failed to upgrade base package to v2"
+        return
+    fi
+
+    if [ "$(cat "$root/bin/sysinit" 2>/dev/null || true)" != "v2 binary" ]; then
+        test_fail "Scenario 21" "Atomic replacement failed to update /bin/sysinit to v2"
+        return
+    fi
+
+    # 4. Remove with --force -> must succeed
+    if ! "$SPM_BIN" remove "base-sys" --force --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 21" "spm remove --force failed on base=true package"
+        return
+    fi
+
+    if [ -e "$root/bin/sysinit" ]; then
+        test_fail "Scenario 21" "/bin/sysinit still present after spm remove --force"
+        return
+    fi
+
+    test_pass "Scenario 21: Base package removal protection & atomic replacement (removal blocked without --force, atomic upgrade verified, removal permitted with --force)"
+}
+
+# -----------------------------------------------------------------------------
 # Main Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -1654,6 +1720,7 @@ main() {
     test_fail_closed_checksum
     test_package_upgrade_obsolete_file_pruning
     test_package_upgrade_rdeps_pruning
+    test_base_package_protection_and_atomic_replacement
 
     printf '\n==================================================\n'
     printf 'SPM Test Suite Summary: %d passed, %d failed\n' "$PASSED_COUNT" "$FAILED_COUNT"
