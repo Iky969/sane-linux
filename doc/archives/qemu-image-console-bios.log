@@ -1,25 +1,25 @@
 linux: Loading kernel `boot():/bzImage`...
 linux: Loading module `boot():/initramfs.cpio.gz`...
 switch_root: pivoting to /dev/vda2
-[2026-11-16 15:03:48] ninit: proc: /proc already mounted
-[2026-11-16 15:03:48] ninit: sysfs: /sys already mounted
-[2026-11-16 15:03:48] ninit: devtmpfs: /dev already mounted
-[2026-11-16 15:03:48] ninit: tmpfs: /run already mounted
-[2026-11-16 15:03:48] ninit: cgroup2: /sys/fs/cgroup mounted
-[2026-11-16 15:03:48] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
-[2026-11-16 15:03:48] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
-[2026-11-16 15:03:48] ninit: === ninit start (PID 1) v1.1.0 ===
-[2026-11-16 15:03:49] ninit: hostname = S.A.N.E
-[2026-11-16 15:03:49] ninit: network: state STOPPED -> STARTING
-[2026-11-16 15:03:49] ninit: network: state STARTING -> RUNNING
-[2026-11-16 15:03:49] ninit: started network (pid 513)
-[2026-11-16 15:03:49] ninit: cgroup: 'network' (pid 513) -> /sys/fs/cgroup/ninit/network
-[2026-11-16 15:03:49] ninit: tty1: state STOPPED -> STARTING
-[2026-11-16 15:03:49] ninit: tty1: state STARTING -> RUNNING
-[2026-11-16 15:03:49] ninit: started tty1 (pid 514)
-[2026-11-16 15:03:49] ninit: cgroup: 'tty1' (pid 514) -> /sys/fs/cgroup/ninit/tty1
-[2026-11-16 15:03:49] ninit: console: state STOPPED -> STARTING
-[2026-11-16 15:03:49] ninit: console: state STARTING -> RUNNING
-[2026-11-16 15:03:49] ninit: started console (pid 515)
-[2026-11-16 15:03:49] ninit: cgroup: 'console' (pid 515) -> /sys/fs/cgroup/ninit/console
-[2026-11-16 15:03:49] ninit: main loop ready
+[2026-11-16 15:32:24] ninit: proc: /proc already mounted
+[2026-11-16 15:32:24] ninit: sysfs: /sys already mounted
+[2026-11-16 15:32:24] ninit: devtmpfs: /dev already mounted
+[2026-11-16 15:32:24] ninit: tmpfs: /run already mounted
+[2026-11-16 15:32:24] ninit: cgroup2: /sys/fs/cgroup mounted
+[2026-11-16 15:32:24] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
+[2026-11-16 15:32:24] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
+[2026-11-16 15:32:24] ninit: === ninit start (PID 1) v1.1.0 ===
+[2026-11-16 15:32:24] ninit: hostname = S.A.N.E
+[2026-11-16 15:32:24] ninit: network: state STOPPED -> STARTING
+[2026-11-16 15:32:24] ninit: network: state STARTING -> RUNNING
+[2026-11-16 15:32:24] ninit: started network (pid 515)
+[2026-11-16 15:32:25] ninit: cgroup: 'network' (pid 515) -> /sys/fs/cgroup/ninit/network
+[2026-11-16 15:32:25] ninit: tty1: state STOPPED -> STARTING
+[2026-11-16 15:32:25] ninit: tty1: state STARTING -> RUNNING
+[2026-11-16 15:32:25] ninit: started tty1 (pid 516)
+[2026-11-16 15:32:25] ninit: cgroup: 'tty1' (pid 516) -> /sys/fs/cgroup/ninit/tty1
+[2026-11-16 15:32:25] ninit: console: state STOPPED -> STARTING
+[2026-11-16 15:32:25] ninit: console: state STARTING -> RUNNING
+[2026-11-16 15:32:25] ninit: started console (pid 517)
+[2026-11-16 15:32:25] ninit: cgroup: 'console' (pid 517) -> /sys/fs/cgroup/ninit/console
+[2026-11-16 15:32:25] ninit: main loop ready
