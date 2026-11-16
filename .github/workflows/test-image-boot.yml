@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio curl parted dosfstools mtools e2fsprogs gdisk squashfs-tools qemu-system-x86 ovmf
+          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio curl parted dosfstools mtools e2fsprogs gdisk squashfs-tools qemu-system-x86 ovmf musl-tools musl-dev byacc bison
 
       - name: Build rootfs and initramfs
         run: |

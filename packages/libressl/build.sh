@@ -12,7 +12,16 @@ TARBALL="$CACHE_DIR/libressl-3.9.2.tar.gz"
 URL="https://cdn.openbsd.org/pub/OpenBSD/LibreSSL/libressl-3.9.2.tar.gz"
 EXPECTED_SHA256="7b031dac64a59eb6ee3304f7ffb75dad33ab8c9d279c847f92c89fb846068f97"
 
-mkdir -p "$OUT_DIR" "$CACHE_DIR" "$BUILD_ROOT"
+mkdir -p "$OUT_DIR"
+
+if [ -f "$PKG_DIR/x/usr/lib/libssl.a" ] && [ -f "$PKG_DIR/x/usr/bin/openssl" ] && [ "${REBUILD:-0}" != "1" ]; then
+    printf 'Using prebuilt LibreSSL payload in %s/x\n' "$PKG_DIR"
+    chmod -R u+rwX,go+rX "$PKG_DIR/x"
+    "$REPO_ROOT/scripts/build-package.sh" --source "$PKG_DIR" --output "$OUT_DIR"
+    exit 0
+fi
+
+mkdir -p "$CACHE_DIR" "$BUILD_ROOT"
 
 # 1. Cache source tarball and verify checksum
 if [ -f "$TARBALL" ]; then

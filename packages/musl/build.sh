@@ -8,6 +8,13 @@ OUT_DIR="${1:-$REPO_ROOT/distro/packages}"
 
 mkdir -p "$OUT_DIR"
 
+if [ -f "$PKG_DIR/x/usr/lib/libc.a" ] && [ -d "$PKG_DIR/x/usr/include" ] && [ "${REBUILD:-0}" != "1" ]; then
+    printf 'Using prebuilt musl payload in %s/x\n' "$PKG_DIR"
+    chmod -R u+rwX,go+rX "$PKG_DIR/x"
+    "$REPO_ROOT/scripts/build-package.sh" --source "$PKG_DIR" --output "$OUT_DIR" --base
+    exit 0
+fi
+
 # Clean and recreate staging payload
 rm -rf "$PKG_DIR/x"
 mkdir -p "$PKG_DIR/x/usr/include" "$PKG_DIR/x/usr/lib" "$PKG_DIR/x/lib"

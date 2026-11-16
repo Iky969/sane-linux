@@ -37,7 +37,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static python3
+          sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev byacc bison
 
       - name: Static build
         run: make
@@ -99,7 +99,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static python3 bzip2 cpio qemu-system-x86 curl
+          sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev byacc bison bzip2 cpio qemu-system-x86 curl
 
       - name: rootfs + initramfs from source (BUSYBOX_MODE=auto)
         run: |
