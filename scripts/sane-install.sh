@@ -421,22 +421,79 @@ EOF
 
 cat <<'EOF' > "$TARGET_ROOT/etc/init.conf"
 # /etc/init.conf -- S.A.N.E Linux service supervision
-console:respawn:cttyhack /bin/sh -i
-hello:once:/usr/bin/sane-hello
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
+tty1:respawn:/sbin/getty 38400 tty1 linux
+console:respawn:cttyhack /sbin/getty -L 115200 - vt100
 EOF
 
 printf 'S.A.N.E\n' > "$TARGET_ROOT/etc/hostname"
 
-if [ ! -f "$TARGET_ROOT/etc/passwd" ]; then
-    cat <<'EOF' > "$TARGET_ROOT/etc/passwd"
+cat <<'EOF' > "$TARGET_ROOT/etc/passwd"
 root:x:0:0:root:/root:/bin/sh
+sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh
 EOF
+chmod 0644 "$TARGET_ROOT/etc/passwd"
+
+cat <<'EOF' > "$TARGET_ROOT/etc/group"
+root:x:0:
+wheel:x:10:root,sane
+sane:x:1000:
+EOF
+chmod 0644 "$TARGET_ROOT/etc/group"
+
+cat <<'EOF' > "$TARGET_ROOT/etc/shadow"
+root:$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0:19700:0:99999:7:::
+sane:$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.:19700:0:99999:7:::
+EOF
+chmod 0600 "$TARGET_ROOT/etc/shadow"
+
+cat <<'EOF' > "$TARGET_ROOT/etc/doas.conf"
+permit persist :wheel
+EOF
+chmod 0600 "$TARGET_ROOT/etc/doas.conf"
+chown 0:0 "$TARGET_ROOT/etc/doas.conf" 2>/dev/null || true
+
+if [ -f "$TARGET_ROOT/usr/bin/doas" ]; then
+    chmod 4755 "$TARGET_ROOT/usr/bin/doas"
 fi
 
-if [ ! -f "$TARGET_ROOT/etc/group" ]; then
-    cat <<'EOF' > "$TARGET_ROOT/etc/group"
-root:x:0:
+cat <<'EOF' > "$TARGET_ROOT/etc/issue"
+Welcome to S.A.N.E Linux (\m) - \l
+Kernel \r on an \m (\l)
+
 EOF
+
+mkdir -p "$TARGET_ROOT/home/sane"
+chmod 0750 "$TARGET_ROOT/home/sane"
+chown 1000:1000 "$TARGET_ROOT/home/sane" 2>/dev/null || true
+
+cat <<'EOF' > "$TARGET_ROOT/etc/profile"
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+export USER=$(id -un 2>/dev/null || echo "$USER")
+export LOGNAME="$USER"
+export HOME="/home/$USER"
+[ "$USER" = "root" ] && export HOME="/root"
+EOF
+chmod 0644 "$TARGET_ROOT/etc/profile"
+
+# Setup kernel module directory for modprobe
+kver_inst=""
+if [ -n "${KERNEL_SRC:-}" ] && [ -f "$KERNEL_SRC" ]; then
+    kver_inst=$(strings "$KERNEL_SRC" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+elif [ -f "$TARGET_ROOT/boot/bzImage" ]; then
+    kver_inst=$(strings "$TARGET_ROOT/boot/bzImage" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+elif [ -f "$TARGET_ROOT/boot/vmlinuz-virt" ]; then
+    kver_inst=$(strings "$TARGET_ROOT/boot/vmlinuz-virt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+fi
+[ -n "$kver_inst" ] || kver_inst="6.6.134-0-virt"
+if [ -d "$TARGET_ROOT/lib/modules" ]; then
+    mkdir -p "$TARGET_ROOT/lib/modules/$kver_inst"
+    find "$TARGET_ROOT/lib/modules" -maxdepth 1 -name "*.ko" -exec cp -u {} "$TARGET_ROOT/lib/modules/$kver_inst/" \; 2>/dev/null || true
+    if command -v depmod >/dev/null 2>&1; then
+        depmod -b "$TARGET_ROOT" "$kver_inst" 2>/dev/null || true
+    elif [ -x "$TARGET_ROOT/bin/busybox" ]; then
+        chroot "$TARGET_ROOT" /bin/busybox depmod "$kver_inst" 2>/dev/null || true
+    fi
 fi
 
 # Step 5: Populating boot partition (ESP) with kernel, initramfs, and Limine

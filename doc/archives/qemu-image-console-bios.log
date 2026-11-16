@@ -1,29 +1,25 @@
 linux: Loading kernel `boot():/bzImage`...
 linux: Loading module `boot():/initramfs.cpio.gz`...
 switch_root: pivoting to /dev/vda2
-[2026-11-14 19:15:47] ninit: proc: /proc already mounted
-[2026-11-14 19:15:47] ninit: sysfs: /sys already mounted
-[2026-11-14 19:15:47] ninit: devtmpfs: /dev already mounted
-[2026-11-14 19:15:47] ninit: tmpfs: /run already mounted
-[2026-11-14 19:15:47] ninit: cgroup2: /sys/fs/cgroup mounted
-[2026-11-14 19:15:47] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
-[2026-11-14 19:15:47] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
-[2026-11-14 19:15:47] ninit: === ninit start (PID 1) v1.1.0 ===
-[2026-11-14 19:15:47] ninit: hostname = S.A.N.E
-[2026-11-14 19:15:47] ninit: console: state STOPPED -> STARTING
-[2026-11-14 19:15:47] ninit: console: state STARTING -> RUNNING
-[2026-11-14 19:15:47] ninit: started console (pid 515)
-[2026-11-14 19:15:47] ninit: cgroup: 'console' (pid 515) -> /sys/fs/cgroup/ninit/console
-[2026-11-14 19:15:47] ninit: hello: state STOPPED -> STARTING
-[2026-11-14 19:15:47] ninit: hello: state STARTING -> RUNNING
-[2026-11-14 19:15:47] ninit: started hello (pid 516)
-[2026-11-14 19:15:47] ninit: cgroup: 'hello' (pid 516) -> /sys/fs/cgroup/ninit/hello
-[2026-11-14 19:15:47] ninit: main loop ready
-
-
-BusyBox v1.37.0 (Ubuntu 1:1.37.0-7ubuntu1) built-in shell (ash)
-Enter 'help' for a list of built-in commands.
-
-[2026-11-14 19:15:47] [service] Hello from S.A.N.E Linux!
-[2026-11-14 19:15:47] ninit: hello (pid 516) exit status=0x0
-[2026-11-14 19:15:48] ninit: hello: state RUNNING -> DONE
+[2026-11-16 15:03:48] ninit: proc: /proc already mounted
+[2026-11-16 15:03:48] ninit: sysfs: /sys already mounted
+[2026-11-16 15:03:48] ninit: devtmpfs: /dev already mounted
+[2026-11-16 15:03:48] ninit: tmpfs: /run already mounted
+[2026-11-16 15:03:48] ninit: cgroup2: /sys/fs/cgroup mounted
+[2026-11-16 15:03:48] ninit: fstab: mount /dev/vda2 -> / (ext4) [data: -] ok
+[2026-11-16 15:03:48] ninit: fstab: mount /dev/vda1 -> /boot (vfat) [data: -] ok
+[2026-11-16 15:03:48] ninit: === ninit start (PID 1) v1.1.0 ===
+[2026-11-16 15:03:49] ninit: hostname = S.A.N.E
+[2026-11-16 15:03:49] ninit: network: state STOPPED -> STARTING
+[2026-11-16 15:03:49] ninit: network: state STARTING -> RUNNING
+[2026-11-16 15:03:49] ninit: started network (pid 513)
+[2026-11-16 15:03:49] ninit: cgroup: 'network' (pid 513) -> /sys/fs/cgroup/ninit/network
+[2026-11-16 15:03:49] ninit: tty1: state STOPPED -> STARTING
+[2026-11-16 15:03:49] ninit: tty1: state STARTING -> RUNNING
+[2026-11-16 15:03:49] ninit: started tty1 (pid 514)
+[2026-11-16 15:03:49] ninit: cgroup: 'tty1' (pid 514) -> /sys/fs/cgroup/ninit/tty1
+[2026-11-16 15:03:49] ninit: console: state STOPPED -> STARTING
+[2026-11-16 15:03:49] ninit: console: state STARTING -> RUNNING
+[2026-11-16 15:03:49] ninit: started console (pid 515)
+[2026-11-16 15:03:49] ninit: cgroup: 'console' (pid 515) -> /sys/fs/cgroup/ninit/console
+[2026-11-16 15:03:49] ninit: main loop ready

@@ -271,8 +271,8 @@ else
 fi
 
 # Check init.conf contents
-if grep -q "console:respawn:cttyhack /bin/sh -i" "$MNT_TMP/root/etc/init.conf"; then
-    pass "Rootfs /etc/init.conf configured with cttyhack interactive console"
+if grep -E -q "console:respawn:cttyhack (/bin/sh -i|/sbin/getty)" "$MNT_TMP/root/etc/init.conf"; then
+    pass "Rootfs /etc/init.conf configured with cttyhack interactive console / getty"
 else
     die "Rootfs /etc/init.conf missing cttyhack interactive console"
 fi

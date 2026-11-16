@@ -19,6 +19,7 @@ PACKAGES=(
     libressl
     ca-certificates
     curl
+    doas
 )
 
 printf '=== Building S.A.N.E Distro Packages ===\n'

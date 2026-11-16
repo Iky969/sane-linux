@@ -1,9 +1,9 @@
 # S.A.N.E Linux Boot Verification Report
 
-- **Timestamp**: 2026-11-14 19:15:54 UTC
+- **Timestamp**: 2026-11-16 15:03:55 UTC
 - **Test Mode**: `all`
 - **Overall Result**: **PASS** (Exit code: 0)
-- **Disk Image**: `sane.img` (58M, 536870912 bytes)
+- **Disk Image**: `sane.img` (80M, 536870912 bytes)
 - **QEMU Acceleration**: `-cpu max`
 - **UEFI Firmware**: `/usr/share/ovmf/OVMF.fd`
 
@@ -18,18 +18,18 @@
 
 ### BIOS Boot Verification
 - **Status**: `PASS`
-- **switch_root to /dev/vda2**: 3692 ms
-- **ninit PID 1 startup banner**: 3808 ms
-- **ninit main loop ready**: 3942 ms
-- **Service execution (sane-hello / console)**: 3813 ms
+- **switch_root to /dev/vda2**: 3870 ms
+- **ninit PID 1 startup banner**: 3988 ms
+- **ninit main loop ready**: 4108 ms
+- **Service execution (sane-hello / console)**: 4114 ms
 - **Kernel panic check**: Zero panics (OK)
 
 ### UEFI Boot Verification
 - **Status**: `PASS`
-- **switch_root to /dev/vda2**: 5800 ms
-- **ninit PID 1 startup banner**: 5920 ms
-- **ninit main loop ready**: 6042 ms
-- **Service execution (sane-hello / console)**: 5927 ms
+- **switch_root to /dev/vda2**: 5172 ms
+- **ninit PID 1 startup banner**: 5405 ms
+- **ninit main loop ready**: 5411 ms
+- **Service execution (sane-hello / console)**: 5416 ms
 - **Kernel panic check**: Zero panics (OK)
 
 ## Console Logs

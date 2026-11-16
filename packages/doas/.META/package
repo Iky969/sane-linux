@@ -1,0 +1,7 @@
+name=doas
+version=6.8.2
+release=1
+arch=x86_64
+description=OpenDoas privilege escalation utility
+dependencies=musl
+base=false
