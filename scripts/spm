@@ -84,7 +84,7 @@ while [ $nargs -gt 0 ]; do
             exit 0
             ;;
         -v|--version)
-            printf 'spm 1.0.0 (S.A.N.E Package Manager)\n'
+            printf 'spm 1.2.0 (S.A.N.E Package Manager)\n'
             exit 0
             ;;
         init|list|info|query|install|remove)

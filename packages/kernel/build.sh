@@ -9,7 +9,7 @@ OUT_DIR="${1:-$REPO_ROOT/distro/packages}"
 CACHE_DIR="$REPO_ROOT/distro/cache"
 KERNEL_CACHE="$CACHE_DIR/vmlinuz-virt-v3.20"
 
-KERNEL_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/vmlinuz-virt"
+KERNEL_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot-3.20.10/vmlinuz-virt"
 KERNEL_PINNED_SHA256="be523954ad673a78c9cdfd3d473a8d39609f5901adfcc68402c67dc037a64c7e"
 
 verify_sha256() {

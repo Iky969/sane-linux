@@ -14,6 +14,7 @@
  *           never exits: the emergency shell is forked, reaped and respawned),
  *           non-blocking fork() EAGAIN retry, cgroup base override gated behind
  *           -DNINIT_TESTING.
+ * v1.2.0  : interactive cttyhack console, fail-closed privilege drop parser (:user=/:group=), sane-ctl IPC /run/initctl lifecycle control
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -111,6 +112,7 @@ typedef struct {
     int         need_drop;
     int         manual_stop;    /* FEAT-63: manually stopped via initctl */
     int         restart_pending;/* FEAT-63: restart requested via initctl */
+    long long   stop_t0;
 } service_t;
 
 static service_t services[MAX_SERVICES];
@@ -120,6 +122,7 @@ static int find_service(const char *name);
 static void enable_cgroup_subtree(const char *path);
 static void cgroup_kill_service(const char *name);
 static void kill_service_group(const service_t *svc, int sig);
+static int service_still_alive(service_t *svc);
 
 static volatile sig_atomic_t sigchld_flag  = 0;
 static volatile sig_atomic_t sigterm_flag  = 0;
@@ -1970,6 +1973,13 @@ static struct timespec *compute_poll_timeout(struct timespec *ts)
         return ts;
     }
     for (int i = 0; i < num_services; i++) {
+        if (services[i].state == SVC_STATE_STOPPING) {
+            ts->tv_sec = 0;
+            ts->tv_nsec = 100 * 1000 * 1000;
+            return ts;
+        }
+    }
+    for (int i = 0; i < num_services; i++) {
         if (services[i].respawn) continue;
         if (services[i].state == SVC_STATE_RUNNING && services[i].timeout > 0) {
             ts->tv_sec = 1;
@@ -2038,6 +2048,26 @@ static void enforce_once_timeout(void)
         if (svc->pid > 0)
             kill_service_group(svc, SIGKILL);
         cancel_dependents();
+    }
+}
+
+static void enforce_stop_timeout(void)
+{
+    if (shutting_down) return;
+
+    long long now_ms = monotonic_ms();
+    for (int i = 0; i < num_services; i++) {
+        service_t *svc = &services[i];
+        if (svc->state == SVC_STATE_STOPPING) {
+            if (service_still_alive(svc) && (now_ms - svc->stop_t0 >= (long long)svc->grace * 1000)) {
+                if (!svc->sigkill_sent) {
+                    svc->sigkill_sent = 1;
+                    init_log("%s: stop grace expired, SIGKILL", svc->name);
+                    kill_service_group(svc, SIGKILL);
+                    cgroup_kill_service(svc->name);
+                }
+            }
+        }
     }
 }
 
@@ -2280,6 +2310,8 @@ static void initctl_stop_service(const char *name)
     svc->manual_stop = 1;
     svc->restart_pending = 0;
     svc->need_respawn = 0;
+    svc->stop_t0 = monotonic_ms();
+    svc->sigkill_sent = 0;
     if (service_still_alive(svc)) {
         init_log("initctl: stopping service '%s' (pid %d)", svc->name, (int)svc->pid);
         svc_set_state(svc, SVC_STATE_STOPPING);
@@ -2336,6 +2368,8 @@ static void initctl_restart_service(const char *name)
         init_log("initctl: restarting service '%s' (pid %d)", svc->name, (int)svc->pid);
         svc->restart_pending = 1;
         svc->need_respawn = 1;
+        svc->stop_t0 = monotonic_ms();
+        svc->sigkill_sent = 0;
         svc_set_state(svc, SVC_STATE_STOPPING);
         kill_service_group(svc, SIGTERM);
     } else {
@@ -3002,7 +3036,7 @@ int main(int argc, char **argv)
     mount_fstab();
     
     log_file_fd = open("/var/log/ninit.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    init_log("=== ninit start (PID 1) v1.1.0 ===");
+    init_log("=== ninit start (PID 1) v1.2.0 ===");
 
     set_hostname();
 
@@ -3097,6 +3131,7 @@ int main(int argc, char **argv)
            services with pending respawns. Also triggered on ppoll timeout
            (ret == 0) -> timer-driven respawn without blocking sleep(). */
         enforce_once_timeout();
+        enforce_stop_timeout();
         respawn_services();
         spawn_eligible_services();
     }
