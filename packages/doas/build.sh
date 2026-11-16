@@ -12,7 +12,29 @@ TARBALL="$CACHE_DIR/opendoas-6.8.2.tar.gz"
 URL="https://github.com/Duncaen/OpenDoas/releases/download/v6.8.2/opendoas-6.8.2.tar.gz"
 EXPECTED_SHA256="28dca29adec5f4336465812d9e2243f599e62a78903de71c24f0cd6fe667edac"
 
-mkdir -p "$OUT_DIR" "$CACHE_DIR" "$BUILD_ROOT"
+mkdir -p "$OUT_DIR"
+
+if [ -x "$PKG_DIR/x/usr/bin/doas" ] && [ -f "$PKG_DIR/x/etc/doas.conf" ] && [ "${REBUILD:-0}" != "1" ]; then
+    printf 'Using prebuilt doas payload in %s/x\n' "$PKG_DIR"
+    if ! command -v readelf >/dev/null 2>&1; then
+        printf 'ERROR: readelf is required for static ELF verification\n' >&2
+        exit 1
+    fi
+    if ! readelf -h "$PKG_DIR/x/usr/bin/doas" >/dev/null 2>&1; then
+        printf 'ERROR: %s is not a valid ELF binary\n' "$PKG_DIR/x/usr/bin/doas" >&2
+        exit 1
+    fi
+    if readelf -lW "$PKG_DIR/x/usr/bin/doas" 2>/dev/null | grep -E -q '(^|[[:space:]])INTERP([[:space:]]|$)|PT_INTERP'; then
+        printf 'ERROR: %s contains dynamic INTERP segment (must be statically linked)\n' "$PKG_DIR/x/usr/bin/doas" >&2
+        exit 1
+    fi
+    chmod 0600 "$PKG_DIR/x/etc/doas.conf"
+    chmod 0755 "$PKG_DIR/x/usr/bin/doas"
+    "$REPO_ROOT/scripts/build-package.sh" --source "$PKG_DIR" --output "$OUT_DIR"
+    exit 0
+fi
+
+mkdir -p "$CACHE_DIR" "$BUILD_ROOT"
 
 # 1. Download and verify source tarball
 if [ -f "$TARBALL" ]; then

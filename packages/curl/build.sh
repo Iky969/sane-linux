@@ -12,7 +12,28 @@ TARBALL="$CACHE_DIR/curl-8.11.0.tar.xz"
 URL="https://curl.se/download/curl-8.11.0.tar.xz"
 EXPECTED_SHA256="db59cf0d671ca6e7f5c2c5ec177084a33a79e04c97e71cf183a5cdea235054eb"
 
-mkdir -p "$OUT_DIR" "$CACHE_DIR" "$BUILD_ROOT"
+mkdir -p "$OUT_DIR"
+
+if [ -x "$PKG_DIR/x/usr/bin/curl" ] && [ "${REBUILD:-0}" != "1" ]; then
+    printf 'Using prebuilt curl payload in %s/x\n' "$PKG_DIR"
+    if ! command -v readelf >/dev/null 2>&1; then
+        printf 'ERROR: readelf is required for static ELF verification\n' >&2
+        exit 1
+    fi
+    if ! readelf -h "$PKG_DIR/x/usr/bin/curl" >/dev/null 2>&1; then
+        printf 'ERROR: %s is not a valid ELF binary\n' "$PKG_DIR/x/usr/bin/curl" >&2
+        exit 1
+    fi
+    if readelf -lW "$PKG_DIR/x/usr/bin/curl" 2>/dev/null | grep -E -q '(^|[[:space:]])INTERP([[:space:]]|$)|PT_INTERP'; then
+        printf 'ERROR: %s contains dynamic INTERP segment (must be statically linked)\n' "$PKG_DIR/x/usr/bin/curl" >&2
+        exit 1
+    fi
+    chmod -R u+rwX,go+rX "$PKG_DIR/x"
+    "$REPO_ROOT/scripts/build-package.sh" --source "$PKG_DIR" --output "$OUT_DIR"
+    exit 0
+fi
+
+mkdir -p "$CACHE_DIR" "$BUILD_ROOT"
 
 # 1. Ensure libressl is built first
 LIBRESSL_PREFIX="$REPO_ROOT/packages/libressl/x/usr"

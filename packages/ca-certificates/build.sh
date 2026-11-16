@@ -8,6 +8,14 @@ OUT_DIR="${1:-$REPO_ROOT/distro/packages}"
 
 mkdir -p "$OUT_DIR"
 
+if [ -f "$PKG_DIR/x/etc/ssl/certs/ca-certificates.crt" ] && [ "${REBUILD:-0}" != "1" ]; then
+    printf 'Using prebuilt ca-certificates payload in %s/x\n' "$PKG_DIR"
+    [ -L "$PKG_DIR/x/etc/ssl/cert.pem" ] || ln -sf certs/ca-certificates.crt "$PKG_DIR/x/etc/ssl/cert.pem"
+    chmod -R u+rwX,go+rX "$PKG_DIR/x"
+    "$REPO_ROOT/scripts/build-package.sh" --source "$PKG_DIR" --output "$OUT_DIR"
+    exit 0
+fi
+
 # Clean and recreate staging payload
 rm -rf "$PKG_DIR/x"
 mkdir -p "$PKG_DIR/x/etc/ssl/certs"
