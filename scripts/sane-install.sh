@@ -626,7 +626,22 @@ echo "switch_root: pivoting to $RESOLVED_DEV"
 exec switch_root /newroot /sbin/init
 EOF
     chmod 0755 "$IR_TMP/init"
-    ( cd "$IR_TMP" && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 > "$TARGET_BOOT/initramfs.cpio.gz" )
+
+    CPIO_OWNER=""
+    if cpio --help 2>&1 | grep -q -- '--owner'; then
+        CPIO_OWNER="--owner=+0:+0"
+    elif cpio --help 2>&1 | grep -q -- '-R'; then
+        CPIO_OWNER="-R 0:0"
+    fi
+
+    CPIO_NULL="-0"
+    if cpio --help 2>&1 | grep -q -- '--null'; then
+        CPIO_NULL="--null"
+    elif cpio --help 2>&1 | grep -q -- '-0'; then
+        CPIO_NULL="-0"
+    fi
+
+    ( cd "$IR_TMP" && find . -print0 | cpio $CPIO_NULL -o -H newc $CPIO_OWNER 2>/dev/null | gzip -9 > "$TARGET_BOOT/initramfs.cpio.gz" )
     rm -rf "$IR_TMP"
     info "Assembled initramfs -> $TARGET_BOOT/initramfs.cpio.gz"
 fi
