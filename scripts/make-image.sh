@@ -550,8 +550,23 @@ exec switch_root /newroot /sbin/init
 EOF
 chmod 0755 "$INITRAMFS_STAGING/init"
 
+# Determine portable cpio owner and null flags
+CPIO_OWNER=""
+if cpio --help 2>&1 | grep -q -- '--owner'; then
+    CPIO_OWNER="--owner=+0:+0"
+elif cpio --help 2>&1 | grep -q -- '-R'; then
+    CPIO_OWNER="-R 0:0"
+fi
+
+CPIO_NULL="-0"
+if cpio --help 2>&1 | grep -q -- '--null'; then
+    CPIO_NULL="--null"
+elif cpio --help 2>&1 | grep -q -- '-0'; then
+    CPIO_NULL="-0"
+fi
+
 # Pack initramfs into boot partition
-( cd "$INITRAMFS_STAGING" && find . -print0 | cpio --null -o -H newc --quiet | gzip -9 > "$MNT_DIR/boot/initramfs.cpio.gz" )
+( cd "$INITRAMFS_STAGING" && find . -print0 | cpio $CPIO_NULL -o -H newc $CPIO_OWNER 2>/dev/null | gzip -9 > "$MNT_DIR/boot/initramfs.cpio.gz" )
 rm -rf "$INITRAMFS_STAGING"
 INITRAMFS_STAGING=""
 
