@@ -4,7 +4,7 @@ All notable changes to the `sane-linux` init system (`ninit`) and distro build h
 
 The project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [v1.2.0] - 2026-11-16
 
 ### Added
 - **Core Init System (`ninit`) Lifecycle & IPC Hardening**:
