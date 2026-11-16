@@ -8,11 +8,12 @@ tanpa dependensi selain libc: membaca daftar layanan, menjalankan dan
 menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 `/etc/fstab`, lalu mematikan sistem dengan rapi.
 
-Repository ini berisi keduanya: builder distro S.A.N.E (rootfs BusyBox +
-initramfs yang bisa di-boot di QEMU) dan sumber init-nya,
-[`ninit.c`](ninit.c) (±2750 baris), biner statis, nol warning dengan
-`-Wall -Werror`. Bonus: event loop ninit berbasis `ppoll`, jadi init tetap
-responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
+Repository ini berisi distribusi lengkap S.A.N.E Linux:
+- **`ninit`**: Init system ringkas dan statis (PID 1) di [`ninit.c`](ninit.c) (±3100 baris) dengan pembatasan cgroup v2, privilege drop fail-closed (`:user=`/`:group=`), IPC `/run/initctl` per baris, eskalasi stop grace period, dan emergency shell tersupervisi.
+- **`spm`**: S.A.N.E Package Manager ([`scripts/spm`](scripts/spm)), manajer paket berbasis POSIX `/bin/sh` dengan atomic staging via `rename(2)` / anti-`ETXTBSY`, verifikasi kriptografis, power-cut journal recovery, dan pelacakan reverse dependencies.
+- **Distro & Image Builder**: Builder rootfs otomatis (`scripts/build-rootfs.sh`), pembuat raw GPT disk image (`scripts/make-image.sh`), dan guest offline live installer (`scripts/sane-install.sh`) berdukungan dual Limine BIOS dan UEFI GPT.
+
+Event loop ninit berbasis `ppoll`, jadi init tetap responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 
 [![CI](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml)
 [![Build Image](https://github.com/Iky969/sane-linux/actions/workflows/build-image.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/build-image.yml)
@@ -43,6 +44,10 @@ responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
 - **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
   `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
   penulisan tidak saling menelan.
+- **Pemisahan Hak Akses (`:user=`, `:group=`)**: menurunkan hak akses ke user/group non-root dari `/etc/passwd` dan `/etc/group` sebelum payload layanan dijalankan, fail-closed jika data identitas tidak valid.
+- **Kontrol Daemon `sane-ctl`**: CLI terpadu untuk `start`, `stop`, `restart`, `status`, dan `reload` daemon lewat FIFO `/run/initctl` dengan pelacakan state di `/run/ninit-*.state` dan eskalasi SIGKILL jika stop grace timeout habis.
+- **S.A.N.E Package Manager (`spm`)**: manajer paket POSIX `/bin/sh` dengan atomic staging `rename(2)`, penggantian binary aktif tanpa `ETXTBSY`, proteksi reverse dependency, hardening keamanan arsip, dan pemulihan transaksi mati lampu (power-cut journal recovery).
+- **Installer Offline & Dual-Boot**: installer live guest (`sane-install.sh`) yang mendukung dual boot Limine BIOS (MBR/GPT) dan UEFI (ESP FAT32) dengan resolusi partisi root via GPT `PARTUUID`.
 - **Biner statis** (`gcc -static`): cukup libc, tanpa library tambahan.
 
 ### Cgroup v2 — kapabilitas pembatasan resource
@@ -128,7 +133,7 @@ make qemu                 # mode interaktif (keluar: Ctrl-A X)
 ```
 
 Hasil nyata di sandbox (emulasi TCG tanpa KVM): banner
-`=== ninit start (PID 1) v1.1.0 ===` dan `main loop siap` muncul di konsol
+`=== ninit start (PID 1) v1.2.0 ===` dan `main loop siap` muncul di konsol
 serial **~1,9–2,1 detik** setelah QEMU dijalankan, shell hidup di konsol
 (`console:respawn:cttyhack /bin/sh -i`), dan di dalam guest `poweroff` benar-benar
 **mematikan** mesin (`reboot: Power down`) sementara `reboot` benar-benar
@@ -228,16 +233,12 @@ LICENSE                  MIT
 
 ## Status
 
-Rilis **v1.1.0** (kontainment cgroup v2 pre-exec, batas resource hierarkis,
-siklus hidup fail-open, reset counter respawn dengan flush cgroup pra-respawn,
-pembersihan leaf deterministik, plus perbaikan reliabilitas v1.0.0: anti-overflow
-pada urut topologis, validasi dependensi, initctl per baris, dan rescue mode
-sungguhan lewat `enter_rescue_mode()`). Ini proyek
-eksperimental untuk belajar cara kerja init di level OS — belum siap dipakai di
-mesin produksi. Batasan yang diketahui:
-semua layanan berjalan sebagai root (belum ada seccomp/user per layanan; pembatasan
-resource ditangani cgroup v2: memory, cpu, pids), dan ini bukan pengganti
-systemd. Uji selalu di VM/container, dan siapkan jalur pemulihan lebih dulu.
+Rilis saat ini: **v1.2.0** (Catatan rilis lengkap ada di [RELEASE-NOTES-v1.2.0.md](RELEASE-NOTES-v1.2.0.md) dan riwayat perubahan di [CHANGELOG.md](CHANGELOG.md)).
+
+### Catatan Core Feature Freeze (Menuju v1.3.0)
+> [!IMPORTANT]
+> Biner engine inti (`ninit` PID 1 dan engine manajer paket `spm`) saat ini berstatus **FEATURE-FROZEN** untuk siklus v1.3.0.
+> Fokus pengembangan dialihkan dari eksperimen "root lab" menjadi **Daily Terminal Workstation**, memprioritaskan paket jaringan userspace, outbound TLS (`ca-certificates`, `mbedtls`, `curl`), dan autentikasi multi-user (`getty`, `udhcpc`, `doas`). Window manager dan lingkungan desktop grafis ditunda ke rilis v2.0/v3.0.
 
 ## Lisensi
 
