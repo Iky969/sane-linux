@@ -1,0 +1,7 @@
+name=libressl
+version=3.9.2
+release=1
+arch=x86_64
+description=LibreSSL cryptographic library and TLS engine
+dependencies=musl
+base=false

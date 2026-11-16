@@ -1,0 +1,6 @@
+name=musl
+version=1.2.5
+release=1
+arch=x86_64
+description=Musl C library runtime headers and static/dynamic libraries
+base=true

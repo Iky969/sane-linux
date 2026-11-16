@@ -1,0 +1,7 @@
+name=curl
+version=8.11.0
+release=1
+arch=x86_64
+description=Command line tool for transferring data with URL syntax over TLS/HTTPS
+dependencies=libressl,ca-certificates
+base=false

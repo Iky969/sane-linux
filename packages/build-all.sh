@@ -15,6 +15,10 @@ PACKAGES=(
     kernel
     limine-static
     disk-tools
+    musl
+    libressl
+    ca-certificates
+    curl
 )
 
 printf '=== Building S.A.N.E Distro Packages ===\n'
