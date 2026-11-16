@@ -4,6 +4,49 @@ All notable changes to the `sane-linux` init system (`ninit`) and distro build h
 
 The project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Core Init System (`ninit`) Lifecycle & IPC Hardening**:
+  - **State Machine Telemetry (T10)**: Strict lifecycle state enum (`STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `DONE`, `FAILED`) exposed via `/run/ninit-<service>.state` telemetry files.
+  - **Non-Blocking Fork EAGAIN Retry (T11)**: Exponential backoff with up to 3 retry attempts on fork failures (`EAGAIN`), preventing boot deadlock while bounded by loop timer.
+  - **Respawn Cleanup & Crash Counter Reset (T12)**: Explicit counter reset upon clean state transitions and pre-respawn orphan cleanup.
+  - **Stop Grace Timeout & SIGKILL Escalation (T13)**: Monotonic timestamp tracking (`stop_t0`) during shutdown/stop with automatic escalation to `SIGKILL` and cgroup purge after grace timeout expires.
+  - **Deterministic Leaf Cgroup Hygiene (T14 / T14B)**: Deep cgroup hierarchy cleanup ensuring zero leaking child cgroup directories upon service death.
+  - **Supervised Rescue Mode (T15)**: Forked emergency shell keeping PID 1 alive and listening to `/run/initctl` rather than replacing PID 1 via `exec`.
+  - **Interactive cttyhack Console**: Console allocation with `cttyhack /bin/sh -i` on `/dev/console` preventing EOF crash loops.
+  - **Fail-Closed Privilege Drop Parser**: Parsing and enforcement of `:user=` and `:group=` directives in service configs with fail-closed credentials resolution.
+  - **`sane-ctl` IPC Control**: Command-line control utility communicating via `/run/initctl` FIFO (`start`, `stop`, `restart`, `status`, `reboot`, `poweroff`) with fail-closed exit codes and polling timeout verification.
+  - **`sane-net` Utility**: Standalone network configuration tool for link setup and address assignments.
+
+- **S.A.N.E Package Manager (`spm`) & Deterministic Builder**:
+  - **POSIX sh Implementation**: Clean port to POSIX `/bin/sh` without bash dependency for ultra-minimal initramfs environments.
+  - **Atomic Staging & Deployment**: Staging directory execution (`/var/lib/spm/staging/tx-*`) with atomic replacement via `rename(2)` (`mv -f`), avoiding Linux `ETXTBSY` when upgrading active binaries.
+  - **Base Package Protection**: Guarding `base=true` core system packages against accidental deletion without explicit `--force`.
+  - **Reverse Dependency Tracking**: Dependency registry (`/var/lib/spm/rdeps/`) preventing removal of required packages by active dependents.
+  - **Archive Security Hardening**:
+    - Rejection of hardlink members (`tar -tvf` starting with `h`).
+    - Rejection of setuid and setgid permissions (`04000`/`02000`) before and after extraction.
+    - Rejection of duplicate archive members and duplicate manifest entries.
+    - Strict regex validation for dependency names (`^[a-zA-Z0-9_-]+$`).
+  - **Power-Cut Journal Recovery**: Automatic detection and clean rollback of interrupted staging transactions on startup.
+  - **Deterministic Package Builder (`build-package.sh`)**: Reproducible tarball generation (`.spm.tar.xz` / `.spm.tar.gz`) with strict metadata auto-generation (`.META/files`, `.META/sha256`).
+
+- **Distribution Image & Live Installer**:
+  - **Host Image Builder (`make-image.sh`)**: Automated raw GPT image creation with hybrid Limine BIOS and UEFI ESP FAT32 dual-boot.
+  - **Guest Offline Live Installer (`sane-install.sh`)**: Offline installer targeting block devices with GPT layout, Limine bootloader installation, and safety preflight checks.
+  - **PARTUUID Root Resolver**: Deterministic root device resolution via GPT `PARTUUID` in initramfs instead of hardcoded block device paths.
+  - **CPIO Ownership Normalization**: Enforced `root:root` (0:0) ownership on `initramfs.cpio.gz` across GNU and BusyBox cpio tools.
+  - **Immutable Toolchain Pinning**: Pinned Alpine netboot kernel and modloop to release `netboot-3.20.10` with verified SHA-256 hashes.
+  - **Mount Cleanup Safety**: Guarded mountpoint cleanup using `rmdir` after unmount rather than recursive `rm -rf`.
+
+- **Comprehensive Test Suites**:
+  - Expanded SPM adversarial test suite to 26 passing scenarios (`scripts/test-spm.sh`).
+  - Automated package builder verification (`scripts/test-build-package.sh`, 12 tests).
+  - Headless QEMU live installer test harness (`scripts/test-installer.sh`, 17 tests).
+  - State machine formalization test suite (`scripts/test-state-machine.sh`).
+  - ASan+UBSan parser fuzz harness (`scripts/fuzz-parsers.sh`).
+
 ## [v1.1.0] - 2026-11-11
 
 ### Added
