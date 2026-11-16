@@ -308,7 +308,9 @@ cleanup() {
             if mountpoint -q "$mnt" 2>/dev/null || grep -q " $mnt " /proc/mounts 2>/dev/null; then
                 umount -f "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
             fi
-            rm -rf "$mnt" 2>/dev/null || true
+            if ! mountpoint -q "$mnt" 2>/dev/null && ! grep -q " $mnt " /proc/mounts 2>/dev/null && [ -d "$mnt" ]; then
+                rmdir "$mnt" 2>/dev/null || true
+            fi
         done
     fi
 }
@@ -690,10 +692,15 @@ cp "$TARGET_BOOT/limine.conf" "$TARGET_BOOT/EFI/BOOT/limine.cfg"
 # Step 6: Unmount filesystems & install Limine bootloader to MBR/GPT
 log "Step 6/6: Installing Limine bootloader to MBR/GPT ($TARGET)..."
 sync
-umount "$TARGET_BOOT"
-umount "$TARGET_ROOT"
+umount "$TARGET_BOOT" 2>/dev/null || true
+umount "$TARGET_ROOT" 2>/dev/null || true
 CLEANUP_MOUNTS=""
-rm -rf "$TARGET_BOOT" "$TARGET_ROOT"
+if ! mountpoint -q "$TARGET_BOOT" 2>/dev/null && [ -d "$TARGET_BOOT" ]; then
+    rmdir "$TARGET_BOOT" 2>/dev/null || true
+fi
+if ! mountpoint -q "$TARGET_ROOT" 2>/dev/null && [ -d "$TARGET_ROOT" ]; then
+    rmdir "$TARGET_ROOT" 2>/dev/null || true
+fi
 
 "$LIMINE_BIN" bios-install "$TARGET" >/dev/null
 sync

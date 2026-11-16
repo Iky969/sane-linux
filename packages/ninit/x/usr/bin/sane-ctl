@@ -51,7 +51,29 @@ case "$cmd" in
     stop)
         target="${2:-}"
         [ -n "$target" ] || { printf 'Usage: sane-ctl stop <name>\n' >&2; exit 1; }
+        state_file="/run/ninit-${target}.state"
+        if [ ! -f "$state_file" ]; then
+            printf 'sane-ctl: service '\''%s'\'' not found\n' "$target" >&2
+            exit 1
+        fi
         send_cmd "stop $target"
+        i=0
+        while [ "$i" -lt 50 ]; do
+            if [ ! -f "$state_file" ]; then
+                exit 0
+            fi
+            st="$(cat "$state_file" 2>/dev/null || true)"
+            if [ "$st" = "STOPPED" ]; then
+                exit 0
+            fi
+            sleep 0.1
+            i=$((i + 1))
+        done
+        if [ ! -f "$state_file" ] || [ "$(cat "$state_file" 2>/dev/null || true)" = "STOPPED" ]; then
+            exit 0
+        fi
+        printf 'sane-ctl: service '\''%s'\'' stop timed out\n' "$target" >&2
+        exit 1
         ;;
     start)
         target="${2:-}"

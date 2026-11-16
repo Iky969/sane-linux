@@ -139,9 +139,9 @@ else
     die "BOOTIA32.EFI UEFI payload not found in cache or packages"
 fi
 
-KERNEL_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/vmlinuz-virt"
+KERNEL_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot-3.20.10/vmlinuz-virt"
 KERNEL_PINNED_SHA256="be523954ad673a78c9cdfd3d473a8d39609f5901adfcc68402c67dc037a64c7e"
-MODLOOP_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot/modloop-virt"
+MODLOOP_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot-3.20.10/modloop-virt"
 MODLOOP_PINNED_SHA256="a6ed1699b1c8c863fe57543263480ee3835c083b8202251d3919d1817a3c5358"
 PARTUUID="${PARTUUID:-44444444-4444-4444-8888-888888888888}"
 
@@ -281,7 +281,15 @@ cleanup() {
         if mountpoint -q "$MNT_DIR/root" 2>/dev/null; then
             $SUDO umount "$MNT_DIR/root" 2>/dev/null || true
         fi
-        rm -rf "$MNT_DIR" 2>/dev/null || true
+        if ! mountpoint -q "$MNT_DIR/boot" 2>/dev/null && [ -d "$MNT_DIR/boot" ]; then
+            $SUDO rmdir "$MNT_DIR/boot" 2>/dev/null || rmdir "$MNT_DIR/boot" 2>/dev/null || true
+        fi
+        if ! mountpoint -q "$MNT_DIR/root" 2>/dev/null && [ -d "$MNT_DIR/root" ]; then
+            $SUDO rmdir "$MNT_DIR/root" 2>/dev/null || rmdir "$MNT_DIR/root" 2>/dev/null || true
+        fi
+        if ! mountpoint -q "$MNT_DIR" 2>/dev/null && [ -d "$MNT_DIR" ]; then
+            rmdir "$MNT_DIR" 2>/dev/null || true
+        fi
     fi
     if [ -n "$INITRAMFS_STAGING" ] && [ -d "$INITRAMFS_STAGING" ]; then
         rm -rf "$INITRAMFS_STAGING" 2>/dev/null || true
@@ -599,7 +607,15 @@ log "Step 8/8: Flushing buffers, unmounting and installing Limine bootloader..."
 $SUDO sync
 $SUDO umount "$MNT_DIR/boot"
 $SUDO umount "$MNT_DIR/root"
-rm -rf "$MNT_DIR"
+if ! mountpoint -q "$MNT_DIR/boot" 2>/dev/null && [ -d "$MNT_DIR/boot" ]; then
+    $SUDO rmdir "$MNT_DIR/boot" 2>/dev/null || rmdir "$MNT_DIR/boot" 2>/dev/null || true
+fi
+if ! mountpoint -q "$MNT_DIR/root" 2>/dev/null && [ -d "$MNT_DIR/root" ]; then
+    $SUDO rmdir "$MNT_DIR/root" 2>/dev/null || rmdir "$MNT_DIR/root" 2>/dev/null || true
+fi
+if ! mountpoint -q "$MNT_DIR" 2>/dev/null && [ -d "$MNT_DIR" ]; then
+    rmdir "$MNT_DIR" 2>/dev/null || true
+fi
 MNT_DIR=""
 
 $SUDO losetup -d "$LOOP_DEV"
