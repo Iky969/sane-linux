@@ -1,0 +1,6 @@
+name=ca-certificates
+version=2024.11
+release=1
+arch=all
+description=Mozilla root certificate bundle for TLS authentication
+base=false

@@ -309,6 +309,66 @@ install_ninit() {
 	fi
 }
 
+install_networking() {
+	log "installing networking and TLS packages (ca-certificates, curl)"
+	# ca-certificates
+	if [ -f "$REPO_ROOT/packages/ca-certificates/x/etc/ssl/certs/ca-certificates.crt" ]; then
+		mkdir -p "$ROOTFS/etc/ssl/certs"
+		cp -a "$REPO_ROOT/packages/ca-certificates/x/etc/ssl/certs/ca-certificates.crt" "$ROOTFS/etc/ssl/certs/"
+		ln -sf certs/ca-certificates.crt "$ROOTFS/etc/ssl/cert.pem"
+	elif [ -f "/etc/ssl/certs/ca-certificates.crt" ]; then
+		mkdir -p "$ROOTFS/etc/ssl/certs"
+		cp -a "/etc/ssl/certs/ca-certificates.crt" "$ROOTFS/etc/ssl/certs/"
+		ln -sf certs/ca-certificates.crt "$ROOTFS/etc/ssl/cert.pem"
+	fi
+
+	# curl
+	if [ ! -x "$REPO_ROOT/packages/curl/x/usr/bin/curl" ] && [ -x "$REPO_ROOT/packages/curl/build.sh" ]; then
+		info "building curl package..."
+		"$REPO_ROOT/packages/curl/build.sh" "$DISTRO_DIR/packages"
+	fi
+	if [ -x "$REPO_ROOT/packages/curl/x/usr/bin/curl" ]; then
+		mkdir -p "$ROOTFS/usr/bin"
+		install -m 0755 "$REPO_ROOT/packages/curl/x/usr/bin/curl" "$ROOTFS/usr/bin/curl"
+		if ! is_static "$ROOTFS/usr/bin/curl"; then
+			info "WARNING: $ROOTFS/usr/bin/curl is not static; in an initramfs it needs a dynamic loader"
+		fi
+	fi
+
+	# udhcpc event script
+	if [ -f "$REPO_ROOT/packages/busybox/x/usr/share/udhcpc/default.script" ]; then
+		mkdir -p "$ROOTFS/usr/share/udhcpc"
+		install -m 0755 "$REPO_ROOT/packages/busybox/x/usr/share/udhcpc/default.script" "$ROOTFS/usr/share/udhcpc/default.script"
+	fi
+
+	# Network kernel modules
+	local kver=""
+	if [ -n "${KERNEL:-}" ] && [ -f "$KERNEL" ]; then
+		kver=$(strings "$KERNEL" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+	fi
+	[ -n "$kver" ] || kver="6.6.134-0-virt"
+
+	local mod_src=""
+	if [ -d "$REPO_ROOT/distro/cache/storage-modules/modules/$kver" ]; then
+		mod_src="$REPO_ROOT/distro/cache/storage-modules/modules/$kver"
+	elif [ -d "$REPO_ROOT/distro/cache/storage-modules" ]; then
+		mod_src="$REPO_ROOT/distro/cache/storage-modules"
+	elif [ -d "$REPO_ROOT/packages/kernel/x/lib/modules" ]; then
+		mod_src="$REPO_ROOT/packages/kernel/x/lib/modules"
+	fi
+
+	if [ -n "$mod_src" ]; then
+		mkdir -p "$ROOTFS/lib/modules/$kver"
+		find "$mod_src" -name "*.ko" -exec cp -u {} "$ROOTFS/lib/modules/$kver/" \; 2>/dev/null || true
+		find "$mod_src" -name "*.ko" -exec cp -u {} "$ROOTFS/lib/modules/" \; 2>/dev/null || true
+		if command -v depmod >/dev/null 2>&1; then
+			depmod -b "$ROOTFS" "$kver" 2>/dev/null || true
+		elif [ -x "$ROOTFS/bin/busybox" ]; then
+			"$ROOTFS/bin/busybox" depmod -b "$ROOTFS" "$kver" 2>/dev/null || true
+		fi
+	fi
+}
+
 write_etc() {
 	log "writing /etc (init.conf, passwd, group, hostname, fstab)"
 	# Important note: ninit starts services with stdin = /dev/null and
@@ -331,6 +391,7 @@ write_etc() {
 # interactive shell would complain "can't access tty; job control turned off".
 # cttyhack opens /dev/console, makes it the controlling tty (TIOCSCTTY), then
 # hands control to the shell so job control (Ctrl-C, jobs, fg) works normally.
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
 console:respawn:cttyhack /bin/sh -i
 EOF
 
@@ -343,6 +404,12 @@ root:x:0:
 EOF
 
 	printf '%s\n' "$HOSTNAME_NAME" > "$ROOTFS/etc/hostname"
+
+	# Guest network resolution (/etc/resolv.conf)
+	cat > "$ROOTFS/etc/resolv.conf" <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
 
 	# Comments only: ninit already mounts proc/sysfs/devtmpfs/tmpfs itself, so no
 	# fstab entries are needed. This file exists so the boot console does not show
@@ -391,6 +458,7 @@ summary() {
 	info "initramfs  : $INITRAMFS ($(du -h "$INITRAMFS" | cut -f1), sha256 $(sha256sum "$INITRAMFS" | cut -c1-16)…)"
 	info "busybox    : $(du -h "$ROOTFS/bin/busybox" | cut -f1) statis, $(printf '%s\n' "${APPLET_LIST:-}" | grep -c . ) applet"
 	info "init       : $(ls -l "$ROOTFS/sbin/init" | awk '{print $5" bytes"}') (ninit v1.2.0)"
+	[ -x "$ROOTFS/usr/bin/curl" ] && info "curl       : $(ls -l "$ROOTFS/usr/bin/curl" | awk '{print $5" bytes"}') (static)"
 	info "init.conf  : $(grep -v '^#' "$ROOTFS/etc/init.conf" | grep . | head -n 1)"
 	info "boot in QEMU: sh ./scripts/run-qemu.sh"
 }
@@ -428,6 +496,7 @@ install_busybox
 install_wrappers
 make_dev_nodes
 install_ninit
+install_networking
 write_etc
 pack_initramfs
 summary

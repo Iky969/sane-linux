@@ -154,6 +154,10 @@ run_qemu() { # $1 = auto | interactive
 	else
 		info "NO_REBOOT=0: a guest reboot resets the machine (QEMU does not exit)"
 	fi
+	if [ -n "${EXTRA_QEMU_ARGS:-}" ]; then
+		# shellcheck disable=SC2086
+		set -- "$@" $EXTRA_QEMU_ARGS
+	fi
 	if [ "$mode" = auto ]; then
 		exec timeout -k 2 "$SECS" qemu-system-x86_64 -m "$MEM" "$@" \
 			-kernel "$KERNEL" -initrd "$INITRAMFS" -append "$APPEND"

@@ -24,8 +24,8 @@ mkdir -p "$OUT_DIR" "$PKG_DIR/x/boot" "$PKG_DIR/x/etc" "$PKG_DIR/x/lib/modules" 
 
 # Copy storage modules into package payload if available in cache and missing in tree
 MODULES_CACHE="$CACHE_DIR/storage-modules"
-if [ -d "$MODULES_CACHE" ] && [ -z "$(ls -A "$PKG_DIR/x/lib/modules" 2>/dev/null)" ]; then
-    find "$MODULES_CACHE" -name "*.ko" -exec cp {} "$PKG_DIR/x/lib/modules/" \; 2>/dev/null || true
+if [ -d "$MODULES_CACHE" ]; then
+    find "$MODULES_CACHE" -name "*.ko" -exec cp -u {} "$PKG_DIR/x/lib/modules/" \; 2>/dev/null || true
 fi
 
 KERNEL_SRC=""
