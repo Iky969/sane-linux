@@ -8,11 +8,12 @@ with zero dependencies beyond libc: it parses service configurations, spawns
 and supervises services, moves processes into cgroup v2 leaves, mounts
 filesystems declared in `/etc/fstab`, and orchestrates clean system shutdown.
 
-This repository contains both components: the S.A.N.E distribution builder
-(BusyBox rootfs + bootable initramfs for QEMU) and the init system source,
-[`ninit.c`](ninit.c) (±2750 lines), strictly static binary compiling with
-zero warnings under `-Wall -Werror`. The event loop is built on `ppoll`,
-keeping init responsive to signals even during rapid service respawn loops.
+This repository contains the complete S.A.N.E Linux distribution:
+- **`ninit`**: A compact, static init system (PID 1) in [`ninit.c`](ninit.c) (±3100 lines) with cgroup v2 resource limits, fail-closed privilege drop (`:user=`/`:group=`), line-by-line `/run/initctl` IPC, stop grace escalation, and supervised emergency shell.
+- **`spm`**: S.A.N.E Package Manager ([`scripts/spm`](scripts/spm)), a POSIX `/bin/sh` package manager featuring atomic staging via `rename(2)` / anti-`ETXTBSY`, cryptographic verification, power-cut journal recovery, and reverse dependency tracking.
+- **Distro & Image Builder**: Automated rootfs builder (`scripts/build-rootfs.sh`), GPT disk image generator (`scripts/make-image.sh`), and offline live installer (`scripts/sane-install.sh`) supporting dual Limine BIOS and UEFI GPT boots.
+
+The event loop is built on `ppoll`, keeping init responsive to signals even during rapid service respawn loops.
 
 [![CI](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/ci.yml)
 [![Build Image](https://github.com/Iky969/sane-linux/actions/workflows/build-image.yml/badge.svg)](https://github.com/Iky969/sane-linux/actions/workflows/build-image.yml)
@@ -31,6 +32,10 @@ keeping init responsive to signals even during rapid service respawn loops.
 - **Filesystem Mounting (`/etc/fstab`)**: mounts filesystems with flags and data options (`size=`, `mode=`, `uid=`, ...) forwarded to `mount()`; `defaults` is ignored like in `mount(8)`.
 - **Dual Logging**: outputs to `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus a `/run/log.fifo` path capturing service stdout/stderr with a `[service]` prefix.
 - **IPC (`/run/initctl`)**: line-by-line command handling for `poweroff`, `reboot`, `force-poweroff`, and `force-reboot`, preventing dropped commands on multi-line writes.
+- **Privilege Separation (`:user=`, `:group=`)**: drops privileges cleanly to unprivileged users/groups defined in `/etc/passwd` and `/etc/group` prior to executing service payloads, failing closed on lookup errors.
+- **`sane-ctl` Daemon Control**: unified CLI tool to `start`, `stop`, `restart`, `status`, and `reload` daemons over `/run/initctl` FIFO with state tracking in `/run/ninit-*.state` and stop grace timeout escalation.
+- **S.A.N.E Package Manager (`spm`)**: POSIX `/bin/sh` package manager supporting atomic `rename(2)` staging, binary active replacement (anti-`ETXTBSY`), reverse dependency protection, archive hardening, and power-cut journal recovery.
+- **Live Installer & Dual Boot**: guest offline live installer (`sane-install.sh`) supporting dual Limine BIOS (MBR/GPT) and UEFI (ESP FAT32) with GPT `PARTUUID` root partition resolution.
 - **Static Binary**: builds cleanly with `gcc -static`, requiring only libc.
 
 ### Cgroup v2 — Resource Limiting Capabilities
@@ -84,7 +89,7 @@ SECS=5 make qemu          # Automated 5-second boot, verifies milestones & conso
 make qemu                 # Interactive console session (exit with: Ctrl-A X)
 ```
 
-In sandbox environments (TCG emulation without KVM), the banner `=== ninit start (PID 1) v1.1.0 ===` and `main loop ready` appear on the serial console within **~1.9–2.1 seconds**, a shell starts on the console (`console:respawn:cttyhack /bin/sh -i`), and within the guest `poweroff` cleanly powers off the virtual machine (`reboot: Power down`) while `reboot` restarts cleanly. BusyBox applets are mapped via `/sbin/{poweroff,reboot,halt}` wrappers writing to `/run/initctl`.
+In sandbox environments (TCG emulation without KVM), the banner `=== ninit start (PID 1) v1.2.0 ===` and `main loop ready` appear on the serial console within **~1.9–2.1 seconds**, a shell starts on the console (`console:respawn:cttyhack /bin/sh -i`), and within the guest `poweroff` cleanly powers off the virtual machine (`reboot: Power down`) while `reboot` restarts cleanly. BusyBox applets are mapped via `/sbin/{poweroff,reboot,halt}` wrappers writing to `/run/initctl`.
 
 See [doc/distro-builder.md](doc/distro-builder.md) for architectural details, signals, and known limitations.
 
@@ -175,9 +180,12 @@ LICENSE                       MIT License
 
 ## Status
 
-Current release: **v1.1.0** (cgroup v2 pre-exec containment, hierarchical resource limits, fail-open lifecycle, respawn counter reset with pre-respawn cgroup flush, deterministic leaf cleanup, and the v1.0.0 reliability hardening: anti-overflow topo-sort, dependency validation, line-by-line initctl, rescue shell).
+Current release: **v1.2.0** (See full release details in [RELEASE-NOTES-v1.2.0.md](RELEASE-NOTES-v1.2.0.md) and changelog history in [CHANGELOG.md](CHANGELOG.md)).
 
-This is an experimental educational project designed to explore OS-level init system design. It is not intended as a drop-in replacement for production init systems like systemd. Known limitations: all services run as root (no per-service seccomp or user separation; resource limiting is handled via cgroup v2). Always test within virtual machines or containers with recovery paths configured.
+### Core Feature Freeze Notice (v1.3.0 Milestone)
+> [!IMPORTANT]
+> The core engine binaries (`ninit` PID 1 and `spm` package manager engine) are **FEATURE-FROZEN** for the v1.3.0 cycle.
+> Development has pivoted from an experimental "root lab" appliance to a **Daily Terminal Workstation**, prioritizing userspace networking, outbound TLS (`ca-certificates`, `mbedtls`, `curl`), and multi-user login (`getty`, `udhcpc`, `doas`). Window manager and graphical desktop environments are deferred to v2.0/v3.0.
 
 ## License
 
