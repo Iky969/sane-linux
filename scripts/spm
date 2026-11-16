@@ -216,6 +216,7 @@ acquire_lock() {
         log "Waiting for exclusive lock on $LOCK_FILE..."
         flock -x $LOCK_FD
     fi
+    recover_interrupted_journals
 }
 
 acquire_shared_lock() {
@@ -241,6 +242,33 @@ get_val_from_str() {
     local str="$1"
     local key="$2"
     printf '%s\n' "$str" | grep -E "^[[:space:]]*${key}=" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d '\r\n' || true
+}
+
+# Recover leftover journals from interrupted power cuts or crashes
+recover_interrupted_journals() {
+    [ -d "$STAGING_BASE" ] || return 0
+    for jdir in "$STAGING_BASE"/tx-*/.journal; do
+        [ -d "$jdir" ] || continue
+        local staging_dir="${jdir%/.journal}"
+        [ -d "$staging_dir" ] || continue
+
+        local pkg_name=""
+        if [ -f "$staging_dir/.META/package" ]; then
+            pkg_name="$(get_val "$staging_dir/.META/package" "name")"
+        elif [ -f "$staging_dir/.journal/installed_pkg/package" ]; then
+            pkg_name="$(get_val "$staging_dir/.journal/installed_pkg/package" "name")"
+        fi
+        if [ -z "$pkg_name" ]; then
+            local tx_base
+            tx_base="$(basename "$staging_dir")"
+            pkg_name="${tx_base#tx-}"
+            pkg_name="${pkg_name%-[0-9]*}"
+        fi
+
+        do_rollback "$staging_dir" "$pkg_name"
+        rm -rf "$staging_dir"
+        warn "Interrupted transaction recovered: rolled back $pkg_name and cleaned $staging_dir"
+    done
 }
 
 # Helper to verify archive entries (anti-tar-slip)
@@ -750,6 +778,33 @@ cmd_install() {
     [ -f "$WORLD_FILE" ] || touch "$WORLD_FILE"
 
     log "Step 1/6: Verifying archive format and security invariants..."
+    # Pre-extraction inspection: reject duplicate archive members
+    if tar -tf "$archive_file" 2>/dev/null | sort | uniq -d | grep -q .; then
+        local dup_member
+        dup_member="$(tar -tf "$archive_file" 2>/dev/null | sort | uniq -d | head -n 1 || true)"
+        die "Archive contains duplicate member path: $dup_member"
+    fi
+
+    # Pre-extraction inspection: reject hardlinks and setuid/setgid files
+    local tmp_tv
+    tmp_tv="$(mktemp "${TMPDIR:-/tmp}/spm-tv.XXXXXX")"
+    tar -tvf "$archive_file" > "$tmp_tv" 2>/dev/null || { rm -f "$tmp_tv"; die "Failed to inspect archive: $archive_file"; }
+    while IFS= read -r tv_line || [ -n "$tv_line" ]; do
+        [ -n "$tv_line" ] || continue
+        case "$tv_line" in
+            h*)
+                rm -f "$tmp_tv"
+                die "Archive contains forbidden hard link: $tv_line"
+                ;;
+        esac
+        local tv_mode="${tv_line%% *}"
+        if echo "$tv_mode" | grep -qE '^.[rwx-]{2}[sS]|^.[rwx-]{5}[sS]'; then
+            rm -f "$tmp_tv"
+            die "Archive contains forbidden setuid/setgid file: $tv_line"
+        fi
+    done < "$tmp_tv"
+    rm -f "$tmp_tv"
+
     verify_archive_entries "$archive_file"
     verify_archive_symlinks "$archive_file"
 
@@ -779,16 +834,38 @@ cmd_install() {
     [ "$pkg_arch" = "x86_64" ] || [ "$pkg_arch" = "all" ] || die "Architecture '$pkg_arch' is not supported (must be 'x86_64' or 'all')"
     [ "$pkg_base" = "true" ] || [ "$pkg_base" = "false" ] || die "Invalid base flag '$pkg_base' (must be 'true' or 'false')"
 
-    # Check dependencies
+    # Validate dependencies in manifest dependencies=
+    if [ -n "$pkg_deps" ]; then
+        local old_ifs="$IFS"
+        IFS=','
+        set -f
+        set -- $pkg_deps
+        set +f
+        IFS="$old_ifs"
+        for dep in "$@"; do
+            dep="$(echo "$dep" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -n "$dep" ] || continue
+            if ! echo "$dep" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+                die "Invalid dependency name '$dep'"
+            fi
+        done
+    fi
+
+    # Check and validate dependencies in .META/depends
     local deps_content
     deps_content="$(tar -xOf "$archive_file" ./.META/depends 2>/dev/null || true)"
     if [ -n "$deps_content" ]; then
         local tmp_deps
         tmp_deps="$(mktemp "${TMPDIR:-/tmp}/spm-deps.XXXXXX")"
         printf '%s\n' "$deps_content" > "$tmp_deps"
-        while IFS= read -r dep || [ -n "$dep" ]; do
-            dep="$(echo "$dep" | tr -d '[:space:]')"
+        while IFS= read -r line || [ -n "$line" ]; do
+            local dep
+            dep="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             [ -n "$dep" ] || continue
+            if ! echo "$dep" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+                rm -f "$tmp_deps"
+                die "Invalid dependency name '$dep'"
+            fi
             if [ ! -d "$INSTALLED_DIR/$dep" ]; then
                 rm -f "$tmp_deps"
                 die "Missing dependency: package '$dep' is required by '$pkg_name' but not installed"
@@ -805,6 +882,14 @@ cmd_install() {
     local tmp_files
     tmp_files="$(mktemp "${TMPDIR:-/tmp}/spm-files.XXXXXX")"
     printf '%s\n' "$files_content" > "$tmp_files"
+
+    # Pre-extraction inspection: reject duplicate entries in .META/files
+    if sort "$tmp_files" | uniq -d | grep -q .; then
+        local dup_entry
+        dup_entry="$(sort "$tmp_files" | uniq -d | head -n 1)"
+        rm -f "$tmp_files"
+        die "Archive metadata .META/files contains duplicate entry: $dup_entry"
+    fi
 
     while IFS= read -r fline || [ -n "$fline" ]; do
         [ -n "$fline" ] || continue
@@ -859,6 +944,15 @@ cmd_install() {
 
     [ -d "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; die "Archive missing payload root ./x/"; }
     [ -d "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; die "Archive missing metadata directory ./.META/"; }
+
+    # Post-extraction audit for setuid/setgid files
+    local suid_sgid_files
+    suid_sgid_files="$(find "$STAGING_DIR/x" \( -perm -4000 -o -perm -2000 \) 2>/dev/null || true)"
+    if [ -n "$suid_sgid_files" ]; then
+        rm -rf "$STAGING_DIR"
+        CURRENT_STAGING_DIR=""
+        die "Archive contains forbidden setuid/setgid file"
+    fi
 
     # Bidirectional 1:1 manifest-to-payload parity verification
     verify_manifest_payload_parity "$STAGING_DIR"
@@ -1108,6 +1202,10 @@ cmd_install() {
 
     log "SUCCESS: Installed package '$pkg_name' ($pkg_version-$pkg_release)"
     release_lock
+}
+
+install_package() {
+    cmd_install "$@"
 }
 
 # Subcommand: remove

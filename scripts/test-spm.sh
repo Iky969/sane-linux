@@ -22,6 +22,12 @@
 #  18. Fail-closed checksum -> missing manifest, malformed hash, missing file, or ghost checksum rejected with exit 1.
 #  19. Package upgrade obsolete file pruning -> obsolete files and empty dirs pruned bottom-up, DB consistent.
 #  20. Package upgrade rdeps pruning -> dropped dependencies pruned from rdeps and safely removable.
+#  21. Base package removal protection & atomic replacement -> base=true blocks removal without --force.
+#  22. Hardlink rejection -> archive containing hard link member rejected with exit 1.
+#  23. Setuid/setgid rejection -> pre-extraction and post-extraction audit reject setuid/setgid binaries with exit 1.
+#  24. Duplicate member rejection -> duplicate archive member or duplicate .META/files rejected with exit 1.
+#  25. Invalid dependency name rejection -> invalid dependency names in .META/depends or manifest rejected with exit 1.
+#  26. Power-cut journal recovery simulation -> leftover transaction journal rolled back cleanly on startup.
 
 set -eu
 
@@ -66,7 +72,7 @@ python_pkg_helper() {
 import sys, os, io, tarfile, lzma, hashlib
 
 def make_package(out_path, name, version="1.0.0", release="1", arch="x86_64",
-                 desc="Test package", base=False, deps="",
+                 desc="Test package", base=False, deps="", manifest_deps="",
                  payload_files=None, symlinks=None, raw_entries=None,
                  corrupt_sha=False,
                  custom_files=None, custom_sha=None, omit_sha=False,
@@ -128,6 +134,8 @@ def make_package(out_path, name, version="1.0.0", release="1", arch="x86_64",
         f"description={desc}\n"
         f"base={'true' if base else 'false'}\n"
     )
+    if manifest_deps:
+        pkg_txt += f"dependencies={manifest_deps}\n"
 
     buf = io.BytesIO()
     with lzma.open(buf, "wb", preset=6) as xz_out:
@@ -339,6 +347,49 @@ elif cmd == "create_ghost_sha":
         sha_lines.append(f"{h}  {p}\n")
     sha_lines.append(f"{'0'*64}  {ghost_rel}\n")
     make_package(out, name, payload_files=payload, custom_sha="".join(sha_lines))
+
+elif cmd == "create_hardlink":
+    out = sys.argv[2]
+    name = sys.argv[3]
+    link_path = sys.argv[4]
+    target_path = sys.argv[5]
+    payload = {"usr/bin/tool": "echo tool"}
+    raw = [(link_path, None, tarfile.LNKTYPE, target_path, 0o644)]
+    make_package(out, name, payload_files=payload, raw_entries=raw)
+
+elif cmd == "create_suid":
+    out = sys.argv[2]
+    name = sys.argv[3]
+    suid_path = sys.argv[4]
+    mode = int(sys.argv[5], 8)
+    raw = [(suid_path, b"suid content", tarfile.REGTYPE, "", mode)]
+    make_package(out, name, raw_entries=raw)
+
+elif cmd == "create_duplicate_member":
+    out = sys.argv[2]
+    name = sys.argv[3]
+    dup_path = sys.argv[4]
+    payload = {dup_path: "content 1"}
+    raw = [("./x/" + dup_path, b"content 2", tarfile.REGTYPE, "", 0o644)]
+    make_package(out, name, payload_files=payload, raw_entries=raw)
+
+elif cmd == "create_duplicate_manifest":
+    out = sys.argv[2]
+    name = sys.argv[3]
+    payload = {"usr/bin/tool": "echo tool"}
+    custom_f = "usr/\nusr/bin/\nusr/bin/tool\nusr/bin/tool\n"
+    make_package(out, name, payload_files=payload, custom_files=custom_f)
+
+elif cmd == "create_invalid_dep":
+    out = sys.argv[2]
+    name = sys.argv[3]
+    dep_location = sys.argv[4]
+    bad_dep = sys.argv[5]
+    payload = {"usr/bin/tool": "echo tool"}
+    if dep_location == "meta":
+        make_package(out, name, deps=bad_dep, payload_files=payload)
+    else:
+        make_package(out, name, manifest_deps=bad_dep, payload_files=payload)
 
 PYEOF
 }
@@ -1691,6 +1742,320 @@ test_base_package_protection_and_atomic_replacement() {
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 22: Hardlink rejection
+# -----------------------------------------------------------------------------
+test_hardlink_rejection() {
+    local tdir="$TEST_TMP/scenario22_hardlink"
+    local root="$tdir/root"
+    local pkg="$tdir/hardlink-pkg-1.0.0.spm.tar.xz"
+    mkdir -p "$root"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1
+
+    python_pkg_helper create_hardlink "$pkg" "hardlink-pkg" "./x/usr/bin/tool-link" "./x/usr/bin/tool"
+
+    local exit_code=0
+    local err_out=""
+    err_out="$("$SPM_BIN" install "$pkg" --root "$root" 2>&1)" || exit_code=$?
+
+    if [ "$exit_code" -ne 1 ]; then
+        test_fail "Scenario 22" "Expected exit code 1 for archive containing hardlink, got $exit_code"
+        return
+    fi
+
+    if ! echo "$err_out" | grep -qi "hard link"; then
+        test_fail "Scenario 22" "Error message did not mention forbidden hard link: '$err_out'"
+        return
+    fi
+
+    if [ -d "$root/var/lib/spm/installed/hardlink-pkg" ]; then
+        test_fail "Scenario 22" "Package record created in DB despite hardlink rejection"
+        return
+    fi
+
+    if [ -e "$root/usr/bin/tool-link" ] || [ -e "$root/usr/bin/tool" ]; then
+        test_fail "Scenario 22" "Files installed to disk despite hardlink rejection"
+        return
+    fi
+
+    test_pass "Scenario 22: Hardlink rejection (archive containing hard link member rejected with exit 1)"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario 23: Setuid/setgid rejection
+# -----------------------------------------------------------------------------
+test_setuid_setgid_rejection() {
+    local tdir="$TEST_TMP/scenario23_suid"
+    local root="$tdir/root"
+    local pkg_suid="$tdir/suid-pkg-1.0.0.spm.tar.xz"
+    local pkg_sgid="$tdir/sgid-pkg-1.0.0.spm.tar.xz"
+    mkdir -p "$root"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1
+
+    # Part A: Setuid file mode 04755
+    python_pkg_helper create_suid "$pkg_suid" "suid-pkg" "./x/usr/bin/suid-tool" "4755"
+    local exit_suid=0
+    local err_suid=""
+    err_suid="$("$SPM_BIN" install "$pkg_suid" --root "$root" 2>&1)" || exit_suid=$?
+
+    if [ "$exit_suid" -ne 1 ]; then
+        test_fail "Scenario 23" "Expected exit code 1 for archive containing setuid file, got $exit_suid"
+        return
+    fi
+
+    if ! echo "$err_suid" | grep -qi "setuid/setgid"; then
+        test_fail "Scenario 23" "Error message did not mention forbidden setuid/setgid: '$err_suid'"
+        return
+    fi
+
+    # Part B: Setgid file mode 02755
+    python_pkg_helper create_suid "$pkg_sgid" "sgid-pkg" "./x/usr/bin/sgid-tool" "2755"
+    local exit_sgid=0
+    local err_sgid=""
+    err_sgid="$("$SPM_BIN" install "$pkg_sgid" --root "$root" 2>&1)" || exit_sgid=$?
+
+    if [ "$exit_sgid" -ne 1 ]; then
+        test_fail "Scenario 23" "Expected exit code 1 for archive containing setgid file, got $exit_sgid"
+        return
+    fi
+
+    if ! echo "$err_sgid" | grep -qi "setuid/setgid"; then
+        test_fail "Scenario 23" "Error message did not mention forbidden setuid/setgid: '$err_sgid'"
+        return
+    fi
+
+    # Verify no records or files created
+    if [ -d "$root/var/lib/spm/installed/suid-pkg" ] || [ -d "$root/var/lib/spm/installed/sgid-pkg" ]; then
+        test_fail "Scenario 23" "Package record created in DB despite setuid/setgid rejection"
+        return
+    fi
+    if [ -e "$root/usr/bin/suid-tool" ] || [ -e "$root/usr/bin/sgid-tool" ]; then
+        test_fail "Scenario 23" "Setuid/setgid files installed to disk despite rejection"
+        return
+    fi
+
+    test_pass "Scenario 23: Setuid/setgid rejection (pre-extraction inspection and post-extraction audit reject setuid/setgid with exit 1)"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario 24: Duplicate member rejection
+# -----------------------------------------------------------------------------
+test_duplicate_member_rejection() {
+    local tdir="$TEST_TMP/scenario24_dup"
+    local root="$tdir/root"
+    local pkg_dup_tar="$tdir/dup-tar-1.0.0.spm.tar.xz"
+    local pkg_dup_meta="$tdir/dup-meta-1.0.0.spm.tar.xz"
+    mkdir -p "$root"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1
+
+    # Part A: Duplicate member in tar archive
+    python_pkg_helper create_duplicate_member "$pkg_dup_tar" "dup-tar-pkg" "usr/bin/dup-tool"
+    local exit_dup_tar=0
+    local err_dup_tar=""
+    err_dup_tar="$("$SPM_BIN" install "$pkg_dup_tar" --root "$root" 2>&1)" || exit_dup_tar=$?
+
+    if [ "$exit_dup_tar" -ne 1 ]; then
+        test_fail "Scenario 24" "Expected exit code 1 for duplicate tar archive member, got $exit_dup_tar"
+        return
+    fi
+
+    if ! echo "$err_dup_tar" | grep -qi "duplicate member path"; then
+        test_fail "Scenario 24" "Error message did not mention duplicate member path: '$err_dup_tar'"
+        return
+    fi
+
+    # Part B: Duplicate entry in .META/files manifest
+    python_pkg_helper create_duplicate_manifest "$pkg_dup_meta" "dup-meta-pkg"
+    local exit_dup_meta=0
+    local err_dup_meta=""
+    err_dup_meta="$("$SPM_BIN" install "$pkg_dup_meta" --root "$root" 2>&1)" || exit_dup_meta=$?
+
+    if [ "$exit_dup_meta" -ne 1 ]; then
+        test_fail "Scenario 24" "Expected exit code 1 for duplicate .META/files entry, got $exit_dup_meta"
+        return
+    fi
+
+    if ! echo "$err_dup_meta" | grep -qiE "duplicate entry|duplicate member"; then
+        test_fail "Scenario 24" "Error message did not mention duplicate entry: '$err_dup_meta'"
+        return
+    fi
+
+    test_pass "Scenario 24: Duplicate member rejection (duplicate archive member and duplicate .META/files rejected with exit 1)"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario 25: Invalid dependency name rejection
+# -----------------------------------------------------------------------------
+test_invalid_dependency_name_rejection() {
+    local tdir="$TEST_TMP/scenario25_deps"
+    local root="$tdir/root"
+    local pkg_dep_slash="$tdir/dep-slash-1.0.0.spm.tar.xz"
+    local pkg_dep_space="$tdir/dep-space-1.0.0.spm.tar.xz"
+    local pkg_dep_spec="$tdir/dep-spec-1.0.0.spm.tar.xz"
+    local pkg_mani_slash="$tdir/mani-slash-1.0.0.spm.tar.xz"
+    local pkg_mani_space="$tdir/mani-space-1.0.0.spm.tar.xz"
+    mkdir -p "$root"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1
+
+    # Part A: .META/depends with slash
+    python_pkg_helper create_invalid_dep "$pkg_dep_slash" "dep-slash-pkg" "meta" "invalid/dep"
+    local exit_a=0
+    local err_a=""
+    err_a="$("$SPM_BIN" install "$pkg_dep_slash" --root "$root" 2>&1)" || exit_a=$?
+    if [ "$exit_a" -ne 1 ] || ! echo "$err_a" | grep -q "Invalid dependency name 'invalid/dep'"; then
+        test_fail "Scenario 25" "Expected exit 1 and 'Invalid dependency name' for slash in .META/depends (got exit $exit_a, msg: '$err_a')"
+        return
+    fi
+
+    # Part B: .META/depends with space
+    python_pkg_helper create_invalid_dep "$pkg_dep_space" "dep-space-pkg" "meta" "invalid dep"
+    local exit_b=0
+    local err_b=""
+    err_b="$("$SPM_BIN" install "$pkg_dep_space" --root "$root" 2>&1)" || exit_b=$?
+    if [ "$exit_b" -ne 1 ] || ! echo "$err_b" | grep -q "Invalid dependency name 'invalid dep'"; then
+        test_fail "Scenario 25" "Expected exit 1 and 'Invalid dependency name' for space in .META/depends (got exit $exit_b, msg: '$err_b')"
+        return
+    fi
+
+    # Part C: .META/depends with special characters
+    python_pkg_helper create_invalid_dep "$pkg_dep_spec" "dep-spec-pkg" "meta" "dep\$evil"
+    local exit_c=0
+    local err_c=""
+    err_c="$("$SPM_BIN" install "$pkg_dep_spec" --root "$root" 2>&1)" || exit_c=$?
+    if [ "$exit_c" -ne 1 ] || ! echo "$err_c" | grep -q "Invalid dependency name 'dep\$evil'"; then
+        test_fail "Scenario 25" "Expected exit 1 and 'Invalid dependency name' for special char in .META/depends (got exit $exit_c, msg: '$err_c')"
+        return
+    fi
+
+    # Part D: manifest dependencies= with slash
+    python_pkg_helper create_invalid_dep "$pkg_mani_slash" "mani-slash-pkg" "manifest" "bad/pkg"
+    local exit_d=0
+    local err_d=""
+    err_d="$("$SPM_BIN" install "$pkg_mani_slash" --root "$root" 2>&1)" || exit_d=$?
+    if [ "$exit_d" -ne 1 ] || ! echo "$err_d" | grep -q "Invalid dependency name 'bad/pkg'"; then
+        test_fail "Scenario 25" "Expected exit 1 and 'Invalid dependency name' for slash in manifest (got exit $exit_d, msg: '$err_d')"
+        return
+    fi
+
+    # Part E: manifest dependencies= with space
+    python_pkg_helper create_invalid_dep "$pkg_mani_space" "mani-space-pkg" "manifest" "bad pkg"
+    local exit_e=0
+    local err_e=""
+    err_e="$("$SPM_BIN" install "$pkg_mani_space" --root "$root" 2>&1)" || exit_e=$?
+    if [ "$exit_e" -ne 1 ] || ! echo "$err_e" | grep -q "Invalid dependency name 'bad pkg'"; then
+        test_fail "Scenario 25" "Expected exit 1 and 'Invalid dependency name' for space in manifest (got exit $exit_e, msg: '$err_e')"
+        return
+    fi
+
+    test_pass "Scenario 25: Invalid dependency name rejection (invalid dependency names in .META/depends and manifest rejected with exit 1)"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario 26: Power-cut journal recovery simulation
+# -----------------------------------------------------------------------------
+test_power_cut_journal_recovery() {
+    local tdir="$TEST_TMP/scenario26_powercut"
+    local root="$tdir/root"
+    local pkg_orig="$tdir/pkg-orig-1.0.0.spm.tar.xz"
+    mkdir -p "$root"
+
+    # 1. Install an original package cleanly
+    python_pkg_helper create_valid "$pkg_orig" "pkg-orig" "1.0.0" "false" "Original Package" \
+        "usr/bin/orig-tool:orig binary v1 content"
+
+    if ! "$SPM_BIN" install "$pkg_orig" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 26" "Failed to install initial pkg-orig"
+        return
+    fi
+
+    # 2. Simulate an interrupted power-cut update:
+    # Overwrite the target file with incomplete/corrupted content
+    echo "corrupted powercut content" > "$root/usr/bin/orig-tool"
+    # Create an uncommitted newly created file that was partially staged to disk
+    mkdir -p "$root/usr/bin"
+    echo "uncommitted leaked tool" > "$root/usr/bin/new-staged-tool"
+
+    # Create the interrupted transaction staging directory with .journal
+    local staging_tx="$root/var/lib/spm/staging/tx-pkg-orig-9999"
+    mkdir -p "$staging_tx/.journal/backup/usr/bin"
+    echo "orig binary v1 content" > "$staging_tx/.journal/backup/usr/bin/orig-tool"
+
+    # Record created file
+    printf '%s/usr/bin/new-staged-tool\n' "$root" > "$staging_tx/.journal/created"
+
+    # Create .META/package in staging
+    mkdir -p "$staging_tx/.META"
+    cat > "$staging_tx/.META/package" <<EOF
+name=pkg-orig
+version=2.0.0
+release=1
+arch=x86_64
+description=Updated Package
+base=false
+EOF
+    cat > "$staging_tx/.META/files" <<EOF
+usr/
+usr/bin/
+usr/bin/orig-tool
+usr/bin/new-staged-tool
+EOF
+
+    # Snapshot of installed_pkg
+    cp -a "$root/var/lib/spm/installed/pkg-orig" "$staging_tx/.journal/installed_pkg"
+    touch "$staging_tx/.journal/had_installed_pkg"
+
+    # Corrupt or alter DB installed record to simulate mid-transaction failure
+    echo "2.0.0-1" > "$root/var/lib/spm/installed/pkg-orig/version"
+
+    # 3. Invoke any spm command that acquires the lock (e.g. spm init or list or install)
+    local rec_out=""
+    rec_out="$("$SPM_BIN" init --root "$root" 2>&1)"
+
+    if ! echo "$rec_out" | grep -qi "Interrupted transaction recovered: rolled back pkg-orig"; then
+        test_fail "Scenario 26" "Output did not report journal recovery: '$rec_out'"
+        return
+    fi
+
+    # 4. Assert disk state rolled back:
+    # - /usr/bin/orig-tool restored to original content
+    if [ ! -f "$root/usr/bin/orig-tool" ]; then
+        test_fail "Scenario 26" "/usr/bin/orig-tool missing after recovery"
+        return
+    fi
+    local restored_content
+    restored_content="$(cat "$root/usr/bin/orig-tool")"
+    if [ "$restored_content" != "orig binary v1 content" ]; then
+        test_fail "Scenario 26" "orig-tool content was not restored (got: '$restored_content')"
+        return
+    fi
+
+    # - /usr/bin/new-staged-tool was pruned
+    if [ -e "$root/usr/bin/new-staged-tool" ]; then
+        test_fail "Scenario 26" "Uncommitted file /usr/bin/new-staged-tool still present on disk"
+        return
+    fi
+
+    # - Staging directory was cleaned
+    if [ -d "$staging_tx" ]; then
+        test_fail "Scenario 26" "Staging transaction directory was not cleaned up after recovery"
+        return
+    fi
+
+    # - DB version was restored to 1.0.0-1
+    local db_ver
+    db_ver="$(cat "$root/var/lib/spm/installed/pkg-orig/version" 2>/dev/null || true)"
+    if [ "$db_ver" != "1.0.0-1" ]; then
+        test_fail "Scenario 26" "DB version was not restored to 1.0.0-1 (got: '$db_ver')"
+        return
+    fi
+
+    test_pass "Scenario 26: Power-cut journal recovery simulation (leftover staging transaction journal rolled back cleanly on startup)"
+}
+
+# -----------------------------------------------------------------------------
 # Main Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -1721,6 +2086,11 @@ main() {
     test_package_upgrade_obsolete_file_pruning
     test_package_upgrade_rdeps_pruning
     test_base_package_protection_and_atomic_replacement
+    test_hardlink_rejection
+    test_setuid_setgid_rejection
+    test_duplicate_member_rejection
+    test_invalid_dependency_name_rejection
+    test_power_cut_journal_recovery
 
     printf '\n==================================================\n'
     printf 'SPM Test Suite Summary: %d passed, %d failed\n' "$PASSED_COUNT" "$FAILED_COUNT"
