@@ -24,6 +24,7 @@ bin/hostname
 bin/id
 bin/kill
 bin/ln
+bin/login
 bin/ls
 bin/mkdir
 bin/mknod
@@ -56,6 +57,7 @@ bin/uname
 bin/uniq
 bin/wc
 bin/wget
+bin/whoami
 bin/xargs
 sbin/
 sbin/fdisk

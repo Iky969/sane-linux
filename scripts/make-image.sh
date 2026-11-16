@@ -12,6 +12,8 @@ OUTPUT_FILE="${REPO_ROOT}/distro/sane.img"
 SIZE_MB=512
 PACKAGES_DIR="${REPO_ROOT}/distro/packages"
 CACHE_DIR="${REPO_ROOT}/distro/cache"
+DISTRO_DIR="${REPO_ROOT}/distro"
+ROOTFS="${DISTRO_DIR}/rootfs"
 
 log()  { printf '==> %s\n' "$1"; }
 info() { printf '    %s\n' "$1"; }
@@ -363,10 +365,23 @@ for pkg in "$PACKAGES_DIR"/*.spm.tar.xz; do
     fi
 done
 
-# Install storage modules to rootfs /lib/modules
-if [ -d "$MODULES_STAGING" ]; then
+# Install kernel modules to rootfs /lib/modules
+if [ -d "$ROOTFS/lib/modules" ]; then
+    $SUDO mkdir -p "$MNT_DIR/root/lib/modules"
+    $SUDO cp -a "$ROOTFS/lib/modules/." "$MNT_DIR/root/lib/modules/"
+elif [ -d "$MODULES_STAGING" ]; then
     $SUDO mkdir -p "$MNT_DIR/root/lib/modules"
     $SUDO find "$MODULES_STAGING" -name "*.ko" -exec cp {} "$MNT_DIR/root/lib/modules/" \;
+fi
+
+if [ -n "$kver" ] && [ -d "$MNT_DIR/root/lib/modules" ]; then
+    $SUDO mkdir -p "$MNT_DIR/root/lib/modules/$kver"
+    $SUDO find "$MNT_DIR/root/lib/modules" -maxdepth 1 -name "*.ko" -exec cp -u {} "$MNT_DIR/root/lib/modules/$kver/" \; 2>/dev/null || true
+    if command -v depmod >/dev/null 2>&1; then
+        $SUDO depmod -b "$MNT_DIR/root" "$kver" 2>/dev/null || true
+    elif [ -x "$MNT_DIR/root/bin/busybox" ]; then
+        $SUDO chroot "$MNT_DIR/root" /bin/busybox depmod "$kver" 2>/dev/null || true
+    fi
 fi
 
 # Ensure standard system directories and permissions exist
@@ -384,8 +399,9 @@ EOF
 # Configure /etc/init.conf
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/init.conf" >/dev/null
 # /etc/init.conf -- S.A.N.E Linux service supervision
-console:respawn:cttyhack /bin/sh -i
-hello:once:/usr/bin/sane-hello
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
+tty1:respawn:/sbin/getty 38400 tty1 linux
+console:respawn:cttyhack /sbin/getty -L 115200 - vt100
 EOF
 
 # Configure /etc/hostname
@@ -394,10 +410,57 @@ printf 'S.A.N.E\n' | $SUDO tee "$MNT_DIR/root/etc/hostname" >/dev/null
 # Configure /etc/passwd and /etc/group
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/passwd" >/dev/null
 root:x:0:0:root:/root:/bin/sh
+sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh
 EOF
+$SUDO chmod 0644 "$MNT_DIR/root/etc/passwd"
+
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/group" >/dev/null
 root:x:0:
+wheel:x:10:root,sane
+sane:x:1000:
 EOF
+$SUDO chmod 0644 "$MNT_DIR/root/etc/group"
+
+# Configure /etc/shadow
+cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/shadow" >/dev/null
+root:$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0:19700:0:99999:7:::
+sane:$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.:19700:0:99999:7:::
+EOF
+$SUDO chmod 0600 "$MNT_DIR/root/etc/shadow"
+
+# Configure /etc/doas.conf
+cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/doas.conf" >/dev/null
+permit persist :wheel
+EOF
+$SUDO chmod 0600 "$MNT_DIR/root/etc/doas.conf"
+$SUDO chown 0:0 "$MNT_DIR/root/etc/doas.conf"
+
+# Setuid permissions for doas
+if [ -f "$MNT_DIR/root/usr/bin/doas" ]; then
+    $SUDO chmod 4755 "$MNT_DIR/root/usr/bin/doas"
+fi
+
+# Configure /etc/issue
+cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/issue" >/dev/null
+Welcome to S.A.N.E Linux (\m) - \l
+Kernel \r on an \m (\l)
+
+EOF
+
+# Create /home/sane
+$SUDO mkdir -p "$MNT_DIR/root/home/sane"
+$SUDO chmod 0750 "$MNT_DIR/root/home/sane"
+$SUDO chown 1000:1000 "$MNT_DIR/root/home/sane"
+
+# Configure /etc/profile
+cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/profile" >/dev/null
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+export USER=$(id -un 2>/dev/null || echo "$USER")
+export LOGNAME="$USER"
+export HOME="/home/$USER"
+[ "$USER" = "root" ] && export HOME="/root"
+EOF
+$SUDO chmod 0644 "$MNT_DIR/root/etc/profile"
 
 # Step 7: Assemble minimal initramfs for switch_root
 log "Step 7/8: Assembling minimal switch_root initramfs..."

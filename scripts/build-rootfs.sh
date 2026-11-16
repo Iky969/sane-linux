@@ -198,9 +198,9 @@ install_busybox() {
 	# Standard symlinks that must exist; skip applets that were not compiled.
 	for a in sh ash cat chmod chown cp cut date dd df dirname dmesg \
 	         du echo env expr false find grep head hostname id kill \
-	         ln ls mkdir mknod more mount mv od printf ps pwd readlink \
+	         ln login ls mkdir mknod more mount mv od printf ps pwd readlink \
 	         realpath rm rmdir sed seq sleep sort stat sync tail tar tee \
-	         touch tr true umount uname uniq wc wget xargs; do
+	         touch tr true umount uname uniq wc wget whoami xargs; do
 		link_applet bin "$a"
 	done
 	for a in fdisk getty halt ifconfig ip login mdev mkswap modprobe \
@@ -229,11 +229,14 @@ make_dirs() {
 	mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin" "$ROOTFS/etc" \
 	         "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev" \
 	         "$ROOTFS/tmp" "$ROOTFS/var/log" \
-	         "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin"
+	         "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin" \
+	         "$ROOTFS/home/sane"
 	# /run is required: ninit mounts its tmpfs there and creates the control FIFOs.
 	# /root is only for the root user's home directory in /etc/passwd.
 	chmod 1777 "$ROOTFS/tmp"
 	mkdir -p "$ROOTFS/run" "$ROOTFS/root"
+	chmod 0750 "$ROOTFS/home/sane"
+	chown 1000:1000 "$ROOTFS/home/sane" 2>/dev/null || true
 }
 
 make_dev_nodes() {
@@ -335,6 +338,19 @@ install_networking() {
 		fi
 	fi
 
+	# doas
+	if [ ! -x "$REPO_ROOT/packages/doas/x/usr/bin/doas" ] && [ -x "$REPO_ROOT/packages/doas/build.sh" ]; then
+		info "building doas package..."
+		"$REPO_ROOT/packages/doas/build.sh" "$DISTRO_DIR/packages"
+	fi
+	if [ -x "$REPO_ROOT/packages/doas/x/usr/bin/doas" ]; then
+		mkdir -p "$ROOTFS/usr/bin"
+		install -m 0755 "$REPO_ROOT/packages/doas/x/usr/bin/doas" "$ROOTFS/usr/bin/doas"
+		if ! is_static "$ROOTFS/usr/bin/doas"; then
+			info "WARNING: $ROOTFS/usr/bin/doas is not static; in an initramfs it needs a dynamic loader"
+		fi
+	fi
+
 	# udhcpc event script
 	if [ -f "$REPO_ROOT/packages/busybox/x/usr/share/udhcpc/default.script" ]; then
 		mkdir -p "$ROOTFS/usr/share/udhcpc"
@@ -370,38 +386,60 @@ install_networking() {
 }
 
 write_etc() {
-	log "writing /etc (init.conf, passwd, group, hostname, fstab)"
-	# Important note: ninit starts services with stdin = /dev/null and
-	# stdout/stderr = /run/log.fifo (see spawn_service() in ninit.c). So a plain
-	# `shell:respawn:/bin/sh` immediately hits EOF and respawns every 2 seconds
-	# instead of becoming a console shell. Because every command runs through
-	# `/bin/sh -c`, the redirections below attach the shell to the console and
-	# route its stdout/stderr there as well:
-	#   <> /dev/console   open the console read-write as stdin
-	#   >&0 2>&0          stdout & stderr follow stdin (the console)
+	log "writing /etc (init.conf, passwd, group, shadow, doas.conf, issue, hostname, fstab)"
 	cat > "$ROOTFS/etc/init.conf" <<'EOF'
-# /etc/init.conf -- S.A.N.E distro rootfs
-#
-# Services run through `/bin/sh -c` with stdin /dev/null and
-# stdout/stderr on /run/log.fifo (ninit defaults). The literal
-# `console:respawn:/bin/sh` is not an option: without redirection, stdin /dev/null
-# = immediate EOF -> the shell exits and is respawned forever.
-#
-# cttyhack: ninit calls setsid() in the child (no controlling tty), so an
-# interactive shell would complain "can't access tty; job control turned off".
-# cttyhack opens /dev/console, makes it the controlling tty (TIOCSCTTY), then
-# hands control to the shell so job control (Ctrl-C, jobs, fg) works normally.
 network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
-console:respawn:cttyhack /bin/sh -i
+tty1:respawn:/sbin/getty 38400 tty1 linux
+console:respawn:cttyhack /sbin/getty -L 115200 - vt100
 EOF
 
 	cat > "$ROOTFS/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
+sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh
 EOF
+	chmod 0644 "$ROOTFS/etc/passwd"
 
 	cat > "$ROOTFS/etc/group" <<'EOF'
 root:x:0:
+wheel:x:10:root,sane
+sane:x:1000:
 EOF
+	chmod 0644 "$ROOTFS/etc/group"
+
+	cat > "$ROOTFS/etc/shadow" <<'EOF'
+root:$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0:19700:0:99999:7:::
+sane:$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.:19700:0:99999:7:::
+EOF
+	chmod 0600 "$ROOTFS/etc/shadow"
+
+	cat > "$ROOTFS/etc/doas.conf" <<'EOF'
+permit persist :wheel
+EOF
+	chmod 0600 "$ROOTFS/etc/doas.conf"
+	chown 0:0 "$ROOTFS/etc/doas.conf" 2>/dev/null || true
+
+	if [ -f "$ROOTFS/usr/bin/doas" ]; then
+		chmod 4755 "$ROOTFS/usr/bin/doas"
+	fi
+
+	cat > "$ROOTFS/etc/issue" <<'EOF'
+Welcome to S.A.N.E Linux (\m) - \l
+Kernel \r on an \m (\l)
+
+EOF
+
+	mkdir -p "$ROOTFS/home/sane"
+	chmod 0750 "$ROOTFS/home/sane"
+	chown 1000:1000 "$ROOTFS/home/sane" 2>/dev/null || true
+
+	cat > "$ROOTFS/etc/profile" <<'EOF'
+export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+export USER=$(id -un 2>/dev/null || echo "$USER")
+export LOGNAME="$USER"
+export HOME="/home/$USER"
+[ "$USER" = "root" ] && export HOME="/root"
+EOF
+	chmod 0644 "$ROOTFS/etc/profile"
 
 	printf '%s\n' "$HOSTNAME_NAME" > "$ROOTFS/etc/hostname"
 
@@ -447,8 +485,32 @@ pack_initramfs() {
 	if [ "$CPIO_CMD" = "cpio" ] && cpio --help 2>&1 | grep -q -- --owner; then
 		CPIO_OWNER="--owner=+0:+0"
 	fi
-	( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc $CPIO_OWNER --quiet ) \
-		| gzip -9 > "$INITRAMFS" || die "initramfs creation failed"
+	if [ -n "$CPIO_OWNER" ] && command -v python3 >/dev/null 2>&1; then
+		( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc $CPIO_OWNER --quiet ) \
+			| python3 -c "
+import sys
+buf = bytearray(sys.stdin.buffer.read())
+pos = 0
+while pos < len(buf):
+    if buf[pos:pos+6] != b'070701':
+        break
+    namesize = int(buf[pos+94:pos+102].decode(), 16)
+    filesize = int(buf[pos+54:pos+62].decode(), 16)
+    name = buf[pos+110:pos+110+namesize-1].decode()
+    if name in ('home/sane', './home/sane'):
+        buf[pos+22:pos+30] = b'%08x' % 1000
+        buf[pos+30:pos+38] = b'%08x' % 1000
+    hlen = 110 + namesize
+    pad1 = (4 - (hlen % 4)) % 4
+    pos += hlen + pad1 + filesize
+    pad2 = (4 - (filesize % 4)) % 4
+    pos += pad2
+sys.stdout.buffer.write(buf)
+" | gzip -9 > "$INITRAMFS" || die "initramfs creation failed"
+	else
+		( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc $CPIO_OWNER --quiet ) \
+			| gzip -9 > "$INITRAMFS" || die "initramfs creation failed"
+	fi
 	[ -s "$INITRAMFS" ] || die "initramfs is empty"
 }
 
