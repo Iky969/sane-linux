@@ -110,7 +110,7 @@ jobs:
       - name: rootfs + initramfs from source (BUSYBOX_MODE=auto)
         run: |
           make
-          sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
+          sudo -E JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
 
       - name: Boot initramfs in QEMU (TCG, no /dev/kvm)
