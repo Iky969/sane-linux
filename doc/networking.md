@@ -63,11 +63,16 @@ supported yet.
 `ca-certificates` and static `curl` are installed by `scripts/build-rootfs.sh`.
 `sane-net tls-check URL` uses `curl --cacert /etc/ssl/certs/ca-certificates.crt`
 so TLS verification never depends on a dynamic CA lookup. A missing CA bundle
-is a hard error.
+or a non-`https://` URL is a hard error.
+
+`static` fails closed when `ip addr add` or `ip route add` fails (idempotent
+checks prevent false failures on repeated runs). `dns default` restores the
+baseline through the same atomic `mktemp` + `mv` path as all other resolver
+writes.
 
 ## Testing
 
-`scripts/test-network.sh` (41 assertions) stubs `ip`, `udhcpc`, `curl`, and
+`scripts/test-network.sh` (55 assertions) stubs `ip`, `udhcpc`, `curl`, and
 `wpa_supplicant` through `PATH` and redirects all writable paths into a temp
 root, so no host network or host `/etc` is touched. It is wired into
 `make test`, `make test-network`, and CI.
