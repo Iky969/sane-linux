@@ -49,7 +49,7 @@ $(TESTBIN): $(SRC)
 TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-config.sh \
                 scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
                 scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
-                scripts/test-state-machine.sh
+                scripts/test-state-machine.sh scripts/test-reliability.sh
 
 test: $(TESTBIN)
 	@PRE_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
@@ -100,6 +100,9 @@ test-pkg:
 
 test-spm:
 	bash ./scripts/test-spm.sh
+
+test-reliability:
+	sh ./scripts/test-reliability.sh
 
 image: packages
 	sudo bash ./scripts/make-image.sh
