@@ -1,0 +1,7 @@
+name=clawrza-binutils
+version=2.44
+release=1
+arch=x86_64
+description=Source recipe for GNU binutils 2.44 self-hosting toolchain
+dependencies=clawrza-glibc-headers
+base=false

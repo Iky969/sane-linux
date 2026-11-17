@@ -1,0 +1,6 @@
+name=clawrza-glibc-headers
+version=2.41
+release=1
+arch=x86_64
+description=Source recipe for glibc 2.41 headers and startup files
+base=false

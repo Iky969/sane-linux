@@ -1,0 +1,9 @@
+name=clawrza-gcc
+upstream=gcc
+version=14.2.0
+tarball=gcc-14.2.0.tar.xz
+url=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+sha256=a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9
+build_order=3
+requires=clawrza-binutils,clawrza-glibc-headers
+description=GCC 14.2.0 C compiler installed into a self-hosting sysroot

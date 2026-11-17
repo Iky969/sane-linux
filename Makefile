@@ -96,6 +96,9 @@ lint:
 packages: $(BIN)
 	bash ./packages/build-all.sh
 
+clawrza:
+	bash ./packages/clawrza-build-all.sh
+
 test-accounts:
 	sh ./scripts/test-accounts.sh
 
@@ -132,4 +135,4 @@ test-image-uefi:
 test-installer installer-test: packages
 	sudo bash ./scripts/test-installer.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test
