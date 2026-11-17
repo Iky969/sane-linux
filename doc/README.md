@@ -15,6 +15,7 @@ For a high-level overview, quick start guide, and configuration examples, see th
 | [boot-pipeline.md](boot-pipeline.md) | Boot pipeline, GPT layout, Limine bootloader, and initramfs `switch_root` handoff |
 | [package-format.md](package-format.md) | S.A.N.E package manager container specification (`.spm.tar.xz`), metadata, and symlink rules |
 | [package-manager.md](package-manager.md) | S.A.N.E package manager CLI (`spm`), database layout, locking, atomic transactions, and removal |
+| [reliability.md](reliability.md) | Phase C: snapshots, verified rollback, staged upgrades, recovery, logging, backup and restore |
 | [toolchain-and-rootfs-from-source.md](toolchain-and-rootfs-from-source.md) | Comprehensive guide: hermetic musl toolchain, compiling BusyBox, Linux kernel, ninit, and rootfs assembly |
 | [glossary-i18n.md](glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
 | [networking.md](networking.md) | Phase B: `sane-net`, DNS/DHCP, Wi-Fi, reconnect, and outbound TLS |

@@ -181,6 +181,7 @@ LICENSE                       MIT License
 | [doc/distro-builder.md](doc/distro-builder.md) | Rootfs assembly, initramfs packaging, QEMU headless validation |
 | [doc/glossary-i18n.md](doc/glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
 | [doc/networking.md](doc/networking.md) | Phase B: `sane-net`, DNS/DHCP, Wi-Fi, reconnect, and outbound TLS |
+| [doc/reliability.md](doc/reliability.md) | Phase C: snapshots, verified rollback, staged upgrades, recovery, logging, backup and restore |
 | [doc/README.md](doc/README.md) | Documentation index, project status, and architectural roadmap |
 | [SECURITY.md](SECURITY.md) | Threat model, operational security boundaries, and vulnerability reporting |
 
