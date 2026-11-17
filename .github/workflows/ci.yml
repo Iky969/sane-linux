@@ -55,6 +55,12 @@ jobs:
       - name: Lint log patterns & format strings
         run: make lint
 
+      - name: Phase A account lifecycle & policy validation
+        run: sh ./scripts/test-accounts.sh
+
+      - name: Phase B networking (sane-net, DNS, DHCP, TLS)
+        run: sh ./scripts/test-network.sh
+
       - name: Phase C reliability suite
         run: sh ./scripts/test-reliability.sh
 

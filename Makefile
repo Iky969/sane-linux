@@ -49,6 +49,10 @@ $(TESTBIN): $(SRC)
 TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-config.sh \
                 scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
                 scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
+                scripts/test-state-machine.sh scripts/test-accounts.sh \
+                scripts/test-network.sh scripts/test-reliability.sh
+                scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
+                scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
                 scripts/test-state-machine.sh scripts/test-reliability.sh
 
 test: $(TESTBIN)
@@ -97,6 +101,15 @@ packages: $(BIN)
 
 test-pkg:
 	bash ./scripts/test-build-package.sh
+
+test-accounts:
+	sh ./scripts/test-accounts.sh
+
+test-network:
+	sh ./scripts/test-network.sh
+
+test-reliability:
+	sh ./scripts/test-reliability.sh
 
 test-spm:
 	bash ./scripts/test-spm.sh
