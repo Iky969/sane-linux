@@ -198,7 +198,7 @@ install_busybox() {
 	# Standard symlinks that must exist; skip applets that were not compiled.
 	for a in sh ash cat chmod chown cp cut date dd df dirname dmesg \
 	         du echo env expr false find grep head hostname id kill \
-	         ln login ls mkdir mknod more mount mv od printf ps pwd readlink \
+	         ln login ls mkdir mknod more mount mv od passwd printf ps pwd readlink \
 	         realpath rm rmdir sed seq sleep sort stat sync tail tar tee \
 	         touch tr true umount uname uniq wc wget whoami xargs; do
 		link_applet bin "$a"

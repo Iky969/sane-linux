@@ -160,7 +160,7 @@ Commands executed on the serial console after shell readiness:
 ## Known Limitations
 
 - **Early serial input (t=0) timing**: Piped input sent before the guest shell finishes initialization can be dropped. Use a ~6 second delay or interact via live terminal.
-- **No `getty`/`login` authentication**: Boots directly into a root console shell (`console:respawn:cttyhack /bin/sh -i`).
+- **Default credentials must be changed**: consoles require `getty`/`login` authentication and the shipped `sane` account uses password `sane`; change it on first boot. See [account-security.md](account-security.md).
 - **Transient RAM disk**: Executes from initramfs; changes do not persist across reboot cycles.
 - **Kernel source**: Defaults to host kernel or precompiled Alpine `vmlinuz-virt` (v3.20) rather than a custom-built minimal kernel.
 - BusyBox is built with `defconfig` minus the `tc` applet (401 applets), avoiding legacy CBQ header compatibility issues on modern kernels.

@@ -49,7 +49,7 @@ $(TESTBIN): $(SRC)
 TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-config.sh \
                 scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
                 scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
-                scripts/test-state-machine.sh
+                scripts/test-state-machine.sh scripts/test-accounts.sh
 
 test: $(TESTBIN)
 	@PRE_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
@@ -94,6 +94,9 @@ lint:
 
 packages: $(BIN)
 	bash ./packages/build-all.sh
+
+test-accounts:
+	sh ./scripts/test-accounts.sh
 
 test-pkg:
 	bash ./scripts/test-build-package.sh
