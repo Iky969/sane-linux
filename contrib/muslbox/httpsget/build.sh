@@ -52,5 +52,7 @@ musl-gcc -O2 -Wall -Wextra -static -I"$SRC/include" \
 	"$SRC/library/libmbedx509.a" \
 	"$SRC/library/libmbedcrypto.a" \
 	-o "$HERE/httpsget"
-readelf -lW "$HERE/httpsget" | grep -q INTERP && die "httpsget is not static"
+if readelf -lW "$HERE/httpsget" | grep -q INTERP; then
+	die "httpsget is not static"
+fi
 printf 'OK: %s (%s, static musl)\n' "$HERE/httpsget" "$(du -h "$HERE/httpsget" | cut -f1)"

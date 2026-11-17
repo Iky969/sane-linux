@@ -62,3 +62,6 @@ Two host details worth keeping:
   connect and read are bounded by `alarm(30)` / a 15 s read timeout.
 - Build output (`httpsget/httpsget`, `httpsget/work/`) is gitignored, and a
   bad cached tarball is deleted and re-downloaded instead of bricking builds.
+- `httpsget/test-smoke.sh` checks the static ELF, usage text and URL validation
+  without network; `NETWORK=1 ./test-smoke.sh` also asserts an HTTP 200.
+  The `Host:` header includes a non-default port (e.g. `:8443`).

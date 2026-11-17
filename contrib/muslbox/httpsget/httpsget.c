@@ -76,7 +76,7 @@ static void die(const char *msg, int code) {
 
 int main(int argc, char **argv) {
 	const char *url = argc > 1 ? argv[1] : NULL;
-	const char *ca_path = pick_ca(argc > 2 ? argv[2] : NULL);
+	const char *ca_path = NULL;  /* resolved after URL/arg validation */
 	char host[256] = "", path[512] = "/";
 	char port[16] = "443";
 
@@ -122,6 +122,7 @@ int main(int argc, char **argv) {
 	}
 	if (!valid_path(path))
 		die("path contains disallowed characters", 0);
+	ca_path = pick_ca(argc > 2 ? argv[2] : NULL);
 
 	mbedtls_net_context fd;
 	mbedtls_entropy_context entropy;
@@ -176,6 +177,8 @@ int main(int argc, char **argv) {
 	mbedtls_ssl_set_bio(&ssl, &fd, mbedtls_net_send, mbedtls_net_recv, NULL);
 
 	while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+		if (ret == MBEDTLS_ERR_SSL_TIMEOUT)
+			die("ssl_handshake timed out", 0);
 		if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
 			die("ssl_handshake", ret);
 	}
@@ -187,11 +190,16 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	char host_header[300];
+	if (strcmp(port, "443") == 0)
+		snprintf(host_header, sizeof(host_header), "%s", host);
+	else
+		snprintf(host_header, sizeof(host_header), "%s:%s", host, port);
 	char req[1024];
 	int n = snprintf(req, sizeof(req),
 	                 "GET %s HTTP/1.1\r\nHost: %s\r\n"
 	                 "User-Agent: muslbox/0.2\r\nConnection: close\r\n\r\n",
-	                 path, host);
+	                 path, host_header);
 	if (n <= 0 || (size_t)n >= sizeof(req))
 		die("request too large", 0);
 	size_t sent = 0;
@@ -200,6 +208,8 @@ int main(int argc, char **argv) {
 		                        (size_t)n - sent);
 		if (ret > 0)
 			sent += (size_t)ret;
+		else if (ret == MBEDTLS_ERR_SSL_TIMEOUT)
+			die("ssl_write timed out", 0);
 		else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
 			die("ssl_write", ret);
 	}
@@ -215,6 +225,8 @@ int main(int argc, char **argv) {
 			break;
 		if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
 			continue;
+		if (ret == MBEDTLS_ERR_SSL_TIMEOUT)
+			die("ssl_read timed out", 0);
 		die("ssl_read", ret);
 	}
 	fflush(stdout);
