@@ -55,6 +55,9 @@ jobs:
       - name: Lint log patterns & format strings
         run: make lint
 
+      - name: Phase B networking (sane-net, DNS, DHCP, TLS)
+        run: sh ./scripts/test-network.sh
+
       - name: Smoke test PID 1 (SIGTERM -> clean shutdown)
         run: sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh
 

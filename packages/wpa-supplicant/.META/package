@@ -1,0 +1,7 @@
+name=wpa-supplicant
+version=2.10
+release=1
+arch=x86_64
+description=Wi-Fi supplicant with WPA/WPA2, static musl build using LibreSSL
+dependencies=musl,libressl
+base=false
