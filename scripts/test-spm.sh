@@ -32,7 +32,7 @@
 #  28. Upgrade failing mid-commit -> injected mv failure rolls back file content, DB and staging.
 #  29. Real SIGKILL mid-commit -> journal recovery on next command restores disk and DB.
 #  30. Shared-file ownership conflict -> intruder rejected; uninstall leaves other package files intact.
-#  31. Two simultaneous installs -> serialized by flock, both payloads and DB indexes intact.
+#  31. Two simultaneous installs -> observed blocking on held spm lock, then both complete with intact payloads and DB.
 
 set -eu
 
@@ -2097,6 +2097,8 @@ test_invalid_metadata_rejection() {
     local tdir="$TEST_TMP/scenario27_invalid_meta"
     local root="$tdir/root"
     mkdir -p "$root"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 27" "init failed"; return; }
 
     local cases
     cases="name:Invalid_Name arch:armv7 base:yes"
@@ -2129,6 +2131,8 @@ test_failed_upgrade_rollback() {
     local root="$tdir/root"
     local bin="$tdir/bin"
     mkdir -p "$root" "$bin"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 28" "init failed"; return; }
 
     python_pkg_helper create_valid "$tdir/v1.spm.tar.xz" "upg-test" "1.0.0" "false" \
         "Upgrade test v1" "usr/bin/tool:v1-content"
@@ -2138,22 +2142,36 @@ test_failed_upgrade_rollback() {
     python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "upg-test" "2.0.0" "false" \
         "Upgrade test v2" "usr/bin/tool:v2-content"
 
-    # Fail the first mv -f during commit; pass all later mv calls (rollback needs them).
+    # Fail the first rename whose destination lands under the test root, regardless
+    # of whether spm uses "mv" or "mv -f". Later mv calls pass so rollback works.
+    local real_mv
+    real_mv="$(command -v mv)"
     cat > "$bin/mv" <<'SHIM'
 #!/bin/sh
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+    "$SPM_ROOT"/*) target=1 ;;
+    *) target=0 ;;
+esac
 marker="${SPM_FAIL_MARKER:-}"
-if [ "$1" = "-f" ] && [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+if [ "$target" = 1 ] && [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
     touch "$marker.done"
     echo "injected mv failure" >&2
     exit 1
 fi
-exec /usr/bin/mv "$@"
+exec "$SPM_REAL_MV" "$@"
 SHIM
     chmod +x "$bin/mv"
 
-    if PATH="$bin:$PATH" SPM_FAIL_MARKER="$tdir/fail" \
+    if PATH="$bin:$PATH" SPM_ROOT="$root" SPM_REAL_MV="$real_mv" \
+        SPM_FAIL_MARKER="$tdir/fail" \
         "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
         test_fail "Scenario 28" "Upgrade unexpectedly succeeded after injected mv failure"
+        return
+    fi
+    if [ ! -f "$tdir/fail.done" ]; then
+        test_fail "Scenario 28" "Fault injection never fired; test would be vacuous"
         return
     fi
 
@@ -2181,6 +2199,8 @@ test_sigkill_interrupted_install_recovery() {
     local root="$tdir/root"
     local bin="$tdir/bin"
     mkdir -p "$root" "$bin"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 29" "init failed"; return; }
 
     python_pkg_helper create_valid "$tdir/v1.spm.tar.xz" "kill-test" "1.0.0" "false" \
         "Kill test v1" "usr/bin/tool:v1-content"
@@ -2190,25 +2210,38 @@ test_sigkill_interrupted_install_recovery() {
     python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "kill-test" "2.0.0" "false" \
         "Kill test v2" "usr/bin/tool:v2-content"
 
+    local real_mv
+    real_mv="$(command -v mv)"
     cat > "$bin/mv" <<'SHIM'
 #!/bin/sh
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+    "$SPM_ROOT"/*) target=1 ;;
+    *) target=0 ;;
+esac
 marker="${SPM_KILL_MARKER:-}"
-if [ "$1" = "-f" ] && [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+if [ "$target" = 1 ] && [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
     touch "$marker.done"
     kill -9 "$PPID" 2>/dev/null || true
     exit 137
 fi
-exec /usr/bin/mv "$@"
+exec "$SPM_REAL_MV" "$@"
 SHIM
     chmod +x "$bin/mv"
 
     set +e
-    ( PATH="$bin:$PATH" SPM_KILL_MARKER="$tdir/kill" \
-        "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" ) >/dev/null 2>&1
+    ( PATH="$bin:$PATH" SPM_ROOT="$root" SPM_REAL_MV="$real_mv" \
+      SPM_KILL_MARKER="$tdir/kill" \
+      "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" ) >/dev/null 2>&1
     local rc=$?
     set -e
     if [ "$rc" -eq 0 ]; then
         test_fail "Scenario 29" "Injected SIGKILL did not interrupt install"
+        return
+    fi
+    if [ ! -f "$tdir/kill.done" ]; then
+        test_fail "Scenario 29" "Fault injection never fired; test would be vacuous"
         return
     fi
 
@@ -2241,6 +2274,8 @@ test_uninstall_with_shared_file() {
     local tdir="$TEST_TMP/scenario30_shared_uninstall"
     local root="$tdir/root"
     mkdir -p "$root"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 30" "init failed"; return; }
 
     python_pkg_helper create_valid "$tdir/base.spm.tar.xz" "base-shared" "1.0.0" "true" \
         "Base owner" "usr/bin/shared:base-content" "usr/bin/base-only:base-only-content"
@@ -2278,25 +2313,47 @@ test_concurrent_installs() {
     local tdir="$TEST_TMP/scenario31_concurrent_installs"
     local root="$tdir/root"
     mkdir -p "$root"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 31" "init failed"; return; }
 
     python_pkg_helper create_valid "$tdir/a.spm.tar.xz" "conc-a" "1.0.0" "false" \
         "Concurrent A" "usr/bin/conc-a:a-content"
     python_pkg_helper create_valid "$tdir/b.spm.tar.xz" "conc-b" "1.0.0" "false" \
         "Concurrent B" "usr/bin/conc-b:b-content"
 
+    # Hold spm's own exclusive lock. Both installs must block until we release it;
+    # final-state checks alone would pass even with flock removed from spm.
+    local lock_file="$root/var/lib/spm/spm.lock"
+    exec 8>"$lock_file"
+    flock -x 8
+
     set +e
-    "$SPM_BIN" install "$tdir/a.spm.tar.xz" --root "$root" > "$tdir/a.out" 2>&1 &
+    "$SPM_BIN" install "$tdir/a.spm.tar.xz" --root "$root" 8>&- > "$tdir/a.out" 2>&1 &
     local pid_a=$!
-    "$SPM_BIN" install "$tdir/b.spm.tar.xz" --root "$root" > "$tdir/b.out" 2>&1 &
+    "$SPM_BIN" install "$tdir/b.spm.tar.xz" --root "$root" 8>&- > "$tdir/b.out" 2>&1 &
     local pid_b=$!
+    sleep 1
+    local blocked=1
+    if ! kill -0 "$pid_a" 2>/dev/null || ! kill -0 "$pid_b" 2>/dev/null; then
+        blocked=0
+    fi
+    if [ -e "$root/usr/bin/conc-a" ] || [ -e "$root/usr/bin/conc-b" ]; then
+        blocked=0
+    fi
+    flock -u 8
+    exec 8>&-
     wait "$pid_a"
     local rc_a=$?
     wait "$pid_b"
     local rc_b=$?
     set -e
 
+    if [ "$blocked" -ne 1 ]; then
+        test_fail "Scenario 31" "Installs did not block while spm lock was held"
+        return
+    fi
     if [ "$rc_a" -ne 0 ] || [ "$rc_b" -ne 0 ]; then
-        test_fail "Scenario 31" "Concurrent installs failed (a=$rc_a b=$rc_b)"
+        test_fail "Scenario 31" "Installs failed after lock release (a=$rc_a b=$rc_b)"
         return
     fi
     if [ "$(cat "$root/usr/bin/conc-a" 2>/dev/null || true)" != "a-content" ] ||
@@ -2315,7 +2372,7 @@ test_concurrent_installs() {
         test_fail "Scenario 31" "Providers index incomplete after concurrent installs"
         return
     fi
-    test_pass "Scenario 31: Two simultaneous installs serialize through flock; both payloads and DB indexes remain consistent"
+    test_pass "Scenario 31: Held spm lock blocks both installs; after release both complete with intact payloads and DB"
 }
 
 # -----------------------------------------------------------------------------
