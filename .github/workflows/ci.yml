@@ -117,7 +117,7 @@ jobs:
         run: sudo SECS=20 sh ./scripts/run-qemu.sh
 
       - name: Cross-layer integration test fstab <-> kernel <-> services (second QEMU boot)
-        run: sudo SECS=40 sh ./scripts/test-integration.sh
+        run: sudo env SANE_WEAK_DEFAULT_CREDS=1 SECS=40 sh ./scripts/test-integration.sh
 
       - name: Panic-path regression (QEMU)
         run: sudo sh ./scripts/test-kernel-panic-specific.sh
