@@ -1,0 +1,79 @@
+#!/bin/sh
+# sane-firstboot -- one-time credential setup on a fresh S.A.N.E system.
+#
+# Runs from /etc/init.conf as a `once` service before getty. Accounts are
+# shipped locked (no known password), so nobody can log in until this script
+# has set both passwords. A marker file makes subsequent boots a no-op.
+#
+# Recovery: if setup fails, init.conf drops to a root shell on the console
+# (physical/serial console access is already a trusted boundary here).
+set -u
+
+MARK=/etc/.sane-firstboot-done
+
+if [ -f "$MARK" ]; then
+	exit 0
+fi
+
+# All prompts happen on the real console, not on a random service fd.
+exec </dev/console >/dev/console 2>&1
+
+no_echo() {
+	stty -echo 2>/dev/null || true
+}
+
+with_echo() {
+	stty echo 2>/dev/null || true
+	printf '\n'
+}
+
+ask_password() {
+	user=$1
+	while :; do
+		printf 'New password for %s: ' "$user"
+		no_echo
+		p1=
+		IFS= read -r p1 || { with_echo; return 1; }
+		with_echo
+		printf 'Retype password for %s: ' "$user"
+		no_echo
+		p2=
+		IFS= read -r p2 || { with_echo; return 1; }
+		with_echo
+		if [ -z "$p1" ]; then
+			printf 'ERROR: password must not be empty.\n'
+			continue
+		fi
+		if [ "$p1" != "$p2" ]; then
+			printf 'ERROR: passwords do not match. Try again.\n'
+			continue
+		fi
+		if printf '%s\n%s\n' "$p1" "$p2" | passwd -a sha512 "$user" >/dev/null 2>&1; then
+			printf 'Password set for %s.\n' "$user"
+			return 0
+		fi
+		printf 'ERROR: password was rejected (too weak?). Try again.\n'
+	done
+}
+
+printf '\n=== S.A.N.E Linux first boot ===\n'
+printf 'Set a password for root and for the daily user "sane".\n'
+printf 'The sane account is in wheel and may use doas after authentication.\n\n'
+
+if ! ask_password root; then
+	printf 'FATAL: could not read the root password from the console.\n' >&2
+	exit 1
+fi
+if ! ask_password sane; then
+	printf 'FATAL: could not read the sane password from the console.\n' >&2
+	exit 1
+fi
+
+if ! printf 'done\n' > "$MARK"; then
+	printf 'FATAL: could not write %s.\n' "$MARK" >&2
+	exit 1
+fi
+chmod 0600 "$MARK" 2>/dev/null || true
+
+printf '\nFirst-boot setup complete. Continue with login on the console.\n'
+exit 0

@@ -422,40 +422,25 @@ EOF
 cat <<'EOF' > "$TARGET_ROOT/etc/init.conf"
 # /etc/init.conf -- S.A.N.E Linux service supervision
 network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
-tty1:respawn:/sbin/getty 38400 tty1 linux
-console:respawn:cttyhack /sbin/getty -L 115200 - vt100
+tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
+console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i'
 EOF
 
 printf 'S.A.N.E\n' > "$TARGET_ROOT/etc/hostname"
 
-cat <<'EOF' > "$TARGET_ROOT/etc/passwd"
-root:x:0:0:root:/root:/bin/sh
-sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh
-EOF
-chmod 0644 "$TARGET_ROOT/etc/passwd"
-
-cat <<'EOF' > "$TARGET_ROOT/etc/group"
-root:x:0:
-wheel:x:10:root,sane
-sane:x:1000:
-EOF
-chmod 0644 "$TARGET_ROOT/etc/group"
-
-cat <<'EOF' > "$TARGET_ROOT/etc/shadow"
-root:$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0:19700:0:99999:7:::
-sane:$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.:19700:0:99999:7:::
-EOF
-chmod 0600 "$TARGET_ROOT/etc/shadow"
-
-cat <<'EOF' > "$TARGET_ROOT/etc/doas.conf"
-permit persist :wheel
-EOF
-chmod 0600 "$TARGET_ROOT/etc/doas.conf"
-chown 0:0 "$TARGET_ROOT/etc/doas.conf" 2>/dev/null || true
-
 if [ -f "$TARGET_ROOT/usr/bin/doas" ]; then
     chmod 4755 "$TARGET_ROOT/usr/bin/doas"
 fi
+
+# Single source of truth for identity files + account utilities.
+PROVISION_BIN=$(find_tool provision-accounts.sh "$SCRIPT_DIR/provision-accounts.sh" \
+    "$REPO_ROOT/scripts/provision-accounts.sh" /usr/share/sane-install/provision-accounts.sh || true)
+[ -n "$PROVISION_BIN" ] || die "provision-accounts.sh not found"
+if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
+    export SANE_WEAK_DEFAULT_CREDS=1
+fi
+sh "$PROVISION_BIN" "$TARGET_ROOT"
 
 cat <<'EOF' > "$TARGET_ROOT/etc/issue"
 Welcome to S.A.N.E Linux (\m) - \l

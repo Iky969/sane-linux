@@ -6,10 +6,10 @@
 # POSIX sh, fail-closed: invalid input exits non-zero without partial edits.
 #
 # Subcommands:
-#   init                         write baseline passwd/group/shadow/doas.conf
+#   init [--force]               write baseline passwd/group/shadow/doas.conf
 #   add-user NAME [UID] [GROUP]  create account, group and home (locked by default)
 #   del-user NAME [--remove-home] remove account, group membership and home
-#   set-password NAME PASSWORD   set SHA-512 crypt password in shadow
+#   set-password NAME            read password from stdin, write SHA-512 hash
 #   lock NAME | unlock NAME      prefix/remove the shadow lock marker
 #   list                         list accounts
 #   validate                     audit files, hashes and doas policy
@@ -19,19 +19,23 @@ set -eu
 PROG=${0##*/}
 ROOT=/
 VERBOSE=0
+FORCE=0
+SKIP_CHOWN=0
+FIRSTBOOT=0
+SKIP_OWNER=0
 
 ROOT_HASH='$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0'
 SANE_HASH='$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.'
 
 usage() {
 	cat <<EOF
-Usage: $PROG [--root DIR] <command> [args]
+Usage: $PROG [--root DIR] [--force] [--skip-chown] [--firstboot] <command> [args]
 
 Commands:
-  init                          write baseline identity files
+  init [--force] [--firstboot]  write baseline identity files (refuse overwrite)
   add-user NAME [UID] [GROUP]   create a locked account + home
   del-user NAME [--remove-home] remove an account
-  set-password NAME PASSWORD    set a SHA-512 crypt password
+  set-password NAME             read password from stdin (one line)
   lock NAME                     lock an account (prefix '!' in shadow)
   unlock NAME                   unlock an account
   list                          list accounts
@@ -48,6 +52,10 @@ while [ "$#" -gt 0 ]; do
 			[ "$#" -ge 2 ] || die "--root needs a directory"
 			ROOT=$2; shift 2 ;;
 		-v|--verbose) VERBOSE=1; shift ;;
+		--force) FORCE=1; shift ;;
+		--skip-chown) SKIP_CHOWN=1; shift ;;
+		--firstboot) FIRSTBOOT=1; shift ;;
+		--skip-owner-check) SKIP_OWNER=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		--) shift; break ;;
 		-*) die "unknown option: $1" ;;
@@ -72,6 +80,10 @@ DOAS_CONF="$ETC/doas.conf"
 
 mode_of() {
 	stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf '?'
+}
+
+owner_of() {
+	stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null || printf '?:?'
 }
 
 ensure_etc() {
@@ -124,11 +136,32 @@ next_id() {
 }
 
 cmd_init() {
+	# --force is also accepted after the subcommand for convenience.
+	if [ "${1:-}" = "--force" ]; then
+		FORCE=1
+	fi
+	if [ "${1:-}" = "--firstboot" ]; then
+		FIRSTBOOT=1
+	fi
+	if [ "${2:-}" = "--firstboot" ]; then
+		FIRSTBOOT=1
+	fi
+	if [ "$FORCE" -ne 1 ]; then
+		for f in "$PASSWD" "$GROUP" "$SHADOW" "$DOAS_CONF"; do
+			[ -e "$f" ] && die "refusing to overwrite existing ${f#$ROOT}; use --force"
+		done
+	fi
 	ensure_etc
 	mkdir -p "$HOME_BASE/sane"
 	printf 'root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh\n' > "$PASSWD"
 	printf 'root:x:0:\nwheel:x:10:root,sane\nsane:x:1000:\n' > "$GROUP"
-	printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' "$ROOT_HASH" "$SANE_HASH" > "$SHADOW"
+	if [ "$FIRSTBOOT" -eq 1 ]; then
+		# No public password: accounts stay locked until sane-firstboot sets them.
+		printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$SHADOW"
+	else
+		printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' \
+			"$ROOT_HASH" "$SANE_HASH" > "$SHADOW"
+	fi
 	printf 'permit persist :wheel\n' > "$DOAS_CONF"
 	chmod 0644 "$PASSWD" "$GROUP"
 	chmod 0600 "$SHADOW" "$DOAS_CONF"
@@ -139,7 +172,25 @@ cmd_init() {
 
 cmd_add_user() {
 	[ "$#" -ge 1 ] || die "add-user needs a name"
-	name=$1; uid=${2:-}; group=${3:-$name}
+	name=$1; shift
+	uid=; group=
+	skip_chown=$SKIP_CHOWN
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--skip-chown) skip_chown=1 ;;
+			*)
+				if [ -z "$uid" ]; then
+					uid=$1
+				elif [ -z "$group" ]; then
+					group=$1
+				else
+					die "too many arguments to add-user"
+				fi
+				;;
+		esac
+		shift
+	done
+	[ -n "$group" ] || group=$name
 	valid_name "$name" || die "invalid account name: $name"
 	[ "$name" = "root" ] && die "refusing to add the reserved 'root' account"
 	ensure_base
@@ -183,8 +234,13 @@ cmd_add_user() {
 	fi
 	mkdir -p "$home" || die "cannot create home directory: $home"
 	chmod 0750 "$home" || { rmdir "$home" 2>/dev/null || true; die "cannot set home mode: $home"; }
-	if [ "$ROOT" = "/" ] && command -v chown >/dev/null 2>&1; then
-		chown "$uid:$gid" "$home" 2>/dev/null || true
+	if [ "$skip_chown" -eq 1 ]; then
+		note "WARNING: ownership of $home not set (--skip-chown)"
+	else
+		if ! chown "$uid:$gid" "$home"; then
+			rmdir "$home" 2>/dev/null || true
+			die "cannot set ownership of $home to $uid:$gid; use --skip-chown only for non-privileged test builds"
+		fi
 	fi
 
 	rollback_add() {
@@ -261,14 +317,31 @@ cmd_del_user() {
 	ensure_base
 	user_exists "$name" || die "no such account: $name"
 
+	# Never delete a private group that another account still relies on.
+	keep_group=0
+	if group_exists "$name"; then
+		ggid=$(field_of "$GROUP" "$name" 3)
+		if awk -F: -v g="$ggid" -v n="$name" \
+			'$1!=n && $4==g {found=1} END{exit !found}' "$PASSWD"; then
+			keep_group=1
+		elif awk -F: -v n="$name" '$1==n {
+			k=split($4,a,","); for(i=1;i<=k;i++) if(a[i]!="" && a[i]!=n) found=1
+		} END{exit !found}' "$GROUP"; then
+			keep_group=1
+		fi
+		if [ "$keep_group" -eq 1 ]; then
+			note "keeping group '$name' (gid=$ggid): still in use by another account"
+		fi
+	fi
+
 	for file in "$PASSWD" "$SHADOW"; do
 		tmp=$(mktemp "$(dirname "$file")/.sane-accounts.XXXXXX") || die "cannot create temp file"
 		awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$file" > "$tmp"
 		mv "$tmp" "$file"
 	done
 	tmp=$(mktemp "$(dirname "$GROUP")/.sane-accounts.XXXXXX") || die "cannot create temp file"
-	awk -v n="$name" 'BEGIN{FS=OFS=":"} {
-		if ($1==n) next
+	awk -v n="$name" -v keep="$keep_group" 'BEGIN{FS=OFS=":"} {
+		if ($1==n && keep!="1") next
 		if ($4!="") {
 			out=""; c=0; k=split($4,a,",")
 			for (i=1;i<=k;i++) if (a[i]!="" && a[i]!=n) {
@@ -290,8 +363,11 @@ cmd_del_user() {
 }
 
 cmd_set_password() {
-	[ "$#" -eq 2 ] || die "usage: set-password NAME PASSWORD"
-	name=$1; password=$2
+	[ "$#" -eq 1 ] || die "usage: set-password NAME (password on stdin)"
+	name=$1
+	# Read one line from stdin: keeps the secret out of argv and shell history.
+	password=
+	IFS= read -r password || true
 	ensure_base
 	user_exists "$name" || die "no such account: $name"
 	[ -n "$password" ] || die "refusing to set an empty password"
@@ -358,6 +434,10 @@ cmd_validate() {
 	m=$(mode_of "$GROUP");  [ "$m" = 644 ] || audit_fail "group mode $m (expected 644)"
 	m=$(mode_of "$SHADOW"); [ "$m" = 600 ] || audit_fail "shadow mode $m (expected 600)"
 	m=$(mode_of "$DOAS_CONF"); [ "$m" = 600 ] || audit_fail "doas.conf mode $m (expected 600)"
+	if [ "$SKIP_OWNER" -ne 1 ]; then
+		o=$(owner_of "$DOAS_CONF"); [ "$o" = 0:0 ] || \
+			audit_fail "doas.conf owner $o (expected 0:0)"
+	fi
 
 	awk -F: '$3!~/^[0-9]+$/ || $4!~/^[0-9]+$/ {bad=1} END{exit !bad}' "$PASSWD" && \
 		audit_fail "passwd contains non-numeric uid/gid"
@@ -385,12 +465,16 @@ cmd_validate() {
 	if grep -qE '^[[:space:]]*permit[[:space:]]+nopass' "$DOAS_CONF"; then
 		audit_fail "doas.conf grants 'nopass' (passwordless escalation)"
 	fi
-	if ! grep -qE '^[[:space:]]*permit([[:space:]]|$)' "$DOAS_CONF"; then
-		audit_fail "doas.conf has no permit rule"
+	if ! grep -qE '^[[:space:]]*permit([[:space:]]+[a-z]+)*[[:space:]]+:wheel([[:space:]]|$)' "$DOAS_CONF"; then
+		audit_fail "doas.conf has no effective permit rule for :wheel"
 	fi
 	if [ -e "$ROOT/usr/bin/doas" ]; then
 		m=$(mode_of "$ROOT/usr/bin/doas")
 		[ "$m" = 4755 ] || audit_fail "doas mode $m (expected 4755 setuid root)"
+		if [ "$SKIP_OWNER" -ne 1 ]; then
+			o=$(owner_of "$ROOT/usr/bin/doas")
+			[ "$o" = 0:0 ] || audit_fail "doas owner $o (expected 0:0)"
+		fi
 	else
 		audit_fail "doas binary is missing"
 	fi
