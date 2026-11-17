@@ -103,7 +103,7 @@ See [doc/distro-builder.md](doc/distro-builder.md) for architectural details, si
 
 ```bash
 make image            # required once: builds distro/sane.img
-make test-lifecycle   # seven QEMU scenarios; skips cleanly without root/QEMU/debugfs
+make test-lifecycle   # seven QEMU scenarios; skips cleanly without root/QEMU/losetup or a built image
 LIFECYCLE_LOGDIR=/tmp/my-logs make test-lifecycle
 ```
 

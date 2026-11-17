@@ -149,6 +149,14 @@ jobs:
       - name: Run boot lifecycle suite
         run: make test-lifecycle
 
+      - name: Upload lifecycle console logs
+        if: always()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: boot-lifecycle-logs
+          path: /tmp/sane-lifecycle-logs/
+          if-no-files-found: warn
+
   clawrza-packages:
     name: clawrza self-hosting recipes (build + spm install)
     runs-on: ubuntu-latest

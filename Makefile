@@ -14,7 +14,7 @@
 #                   via one real QEMU boot (requires root + qemu-system-x86)
 #   make test-panic  kernel-panic regression suite (QEMU; requires root + qemu)
 #   make test-lifecycle  boot/account lifecycle scenarios in QEMU (requires
-#                   root, QEMU, debugfs and a built disk image)
+#                   root, QEMU, losetup and a built disk image)
 #   make fuzz       ASan+UBSan fuzz harness for config/fstab/initctl parsers
 #   make lint       run python linter on log patterns, markers, and format specifiers
 #   make packages   build all base S.A.N.E distro packages (.spm.tar.xz)

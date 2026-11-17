@@ -13,6 +13,7 @@ import re
 import tempfile
 import select
 import socket
+import string
 import subprocess
 import sys
 import time
@@ -21,6 +22,25 @@ from pathlib import Path
 ROOT_PW = "LifecycleRoot2026"
 USER_PW = "LifecycleUser2026"
 USER = "sane"
+
+# A usable password hash is a complete SHA-512 crypt value, not a bare "$6$"
+# prefix left behind by an interrupted passwd. Mirrors valid_sha512_hash() in
+# scripts/sane-accounts so both suites judge a shadow file the same way.
+_HASH_CHARS = frozenset(string.ascii_letters + string.digits + "./")
+
+
+def valid_sha512_hash(value: str) -> bool:
+    if not value.startswith("$6$"):
+        return False
+    parts = value[3:].split("$")
+    if len(parts) != 2:
+        return False
+    salt, checksum = parts
+    if not (1 <= len(salt) <= 16) or not set(salt) <= _HASH_CHARS:
+        return False
+    if len(checksum) != 86 or not set(checksum) <= _HASH_CHARS:
+        return False
+    return True
 
 
 def run(cmd, *, capture=True, check=False, stdin=None):
@@ -125,12 +145,29 @@ class Boot:
             os.unlink(self.monitor_path)
         master, slave = pty.openpty()
         self.master = master
+        # Match the other QEMU harnesses in this repo (test-image-boot.sh,
+        # run-qemu.sh): the default qemu64 CPU is too old for modern
+        # toolchains, and a guest that dies before printing anything makes
+        # every console-based check fail on an empty buffer.
+        accel = (["-enable-kvm", "-cpu", "host"]
+                 if os.access("/dev/kvm", os.W_OK) else ["-cpu", "max"])
+        self.cmd = ["qemu-system-x86_64", "-M", "q35", "-m", "768", "-smp", "2",
+                    "-no-reboot", "-nographic", "-monitor",
+                    f"unix:{self.monitor_path},server,nowait",
+                    "-drive", f"file={image},format=raw,if=virtio", "-boot", "order=c"] + accel
         self.proc = subprocess.Popen(
-            ["qemu-system-x86_64", "-M", "q35", "-m", "768", "-smp", "2",
-             "-no-reboot", "-nographic", "-monitor", f"unix:{self.monitor_path},server,nowait",
-             "-drive", f"file={image},format=raw,if=virtio", "-boot", "order=c"],
-            stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+            self.cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
         os.close(slave)
+        self._dead_diag_printed = False
+
+    def _print_dead_diag(self):
+        """Surface a QEMU startup failure in the CI log, not just the log file."""
+        if self._dead_diag_printed:
+            return
+        self._dead_diag_printed = True
+        tail = self.buf[-800:].replace("\r", "\\r").replace("\n", "\\n")
+        print(f"[diag] {self.log.name}: QEMU exited rc={self.proc.returncode}; "
+              f"cmd={' '.join(self.cmd)}; console tail={tail!r}", flush=True)
 
     def send(self, line):
         os.write(self.master, (line + "\n").encode())
@@ -145,6 +182,7 @@ class Boot:
                 self.pos = m.end()
                 return True
             if self.proc.poll() is not None:
+                self._print_dead_diag()
                 break
             r, _, _ = select.select([self.master], [], [], 0.5)
             if r:
@@ -208,6 +246,19 @@ class Runner:
         print(f"{'ok  ' if ok else 'FAIL'} - {name}" + (f" [{detail}]" if detail and not ok else ""))
         return bool(ok)
 
+    def _shadow_passwords(self):
+        passwords = {}
+        for line in self.image.shadow().splitlines():
+            fields = line.split(":")
+            if len(fields) >= 2:
+                passwords[fields[0]] = fields[1]
+        return passwords
+
+    def passwords_hashed(self):
+        """Both accounts must hold a complete SHA-512 hash, not a bare prefix."""
+        passwords = self._shadow_passwords()
+        return all(valid_sha512_hash(passwords.get(name, "")) for name in ("root", USER))
+
     def stop(self, boot):
         boot.stop()
         self.image.refresh()
@@ -264,9 +315,8 @@ class Runner:
 
     def ensure_setup(self, label="setup"):
         """Make login-only scenarios self-contained: set up first if needed."""
-        shadow = self.image.shadow()
         if (self.image.exists("/etc/.sane-firstboot-done") and
-                "root:$6$" in shadow and "sane:$6$" in shadow):
+                self.passwords_hashed()):
             return True
         self.fresh()
         b = Boot(self.image.path, self.logdir, label)
@@ -287,8 +337,7 @@ class Runner:
             self.check("S1 setup completes on first boot", ok)
             self.check("S1 marker written after setup", self.image.exists("/etc/.sane-firstboot-done"),
                        b.save())
-            shadow = self.image.shadow()
-            self.check("S1 passwords are hashed after setup", "root:$6$" in shadow and "sane:$6$" in shadow)
+            self.check("S1 passwords are hashed after setup", self.passwords_hashed())
         finally:
             self.stop(b)
 
@@ -381,8 +430,7 @@ class Runner:
         try:
             ok = self.setup(b2, expect_recovery=True)
             self.check("S7 corrupt account config triggers recovery and re-setup", ok, b2.save())
-            shadow = self.image.shadow()
-            self.check("S7 shadow rebuilt with hashes", "root:$6$" in shadow and "sane:$6$" in shadow)
+            self.check("S7 shadow rebuilt with hashes", self.passwords_hashed())
         finally:
             self.stop(b2)
 
@@ -391,7 +439,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image", type=Path)
     ap.add_argument("--logdir", type=Path, default=Path("/tmp/sane-lifecycle-logs"))
-    ap.add_argument("--scenario", action="append", help="run only this scenario number (1-7)")
+    ap.add_argument("--scenario", action="append", type=int, choices=range(1, 8),
+                    help="run only this scenario number (1-7), repeatable")
     args = ap.parse_args()
     args.logdir.mkdir(parents=True, exist_ok=True)
     r = Runner(args.image.resolve(), args.logdir)
@@ -404,7 +453,7 @@ def main():
         6: r.scenario_6_repeated_reboots,
         7: r.scenario_7_recovery,
     }
-    wanted = [int(s) for s in args.scenario] if args.scenario else list(scenarios)
+    wanted = args.scenario or list(scenarios)
     try:
         for n in wanted:
             print(f"\n=== Scenario {n} ===")
