@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
@@ -15,8 +16,54 @@
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
 
-#define DEFAULT_CA "/etc/ssl/certs/ca-bundle.crt"
 #define IO_BUF 4096
+
+static void die(const char *msg, int code);
+
+/* MUSLBOX ships ca-bundle.crt; S.A.N.E installs ca-certificates.crt and a
+ * cert.pem symlink. Pick whichever exists so the tool works in both. */
+static const char *ca_candidates[] = {
+    "/etc/ssl/certs/ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/cert.pem",
+    NULL,
+};
+
+static const char *pick_ca(const char *explicit) {
+    if (explicit) {
+        if (access(explicit, R_OK) == 0)
+            return explicit;
+        die("CA bundle not readable", 0);
+    }
+    for (int i = 0; ca_candidates[i]; i++)
+        if (access(ca_candidates[i], R_OK) == 0)
+            return ca_candidates[i];
+    die("no CA bundle found; pass one explicitly", 0);
+    return NULL;
+}
+
+static int valid_host(const char *s) {
+    if (!s || !*s)
+        return 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int valid_path(const char *s) {
+    if (!s || *s != '/')
+        return 0;
+    /* Printable ASCII only: no space, CR/LF or other control characters,
+     * which would otherwise allow request smuggling / header injection. */
+    for (; *s; s++)
+        if ((unsigned char)*s < 0x21 || (unsigned char)*s > 0x7e)
+            return 0;
+    return 1;
+}
 
 static void die(const char *msg, int code) {
 	char buf[256];
@@ -29,7 +76,7 @@ static void die(const char *msg, int code) {
 
 int main(int argc, char **argv) {
 	const char *url = argc > 1 ? argv[1] : NULL;
-	const char *ca_path = argc > 2 ? argv[2] : DEFAULT_CA;
+	const char *ca_path = pick_ca(argc > 2 ? argv[2] : NULL);
 	char host[256] = "", path[512] = "/";
 	char port[16] = "443";
 
@@ -39,13 +86,26 @@ int main(int argc, char **argv) {
 	}
 	const char *start = url + 8;
 	const char *slash = strchr(start, '/');
+	const char *userinfo = strchr(start, '@');
+	if (userinfo && (!slash || userinfo < slash))
+		die("userinfo in URL is not supported", 0);
+	if (*start == '[')
+		die("IPv6 literals are not supported", 0);
 	const char *colon = strchr(start, ':');
 	size_t hostlen = slash ? (size_t)(slash - start) : strlen(start);
 	if (colon && (!slash || colon < slash)) {
 		hostlen = (size_t)(colon - start);
 		size_t portlen = slash ? (size_t)(slash - colon - 1) : strlen(colon + 1);
-		if (portlen >= sizeof(port))
-			portlen = sizeof(port) - 1;
+		if (portlen == 0 || portlen >= sizeof(port))
+			die("invalid port", 0);
+		unsigned portnum = 0;
+		for (size_t i = 0; i < portlen; i++) {
+			if (colon[1 + i] < '0' || colon[1 + i] > '9')
+				die("invalid port", 0);
+			portnum = portnum * 10 + (unsigned)(colon[1 + i] - '0');
+		}
+		if (portnum == 0 || portnum > 65535)
+			die("port out of range", 0);
 		memcpy(port, colon + 1, portlen);
 		port[portlen] = '\0';
 	}
@@ -53,8 +113,15 @@ int main(int argc, char **argv) {
 		die("invalid host", 0);
 	memcpy(host, start, hostlen);
 	host[hostlen] = '\0';
-	if (slash && strlen(slash) < sizeof(path))
+	if (!valid_host(host))
+		die("host contains disallowed characters", 0);
+	if (slash) {
+		if (strlen(slash) >= sizeof(path))
+			die("path too long", 0);
 		strcpy(path, slash);
+	}
+	if (!valid_path(path))
+		die("path contains disallowed characters", 0);
 
 	mbedtls_net_context fd;
 	mbedtls_entropy_context entropy;
@@ -82,6 +149,9 @@ int main(int argc, char **argv) {
 	if (ret > 0)
 		fprintf(stderr, "httpsget: warning: skipped %d invalid certs\n", ret);
 
+	/* Bound both the blocking connect and the TLS read so a blackholed host
+	 * cannot hang the client forever. */
+	alarm(30);
 	ret = mbedtls_net_connect(&fd, host, port, MBEDTLS_NET_PROTO_TCP);
 	if (ret)
 		die("net_connect", ret);
@@ -91,6 +161,8 @@ int main(int argc, char **argv) {
 	                                  MBEDTLS_SSL_PRESET_DEFAULT);
 	if (ret)
 		die("ssl_config_defaults", ret);
+	alarm(0);
+	mbedtls_ssl_conf_read_timeout(&conf, 15000);
 	mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 	mbedtls_ssl_conf_ca_chain(&conf, &ca, NULL);
 	mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);

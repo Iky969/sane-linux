@@ -56,3 +56,9 @@ Two host details worth keeping:
   never through `CPPFLAGS` (that drops the build system's own `-Iinclude`).
 - QEMU user-mode DNS is at `10.0.2.3` here; `10.0.2.2` is the gateway and did
   not answer musl's DNS queries.
+- With no CA argument, `httpsget` auto-detects `ca-bundle.crt` (MUSLBOX),
+  `ca-certificates.crt` (S.A.N.E), then `cert.pem`. URL parsing rejects
+  userinfo, IPv6 literals, bad ports, and non-printable path characters;
+  connect and read are bounded by `alarm(30)` / a 15 s read timeout.
+- Build output (`httpsget/httpsget`, `httpsget/work/`) is gitignored, and a
+  bad cached tarball is deleted and re-downloaded instead of bricking builds.
