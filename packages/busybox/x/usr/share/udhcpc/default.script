@@ -1,15 +1,52 @@
 #!/bin/sh
-# /usr/share/udhcpc/default.script -- BusyBox udhcpc event script (FEAT-64)
-set -e
+# /usr/share/udhcpc/default.script -- BusyBox udhcpc event script (FEAT-64, Phase B)
+# Fail-closed: invalid server values are ignored, resolv.conf is replaced
+# atomically, and the original resolver is restored on deconfig.
+set -eu
 
-[ -n "${1:-}" ] || { echo "Error: called without event" >&2; exit 1; }
+[ -n "${1:-}" ] || { printf 'Error: called without event\n' >&2; exit 1; }
 
 RESOLV_CONF="/etc/resolv.conf"
+RESOLV_DEFAULT="/etc/resolv.conf.default"
+
+valid_server() {
+	case "$1" in
+		''|*[!a-zA-Z0-9.:_-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+write_resolv() {
+	dir=$(dirname "$RESOLV_CONF")
+	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || return 1
+	if [ -n "${domain:-}" ]; then
+		case "$domain" in
+			''|*[!a-zA-Z0-9._-]*) ;;
+			*) printf 'domain %s\n' "$domain" >> "$tmp" ;;
+		esac
+	fi
+	for ns in "$@"; do
+		valid_server "$ns" || continue
+		printf 'nameserver %s\n' "$ns" >> "$tmp"
+	done
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$RESOLV_CONF"
+}
+
+restore_default_resolv() {
+	[ -f "$RESOLV_DEFAULT" ] || return 0
+	dir=$(dirname "$RESOLV_CONF")
+	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || return 1
+	if ! cat "$RESOLV_DEFAULT" > "$tmp"; then rm -f "$tmp"; return 1; fi
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$RESOLV_CONF"
+}
 
 case "$1" in
     deconfig)
         ip addr flush dev "$interface" 2>/dev/null || true
         ip link set "$interface" up 2>/dev/null || true
+        restore_default_resolv || true
         ;;
     renew|bound)
         ip addr flush dev "$interface" 2>/dev/null || true
@@ -31,12 +68,7 @@ case "$1" in
         fi
 
         if [ -n "${dns:-}" ]; then
-            tmp_resolv="/etc/resolv.conf.tmp.$$"
-            rm -f "$tmp_resolv" 2>/dev/null || true
-            for ns in $dns; do
-                printf 'nameserver %s\n' "$ns" >> "$tmp_resolv"
-            done
-            mv -f "$tmp_resolv" "$RESOLV_CONF" 2>/dev/null || true
+            write_resolv $dns || true
         fi
         ;;
     nak|leasefail)

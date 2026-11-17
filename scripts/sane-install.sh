@@ -421,16 +421,25 @@ EOF
 
 cat <<'EOF' > "$TARGET_ROOT/etc/init.conf"
 # /etc/init.conf -- S.A.N.E Linux service supervision
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi"
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':timeout=0
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
-firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':timeout=0
 EOF
 
 printf 'S.A.N.E\n' > "$TARGET_ROOT/etc/hostname"
+# No base package ships /etc/resolv.conf, so create the default resolver here.
+if [ ! -f "$TARGET_ROOT/etc/resolv.conf" ]; then
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$TARGET_ROOT/etc/resolv.conf"
+fi
+cp "$TARGET_ROOT/etc/resolv.conf" "$TARGET_ROOT/etc/resolv.conf.default"
 
 if [ -f "$TARGET_ROOT/usr/bin/doas" ]; then
     chmod 4755 "$TARGET_ROOT/usr/bin/doas"
+fi
+# Wi-Fi config holds secrets: always root-owned 0600.
+if [ -f "$TARGET_ROOT/etc/wpa_supplicant.conf" ]; then
+    chmod 0600 "$TARGET_ROOT/etc/wpa_supplicant.conf"
 fi
 
 # Single source of truth for identity files + account utilities.

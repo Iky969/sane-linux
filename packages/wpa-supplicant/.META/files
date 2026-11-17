@@ -1,0 +1,6 @@
+etc/
+etc/wpa_supplicant.conf
+usr/
+usr/bin/
+usr/bin/wpa_cli
+usr/bin/wpa_supplicant
