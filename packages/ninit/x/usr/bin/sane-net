@@ -1,40 +1,198 @@
 #!/bin/sh
-# sane-net -- S.A.N.E minimal network bring-up (FEAT-64)
+# sane-net -- S.A.N.E minimal network configuration (FEAT-64, Phase B).
+#
+# POSIX sh, designed for the static BusyBox userspace. Every external tool
+# (ip, udhcpc, curl, wpa_supplicant) is resolved through PATH so the tool can
+# be exercised in tests with stubs.
 set -eu
 
+PROG=${0##*/}
+RESOLV=/etc/resolv.conf
+RESOLV_DEFAULT=/etc/resolv.conf.default
+WPACONF=/etc/wpa_supplicant.conf
+CABUNDLE=/etc/ssl/certs/ca-certificates.crt
+
 usage() {
-    printf 'Usage: sane-net dhcp <iface>\n' >&2
-    printf '       sane-net static <iface> <ip/cidr> <gw> [dns]\n' >&2
-    exit 1
+	cat <<EOF
+Usage: $PROG <command> [args]
+
+  link IFACE [up|down]                 show or set link state
+  static IFACE IP/CIDR GW [DNS ...]    configure a static address + DNS
+  dhcp IFACE                           start udhcpc in background
+  dns SERVER [SERVER ...]              write /etc/resolv.conf atomically
+  dns default                          restore /etc/resolv.conf.default
+  wifi IFACE SSID PSK                  configure WPA2 and start supplicant
+  status [IFACE]                       show addresses, routes and DNS
+  tls-check URL                        verify HTTPS with the CA bundle
+  reconnect IFACE [SECONDS]            wait for carrier, then restart DHCP
+EOF
+	exit 1
 }
 
-cmd="${1:-}"
-[ -n "$cmd" ] || usage
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
+# Escape a value for use inside a double-quoted wpa_supplicant.conf field.
+wpa_escape() {
+	printf '%s' "$1" | sed 's/[\\"]/\\&/g'
+}
+
+valid_server() {
+	# IPv4, IPv6 or hostname; allow hyphens inside names but not as a prefix.
+	case "$1" in
+		''|-*|*[!a-zA-Z0-9.:_-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+write_resolv() {
+	# write_resolv FILE SERVER... -- atomic, mode 0644, no partial writes.
+	file=$1; shift
+	[ "$#" -ge 1 ] || die "no DNS server given"
+	for ns in "$@"; do
+		valid_server "$ns" || die "invalid DNS server: $ns"
+	done
+	dir=$(dirname "$file")
+	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || die "cannot create temp file in $dir"
+	for ns in "$@"; do
+		printf 'nameserver %s\n' "$ns" >> "$tmp"
+	done
+	chmod 0644 "$tmp"
+	mv "$tmp" "$file"
+}
+
+cmd_link() {
+	need ip
+	[ "${1:-}" ] || usage
+	iface=$1
+	case "${2:-}" in
+		'') ip link show dev "$iface" ;;
+		up) ip link set "$iface" up ;;
+		down) ip link set "$iface" down ;;
+		*) usage ;;
+	esac
+}
+
+cmd_static() {
+	need ip
+	[ "$#" -ge 3 ] || usage
+	iface=$1; ip_cidr=$2; gw=$3; shift 3
+	ip link set "$iface" up || die "cannot bring up $iface"
+	if ! ip addr show dev "$iface" 2>/dev/null | grep -q "$ip_cidr"; then
+		ip addr add "$ip_cidr" dev "$iface" || die "cannot add $ip_cidr to $iface"
+	fi
+	if ! ip route show 2>/dev/null | grep -q '^default '; then
+		ip route add default via "$gw" || die "cannot add default route via $gw"
+	fi
+	if [ "$#" -gt 0 ]; then
+		write_resolv "$RESOLV" "$@"
+	fi
+}
+
+cmd_dhcp() {
+	need ip; need udhcpc
+	[ "${1:-}" ] || usage
+	iface=$1
+	ip link set "$iface" up
+	exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
+		-s /usr/share/udhcpc/default.script
+}
+
+cmd_dns() {
+	[ "$#" -ge 1 ] || usage
+	if [ "$1" = "default" ]; then
+		[ -f "$RESOLV_DEFAULT" ] || die "$RESOLV_DEFAULT is missing"
+		dir=$(dirname "$RESOLV")
+		tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || die "cannot create temp file in $dir"
+		cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; die "cannot read $RESOLV_DEFAULT"; }
+		chmod 0644 "$tmp"
+		mv "$tmp" "$RESOLV"
+		return 0
+	fi
+	write_resolv "$RESOLV" "$@"
+}
+
+cmd_wifi() {
+	need ip; need wpa_supplicant
+	[ "$#" -eq 3 ] || { printf 'Usage: %s wifi IFACE SSID PSK\n' "$PROG" >&2; exit 1; }
+	iface=$1; ssid=$2; psk=$3
+	[ -n "$ssid" ] || die "SSID must not be empty"
+	case "$ssid" in *[![:print:]]*) die "SSID contains non-printable characters" ;; esac
+	[ "${#psk}" -ge 8 ] || die "PSK must be at least 8 characters"
+	case "$psk" in *[![:print:]]*) die "PSK contains non-printable characters" ;; esac
+	ssid_e=$(wpa_escape "$ssid")
+	psk_e=$(wpa_escape "$psk")
+	ip link set "$iface" up
+	tmp=$(mktemp "$(dirname "$WPACONF")/.wpa_supplicant.XXXXXX") || die "cannot create temp file"
+	cat > "$tmp" <<EOF
+ctrl_interface=/run/wpa_supplicant
+update_config=1
+network={
+    ssid="$ssid_e"
+    psk="$psk_e"
+    key_mgmt=WPA-PSK
+}
+EOF
+	chmod 0600 "$tmp"
+	mv "$tmp" "$WPACONF"
+	exec wpa_supplicant -B -i "$iface" -c "$WPACONF" -D wext
+}
+
+cmd_status() {
+	need ip
+	if [ "${1:-}" ]; then
+		ip addr show dev "$1"
+	else
+		ip addr show
+		ip route show
+	fi
+	if [ -f "$RESOLV" ]; then
+		printf '\nDNS:\n'
+		cat "$RESOLV"
+	fi
+}
+
+cmd_tls_check() {
+	need curl
+	[ "${1:-}" ] || usage
+	url=$1
+	case "$url" in
+		https://*) ;;
+		*) die "tls-check requires an https:// URL" ;;
+	esac
+	[ -f "$CABUNDLE" ] || die "CA bundle missing: $CABUNDLE"
+	curl --cacert "$CABUNDLE" -fsSI --max-time 15 "$url" >/dev/null
+}
+
+cmd_reconnect() {
+	need ip; need udhcpc
+	[ "${1:-}" ] || usage
+	iface=$1; limit=${2:-30}
+	case "$limit" in ''|*[!0-9]*) die "seconds must be numeric" ;; esac
+	i=0
+	while [ "$i" -lt "$limit" ]; do
+		if ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
+			exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
+				-s /usr/share/udhcpc/default.script
+		fi
+		ip link set "$iface" up 2>/dev/null || true
+		i=$((i + 1))
+		sleep 1
+	done
+	die "no carrier on $iface after ${limit}s"
+}
+
+cmd=${1:-}
+[ -n "$cmd" ] || usage
+shift
 case "$cmd" in
-    dhcp)
-        iface="${2:-}"
-        [ -n "$iface" ] || { printf 'Error: interface required for dhcp\n' >&2; usage; }
-        ip link set "$iface" up
-        exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" -s /usr/share/udhcpc/default.script
-        ;;
-    static)
-        iface="${2:-}"
-        ip_cidr="${3:-}"
-        gw="${4:-}"
-        dns="${5:-}"
-        [ -n "$iface" ] && [ -n "$ip_cidr" ] && [ -n "$gw" ] || {
-            printf 'Error: iface, ip/cidr, and gw required for static\n' >&2
-            usage
-        }
-        ip link set "$iface" up
-        ip addr add "$ip_cidr" dev "$iface"
-        ip route add default via "$gw"
-        if [ -n "$dns" ]; then
-            printf 'nameserver %s\n' "$dns" > /etc/resolv.conf
-        fi
-        ;;
-    *)
-        usage
-        ;;
+	link)      cmd_link "$@" ;;
+	static)    cmd_static "$@" ;;
+	dhcp)      cmd_dhcp "$@" ;;
+	dns)       cmd_dns "$@" ;;
+	wifi)      cmd_wifi "$@" ;;
+	status)    cmd_status "$@" ;;
+	tls-check) cmd_tls_check "$@" ;;
+	reconnect) cmd_reconnect "$@" ;;
+	*) usage ;;
 esac

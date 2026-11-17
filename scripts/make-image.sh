@@ -399,18 +399,27 @@ EOF
 # Configure /etc/init.conf
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/init.conf" >/dev/null
 # /etc/init.conf -- S.A.N.E Linux service supervision
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi"
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':timeout=0
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
-firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':timeout=0
 EOF
 
 # Configure /etc/hostname
 printf 'S.A.N.E\n' | $SUDO tee "$MNT_DIR/root/etc/hostname" >/dev/null
+# No base package ships /etc/resolv.conf, so create the default resolver here.
+if [ ! -f "$MNT_DIR/root/etc/resolv.conf" ]; then
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | $SUDO tee "$MNT_DIR/root/etc/resolv.conf" >/dev/null
+fi
+$SUDO cp "$MNT_DIR/root/etc/resolv.conf" "$MNT_DIR/root/etc/resolv.conf.default"
 
 # Setuid permissions for doas
 if [ -f "$MNT_DIR/root/usr/bin/doas" ]; then
     $SUDO chmod 4755 "$MNT_DIR/root/usr/bin/doas"
+fi
+# Wi-Fi config holds secrets: always root-owned 0600.
+if [ -f "$MNT_DIR/root/etc/wpa_supplicant.conf" ]; then
+    $SUDO chmod 0600 "$MNT_DIR/root/etc/wpa_supplicant.conf"
 fi
 
 # Single source of truth for identity files + account utilities.

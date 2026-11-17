@@ -1,0 +1,3 @@
+55c0680ece673afef01d2ff1b3a9b9630502c503d08fdeac52c6201b03c9a1ca  etc/wpa_supplicant.conf
+f98a807b6f8cadea48575f9903ab0f7628e5c4d7e57cda66ee2261fb40401d88  usr/bin/wpa_cli
+dd04dfc6446ff8968350a92e83cf0b14364830b4201f28cd3323b3eeb25ff132  usr/bin/wpa_supplicant
