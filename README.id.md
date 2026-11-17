@@ -240,6 +240,12 @@ Rilis saat ini: **v1.2.0** (Catatan rilis lengkap ada di [RELEASE-NOTES-v1.2.0.m
 > Biner engine inti (`ninit` PID 1 dan engine manajer paket `spm`) saat ini berstatus **FEATURE-FROZEN** untuk siklus v1.3.0.
 > Fokus pengembangan dialihkan dari eksperimen "root lab" menjadi **Daily Terminal Workstation**, memprioritaskan paket jaringan userspace, outbound TLS (`ca-certificates`, `mbedtls`, `curl`), dan autentikasi multi-user (`getty`, `udhcpc`, `doas`). Window manager dan lingkungan desktop grafis ditunda ke rilis v2.0/v3.0.
 
+## Kontributor
+
+- [Iky969](https://github.com/Iky969) — maintainer, `ninit` PID 1 dan engine inti
+- [fyxm969](https://github.com/fyxm969) — resep toolchain self-hosting clawrza
+- [fbri67](https://github.com/fbri67) — guard `safe_path()` dan resep `httpsget` statis di `contrib/muslbox`
+
 ## Lisensi
 
 [MIT](LICENSE) © 2026 Iky969. Masalah keamanan: jangan buka issue publik —

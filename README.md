@@ -194,6 +194,12 @@ Current release: **v1.2.0** (See full release details in [RELEASE-NOTES-v1.2.0.m
 > The core engine binaries (`ninit` PID 1 and `spm` package manager engine) are **FEATURE-FROZEN** for the v1.3.0 cycle.
 > Development has pivoted from an experimental "root lab" appliance to a **Daily Terminal Workstation**, prioritizing userspace networking, outbound TLS (`ca-certificates`, `mbedtls`, `curl`), and multi-user login (`getty`, `udhcpc`, `doas`). Window manager and graphical desktop environments are deferred to v2.0/v3.0.
 
+## Contributors
+
+- [Iky969](https://github.com/Iky969) — maintainer, `ninit` PID 1 and core engine
+- [fyxm969](https://github.com/fyxm969) — clawrza self-hosting toolchain recipes
+- [fbri67](https://github.com/fbri67) — `contrib/muslbox` `safe_path()` guard and static `httpsget` recipe
+
 ## License
 
 [MIT](LICENSE) © 2026 Iky969. Security issues: do not open public issues — please follow [SECURITY.md](SECURITY.md).
