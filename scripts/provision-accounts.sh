@@ -41,7 +41,7 @@ fi
 $SUDO mkdir -p "$TARGET/usr/bin"
 $SUDO install -m 0755 "$ACCOUNTS" "$TARGET/usr/bin/sane-accounts"
 $SUDO install -m 0755 "$FIRSTBOOT" "$TARGET/usr/bin/sane-firstboot"
-install -m 0755 "$RECOVERY" "$TARGET/usr/bin/sane-account-recovery"
+$SUDO install -m 0755 "$RECOVERY" "$TARGET/usr/bin/sane-account-recovery"
 
 # Recheck the resulting policy (owner checks are skipped when sudo is used for
 # writes because the files may legitimately be owned by the build user).

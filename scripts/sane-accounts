@@ -88,6 +88,25 @@ owner_of() {
 	stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null || printf '?:?'
 }
 
+# A SHA-512 crypt hash is $6$<salt>$<checksum>: salt 1-16 chars, checksum
+# exactly 86 chars, both from [./A-Za-z0-9]. A bare "$6$" prefix (e.g. a hash
+# truncated by an interrupted passwd) must NOT count as usable, otherwise the
+# recovery service accepts it and firstboot stays marked done with no login.
+valid_sha512_hash() {
+	case "$1" in
+		'$6$'*) ;;
+		*) return 1 ;;
+	esac
+	awk -v h="${1#\$6\$}" 'BEGIN {
+		n = split(h, part, "\\$")
+		if (n != 2) exit 1
+		salt = part[1]; sum = part[2]
+		if (salt == "" || length(salt) > 16 || salt ~ /[^.\/A-Za-z0-9]/) exit 1
+		if (length(sum) != 86 || sum ~ /[^.\/A-Za-z0-9]/) exit 1
+		exit 0
+	}'
+}
+
 ensure_etc() {
 	[ -d "$ETC" ] || die "target root has no /etc: $ETC"
 }
@@ -427,6 +446,7 @@ audit_fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 
 cmd_validate() {
 	ensure_etc
+	MARK="$ETC/.sane-firstboot-done"
 	for f in "$PASSWD" "$GROUP" "$SHADOW" "$DOAS_CONF"; do
 		[ -f "$f" ] || audit_fail "missing file: ${f#$ROOT}"
 	done
@@ -450,13 +470,21 @@ cmd_validate() {
 	awk -F: '{if (seen[$3]++) {bad=1}} END{exit !bad}' "$GROUP" && \
 		audit_fail "duplicate gid in group"
 
-	awk -F: '{
-		if ($2=="") { bad=1; next }
-		h=$2; sub(/^!/,"",h)
-		if (h=="*" || h=="") next
-		if (h !~ /^\$6\$/) bad=1
-	} END{exit !bad}' "$SHADOW" && \
-		audit_fail "shadow has an empty password field or a non-SHA512 active hash"
+	# An active hash must be a complete SHA-512 crypt value, not just a "$6$"
+	# prefix. A truncated hash passes a prefix-only check and leaves the
+	# console locked out while validation still reports success.
+	bad=0
+	while IFS=: read -r _u _p _uid _gid _gecos _home _shell _rest; do
+		h=$_p; [ -z "$h" ] && { bad=1; continue; }
+		case "$h" in '!'*) h=${h#!} ;; esac
+		case "$h" in
+			'*'|'') continue ;;  # deliberately disabled account
+			'$6$'*) valid_sha512_hash "$h" || bad=1 ;;
+			*) bad=1 ;;           # unsupported active hash algorithm
+		esac
+	done < "$SHADOW"
+	[ "$bad" -eq 0 ] || \
+		audit_fail "shadow has an empty field, truncated hash, or unsupported active hash"
 
 	if ! awk -F: -v n=wheel '$1==n {found=1} END{exit !found}' "$GROUP"; then
 		audit_fail "wheel group is missing"
@@ -481,6 +509,18 @@ cmd_validate() {
 		audit_fail "doas binary is missing"
 	fi
 
+	# root and sane are required daily-use accounts. Once firstboot is marked
+	# done they must have an active hash; a surviving root hash alone is not
+	# enough, otherwise a lost sane hash silently locks the daily account out.
+	if [ -f "$MARK" ]; then
+		for req in root sane; do
+			h=$(field_of "$SHADOW" "$req" 2 || true)
+			case "$h" in '!'*) h=${h#!} ;; esac
+			valid_sha512_hash "$h" || \
+				audit_fail "required account $req has no usable hash after firstboot"
+		done
+	fi
+
 	if [ "$FAIL" -ne 0 ]; then
 		printf '%s: %d validation failure(s)\n' "$PROG" "$FAIL" >&2
 		return 1
@@ -499,10 +539,10 @@ cmd_recover() {
 	if [ -f "$SHADOW" ]; then
 		h=$(field_of "$SHADOW" root 2 || true)
 		case "$h" in '!'*) h=${h#!} ;; esac
-		case "$h" in '$6$'*) ROOT_HASH_OLD=$h ;; esac
+		valid_sha512_hash "$h" && ROOT_HASH_OLD=$h
 		h=$(field_of "$SHADOW" sane 2 || true)
 		case "$h" in '!'*) h=${h#!} ;; esac
-		case "$h" in '$6$'*) SANE_HASH_OLD=$h ;; esac
+		valid_sha512_hash "$h" && SANE_HASH_OLD=$h
 	fi
 
 	FIRSTBOOT=1
@@ -512,9 +552,9 @@ cmd_recover() {
 	chmod 0600 "$SHADOW" "$DOAS_CONF"
 
 	MARK="$ETC/.sane-firstboot-done"
-	if [ -z "$ROOT_HASH_OLD" ]; then
+	if [ -z "$ROOT_HASH_OLD" ] || [ -z "$SANE_HASH_OLD" ]; then
 		rm -f "$MARK"
-		printf 'recover: no valid root hash; first boot will ask for passwords again\n'
+		printf 'recover: no usable root/sane hash; first boot will ask for passwords again\n'
 	else
 		printf 'done\n' > "$MARK"
 		chmod 0600 "$MARK"

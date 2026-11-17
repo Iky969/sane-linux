@@ -141,7 +141,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev \
-            byacc bison bzip2 cpio curl qemu-system-x86 squashfs-tools dosfstools gptfdisk e2fsprogs
+            byacc bison bzip2 cpio curl qemu-system-x86 squashfs-tools dosfstools gdisk e2fsprogs
 
       - name: Build disk image
         run: make image

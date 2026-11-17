@@ -322,6 +322,7 @@ check "recover writes locked root shadow" sh -c \
 
 base_firstboot
 set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
 printf 'garbage\n' > "$T/etc/doas.conf"
 printf 'done\n' > "$T/etc/.sane-firstboot-done"
 expect_ok "recover rebuilds corrupted doas.conf" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
@@ -332,14 +333,93 @@ check "recover preserves root hash from valid shadow" sh -c \
 
 base_firstboot
 set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
 printf ':broken:\n' > "$T/etc/passwd"
 printf 'done\n' > "$T/etc/.sane-firstboot-done"
 expect_ok "recover rebuilds corrupted passwd" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
 expect_ok "validate passes after passwd recovery" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 check "recover keeps firstboot marker when passwd is repaired" test -f "$T/etc/.sane-firstboot-done"
 
+# A hash truncated by an interrupted passwd must fail validation and must not
+# be preserved by recover (otherwise firstboot stays marked done with no login).
+base_firstboot
+set_pw root 'LifecyclePass1!'
+awk -F: -v OFS=: '$1=="root"{$2="$6$truncated"}1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects truncated SHA-512 hash" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds from truncated root hash" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover re-arms firstboot when root hash is truncated" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+
+# fbri67: a surviving root hash must not keep the done marker when the daily
+# account lost its hash. Otherwise firstboot never reruns and sane stays locked.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+awk -F: -v OFS=: '$1=="sane"{$2="!"}1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects locked sane with firstboot done" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover re-arms when only sane hash is lost" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover clears done marker when sane hash is lost" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+check "recover restores sane to locked baseline" sh -c \
+	"grep -q '^sane:!:19700:' '$T/etc/shadow'"
+
 check "provision installs account recovery helper" \
 	test -f "$REPO_ROOT/scripts/sane-account-recovery"
+
+printf '\n--- recovery boot wrapper (branch coverage) ---\n'
+WRAPPER="$REPO_ROOT/scripts/sane-account-recovery"
+check "recovery wrapper is present and readable" test -f "$WRAPPER"
+: > "$T/cli-calls"
+cat > "$T/stub-cli" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$T/cli-calls"
+case "\$*" in
+	*validate*) rc=0; [ -f "$T/validate-fail" ] && rc=1 ;;
+	*recover*)  rc=0
+	            [ -f "$T/recover-fail" ] && rc=1
+	            rm -f "$T/validate-fail" ;;
+	*) rc=1 ;;
+esac
+exit "\$rc"
+STUB
+chmod +x "$T/stub-cli"
+cat > "$T/stub-shell" <<STUB
+#!/bin/sh
+printf 'fallback shell reached\n' >> "$T/cli-calls"
+exit 42
+STUB
+chmod +x "$T/stub-shell"
+
+run_wrapper() {
+	SANE_ACCOUNTS_CLI="$T/stub-cli" \
+	SANE_RECOVERY_SHELL="$T/stub-shell" \
+	SANE_RECOVERY_BIN_DIR="$T" \
+		sh "$WRAPPER"
+}
+
+: > "$T/cli-calls"
+expect_ok "wrapper exits 0 when validation passes" run_wrapper
+check "wrapper validates and does not recover when healthy" sh -c \
+	"[ \$(wc -l < '$T/cli-calls') -eq 1 ] && grep -q 'validate' '$T/cli-calls'"
+
+: > "$T/cli-calls"; touch "$T/validate-fail"
+expect_ok "wrapper recovers when validation fails" run_wrapper
+check "wrapper validates, recovers, then revalidates" sh -c \
+	"[ \$(wc -l < '$T/cli-calls') -eq 3 ] && \
+	 grep -q 'recover' '$T/cli-calls'"
+
+: > "$T/cli-calls"; touch "$T/validate-fail" "$T/recover-fail"
+run_wrapper >/dev/null 2>&1
+check "wrapper drops to shell when rebuild fails" \
+	test "$(grep -c 'fallback shell reached' "$T/cli-calls")" -eq 1
 
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -10,6 +10,7 @@ import argparse
 import os
 import pty
 import re
+import tempfile
 import select
 import socket
 import subprocess
@@ -44,11 +45,13 @@ class Image:
         self.path = path
         self.mnt = logdir / "rootfs"
         self.mnt.mkdir(parents=True, exist_ok=True)
+        # Override when the image layout changes (e.g. an extra boot partition).
+        self.part = os.environ.get("SANE_ROOT_PART", "p2")
 
     def _mount(self):
         loop = run(sudo(["losetup", "--find", "--show", "--partscan", str(self.path)]),
                    check=True).stdout.strip()
-        run(sudo(["mount", "-o", "rw", loop + "p2", str(self.mnt)]), check=True)
+        run(sudo(["mount", "-o", "rw", loop + self.part, str(self.mnt)]), check=True)
         return loop
 
     def _unmount(self, loop):
@@ -80,17 +83,24 @@ class Image:
             self._unmount(loop)
 
     def write(self, path, content, mode="0644"):
-        target = self._host(path)
-        tmp = Path("/tmp") / f"lifecycle-{os.getpid()}-{path.replace('/', '_')}"
-        tmp.write_text(content)
+        # mkstemp() in a private 0700 directory: predictable /tmp names let a
+        # local attacker pre-plant a symlink and redirect our privileged write.
         loop = self._mount()
         try:
+            target = self._host(path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            run(sudo(["install", "-o", "0", "-g", "0", "-m", mode, str(tmp), str(target)]),
-                check=True)
+            with tempfile.TemporaryDirectory(prefix="sane-lifecycle-") as d:
+                fd, tmpname = tempfile.mkstemp(dir=d)
+                try:
+                    os.write(fd, content.encode())
+                    os.close(fd)
+                    run(sudo(["install", "-o", "0", "-g", "0", "-m", mode,
+                              tmpname, str(target)]), check=True)
+                finally:
+                    if os.path.exists(tmpname):
+                        os.unlink(tmpname)
         finally:
             self._unmount(loop)
-            tmp.unlink(missing_ok=True)
 
     def exists(self, path):
         loop = self._mount()
@@ -252,6 +262,19 @@ class Runner:
                          mode="0600")
         self.image.write("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:sane:/home/sane:/bin/sh\n")
 
+    def ensure_setup(self, label="setup"):
+        """Make login-only scenarios self-contained: set up first if needed."""
+        shadow = self.image.shadow()
+        if (self.image.exists("/etc/.sane-firstboot-done") and
+                "root:$6$" in shadow and "sane:$6$" in shadow):
+            return True
+        self.fresh()
+        b = Boot(self.image.path, self.logdir, label)
+        try:
+            return self.setup(b)
+        finally:
+            self.stop(b)
+
     def scenario_1_no_default_credentials(self):
         self.fresh()
         shadow = self.image.shadow()
@@ -322,6 +345,8 @@ class Runner:
             self.stop(b2)
 
     def scenario_5_normal_login(self):
+        self.check("S5 setup prerequisite is self-contained",
+                   self.ensure_setup("s5-setup"))
         b = Boot(self.image.path, self.logdir, "s5-login")
         try:
             ok = self.login(b)
@@ -331,6 +356,8 @@ class Runner:
             self.stop(b)
 
     def scenario_6_repeated_reboots(self):
+        self.check("S6 setup prerequisite is self-contained",
+                   self.ensure_setup("s6-setup"))
         for i in range(1, 4):
             b = Boot(self.image.path, self.logdir, f"s6-reboot{i}")
             try:
