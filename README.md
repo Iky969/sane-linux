@@ -37,6 +37,10 @@ The event loop is built on `ppoll`, keeping init responsive to signals even duri
 - **S.A.N.E Package Manager (`spm`)**: POSIX `/bin/sh` package manager supporting atomic `rename(2)` staging, binary active replacement (anti-`ETXTBSY`), reverse dependency protection, archive hardening, and power-cut journal recovery.
 - **Live Installer & Dual Boot**: guest offline live installer (`sane-install.sh`) supporting dual Limine BIOS (MBR/GPT) and UEFI (ESP FAT32) with GPT `PARTUUID` root partition resolution.
 - **Static Binary**: builds cleanly with `gcc -static`, requiring only libc.
+- **First-boot credentials**: accounts ship locked; `/usr/bin/sane-firstboot`
+  prompts for the `root` and `sane` passwords on the console before getty
+  starts. No public password is distributed. See
+  [doc/account-security.md](doc/account-security.md).
 
 ### Cgroup v2 — Resource Limiting Capabilities
 
@@ -171,6 +175,7 @@ LICENSE                       MIT License
 | Document | Contents |
 |---|---|
 | [doc/architecture.md](doc/architecture.md) | Internal architecture: boot sequence, event loop, signals, respawn, shutdown, cgroup, logging |
+| [doc/account-security.md](doc/account-security.md) | Phase A: default accounts, password policy, `sane-accounts` lifecycle CLI, and `doas` escalation policy |
 | [doc/configuration.md](doc/configuration.md) | Syntax and semantics of `/etc/init.conf`, `/etc/fstab`, `/run/initctl`, and log paths |
 | [doc/build-and-test.md](doc/build-and-test.md) | Static build, test harnesses, CI workflow, manual chroot testing, troubleshooting |
 | [doc/distro-builder.md](doc/distro-builder.md) | Rootfs assembly, initramfs packaging, QEMU headless validation |

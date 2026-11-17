@@ -18,6 +18,7 @@ For a high-level overview, quick start guide, and configuration examples, see th
 | [toolchain-and-rootfs-from-source.md](toolchain-and-rootfs-from-source.md) | Comprehensive guide: hermetic musl toolchain, compiling BusyBox, Linux kernel, ninit, and rootfs assembly |
 | [glossary-i18n.md](glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
 | [../SECURITY.md](../SECURITY.md) | Security policy and vulnerability disclosure procedures |
+| [account-security.md](account-security.md) | Phase A: accounts, passwords, user lifecycle, and `doas` policy |
 | [../LICENSE](../LICENSE) | MIT License |
 
 ## Current Features
