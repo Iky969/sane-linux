@@ -170,5 +170,26 @@ check "failed add leaves no passwd entry" sh -c "! grep -q '^bob:' '$T/etc/passw
 check "failed add leaves no shadow entry" sh -c "! grep -q '^bob:' '$T/etc/shadow'"
 check "failed add leaves no group entry" sh -c "! grep -q '^bob:' '$T/etc/group'"
 
+# Force the passwd append to fail (512-byte file-size limit) after the home,
+# the new group and the group entry were already created. This exercises the
+# rollback path that normal tests cannot reach.
+base
+i=0
+while [ "$i" -lt 11 ]; do
+	printf '# pad 012345678901234567890123456789\n' >> "$T/etc/passwd"
+	i=$((i + 1))
+done
+expect_fail "add-user rolls back when passwd write fails" \
+	sh -c 'ulimit -f 1; trap "" XFSZ; exec sh "$1" --root "$2" add-user alice 1005 developers' \
+	sh "$ACCOUNTS" "$T"
+check "rollback removes passwd entry" sh -c "! grep -q '^alice:' '$T/etc/passwd'"
+check "rollback removes shadow entry" sh -c "! grep -q '^alice:' '$T/etc/shadow'"
+check "rollback removes the differently-named group" sh -c \
+	"! grep -q '^developers:' '$T/etc/group'"
+check "rollback removes the home directory" test ! -d "$T/home/alice"
+check "rollback restores passwd mode 0644" test "$(stat -c %a "$T/etc/passwd")" = 644
+check "rollback restores group mode 0644" test "$(stat -c %a "$T/etc/group")" = 644
+check "rollback restores shadow mode 0600" test "$(stat -c %a "$T/etc/shadow")" = 600
+
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

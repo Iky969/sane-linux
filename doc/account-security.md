@@ -80,7 +80,7 @@ absence of a second UID 0, empty password fields, SHA-512 (or locked) shadow
 hashes, the `wheel` group membership, a non-`nopass` `doas.conf` with at least
 one `permit` rule, and the setuid bit on `/usr/bin/doas`. It exits non-zero on
 any violation and is wired into `make test` and CI
-(`scripts/test-accounts.sh`, 63 assertions).
+(`scripts/test-accounts.sh`, 71 assertions).
 
 ## Privilege escalation (`doas`)
 
