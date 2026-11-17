@@ -400,45 +400,21 @@ EOF
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/init.conf" >/dev/null
 # /etc/init.conf -- S.A.N.E Linux service supervision
 network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
-tty1:respawn:/sbin/getty 38400 tty1 linux
-console:respawn:cttyhack /sbin/getty -L 115200 - vt100
+tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
+console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':timeout=0
 EOF
 
 # Configure /etc/hostname
 printf 'S.A.N.E\n' | $SUDO tee "$MNT_DIR/root/etc/hostname" >/dev/null
 
-# Configure /etc/passwd and /etc/group
-cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/passwd" >/dev/null
-root:x:0:0:root:/root:/bin/sh
-sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh
-EOF
-$SUDO chmod 0644 "$MNT_DIR/root/etc/passwd"
-
-cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/group" >/dev/null
-root:x:0:
-wheel:x:10:root,sane
-sane:x:1000:
-EOF
-$SUDO chmod 0644 "$MNT_DIR/root/etc/group"
-
-# Configure /etc/shadow
-cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/shadow" >/dev/null
-root:$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0:19700:0:99999:7:::
-sane:$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.:19700:0:99999:7:::
-EOF
-$SUDO chmod 0600 "$MNT_DIR/root/etc/shadow"
-
-# Configure /etc/doas.conf
-cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/doas.conf" >/dev/null
-permit persist :wheel
-EOF
-$SUDO chmod 0600 "$MNT_DIR/root/etc/doas.conf"
-$SUDO chown 0:0 "$MNT_DIR/root/etc/doas.conf"
-
 # Setuid permissions for doas
 if [ -f "$MNT_DIR/root/usr/bin/doas" ]; then
     $SUDO chmod 4755 "$MNT_DIR/root/usr/bin/doas"
 fi
+
+# Single source of truth for identity files + account utilities.
+$SUDO sh "$REPO_ROOT/scripts/provision-accounts.sh" "$MNT_DIR/root" "$SUDO"
 
 # Configure /etc/issue
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/issue" >/dev/null

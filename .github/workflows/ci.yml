@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SANE_WEAK_DEFAULT_CREDS: "1"
+
 jobs:
   security-scan:
     name: Security scan (Gitleaks)
@@ -54,6 +57,15 @@ jobs:
 
       - name: Lint log patterns & format strings
         run: make lint
+
+      - name: Phase A account lifecycle & policy validation
+        run: sh ./scripts/test-accounts.sh
+
+      - name: Phase B networking (sane-net, DNS, DHCP, TLS)
+        run: sh ./scripts/test-network.sh
+
+      - name: Phase C reliability suite
+        run: sh ./scripts/test-reliability.sh
 
       - name: Smoke test PID 1 (SIGTERM -> clean shutdown)
         run: sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh
@@ -104,14 +116,14 @@ jobs:
       - name: rootfs + initramfs from source (BUSYBOX_MODE=auto)
         run: |
           make
-          sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
+          sudo env SANE_WEAK_DEFAULT_CREDS=1 JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
 
       - name: Boot initramfs in QEMU (TCG, no /dev/kvm)
         run: sudo SECS=20 sh ./scripts/run-qemu.sh
 
       - name: Cross-layer integration test fstab <-> kernel <-> services (second QEMU boot)
-        run: sudo SECS=40 sh ./scripts/test-integration.sh
+        run: sudo env SANE_WEAK_DEFAULT_CREDS=1 SECS=40 sh ./scripts/test-integration.sh
 
       - name: Panic-path regression (QEMU)
         run: sudo sh ./scripts/test-kernel-panic-specific.sh

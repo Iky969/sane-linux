@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SANE_WEAK_DEFAULT_CREDS: "1"
+
 jobs:
   test-installer:
     name: Guest offline installer verification (INST-50 / INST-51)
@@ -24,7 +27,7 @@ jobs:
       - name: Build rootfs and initramfs
         run: |
           make
-          sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
+          sudo env SANE_WEAK_DEFAULT_CREDS=1 JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
           sudo chown -R $(id -u):$(id -g) distro/
 

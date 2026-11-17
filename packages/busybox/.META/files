@@ -32,6 +32,7 @@ bin/more
 bin/mount
 bin/mv
 bin/od
+bin/passwd
 bin/printf
 bin/ps
 bin/pwd
