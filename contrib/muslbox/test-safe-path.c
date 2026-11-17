@@ -7,9 +7,12 @@
 #include "safe_path.h"
 
 static int failures = 0;
+static int total = 0;
 
 static void check(const char *s, int want) {
-    int got = safe_path(s);
+    int got;
+    total++;
+    got = safe_path(s);
     if (got != want) {
         fprintf(stderr, "FAIL safe_path(%s) = %d, want %d\n", s, got, want);
         failures++;
@@ -34,11 +37,14 @@ int main(void) {
     check("back\\slash", 0);
     check("$(id)", 0);
     check("-leading", 1);
+    check("foo..bar", 0);       /* conservative: ".." substring refused */
+    check("\xc3\xa9", 0);         /* non-ASCII refuses regardless of locale */
+    check("tab\there", 0);
 
     if (failures) {
         fprintf(stderr, "%d safe_path test(s) failed\n", failures);
         return 1;
     }
-    printf("safe_path: all %d cases passed\n", 18);
+    printf("safe_path: all %d cases passed\n", total);
     return 0;
 }

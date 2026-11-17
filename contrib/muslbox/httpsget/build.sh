@@ -18,17 +18,26 @@ die() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 command -v musl-gcc >/dev/null || die "musl-gcc missing (install musl-tools)"
 
 mkdir -p "$CACHE"
-if [ ! -s "$CACHE/mbedtls-3.6.8.tar.bz2" ]; then
+TARBALL="$CACHE/mbedtls-3.6.8.tar.bz2"
+PART="$TARBALL.part"
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+if [ -s "$TARBALL" ] && [ "$(sha "$TARBALL")" = "$MBEDTLS_SHA" ]; then
+	log "cached tarball verified"
+else
+	[ ! -s "$TARBALL" ] || { printf '    discarding bad cached tarball\n' >&2; rm -f "$TARBALL"; }
 	log "downloading mbedtls 3.6.8"
-	curl -fL --retry 3 -o "$CACHE/mbedtls-3.6.8.tar.bz2.part" "$MBEDTLS_URL"
-	mv "$CACHE/mbedtls-3.6.8.tar.bz2.part" "$CACHE/mbedtls-3.6.8.tar.bz2"
+	curl -fL --retry 3 -o "$PART" "$MBEDTLS_URL" || { rm -f "$PART"; die "download failed"; }
+	actual=$(sha "$PART")
+	if [ "$actual" != "$MBEDTLS_SHA" ]; then
+		rm -f "$PART"   # never promote a corrupt download into the cache
+		die "mbedtls checksum mismatch: $actual"
+	fi
+	mv "$PART" "$TARBALL"
 fi
-actual=$(sha256sum "$CACHE/mbedtls-3.6.8.tar.bz2" | cut -d' ' -f1)
-[ "$actual" = "$MBEDTLS_SHA" ] || die "mbedtls checksum mismatch: $actual"
 
 if [ ! -d "$SRC" ]; then
 	log "extracting"
-	tar -xjf "$CACHE/mbedtls-3.6.8.tar.bz2" -C "$WORK"
+	tar -xjf "$TARBALL" -C "$WORK"
 fi
 if [ ! -f "$SRC/library/libmbedtls.a" ]; then
 	log "building static libs with musl-gcc -j$JOBS"
