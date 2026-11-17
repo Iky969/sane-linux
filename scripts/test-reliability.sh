@@ -163,5 +163,84 @@ check "restore brings back the snapshot" test -d \
 check "restore brings back the log dir" test -d "$T2/var/log/sane"
 rm -rf -- "$T2"
 
+# --- security / fail-closed regressions ------------------------------------
+# A manifest path must never escape the target root.
+base
+run init
+mkdir -p "$T/payload"
+OUT=$(mktemp "$(dirname "$T")/sane-rel-escape.XXXXXX")
+name=${OUT##*/}
+printf 'pwned\n' > "$T/$name"
+printf '%s  ./../%s\n' "$(sha256sum "$T/$name" | cut -d' ' -f1)" "$name" > "$T/payload/manifest.sha256"
+printf 'sentinel\n' > "$OUT"
+expect_fail "upgrade rejects traversal path in payload manifest" run upgrade "$T/payload"
+check "upgrade did not overwrite a file outside the target root" sh -c \
+	"grep -q '^sentinel$' '$OUT'"
+rm -f "$OUT"
+
+base
+run init
+run snapshot baseline
+OUT=$(mktemp "$(dirname "$T")/sane-rel-escape.XXXXXX")
+name=${OUT##*/}
+printf 'pwned\n' > "$T/var/lib/sane/reliability/$name"
+printf '%s  ./../%s\n' \
+	"$(sha256sum "$T/var/lib/sane/reliability/$name" | cut -d' ' -f1)" \
+	"$name" > "$T/var/lib/sane/reliability/snapshots/baseline/manifest.sha256"
+printf 'sentinel\n' > "$OUT"
+expect_fail "verify rejects traversal path in snapshot manifest" run verify baseline
+expect_fail "rollback rejects traversal path in snapshot manifest" run rollback baseline
+check "rollback did not overwrite a file outside the target root" sh -c \
+	"grep -q '^sentinel$' '$OUT'"
+rm -f "$OUT"
+
+# NUL-delimited manifest: filenames with spaces must survive.
+base
+run init
+printf 'spaced\n' > "$T/var/lib/spm/installed/demo/has space.txt"
+expect_ok "snapshot handles filenames with spaces" run snapshot spaced
+expect_ok "verify handles filenames with spaces" run verify spaced
+
+# Archive validation: unsafe members are rejected before extraction.
+base
+run init
+run snapshot keepme
+mkdir -p "$T/evil/var/lib/sane/reliability/snapshots" "$T/evil/var/log/sane"
+ln -s /etc/passwd "$T/evil/var/lib/sane/reliability/snapshots/absolute"
+printf 'log\n' > "$T/evil/var/log/sane/reliability.log"
+tar -czf "$T/evil.tar.gz" -C "$T/evil" var
+expect_fail "restore rejects an absolute symlink in the archive" run restore "$T/evil.tar.gz"
+check "absolute symlink was not installed" test ! -L \
+	"$T/var/lib/sane/reliability/snapshots/absolute"
+python3 - "$T/traversal.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    data = b'pwned\n'
+    info = tarfile.TarInfo('var/lib/sane/reliability/snapshots/../../../escape.txt')
+    info.size = len(data)
+    tf.addfile(info, io.BytesIO(data))
+PY
+expect_fail "restore rejects a traversal member in the archive" run restore "$T/traversal.tar.gz"
+
+# Force replacement must not destroy the old snapshot before the new one is in place.
+base
+run init
+run snapshot old
+printf 'new\n' > "$T/etc/init.conf"
+expect_ok "snapshot --force replaces an existing tag" run snapshot old --force
+check "forced snapshot holds the new content" sh -c \
+	"grep -q '^new$' '$T/var/lib/sane/reliability/snapshots/old/etc/init.conf'"
+check "force leaves no stale backup directories" sh -c \
+	"! ls -d '$T/var/lib/sane/reliability/snapshots'/.old.* >/dev/null 2>&1"
+
+# Two safety snapshots in the same second must get distinct tags.
+base
+run init
+run snapshot golden
+expect_ok "first rollback succeeds" run rollback golden
+expect_ok "second rollback in the same second succeeds" run rollback golden
+check "two distinct safety snapshots exist" sh -c \
+	"[ \$(ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-rollback-* 2>/dev/null | wc -l) -ge 2 ]"
+
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
