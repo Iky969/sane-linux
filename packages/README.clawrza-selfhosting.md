@@ -18,8 +18,10 @@ musl-based; there is no collision with `musl`'s libc files.
 ## Bootstrap model (host vs guest)
 
 These recipes run on a **host** that already has a seed C toolchain
-(`gcc`, `make`, `binutils`). They bootstrap a *separate* sysroot; they are not
-run inside a pristine S.A.N.E musl guest:
+(`gcc`, `make`, `binutils`) plus `gawk`, `bison`, `python3`, `curl` and
+`sha256sum`. glibc 2.41 configure hard-fails without `gawk`; `build.sh`
+runs a preflight check for these tools. They bootstrap a *separate* sysroot;
+they are not run inside a pristine S.A.N.E musl guest.
 
 ```
 host seed toolchain
@@ -31,8 +33,11 @@ host seed toolchain
 
 `clawrza-glibc-headers` uses `make install-headers install_root=$DESTDIR`, not
 a full glibc `make install`, so it never drops `libc.so`/`crt1.o` into the
-target. There is deliberately **no** `kernel-headers` spm package in this
-repo: stage kernel headers manually before running the recipe, and note that
+target. It then creates the empty `gnu/stubs.h` that glibc's manual header
+bootstrap requires (`install-headers` does not generate it) and finishes with
+a smoke compile of `#include <stdio.h>` against the resulting sysroot.
+
+There is deliberately **no** `kernel-headers` spm package in this repo: stage kernel headers manually before running the recipe, and note that
 `.META/depends` for the headers package is empty on purpose.
 
 GCC uses `--disable-bootstrap`, so the final compiler is produced by the host's
@@ -41,7 +46,10 @@ seed compiler. This is a fast, deterministic bootstrap, not a strict
 self-hosting: the independent `Iky969/clawrza-glibc-selfhost` image proves that
 `kinit` and `spkg` recompile inside QEMU with byte-identical SHA-256.
 `--with-system-zlib` is intentionally omitted to avoid an undeclared host
-`zlib.h`/`libz` build dependency.
+`zlib.h`/`libz` build dependency. The gcc recipe does not hardcode an rpath;
+the guest exports `LD_LIBRARY_PATH` and `GCC_EXEC_PREFIX` at boot instead.
+The binutils recipe uses `--disable-shared`, keeping `ld`/`as` hermetic rather
+than giving the bootstrap linker its own shared-library dependencies.
 
 ## Usage after installation
 

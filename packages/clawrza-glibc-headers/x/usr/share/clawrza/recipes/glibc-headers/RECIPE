@@ -8,5 +8,6 @@ build_order=1
 stage=host-bootstrap
 install_target=install-headers
 seed_toolchain=host-gcc-make
+host_prereqs=gawk,bison,python3,gcc,make,curl,sha256sum
 kernel_headers=manual staging into $DESTDIR/usr/include (no spm package)
 description=glibc headers only; host-built into a sysroot, never into a live musl rootfs
