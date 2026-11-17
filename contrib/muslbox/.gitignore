@@ -2,3 +2,4 @@
 httpsget/httpsget
 httpsget/work/
 *.o
+httpsget/usage.out

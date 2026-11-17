@@ -5,6 +5,9 @@
  *   - reject any ".." substring (conservative, even inside a filename)
  *   - allow only ASCII [A-Za-z0-9._/-+] so shell quoting stays safe
  *
+ * Deliberately not canonicalising: ".", "//" and a lone "." are accepted.
+ * Callers that need canonical paths should normalise before calling.
+ *
  * This is a C reference implementation; S.A.N.E's spm is POSIX shell and
  * already has its own equivalent guards.  Keep both in sync conceptually.
  */
