@@ -27,7 +27,7 @@ jobs:
       - name: Build rootfs and initramfs
         run: |
           make
-          sudo JOBS=$(nproc) sh ./scripts/build-rootfs.sh
+          sudo -E JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
           sudo chown -R $(id -u):$(id -g) distro/
 
@@ -35,7 +35,7 @@ jobs:
         run: make packages
 
       - name: Build raw GPT disk image
-        run: sudo bash scripts/make-image.sh --output distro/sane.img
+        run: sudo -E bash scripts/make-image.sh --output distro/sane.img
 
       - name: Assert image file existence and 0644 permissions
         run: |
