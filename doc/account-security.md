@@ -25,15 +25,21 @@ Files and permissions:
 | `/etc/doas.conf` | `0600`, root:root | privilege escalation policy |
 | `/usr/bin/doas` | `4755` root:setuid | escalation utility |
 
-> **Warning:** the shipped password for both accounts is `sane`. Change it on
-> first boot (`passwd`) before exposing the machine to any network.
+> **Warning:** the shipped passwords are `root` for the `root` account and
+> `sane` for the `sane` account (the stored hashes use salts `root` and `sane`
+> respectively). With `getty` login enabled and `permit persist :wheel`,
+> anyone who reaches a console can log in as `sane` and escalate to root with
+> that password. Change **both** passwords on first boot (`passwd`) before
+> exposing the machine to any network.
 
 ## Password management
 
 - Active passwords are stored as SHA-512 crypt (`$6$<salt>$<hash>`) in
   `/etc/shadow`; `/etc/passwd` only contains the `x` placeholder.
 - New accounts are created **locked** (`!` prefix in the shadow hash) and must
-  be assigned a password explicitly.
+  be assigned a password explicitly. A lock marker with no hash cannot be
+  removed: `unlock` refuses it and directs the operator to `set-password`
+  first, so an empty (passwordless) shadow field can never be produced.
 - In-guest: `/bin/passwd` (BusyBox applet, linked in the rootfs) changes the
   current user's password and rewrites `/etc/shadow` with mode `0600`.
 - At build time: `scripts/sane-accounts set-password <root> <user> <password>`
@@ -65,13 +71,16 @@ Rules enforced by `add-user`:
 - The home directory is created as `/home/NAME` with mode `0750`.
 
 `del-user` removes the passwd/shadow entries and all group memberships. The
-home directory is removed only with `--remove-home`.
+home directory is removed only with `--remove-home`. Account creation is
+transactional: the home directory is created first and any later write failure
+rolls back all identity entries.
 
 `validate` audits file existence and modes, numeric and duplicate UIDs/GIDs,
-absence of a second UID 0, SHA-512 (or locked) shadow hashes, the `wheel`
-group membership, a non-`nopass` `doas.conf` with at least one `permit` rule,
-and the setuid bit on `/usr/bin/doas`. It exits non-zero on any violation and
-is wired into `make test` and CI (`scripts/test-accounts.sh`, 55 assertions).
+absence of a second UID 0, empty password fields, SHA-512 (or locked) shadow
+hashes, the `wheel` group membership, a non-`nopass` `doas.conf` with at least
+one `permit` rule, and the setuid bit on `/usr/bin/doas`. It exits non-zero on
+any violation and is wired into `make test` and CI
+(`scripts/test-accounts.sh`, 63 assertions).
 
 ## Privilege escalation (`doas`)
 

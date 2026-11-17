@@ -69,6 +69,10 @@ check "add-user creates matching group" sh -c \
 check "add-user creates locked shadow entry" sh -c \
 	"grep -q '^alice:!:19700:0:99999:7:::$' '$T/etc/shadow'"
 check "add-user creates home with 0750" test "$(stat -c %a "$T/home/alice")" = 750
+expect_fail "unlock of account without a password hash rejected" \
+	sh "$ACCOUNTS" --root "$T" unlock alice
+check "failed unlock leaves the locked hash unchanged" sh -c \
+	"grep -q '^alice:!:19700:0:99999:7:::$' '$T/etc/shadow'"
 expect_fail "duplicate account name rejected" sh "$ACCOUNTS" --root "$T" add-user alice
 expect_fail "duplicate uid rejected" sh "$ACCOUNTS" --root "$T" add-user bob 1005
 expect_fail "reserved root account rejected" sh "$ACCOUNTS" --root "$T" add-user root
@@ -149,6 +153,22 @@ expect_fail "validate rejects missing wheel group" sh "$ACCOUNTS" --root "$T" va
 base
 rm -f "$T/etc/shadow"
 expect_fail "validate rejects missing shadow" sh "$ACCOUNTS" --root "$T" validate
+
+base
+awk -F: 'BEGIN{OFS=":"} $1=="sane" {$2=""} {print}' "$T/etc/shadow" > "$T/etc/shadow.tmp"
+mv "$T/etc/shadow.tmp" "$T/etc/shadow"
+expect_fail "validate rejects an empty password field" sh "$ACCOUNTS" --root "$T" validate
+
+base
+printf 'clone:x:10:clone:/home/clone:/bin/sh\n' >> "$T/etc/group"
+expect_fail "validate rejects duplicate gid" sh "$ACCOUNTS" --root "$T" validate
+
+base
+printf 'blocked' > "$T/home/bob"
+expect_fail "add-user aborts when home path is a file" sh "$ACCOUNTS" --root "$T" add-user bob 1007
+check "failed add leaves no passwd entry" sh -c "! grep -q '^bob:' '$T/etc/passwd'"
+check "failed add leaves no shadow entry" sh -c "! grep -q '^bob:' '$T/etc/shadow'"
+check "failed add leaves no group entry" sh -c "! grep -q '^bob:' '$T/etc/group'"
 
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
