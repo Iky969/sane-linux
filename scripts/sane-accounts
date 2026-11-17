@@ -13,6 +13,7 @@
 #   lock NAME | unlock NAME      prefix/remove the shadow lock marker
 #   list                         list accounts
 #   validate                     audit files, hashes and doas policy
+#   recover                      rebuild broken identity files without lockout
 #
 set -eu
 
@@ -40,6 +41,7 @@ Commands:
   unlock NAME                   unlock an account
   list                          list accounts
   validate                      audit account files and doas policy
+  recover                       rebuild broken identity files; re-run firstboot if needed
 EOF
 }
 
@@ -486,6 +488,41 @@ cmd_validate() {
 	note "account policy validation passed"
 }
 
+cmd_recover() {
+	# Never leave the system locked out: rebuild the four identity files from
+	# the baseline template, then preserve hashes that are still usable.
+	# If no valid root hash survives, remove the firstboot marker so the
+	# console setup runs again on this boot.
+	ensure_etc
+	ROOT_HASH_OLD=
+	SANE_HASH_OLD=
+	if [ -f "$SHADOW" ]; then
+		h=$(field_of "$SHADOW" root 2 || true)
+		case "$h" in '!'*) h=${h#!} ;; esac
+		case "$h" in '$6$'*) ROOT_HASH_OLD=$h ;; esac
+		h=$(field_of "$SHADOW" sane 2 || true)
+		case "$h" in '!'*) h=${h#!} ;; esac
+		case "$h" in '$6$'*) SANE_HASH_OLD=$h ;; esac
+	fi
+
+	FIRSTBOOT=1
+	cmd_init --force
+	[ -n "$ROOT_HASH_OLD" ] && set_field "$SHADOW" root 2 "$ROOT_HASH_OLD"
+	[ -n "$SANE_HASH_OLD" ] && set_field "$SHADOW" sane 2 "$SANE_HASH_OLD"
+	chmod 0600 "$SHADOW" "$DOAS_CONF"
+
+	MARK="$ETC/.sane-firstboot-done"
+	if [ -z "$ROOT_HASH_OLD" ]; then
+		rm -f "$MARK"
+		printf 'recover: no valid root hash; first boot will ask for passwords again\n'
+	else
+		printf 'done\n' > "$MARK"
+		chmod 0600 "$MARK"
+		printf 'recover: preserved usable password hashes\n'
+	fi
+	note "identity files rebuilt under $ETC"
+}
+
 case "$CMD" in
 	init)          cmd_init "$@" ;;
 	add-user)      cmd_add_user "$@" ;;
@@ -495,5 +532,6 @@ case "$CMD" in
 	unlock)        cmd_unlock "$@" ;;
 	list)          cmd_list "$@" ;;
 	validate)      cmd_validate "$@" ;;
+	recover)       cmd_recover "$@" ;;
 	*) usage >&2; die "unknown command: $CMD" ;;
 esac

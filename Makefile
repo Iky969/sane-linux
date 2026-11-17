@@ -13,6 +13,8 @@
 #   make integration  cross-layer integration test fstab<->kernel<->services
 #                   via one real QEMU boot (requires root + qemu-system-x86)
 #   make test-panic  kernel-panic regression suite (QEMU; requires root + qemu)
+#   make test-lifecycle  boot/account lifecycle scenarios in QEMU (requires
+#                   root, QEMU, debugfs and a built disk image)
 #   make fuzz       ASan+UBSan fuzz harness for config/fstab/initctl parsers
 #   make lint       run python linter on log patterns, markers, and format specifiers
 #   make packages   build all base S.A.N.E distro packages (.spm.tar.xz)
@@ -132,7 +134,12 @@ test-image-bios:
 test-image-uefi:
 	bash ./scripts/test-image-boot.sh --uefi
 
+test-lifecycle:
+	@rc=0; sh ./scripts/test-boot-lifecycle.sh || rc=$$?; \
+	if [ $$rc -eq 77 ]; then echo "SKIP: test-lifecycle (needs root, QEMU, losetup and 'make image')"; exit 0; fi; \
+	exit $$rc
+
 test-installer installer-test: packages
 	sudo bash ./scripts/test-installer.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-reliability

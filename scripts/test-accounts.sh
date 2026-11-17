@@ -280,7 +280,66 @@ check "weak-creds mode marks first boot complete" test -f "$T/etc/.sane-firstboo
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
 	check "firstboot in $tpl has :timeout=0" sh -c \
 		"grep -q '^firstboot:once:.*:timeout=0$' '$REPO_ROOT/scripts/$tpl'"
+	check "recovery service in $tpl precedes firstboot" sh -c \
+		"grep -q '^recovery:once:.*sane-account-recovery.*:timeout=0$' '$REPO_ROOT/scripts/$tpl' && \
+		 grep -q '^firstboot:once:.*:requires=recovery:timeout=0$' '$REPO_ROOT/scripts/$tpl'"
 done
+
+check "firstboot clears stale passwd temp files" sh -c \
+	"grep -q 'rm -f /etc/passwd+ /etc/shadow+' '$REPO_ROOT/scripts/sane-firstboot'"
+
+printf '\n--- account recovery (boot lockout prevention) ---\n'
+stub_doas() {
+	mkdir -p "$T/usr/bin"
+	printf stub > "$T/usr/bin/doas"
+	chmod 4755 "$T/usr/bin/doas"
+}
+check "recovery CLI exists" test -x "$ACCOUNTS"
+
+base_firstboot() {
+	[ -n "$T" ] && rm -rf -- "$T"
+	T=$(mktemp -d)
+	mkdir -p "$T/etc" "$T/home" "$T/usr/bin"
+	stub_doas
+	sh "$ACCOUNTS" --root "$T" --firstboot init >/dev/null
+}
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+expect_ok "recover on healthy files is safe" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after recover on healthy files" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+printf 'garbage\n' > "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects corrupted shadow" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds corrupted shadow" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after recover" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "recover re-arms firstboot when shadow hash is lost" test ! -f "$T/etc/.sane-firstboot-done"
+check "recover writes locked root shadow" sh -c \
+	"grep -q '^root:!:19700:' '$T/etc/shadow'"
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+printf 'garbage\n' > "$T/etc/doas.conf"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "recover rebuilds corrupted doas.conf" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after doas recovery" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "recover keeps firstboot marker when root hash survives" test -f "$T/etc/.sane-firstboot-done"
+check "recover preserves root hash from valid shadow" sh -c \
+	"grep -q '^root:[\$]6[\$]' '$T/etc/shadow'"
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+printf ':broken:\n' > "$T/etc/passwd"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "recover rebuilds corrupted passwd" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after passwd recovery" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "recover keeps firstboot marker when passwd is repaired" test -f "$T/etc/.sane-firstboot-done"
+
+check "provision installs account recovery helper" \
+	test -f "$REPO_ROOT/scripts/sane-account-recovery"
 
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

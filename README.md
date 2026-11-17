@@ -97,6 +97,20 @@ In sandbox environments (TCG emulation without KVM), the banner `=== ninit start
 
 See [doc/distro-builder.md](doc/distro-builder.md) for architectural details, signals, and known limitations.
 
+### Boot and Lifecycle Testing
+
+`make test-lifecycle` boots a persistent disk image in QEMU and drives the console through the account setup state machine. It covers: first boot with no default credentials, interrupted setup, reboot before setup completes, a rejected password followed by a successful retry, normal login, repeated reboots without repeating setup, and recovery after a corrupted account configuration.
+
+```bash
+make image            # required once: builds distro/sane.img
+make test-lifecycle   # seven QEMU scenarios; skips cleanly without root/QEMU/debugfs
+LIFECYCLE_LOGDIR=/tmp/my-logs make test-lifecycle
+```
+
+Each boot writes its serial transcript to `LIFECYCLE_LOGDIR` (default `/tmp/sane-lifecycle-logs`). The suite requires root or passwordless `sudo` for loop devices and `util-linux` (`losetup`) to inspect and repair the image between boots. It never opens a PR by itself.
+
+The recovery path is part of the image: `recovery:once:/usr/bin/sane-account-recovery` runs before `firstboot` and `getty`. A damaged `passwd`, `group`, `shadow`, or `doas.conf` is rebuilt from the baseline; if no valid password hash survives, the first-boot marker is removed so setup runs again instead of leaving the console locked.
+
 ### Manual Testing (chroot)
 
 ```bash
