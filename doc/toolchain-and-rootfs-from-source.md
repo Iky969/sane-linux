@@ -466,7 +466,7 @@ grep "started console" "$CONSOLE_LOG" && echo "[PASS] Service console launched"
 
 A clean boot produces:
 ```text
-[2026-11-14 10:35:01] ninit: === ninit start (PID 1) v1.1.0 ===
+[2026-11-14 10:35:01] ninit: === ninit start (PID 1) v1.2.0 ===
 [2026-11-14 10:35:01] ninit: hostname = S.A.N.E
 [2026-11-14 10:35:01] ninit: started console (pid 402)
 [2026-11-14 10:35:01] ninit: cgroup: 'console' (pid 402) -> /sys/fs/cgroup/ninit/console
