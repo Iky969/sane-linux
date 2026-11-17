@@ -171,6 +171,7 @@ LICENSE                       MIT License
 | Document | Contents |
 |---|---|
 | [doc/architecture.md](doc/architecture.md) | Internal architecture: boot sequence, event loop, signals, respawn, shutdown, cgroup, logging |
+| [doc/account-security.md](doc/account-security.md) | Phase A: default accounts, password policy, `sane-accounts` lifecycle CLI, and `doas` escalation policy |
 | [doc/configuration.md](doc/configuration.md) | Syntax and semantics of `/etc/init.conf`, `/etc/fstab`, `/run/initctl`, and log paths |
 | [doc/build-and-test.md](doc/build-and-test.md) | Static build, test harnesses, CI workflow, manual chroot testing, troubleshooting |
 | [doc/distro-builder.md](doc/distro-builder.md) | Rootfs assembly, initramfs packaging, QEMU headless validation |
