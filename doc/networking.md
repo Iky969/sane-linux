@@ -53,6 +53,11 @@ LibreSSL, no `INTERP`) and installed by `build-rootfs.sh` and the package
 loops in the image/installer. A missing binary is a hard error rather than a
 half-configured interface.
 
+**Limitation:** this recipe enables only the WEXT (`-D wext`) backend.
+`nl80211`/`cfg80211` in wpa_supplicant 2.10 needs external `libnl`, which is
+not part of this single-tarball recipe, so cfg80211-only adapters are not
+supported yet.
+
 ## Outbound TLS
 
 `ca-certificates` and static `curl` are installed by `scripts/build-rootfs.sh`.
