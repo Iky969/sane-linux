@@ -1,0 +1,412 @@
+#!/bin/sh
+# sane-reliability -- Phase C system reliability toolkit.
+#
+# Host-side POSIX sh tool that operates on a target rootfs (--root DIR).
+# Provides snapshots, verified rollback, staged upgrades, journal-driven
+# recovery, structured logging and backup/restore. Fail-closed: a malformed
+# or unverifiable input never modifies the target.
+set -eu
+
+PROG=${0##*/}
+ROOT=/
+VERBOSE=0
+
+STATE_FILES="etc/passwd etc/group etc/shadow etc/doas.conf etc/init.conf etc/fstab etc/hostname"
+
+usage() {
+	cat <<EOF
+Usage: $PROG [--root DIR] <command> [args]
+
+Commands:
+  init                          create state dirs and idle journal
+  snapshot TAG [--force]        capture verified state snapshot
+  list                          list snapshots
+  verify TAG                    verify snapshot integrity
+  rollback TAG                  restore a verified snapshot
+  upgrade PAYLOAD_DIR           verify, snapshot, then commit a payload
+  recover                       roll back an interrupted upgrade
+  log LEVEL MESSAGE             append a structured log entry
+  backup ARCHIVE [--force]      archive snapshots, journal and logs
+  restore ARCHIVE               restore an archive into a target root
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+note() { [ "$VERBOSE" -eq 1 ] && printf 'ok: %s\n' "$*"; return 0; }
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--root) [ "$#" -ge 2 ] || die "--root needs a directory"; ROOT=$2; shift 2 ;;
+		-v|--verbose) VERBOSE=1; shift ;;
+		-h|--help) usage; exit 0 ;;
+		--) shift; break ;;
+		-*) die "unknown option: $1" ;;
+		*) break ;;
+	esac
+done
+
+[ "$#" -ge 1 ] || { usage >&2; exit 1; }
+CMD=$1; shift
+
+case "$ROOT" in
+	/*) ;;
+	*) die "--root must be an absolute path" ;;
+esac
+
+STATE="$ROOT/var/lib/sane/reliability"
+SNAPS="$STATE/snapshots"
+STAGING="$STATE/staging"
+JOURNAL="$STATE/journal"
+LOGDIR="$ROOT/var/log/sane"
+LOGFILE="$LOGDIR/reliability.log"
+MAX_LOG_BYTES=65536
+
+valid_tag() {
+	case "$1" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;
+		-*) return 1 ;;
+	esac
+	[ "${#1}" -le 64 ]
+}
+
+cmd_init() {
+	mkdir -p "$SNAPS" "$STAGING" "$LOGDIR" || die "cannot create reliability state"
+	chmod 0755 "$SNAPS" "$STAGING" "$LOGDIR"
+	[ -f "$JOURNAL" ] || printf 'state=idle\n' > "$JOURNAL"
+	chmod 0600 "$JOURNAL"
+	[ -f "$LOGFILE" ] || : > "$LOGFILE"
+	chmod 0644 "$LOGFILE"
+	note "reliability state initialised in $STATE"
+}
+
+valid_rel_path() {
+	# Reject absolute paths, '..' components and NUL/backslash tricks.
+	case "$1" in
+		''|.|/*|*'\'*|*..*) return 1 ;;
+	esac
+	case "/$1/" in
+		*/../*) return 1 ;;
+	esac
+	return 0
+}
+
+validate_manifest() {
+	# validate_manifest DIR -- fail closed before hashing or applying entries
+	vm_dir=$1
+	[ -f "$vm_dir/manifest.sha256" ] || die "manifest missing in $vm_dir"
+	while IFS= read -r vm_line; do
+		[ -n "$vm_line" ] || continue
+		vm_path=$(printf '%s\n' "$vm_line" | sed 's/^[^ ]*  //')
+		case "$vm_path" in
+			./meta|./manifest.sha256|'') continue ;;
+		esac
+		vm_rel=${vm_path#./}
+		valid_rel_path "$vm_rel" || die "unsafe manifest path: $vm_path"
+	done < "$vm_dir/manifest.sha256"
+}
+
+write_manifest() {
+	# write_manifest DIR -- NUL-delimited so spaced names survive
+	dir=$1
+	(cd "$dir" && find . -type f ! -name manifest.sha256 -print0 | \
+		LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$dir/manifest.sha256"
+}
+
+unique_tag() {
+	# unique_tag PREFIX -- never collide, even twice in the same second
+	ut_prefix=$1; ut_n=0; ut_candidate=$ut_prefix
+	while [ -e "$SNAPS/$ut_candidate" ]; do
+		ut_n=$((ut_n + 1)); ut_candidate="$ut_prefix-$ut_n"
+	done
+	printf '%s\n' "$ut_candidate"
+}
+
+do_snapshot() {
+	# do_snapshot TAG [force] -- internal, no logging
+	ds_tag=$1; ds_force=${2:-0}
+	valid_tag "$ds_tag" || die "invalid snapshot tag: $ds_tag"
+	ds_target="$SNAPS/$ds_tag"
+	[ -d "$ds_target" ] && [ "$ds_force" -ne 1 ] && die "snapshot already exists: $ds_tag"
+	ds_tmp=$(mktemp -d "$SNAPS/.tmp.XXXXXX") || die "cannot create snapshot staging dir"
+	[ -d "$ds_tmp" ] || die "mktemp did not create a directory"
+	for rel in $STATE_FILES; do
+		src="$ROOT/$rel"
+		[ -f "$src" ] || continue
+		mkdir -p "$ds_tmp/$(dirname "$rel")"
+		cp -p "$src" "$ds_tmp/$rel" || { rm -rf -- "$ds_tmp"; die "cannot copy $rel"; }
+	done
+	if [ -d "$ROOT/var/lib/spm" ]; then
+		mkdir -p "$ds_tmp/var/lib"
+		cp -a "$ROOT/var/lib/spm" "$ds_tmp/var/lib/" || { rm -rf -- "$ds_tmp"; die "cannot copy spm DB"; }
+	fi
+	printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$ds_tmp/meta"
+	write_manifest "$ds_tmp" || { rm -rf -- "$ds_tmp"; die "cannot write manifest"; }
+	# Swap atomically: rename the old snapshot aside, install the new one,
+	# then delete the old one. A failed install restores the original.
+	if [ -d "$ds_target" ]; then
+		ds_old=$(mktemp -d "$SNAPS/.old.XXXXXX") || { rm -rf -- "$ds_tmp"; die "cannot stage old snapshot"; }
+		rmdir "$ds_old" || { rm -rf -- "$ds_tmp"; die "cannot stage old snapshot"; }
+		if ! mv "$ds_target" "$ds_old"; then
+			rm -rf -- "$ds_tmp"; die "cannot move old snapshot aside"
+		fi
+		if ! mv "$ds_tmp" "$ds_target"; then
+			mv "$ds_old" "$ds_target" || true
+			rm -rf -- "$ds_tmp"; die "cannot install snapshot $ds_tag"
+		fi
+		rm -rf -- "$ds_old" || true
+	else
+		mv "$ds_tmp" "$ds_target" || { rm -rf -- "$ds_tmp"; die "cannot install snapshot $ds_tag"; }
+	fi
+}
+
+check_snapshot() {
+	tag=$1
+	dir="$SNAPS/$tag"
+	[ -d "$dir" ] || die "no such snapshot: $tag"
+	validate_manifest "$dir"
+	(cd "$dir" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || die "snapshot integrity check failed: $tag"
+}
+
+cmd_snapshot() {
+	[ "$#" -ge 1 ] || die "usage: snapshot TAG [--force]"
+	tag=$1; shift
+	force=0
+	for arg in "$@"; do
+		case "$arg" in
+			--force) force=1 ;;
+			*) die "unknown snapshot option: $arg" ;;
+		esac
+	done
+	cmd_init
+	do_snapshot "$tag" "$force"
+	note "snapshot '$tag' created"
+}
+
+cmd_list() {
+	cmd_init
+	printf 'TAG  CREATED\n'
+	for dir in "$SNAPS"/*; do
+		[ -d "$dir" ] || continue
+		tag=${dir##*/}
+		case "$tag" in .*) continue ;; esac
+		ts=$(sed -n 's/^timestamp=//p' "$dir/meta" 2>/dev/null || true)
+		printf '%-24s %s\n' "$tag" "${ts:-unknown}"
+	done
+}
+
+cmd_verify() {
+	[ "$#" -eq 1 ] || die "usage: verify TAG"
+	cmd_init
+	check_snapshot "$1"
+	printf 'verified: %s\n' "$1"
+}
+
+write_journal() {
+	# write_journal STATE TAG -- atomic, mode 0600
+	st=$1; tag=${2:-}
+	tmp=$(mktemp "$STATE/.journal.XXXXXX") || die "cannot create journal temp"
+	printf 'state=%s\n' "$st" > "$tmp"
+	[ -n "$tag" ] && printf 'snapshot=%s\n' "$tag" >> "$tmp"
+	printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$tmp"
+	mv "$tmp" "$JOURNAL"
+	chmod 0600 "$JOURNAL"
+}
+
+journal_get() { sed -n "s/^$1=//p" "$JOURNAL" 2>/dev/null | head -n1; }
+
+log_event() {
+	# log_event LEVEL MESSAGE -- internal structured logger with rotation
+	level=$1; shift
+	[ -f "$LOGFILE" ] || : > "$LOGFILE"
+	if [ -f "$LOGFILE" ]; then
+		size=$(wc -c < "$LOGFILE" | tr -d ' ')
+		if [ "${size:-0}" -ge "$MAX_LOG_BYTES" ]; then
+			mv "$LOGFILE" "$LOGFILE.1" || true
+			: > "$LOGFILE"
+		fi
+	fi
+	printf '%s %s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$*" >> "$LOGFILE"
+	chmod 0644 "$LOGFILE"
+}
+
+restore_files_from() {
+	# restore_files_from DIR -- apply every manifest entry atomically
+	rf_dir=$1
+	validate_manifest "$rf_dir"
+	while IFS= read -r rf_line; do
+		[ -n "$rf_line" ] || continue
+		rf_path=$(printf '%s\n' "$rf_line" | sed 's/^[^ ]*  //')
+		case "$rf_path" in
+			./meta|./manifest.sha256|'') continue ;;
+		esac
+		rf_rel=${rf_path#./}
+		valid_rel_path "$rf_rel" || die "unsafe manifest path: $rf_path"
+		rf_src="$rf_dir/$rf_path"
+		rf_dst="$ROOT/$rf_rel"
+		[ -f "$rf_src" ] || die "snapshot file missing: $rf_rel"
+		mkdir -p "$(dirname "$rf_dst")" || die "cannot create parent for $rf_rel"
+		rf_tmp=$(mktemp "$(dirname "$rf_dst")/.sane-rel.XXXXXX") || die "cannot stage $rf_rel"
+		cp -p "$rf_src" "$rf_tmp" || { rm -f "$rf_tmp"; die "cannot copy $rf_rel"; }
+		mv "$rf_tmp" "$rf_dst" || { rm -f "$rf_tmp"; die "cannot install $rf_rel"; }
+	done < "$rf_dir/manifest.sha256"
+}
+
+cmd_rollback() {
+	[ "$#" -eq 1 ] || die "usage: rollback TAG"
+	cmd_init
+	tag=$1
+	check_snapshot "$tag"
+	case "$tag" in
+		auto-pre-rollback-*) ;;
+		*)
+			safety=$(unique_tag "auto-pre-rollback-$(date -u '+%Y%m%dT%H%M%SZ')")
+			do_snapshot "$safety" 0 || die "cannot create safety snapshot"
+			;;
+	esac
+	restore_files_from "$SNAPS/$tag"
+	write_journal rolled-back "$tag"
+	log_event INFO "rollback to $tag completed"
+	note "rolled back to '$tag'"
+}
+
+recover_internal() {
+	state=$(journal_get state)
+	[ "$state" = "in-progress" ] || { log_event INFO "no interrupted upgrade to recover"; return 0; }
+	tag=$(journal_get snapshot)
+	[ -n "$tag" ] || die "interrupted upgrade has no snapshot tag"
+	check_snapshot "$tag"
+	restore_files_from "$SNAPS/$tag"
+	write_journal recovered "$tag"
+	log_event WARN "recovered from interrupted upgrade using $tag"
+	note "recovered using '$tag'"
+}
+
+cmd_recover() {
+	cmd_init
+	recover_internal
+}
+
+cmd_upgrade() {
+	[ "$#" -eq 1 ] || die "usage: upgrade PAYLOAD_DIR"
+	payload=$1
+	[ -d "$payload" ] || die "payload directory not found: $payload"
+	[ -f "$payload/manifest.sha256" ] || die "payload has no manifest.sha256"
+	(cd "$payload" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || die "payload integrity check failed"
+	validate_manifest "$payload"
+	cmd_init
+	tag=$(unique_tag "auto-pre-upgrade-$(date -u '+%Y%m%dT%H%M%SZ')")
+	do_snapshot "$tag" 0 || die "cannot create pre-upgrade snapshot"
+	write_journal in-progress "$tag"
+	while IFS= read -r up_line; do
+		[ -n "$up_line" ] || continue
+		up_path=$(printf '%s\n' "$up_line" | sed 's/^[^ ]*  //')
+		case "$up_path" in
+			./manifest.sha256|./meta|'') continue ;;
+		esac
+		up_rel=${up_path#./}
+		valid_rel_path "$up_rel" || die "unsafe manifest path: $up_path"
+		up_src="$payload/$up_path"
+		up_dst="$ROOT/$up_rel"
+		[ -f "$up_src" ] || { recover_internal || true; die "payload file missing: $up_rel"; }
+		mkdir -p "$(dirname "$up_dst")" || { recover_internal || true; die "cannot create parent for $up_rel"; }
+		up_tmp=$(mktemp "$(dirname "$up_dst")/.sane-rel.XXXXXX") || { recover_internal || true; die "cannot stage $up_rel"; }
+		cp -p "$up_src" "$up_tmp" || { rm -f "$up_tmp"; recover_internal || true; die "cannot copy $up_rel"; }
+		mv "$up_tmp" "$up_dst" || { rm -f "$up_tmp"; recover_internal || true; die "cannot install $up_rel"; }
+	done < "$payload/manifest.sha256"
+	write_journal done "$tag"
+	log_event INFO "upgrade committed with pre-upgrade snapshot $tag"
+	note "upgrade committed (rollback tag: $tag)"
+}
+
+cmd_log() {
+	[ "$#" -ge 2 ] || die "usage: log LEVEL MESSAGE"
+	level=$1; shift
+	case "$level" in
+		INFO|WARN|ERROR) ;;
+		*) die "invalid log level: $level" ;;
+	esac
+	[ -n "$*" ] || die "log message must not be empty"
+	cmd_init
+	log_event "$level" "$*"
+}
+
+cmd_backup() {
+	[ "$#" -ge 1 ] || die "usage: backup ARCHIVE [--force]"
+	archive=$1; shift
+	force=0
+	for arg in "$@"; do
+		case "$arg" in
+			--force) force=1 ;;
+			*) die "unknown backup option: $arg" ;;
+		esac
+	done
+	cmd_init
+	[ -e "$archive" ] && [ "$force" -ne 1 ] && die "archive already exists: $archive"
+	tar -czf "$archive" -C "$ROOT" \
+		var/lib/sane/reliability var/log/sane 2>/dev/null || die "cannot create archive"
+	[ -s "$archive" ] || die "archive is empty"
+	note "backup written to $archive"
+}
+
+cmd_restore() {
+	[ "$#" -eq 1 ] || die "usage: restore ARCHIVE"
+	archive=$1
+	[ -f "$archive" ] || die "archive not found: $archive"
+	rt_tmp=$(mktemp -d) || die "cannot create restore staging dir"
+	# Validate member names BEFORE extraction so a traversal entry cannot
+	# write outside the staging directory.
+	tar -tzf "$archive" > "$rt_tmp/members" 2>/dev/null || \
+		{ rm -rf -- "$rt_tmp"; die "cannot read archive"; }
+	while IFS= read -r rt_member; do
+		[ -n "$rt_member" ] || continue
+		case "$rt_member" in
+			/*|..|../*|*/..|*../*) \
+				{ rm -rf -- "$rt_tmp"; die "unsafe archive member: $rt_member"; } ;;
+		esac
+	done < "$rt_tmp/members"
+	tar -xzf "$archive" -C "$rt_tmp" 2>/dev/null || \
+		{ rm -rf -- "$rt_tmp"; die "cannot extract archive"; }
+	[ -d "$rt_tmp/var/lib/sane/reliability/snapshots" ] || \
+		{ rm -rf -- "$rt_tmp"; die "archive has no reliability snapshots"; }
+	# Reject absolute or escaping symlinks before anything is installed.
+	find "$rt_tmp" -type l -print > "$rt_tmp/links"
+	while IFS= read -r rt_link; do
+		[ -n "$rt_link" ] || continue
+		rt_target=$(readlink "$rt_link" 2>/dev/null || true)
+		case "$rt_target" in
+			/*|..|../*|*../*) \
+				{ rm -rf -- "$rt_tmp"; die "unsafe symlink in archive: $rt_target"; } ;;
+		esac
+	done < "$rt_tmp/links"
+	# Verify every snapshot manifest found in the archive.
+	find "$rt_tmp/var/lib/sane/reliability/snapshots" -name manifest.sha256 -print > "$rt_tmp/manifests"
+	while IFS= read -r rt_manifest; do
+		[ -n "$rt_manifest" ] || continue
+		rt_dir=$(dirname "$rt_manifest")
+		validate_manifest "$rt_dir" || { rm -rf -- "$rt_tmp"; die "invalid archive manifest"; }
+		(cd "$rt_dir" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || \
+			{ rm -rf -- "$rt_tmp"; die "archive manifest verification failed"; }
+	done < "$rt_tmp/manifests"
+	mkdir -p "$STATE" "$LOGDIR"
+	cp -a "$rt_tmp/var/lib/sane/reliability/." "$STATE/" || \
+		{ rm -rf -- "$rt_tmp"; die "cannot restore state"; }
+	cp -a "$rt_tmp/var/log/sane/." "$LOGDIR/" || \
+		{ rm -rf -- "$rt_tmp"; die "cannot restore logs"; }
+	rm -rf -- "$rt_tmp"
+	log_event INFO "archive restored"
+	note "archive restored into $ROOT"
+}
+
+case "$CMD" in
+	init)          cmd_init "$@" ;;
+	snapshot)      cmd_snapshot "$@" ;;
+	list)          cmd_list "$@" ;;
+	verify)        cmd_verify "$@" ;;
+	rollback)      cmd_rollback "$@" ;;
+	upgrade)       cmd_upgrade "$@" ;;
+	recover)       cmd_recover "$@" ;;
+	log)           cmd_log "$@" ;;
+	backup)        cmd_backup "$@" ;;
+	restore)       cmd_restore "$@" ;;
+	*) usage >&2; die "unknown command: $CMD" ;;
+esac

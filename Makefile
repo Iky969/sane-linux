@@ -114,6 +114,9 @@ test-reliability:
 test-spm:
 	bash ./scripts/test-spm.sh
 
+test-reliability:
+	sh ./scripts/test-reliability.sh
+
 image: packages
 	sudo bash ./scripts/make-image.sh
 
