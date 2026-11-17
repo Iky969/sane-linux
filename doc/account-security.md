@@ -35,7 +35,9 @@ Files and permissions:
 
 `/etc/init.conf` starts `sane-firstboot` as a `once` service on the console;
 the `tty1` and serial `console` getty services depend on it via
-`:requires=firstboot`. The helper:
+`:requires=firstboot`. The service line carries `:timeout=0`, which disables
+ninit's 30-second `once` timeout so interactive password entry cannot be
+killed. The helper:
 
 1. prompts twice (no echo) for the `root` password,
 2. prompts twice for the `sane` password,
@@ -107,7 +109,7 @@ supplementary group. `validate` checks modes, ownership of doas files,
 numeric/duplicate UIDs and GIDs, absence of a second UID 0, empty password
 fields, SHA-512 (or locked) hashes, `wheel` membership, and an effective
 `permit ... :wheel` rule with no `nopass`. Wired into `make test` and CI
-(`scripts/test-accounts.sh`, 91 assertions).
+(`scripts/test-accounts.sh`, 92 assertions; 94 when run as root).
 
 ## Privilege escalation (`doas`)
 

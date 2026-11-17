@@ -3,6 +3,10 @@
 # Runs without root against a temporary target rootfs. No host /etc is touched.
 set -u
 
+# Always exercise the production (no-public-password) provisioning path,
+# even when CI sets SANE_WEAK_DEFAULT_CREDS for image/installer jobs.
+unset SANE_WEAK_DEFAULT_CREDS 2>/dev/null || true
+
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 ACCOUNTS="$REPO_ROOT/scripts/sane-accounts"
 
@@ -271,6 +275,12 @@ SANE_WEAK_DEFAULT_CREDS=1 sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T" >/d
 check "weak-creds mode writes an active root hash" sh -c \
 	"! grep -q '^root:!' '$T/etc/shadow'"
 check "weak-creds mode marks first boot complete" test -f "$T/etc/.sane-firstboot-done"
+
+# First boot must not be killed by ninit's 30s once-service timeout.
+for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
+	check "firstboot in $tpl has :timeout=0" sh -c \
+		"grep -q '^firstboot:once:.*:timeout=0$' '$REPO_ROOT/scripts/$tpl'"
+done
 
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
