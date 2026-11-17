@@ -40,14 +40,20 @@ start with `-`. Overwriting an existing tag requires `--force`.
 
 `verify TAG` re-checks every manifest entry before a snapshot is used. A
 corrupt or incomplete snapshot is never applied — `rollback`, `upgrade` and
-`recover` all call this check first (fail-closed).
+`recover` all call this check first (fail-closed). Manifest paths are validated
+before hashing or applying: absolute paths and any `..` component are rejected,
+so a crafted manifest cannot write outside the target root. Manifests are
+NUL-delimited internally, so filenames containing spaces are handled correctly.
 
 ### Rollback and safety snapshots
 
 `rollback TAG` first creates an `auto-pre-rollback-<UTC>` snapshot of the
 current state, then restores every manifest entry atomically (stage with
 `mktemp` in the destination directory, `cp -p`, `rename(2)`), preserving file
-modes. The journal records `state=rolled-back` and the tag used.
+modes. The journal records `state=rolled-back` and the tag used. Safety tags
+get a numeric suffix on collision, so two rollbacks in the same second never
+clash. `--force` swaps snapshots via rename-aside/install/delete rather than
+deleting first, so a failed move cannot destroy the previous snapshot.
 
 ### Upgrades and recovery
 
@@ -55,8 +61,8 @@ An upgrade payload is a directory containing the files to install and a
 `manifest.sha256` generated with `sha256sum` from inside that directory:
 
 ```
-(cd payload && find . -type f ! -name manifest.sha256 -print \
-    | LC_ALL=C sort | xargs sha256sum > manifest.sha256)
+(cd payload && find . -type f ! -name manifest.sha256 -print0 \
+    | LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
 ```
 
 `upgrade PAYLOAD_DIR`:
@@ -85,17 +91,18 @@ entry is written. Reliability commands log their own lifecycle events.
 
 `backup ARCHIVE.tar.gz` archives the reliability state and log directory from
 the target root; it refuses to overwrite unless `--force` is given. `restore`
-extracts to a temporary directory, verifies the archive actually contains a
-snapshot tree, then copies the state and logs into the target root.
+extracts to a temporary directory, rejects absolute/traversal member names and
+absolute or escaping symlinks, verifies every snapshot manifest inside the
+archive, then copies the state and logs into the target root.
 
 ## Testing
 
 `scripts/test-reliability.sh` exercises every command against a temporary
-target root (no root privileges, no host state touched): 51 assertions cover
-snapshot integrity, force semantics, tag validation, rollback with mode
-preservation and safety snapshots, payload verification, journal-driven
-recovery, log levels and rotation, and backup/restore. It is wired into
-`make test`, `make test-reliability`, and CI.
+target root (no root privileges, no host state touched): 67 assertions cover
+snapshot integrity, force semantics, tag validation, mode-preserving rollback
+with safety snapshots, payload verification and path traversal, journal-driven
+recovery, log levels and rotation, and backup/restore validation. It is wired
+into `make test`, `make test-reliability`, and CI.
 
 ## Scope and boundaries
 
