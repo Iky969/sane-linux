@@ -28,6 +28,11 @@
 #  24. Duplicate member rejection -> duplicate archive member or duplicate .META/files rejected with exit 1.
 #  25. Invalid dependency name rejection -> invalid dependency names in .META/depends or manifest rejected with exit 1.
 #  26. Power-cut journal recovery simulation -> leftover transaction journal rolled back cleanly on startup.
+#  27. Invalid metadata (name/arch/base) -> rejected with zero filesystem residue.
+#  28. Upgrade failing mid-commit -> injected mv failure rolls back file content, DB and staging.
+#  29. Real SIGKILL mid-commit -> journal recovery on next command restores disk and DB.
+#  30. Shared-file ownership conflict -> intruder rejected; uninstall leaves other package files intact.
+#  31. Two simultaneous installs -> serialized by flock, both payloads and DB indexes intact.
 
 set -eu
 
@@ -2055,6 +2060,264 @@ EOF
     test_pass "Scenario 26: Power-cut journal recovery simulation (leftover staging transaction journal rolled back cleanly on startup)"
 }
 
+# Rewrite one key=value line inside .META/package of an existing .spm archive.
+rewrite_manifest_field() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import io, sys, tarfile, lzma
+path, field, value = sys.argv[1:4]
+buf = io.BytesIO()
+with lzma.open(path, "rb") as fi, lzma.open(buf, "wb") as fo:
+    with tarfile.open(fileobj=fi, mode="r:") as tin, tarfile.open(fileobj=fo, mode="w") as tout:
+        for member in tin.getmembers():
+            data = tin.extractfile(member).read() if member.isfile() else None
+            if data is not None and member.name.endswith("/.META/package"):
+                lines = data.decode("utf-8", "replace").splitlines()
+                out, replaced = [], False
+                for line in lines:
+                    if line.startswith(field + "="):
+                        out.append(field + "=" + value)
+                        replaced = True
+                    else:
+                        out.append(line)
+                if not replaced:
+                    out.append(field + "=" + value)
+                data = ("\n".join(out) + "\n").encode("utf-8")
+            ti = tarfile.TarInfo(member.name)
+            ti.type = member.type
+            ti.mode = member.mode
+            ti.linkname = member.linkname
+            ti.size = len(data) if data is not None else 0
+            tout.addfile(ti, io.BytesIO(data) if data is not None else None)
+with open(path, "wb") as out:
+    out.write(buf.getvalue())
+PY
+}
+
+test_invalid_metadata_rejection() {
+    local tdir="$TEST_TMP/scenario27_invalid_meta"
+    local root="$tdir/root"
+    mkdir -p "$root"
+
+    local cases
+    cases="name:Invalid_Name arch:armv7 base:yes"
+    for case in $cases; do
+        local field="${case%%:*}"
+        local value="${case#*:}"
+        local archive="$tdir/bad-$field.spm.tar.xz"
+        python_pkg_helper create_valid "$archive" "meta-probe" "1.0.0" "false" \
+            "Metadata probe" "usr/bin/tool:echo tool"
+        rewrite_manifest_field "$archive" "$field" "$value"
+
+        if "$SPM_BIN" install "$archive" --root "$root" >/dev/null 2>&1; then
+            test_fail "Scenario 27" "Invalid $field='$value' was accepted"
+            return
+        fi
+        if [ -e "$root/usr/bin/tool" ]; then
+            test_fail "Scenario 27" "Payload leaked to disk after invalid $field"
+            return
+        fi
+        if [ -n "$(ls -A "$root/var/lib/spm/installed" 2>/dev/null || true)" ]; then
+            test_fail "Scenario 27" "DB residue after invalid $field"
+            return
+        fi
+    done
+    test_pass "Scenario 27: Invalid metadata (name/arch/base) rejected with zero filesystem residue"
+}
+
+test_failed_upgrade_rollback() {
+    local tdir="$TEST_TMP/scenario28_upgrade_fail"
+    local root="$tdir/root"
+    local bin="$tdir/bin"
+    mkdir -p "$root" "$bin"
+
+    python_pkg_helper create_valid "$tdir/v1.spm.tar.xz" "upg-test" "1.0.0" "false" \
+        "Upgrade test v1" "usr/bin/tool:v1-content"
+    "$SPM_BIN" install "$tdir/v1.spm.tar.xz" --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 28" "Initial install failed"; return; }
+
+    python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "upg-test" "2.0.0" "false" \
+        "Upgrade test v2" "usr/bin/tool:v2-content"
+
+    # Fail the first mv -f during commit; pass all later mv calls (rollback needs them).
+    cat > "$bin/mv" <<'SHIM'
+#!/bin/sh
+marker="${SPM_FAIL_MARKER:-}"
+if [ "$1" = "-f" ] && [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+    touch "$marker.done"
+    echo "injected mv failure" >&2
+    exit 1
+fi
+exec /usr/bin/mv "$@"
+SHIM
+    chmod +x "$bin/mv"
+
+    if PATH="$bin:$PATH" SPM_FAIL_MARKER="$tdir/fail" \
+        "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 28" "Upgrade unexpectedly succeeded after injected mv failure"
+        return
+    fi
+
+    local content
+    content="$(cat "$root/usr/bin/tool" 2>/dev/null || true)"
+    if [ "$content" != "v1-content" ]; then
+        test_fail "Scenario 28" "Failed upgrade left payload half-updated: '$content'"
+        return
+    fi
+    local dbver
+    dbver="$(cat "$root/var/lib/spm/installed/upg-test/version" 2>/dev/null || true)"
+    if [ "$dbver" != "1.0.0-1" ]; then
+        test_fail "Scenario 28" "Failed upgrade left DB at '$dbver'"
+        return
+    fi
+    if [ -n "$(ls -A "$root/var/lib/spm/staging" 2>/dev/null || true)" ]; then
+        test_fail "Scenario 28" "Staging residue after failed upgrade"
+        return
+    fi
+    test_pass "Scenario 28: Upgrade failing mid-commit rolls back file content, DB version and staging"
+}
+
+test_sigkill_interrupted_install_recovery() {
+    local tdir="$TEST_TMP/scenario29_sigkill"
+    local root="$tdir/root"
+    local bin="$tdir/bin"
+    mkdir -p "$root" "$bin"
+
+    python_pkg_helper create_valid "$tdir/v1.spm.tar.xz" "kill-test" "1.0.0" "false" \
+        "Kill test v1" "usr/bin/tool:v1-content"
+    "$SPM_BIN" install "$tdir/v1.spm.tar.xz" --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 29" "Initial install failed"; return; }
+
+    python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "kill-test" "2.0.0" "false" \
+        "Kill test v2" "usr/bin/tool:v2-content"
+
+    cat > "$bin/mv" <<'SHIM'
+#!/bin/sh
+marker="${SPM_KILL_MARKER:-}"
+if [ "$1" = "-f" ] && [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+    touch "$marker.done"
+    kill -9 "$PPID" 2>/dev/null || true
+    exit 137
+fi
+exec /usr/bin/mv "$@"
+SHIM
+    chmod +x "$bin/mv"
+
+    set +e
+    ( PATH="$bin:$PATH" SPM_KILL_MARKER="$tdir/kill" \
+        "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" ) >/dev/null 2>&1
+    local rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        test_fail "Scenario 29" "Injected SIGKILL did not interrupt install"
+        return
+    fi
+
+    local rec_out
+    rec_out="$("$SPM_BIN" init --root "$root" 2>&1 || true)"
+    if ! echo "$rec_out" | grep -qi "Interrupted transaction recovered"; then
+        test_fail "Scenario 29" "No journal recovery after SIGKILL: '$rec_out'"
+        return
+    fi
+    local content
+    content="$(cat "$root/usr/bin/tool" 2>/dev/null || true)"
+    if [ "$content" != "v1-content" ]; then
+        test_fail "Scenario 29" "Recovered file content is '$content', expected v1-content"
+        return
+    fi
+    local dbver
+    dbver="$(cat "$root/var/lib/spm/installed/kill-test/version" 2>/dev/null || true)"
+    if [ "$dbver" != "1.0.0-1" ]; then
+        test_fail "Scenario 29" "Recovered DB version is '$dbver'"
+        return
+    fi
+    if [ -n "$(ls -A "$root/var/lib/spm/staging" 2>/dev/null || true)" ]; then
+        test_fail "Scenario 29" "Staging residue after recovery"
+        return
+    fi
+    test_pass "Scenario 29: SIGKILL mid-commit recovered on next command; disk and DB fully restored"
+}
+
+test_uninstall_with_shared_file() {
+    local tdir="$TEST_TMP/scenario30_shared_uninstall"
+    local root="$tdir/root"
+    mkdir -p "$root"
+
+    python_pkg_helper create_valid "$tdir/base.spm.tar.xz" "base-shared" "1.0.0" "true" \
+        "Base owner" "usr/bin/shared:base-content" "usr/bin/base-only:base-only-content"
+    python_pkg_helper create_valid "$tdir/regular.spm.tar.xz" "regular-one" "1.0.0" "false" \
+        "Regular owner" "usr/bin/regular:regular-content"
+    python_pkg_helper create_valid "$tdir/intruder.spm.tar.xz" "intruder" "1.0.0" "false" \
+        "Intruder" "usr/bin/shared:intruder-content"
+
+    "$SPM_BIN" install "$tdir/base.spm.tar.xz" --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 30" "Base install failed"; return; }
+    "$SPM_BIN" install "$tdir/regular.spm.tar.xz" --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 30" "Regular install failed"; return; }
+
+    if "$SPM_BIN" install "$tdir/intruder.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "Scenario 30" "Second package was allowed to claim base-owned shared file"
+        return
+    fi
+
+    "$SPM_BIN" remove regular-one --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 30" "Removing unrelated package failed"; return; }
+    local shared
+    shared="$(cat "$root/usr/bin/shared" 2>/dev/null || true)"
+    if [ "$shared" != "base-content" ]; then
+        test_fail "Scenario 30" "Shared file changed after unrelated uninstall: '$shared'"
+        return
+    fi
+    if [ ! -f "$root/usr/bin/base-only" ] || [ -d "$root/var/lib/spm/installed/regular-one" ]; then
+        test_fail "Scenario 30" "Base files or DB damaged by unrelated uninstall"
+        return
+    fi
+    test_pass "Scenario 30: Shared-file ownership conflict rejected; uninstall leaves other package files intact"
+}
+
+test_concurrent_installs() {
+    local tdir="$TEST_TMP/scenario31_concurrent_installs"
+    local root="$tdir/root"
+    mkdir -p "$root"
+
+    python_pkg_helper create_valid "$tdir/a.spm.tar.xz" "conc-a" "1.0.0" "false" \
+        "Concurrent A" "usr/bin/conc-a:a-content"
+    python_pkg_helper create_valid "$tdir/b.spm.tar.xz" "conc-b" "1.0.0" "false" \
+        "Concurrent B" "usr/bin/conc-b:b-content"
+
+    set +e
+    "$SPM_BIN" install "$tdir/a.spm.tar.xz" --root "$root" > "$tdir/a.out" 2>&1 &
+    local pid_a=$!
+    "$SPM_BIN" install "$tdir/b.spm.tar.xz" --root "$root" > "$tdir/b.out" 2>&1 &
+    local pid_b=$!
+    wait "$pid_a"
+    local rc_a=$?
+    wait "$pid_b"
+    local rc_b=$?
+    set -e
+
+    if [ "$rc_a" -ne 0 ] || [ "$rc_b" -ne 0 ]; then
+        test_fail "Scenario 31" "Concurrent installs failed (a=$rc_a b=$rc_b)"
+        return
+    fi
+    if [ "$(cat "$root/usr/bin/conc-a" 2>/dev/null || true)" != "a-content" ] ||
+       [ "$(cat "$root/usr/bin/conc-b" 2>/dev/null || true)" != "b-content" ]; then
+        test_fail "Scenario 31" "Concurrent install payloads are inconsistent"
+        return
+    fi
+    for pkg in conc-a conc-b; do
+        if [ ! -f "$root/var/lib/spm/installed/$pkg/version" ]; then
+            test_fail "Scenario 31" "Missing DB record for $pkg after concurrent installs"
+            return
+        fi
+    done
+    if ! grep -q '/usr/bin/conc-a' "$root/var/lib/spm/providers" ||
+       ! grep -q '/usr/bin/conc-b' "$root/var/lib/spm/providers"; then
+        test_fail "Scenario 31" "Providers index incomplete after concurrent installs"
+        return
+    fi
+    test_pass "Scenario 31: Two simultaneous installs serialize through flock; both payloads and DB indexes remain consistent"
+}
+
 # -----------------------------------------------------------------------------
 # Main Runner
 # -----------------------------------------------------------------------------
@@ -2091,6 +2354,11 @@ main() {
     test_duplicate_member_rejection
     test_invalid_dependency_name_rejection
     test_power_cut_journal_recovery
+    test_invalid_metadata_rejection
+    test_failed_upgrade_rollback
+    test_sigkill_interrupted_install_recovery
+    test_uninstall_with_shared_file
+    test_concurrent_installs
 
     printf '\n==================================================\n'
     printf 'SPM Test Suite Summary: %d passed, %d failed\n' "$PASSED_COUNT" "$FAILED_COUNT"
