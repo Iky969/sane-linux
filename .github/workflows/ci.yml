@@ -61,6 +61,12 @@ jobs:
       - name: Phase A account lifecycle & policy validation
         run: sh ./scripts/test-accounts.sh
 
+      - name: Phase B networking (sane-net, DNS, DHCP, TLS)
+        run: sh ./scripts/test-network.sh
+
+      - name: Phase C reliability suite
+        run: sh ./scripts/test-reliability.sh
+
       - name: Smoke test PID 1 (SIGTERM -> clean shutdown)
         run: sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh
 
