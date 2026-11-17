@@ -1,0 +1,7 @@
+usr/
+usr/share/
+usr/share/clawrza/
+usr/share/clawrza/recipes/
+usr/share/clawrza/recipes/gcc/
+usr/share/clawrza/recipes/gcc/RECIPE
+usr/share/clawrza/recipes/gcc/build.sh

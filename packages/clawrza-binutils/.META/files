@@ -1,0 +1,7 @@
+usr/
+usr/share/
+usr/share/clawrza/
+usr/share/clawrza/recipes/
+usr/share/clawrza/recipes/binutils/
+usr/share/clawrza/recipes/binutils/RECIPE
+usr/share/clawrza/recipes/binutils/build.sh

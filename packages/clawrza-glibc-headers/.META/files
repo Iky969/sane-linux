@@ -1,0 +1,7 @@
+usr/
+usr/share/
+usr/share/clawrza/
+usr/share/clawrza/recipes/
+usr/share/clawrza/recipes/glibc-headers/
+usr/share/clawrza/recipes/glibc-headers/RECIPE
+usr/share/clawrza/recipes/glibc-headers/build.sh

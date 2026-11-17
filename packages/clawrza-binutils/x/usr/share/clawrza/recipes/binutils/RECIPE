@@ -1,0 +1,9 @@
+name=clawrza-binutils
+upstream=binutils
+version=2.44
+tarball=binutils-2.44.tar.xz
+url=https://ftp.gnu.org/gnu/binutils/binutils-2.44.tar.xz
+sha256=ce2017e059d63e67ddb9240e9d4ec49c2893605035cd60e92ad53177f4377237
+build_order=2
+requires=clawrza-glibc-headers
+description=GNU assembler, linker and binary utilities for a self-hosting sysroot

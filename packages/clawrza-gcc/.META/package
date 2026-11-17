@@ -1,0 +1,7 @@
+name=clawrza-gcc
+version=14.2.0
+release=1
+arch=x86_64
+description=Source recipe for GCC 14.2.0 C compiler self-hosting toolchain
+dependencies=clawrza-binutils,clawrza-glibc-headers
+base=false
