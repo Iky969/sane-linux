@@ -427,7 +427,11 @@ console:respawn:cttyhack /sbin/getty -L 115200 - vt100
 EOF
 
 printf 'S.A.N.E\n' > "$TARGET_ROOT/etc/hostname"
-cp "$TARGET_ROOT/etc/resolv.conf" "$TARGET_ROOT/etc/resolv.conf.default" 2>/dev/null || true
+# No base package ships /etc/resolv.conf, so create the default resolver here.
+if [ ! -f "$TARGET_ROOT/etc/resolv.conf" ]; then
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$TARGET_ROOT/etc/resolv.conf"
+fi
+cp "$TARGET_ROOT/etc/resolv.conf" "$TARGET_ROOT/etc/resolv.conf.default"
 
 cat <<'EOF' > "$TARGET_ROOT/etc/passwd"
 root:x:0:0:root:/root:/bin/sh

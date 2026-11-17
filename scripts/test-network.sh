@@ -69,6 +69,15 @@ expect_fail "static without required args rejected" run_net static eth0 10.0.0.2
 check "static config succeeds" run_net static eth0 10.0.0.2/24 10.0.0.1 1.1.1.1 8.8.8.8
 check "static sets address" grep -q '^ip addr add 10.0.0.2/24 dev eth0$' "$LOG"
 check "static sets default route" grep -q '^ip route add default via 10.0.0.1$' "$LOG"
+mkdir -p "$T/failbin"
+cat > "$T/failbin/ip" <<'EOF'
+#!/bin/sh
+[ "$1" = link ] && exit 0
+exit 1
+EOF
+chmod 0755 "$T/failbin/ip"
+expect_fail "static propagates ip address failure" \
+	env PATH="$T/failbin:$PATH" sh "$STAGED" static eth0 10.0.0.2/24 10.0.0.1
 check "resolv.conf contains both servers" sh -c \
 	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf' && grep -q '^nameserver 8.8.8.8$' '$T/etc/resolv.conf'"
 check "resolv.conf mode 0644" test "$(stat -c %a "$T/etc/resolv.conf")" = 644
@@ -84,6 +93,10 @@ printf 'nameserver 1.1.1.1\n' > "$T/etc/resolv.conf.default"
 check "dns default restores baseline" run_net dns default
 check "baseline resolver restored" sh -c \
 	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf'"
+check "dns default writes mode 0644" test "$(stat -c %a "$T/etc/resolv.conf")" = 644
+check "hyphenated hostnames accepted" run_net dns ns-1.example.test
+check "hyphenated hostname written" sh -c \
+	"grep -q '^nameserver ns-1.example.test$' '$T/etc/resolv.conf'"
 
 # --- DHCP / reconnect ------------------------------------------------------
 check "dhcp starts udhcpc with script" run_net dhcp eth0
@@ -98,12 +111,18 @@ check "wpa config mode 0600" test "$(stat -c %a "$T/etc/wpa_supplicant.conf")" =
 check "wpa config contains SSID" grep -q 'ssid="home-net"' "$T/etc/wpa_supplicant.conf"
 check "supplicant started on eth0" grep -q '^wpa_supplicant .*-i eth0' "$LOG"
 expect_fail "wifi rejects short PSK" run_net wifi eth0 home-net short
+check "wifi accepts SSID with spaces and escapes PSK" \
+	run_net wifi eth0 'my net' 'pa"ss\word'
+check "SSID with spaces written" grep -qF 'ssid="my net"' "$T/etc/wpa_supplicant.conf"
+check "PSK quotes and backslashes escaped" \
+	grep -qF 'psk="pa\"ss\\word"' "$T/etc/wpa_supplicant.conf"
 rm -f "$T/etc/wpa_supplicant.conf"
 
 # --- TLS -------------------------------------------------------------------
 printf 'bundle\n' > "$T/etc/ssl/certs/ca-certificates.crt"
 check "tls-check passes cacert to curl" run_net tls-check https://example.invalid
 check "curl invoked with CA bundle" grep -q -- "--cacert $T/etc/ssl/certs/ca-certificates.crt" "$LOG"
+expect_fail "tls-check rejects non-HTTPS URL" run_net tls-check http://example.invalid
 
 # --- udhcpc event script ---------------------------------------------------
 UDHCP_ROOT="$T/udhcp"
@@ -119,11 +138,17 @@ check "udhcpc deconfig restores default DNS" env interface=eth0 \
 	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" deconfig
 check "deconfig DNS restored" sh -c \
 	"grep -q '^nameserver 1.1.1.1$' '$UDHCP_ROOT/etc/resolv.conf'"
+check "deconfig restore is atomic (0644)" \
+	test "$(stat -c %a "$UDHCP_ROOT/etc/resolv.conf")" = 644
 
 # --- build integration -----------------------------------------------------
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
 	check "$tpl boots networking via sane-net" sh -c \
 		"grep -q 'sane-net dhcp eth0' '$REPO_ROOT/scripts/$tpl'"
+done
+for tpl in make-image.sh sane-install.sh; do
+	check "$tpl creates a default resolver" sh -c \
+		"grep -q 'nameserver 1.1.1.1' '$REPO_ROOT/scripts/$tpl' && grep -q 'resolv.conf.default' '$REPO_ROOT/scripts/$tpl'"
 done
 
 # --- Wi-Fi package ---------------------------------------------------------
@@ -132,7 +157,14 @@ check "wpa-supplicant recipe exists" test -f "$WPA_DIR/build.sh"
 check "wpa-supplicant binary is present" test -x "$WPA_DIR/x/usr/bin/wpa_supplicant"
 check "wpa_supplicant is statically linked" sh -c \
 	"! readelf -lW '$WPA_DIR/x/usr/bin/wpa_supplicant' 2>/dev/null | grep -q INTERP"
-check "wpa config template is 0600" test "$(stat -c %a "$WPA_DIR/x/etc/wpa_supplicant.conf")" = 600
+# Git stores 0644 for all tracked files; the mode is enforced at install time.
+cp "$WPA_DIR/x/etc/wpa_supplicant.conf" "$T/etc/wpa_supplicant.conf"
+chmod 0600 "$T/etc/wpa_supplicant.conf"
+check "wpa config install mode is 0600" test "$(stat -c %a "$T/etc/wpa_supplicant.conf")" = 600
+for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
+	check "$tpl enforces 0600 on wpa config" sh -c \
+		"grep -q '0600.*wpa_supplicant.conf' '$REPO_ROOT/scripts/$tpl'"
+done
 check "wpa-supplicant is in build-all.sh" sh -c \
 	"grep -q '^    wpa-supplicant$' '$REPO_ROOT/packages/build-all.sh'"
 

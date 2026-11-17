@@ -32,10 +32,15 @@ EOF
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
+# Escape a value for use inside a double-quoted wpa_supplicant.conf field.
+wpa_escape() {
+	printf '%s' "$1" | sed 's/[\\"]/\\&/g'
+}
+
 valid_server() {
-	# IPv4, IPv6 or hostname; reject whitespace and shell metacharacters.
+	# IPv4, IPv6 or hostname; allow hyphens inside names but not as a prefix.
 	case "$1" in
-		''|*[!a-zA-Z0-9.:_]*) return 1 ;;
+		''|-*|*[!a-zA-Z0-9.:_-]*) return 1 ;;
 		*) return 0 ;;
 	esac
 }
@@ -72,9 +77,13 @@ cmd_static() {
 	need ip
 	[ "$#" -ge 3 ] || usage
 	iface=$1; ip_cidr=$2; gw=$3; shift 3
-	ip link set "$iface" up
-	ip addr add "$ip_cidr" dev "$iface" 2>/dev/null || true
-	ip route add default via "$gw" 2>/dev/null || true
+	ip link set "$iface" up || die "cannot bring up $iface"
+	if ! ip addr show dev "$iface" 2>/dev/null | grep -q "$ip_cidr"; then
+		ip addr add "$ip_cidr" dev "$iface" || die "cannot add $ip_cidr to $iface"
+	fi
+	if ! ip route show 2>/dev/null | grep -q '^default '; then
+		ip route add default via "$gw" || die "cannot add default route via $gw"
+	fi
 	if [ "$#" -gt 0 ]; then
 		write_resolv "$RESOLV" "$@"
 	fi
@@ -93,7 +102,11 @@ cmd_dns() {
 	[ "$#" -ge 1 ] || usage
 	if [ "$1" = "default" ]; then
 		[ -f "$RESOLV_DEFAULT" ] || die "$RESOLV_DEFAULT is missing"
-		cat "$RESOLV_DEFAULT" > "$RESOLV"
+		dir=$(dirname "$RESOLV")
+		tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || die "cannot create temp file in $dir"
+		cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; die "cannot read $RESOLV_DEFAULT"; }
+		chmod 0644 "$tmp"
+		mv "$tmp" "$RESOLV"
 		return 0
 	fi
 	write_resolv "$RESOLV" "$@"
@@ -103,16 +116,20 @@ cmd_wifi() {
 	need ip; need wpa_supplicant
 	[ "$#" -eq 3 ] || { printf 'Usage: %s wifi IFACE SSID PSK\n' "$PROG" >&2; exit 1; }
 	iface=$1; ssid=$2; psk=$3
-	case "$ssid" in ''|*[!a-zA-Z0-9._-]*) die "invalid SSID: $ssid" ;; esac
+	[ -n "$ssid" ] || die "SSID must not be empty"
+	case "$ssid" in *[![:print:]]*) die "SSID contains non-printable characters" ;; esac
 	[ "${#psk}" -ge 8 ] || die "PSK must be at least 8 characters"
+	case "$psk" in *[![:print:]]*) die "PSK contains non-printable characters" ;; esac
+	ssid_e=$(wpa_escape "$ssid")
+	psk_e=$(wpa_escape "$psk")
 	ip link set "$iface" up
 	tmp=$(mktemp "$(dirname "$WPACONF")/.wpa_supplicant.XXXXXX") || die "cannot create temp file"
 	cat > "$tmp" <<EOF
 ctrl_interface=/run/wpa_supplicant
 update_config=1
 network={
-    ssid="$ssid"
-    psk="$psk"
+    ssid="$ssid_e"
+    psk="$psk_e"
     key_mgmt=WPA-PSK
 }
 EOF
@@ -139,6 +156,10 @@ cmd_tls_check() {
 	need curl
 	[ "${1:-}" ] || usage
 	url=$1
+	case "$url" in
+		https://*) ;;
+		*) die "tls-check requires an https:// URL" ;;
+	esac
 	[ -f "$CABUNDLE" ] || die "CA bundle missing: $CABUNDLE"
 	curl --cacert "$CABUNDLE" -fsSI --max-time 15 "$url" >/dev/null
 }

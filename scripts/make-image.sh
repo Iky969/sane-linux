@@ -406,7 +406,11 @@ EOF
 
 # Configure /etc/hostname
 printf 'S.A.N.E\n' | $SUDO tee "$MNT_DIR/root/etc/hostname" >/dev/null
-$SUDO cp "$MNT_DIR/root/etc/resolv.conf" "$MNT_DIR/root/etc/resolv.conf.default" 2>/dev/null || true
+# No base package ships /etc/resolv.conf, so create the default resolver here.
+if [ ! -f "$MNT_DIR/root/etc/resolv.conf" ]; then
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | $SUDO tee "$MNT_DIR/root/etc/resolv.conf" >/dev/null
+fi
+$SUDO cp "$MNT_DIR/root/etc/resolv.conf" "$MNT_DIR/root/etc/resolv.conf.default"
 
 # Configure /etc/passwd and /etc/group
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/passwd" >/dev/null

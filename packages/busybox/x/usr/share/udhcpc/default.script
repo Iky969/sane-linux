@@ -33,13 +33,20 @@ write_resolv() {
 	mv -f "$tmp" "$RESOLV_CONF"
 }
 
+restore_default_resolv() {
+	[ -f "$RESOLV_DEFAULT" ] || return 0
+	dir=$(dirname "$RESOLV_CONF")
+	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || return 1
+	if ! cat "$RESOLV_DEFAULT" > "$tmp"; then rm -f "$tmp"; return 1; fi
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$RESOLV_CONF"
+}
+
 case "$1" in
     deconfig)
         ip addr flush dev "$interface" 2>/dev/null || true
         ip link set "$interface" up 2>/dev/null || true
-        if [ -f "$RESOLV_DEFAULT" ]; then
-            cat "$RESOLV_DEFAULT" > "$RESOLV_CONF" 2>/dev/null || true
-        fi
+        restore_default_resolv || true
         ;;
     renew|bound)
         ip addr flush dev "$interface" 2>/dev/null || true
