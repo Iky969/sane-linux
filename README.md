@@ -175,6 +175,7 @@ LICENSE                       MIT License
 | [doc/build-and-test.md](doc/build-and-test.md) | Static build, test harnesses, CI workflow, manual chroot testing, troubleshooting |
 | [doc/distro-builder.md](doc/distro-builder.md) | Rootfs assembly, initramfs packaging, QEMU headless validation |
 | [doc/glossary-i18n.md](doc/glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
+| [doc/networking.md](doc/networking.md) | Phase B: `sane-net`, DNS/DHCP, Wi-Fi, reconnect, and outbound TLS |
 | [doc/README.md](doc/README.md) | Documentation index, project status, and architectural roadmap |
 | [SECURITY.md](SECURITY.md) | Threat model, operational security boundaries, and vulnerability reporting |
 

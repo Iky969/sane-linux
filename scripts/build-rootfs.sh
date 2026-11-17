@@ -313,7 +313,7 @@ install_ninit() {
 }
 
 install_networking() {
-	log "installing networking and TLS packages (ca-certificates, curl)"
+	log "installing networking, Wi-Fi and TLS packages (ca-certificates, curl, wpa-supplicant)"
 	# ca-certificates
 	if [ -f "$REPO_ROOT/packages/ca-certificates/x/etc/ssl/certs/ca-certificates.crt" ]; then
 		mkdir -p "$ROOTFS/etc/ssl/certs"
@@ -348,6 +348,23 @@ install_networking() {
 		install -m 0755 "$REPO_ROOT/packages/doas/x/usr/bin/doas" "$ROOTFS/usr/bin/doas"
 		if ! is_static "$ROOTFS/usr/bin/doas"; then
 			info "WARNING: $ROOTFS/usr/bin/doas is not static; in an initramfs it needs a dynamic loader"
+		fi
+	fi
+
+	# wpa-supplicant (Wi-Fi)
+	WPA_DIR="$REPO_ROOT/packages/wpa-supplicant"
+	if [ ! -x "$WPA_DIR/x/usr/bin/wpa_supplicant" ] && [ -x "$WPA_DIR/build.sh" ]; then
+		info "building wpa-supplicant package..."
+		"$WPA_DIR/build.sh" "$DISTRO_DIR/packages"
+	fi
+	if [ -x "$WPA_DIR/x/usr/bin/wpa_supplicant" ]; then
+		mkdir -p "$ROOTFS/usr/bin" "$ROOTFS/etc"
+		install -m 0755 "$WPA_DIR/x/usr/bin/wpa_supplicant" "$ROOTFS/usr/bin/wpa_supplicant"
+		if [ -x "$WPA_DIR/x/usr/bin/wpa_cli" ]; then
+			install -m 0755 "$WPA_DIR/x/usr/bin/wpa_cli" "$ROOTFS/usr/bin/wpa_cli"
+		fi
+		if [ -f "$WPA_DIR/x/etc/wpa_supplicant.conf" ]; then
+			install -m 0600 "$WPA_DIR/x/etc/wpa_supplicant.conf" "$ROOTFS/etc/wpa_supplicant.conf"
 		fi
 	fi
 
@@ -388,7 +405,7 @@ install_networking() {
 write_etc() {
 	log "writing /etc (init.conf, passwd, group, shadow, doas.conf, issue, hostname, fstab)"
 	cat > "$ROOTFS/etc/init.conf" <<'EOF'
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then ip link set eth0 up 2>/dev/null; udhcpc -b -i eth0 -s /usr/share/udhcpc/default.script; fi"
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi"
 tty1:respawn:/sbin/getty 38400 tty1 linux
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100
 EOF
@@ -448,6 +465,7 @@ EOF
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 EOF
+	cp "$ROOTFS/etc/resolv.conf" "$ROOTFS/etc/resolv.conf.default"
 
 	# Comments only: ninit already mounts proc/sysfs/devtmpfs/tmpfs itself, so no
 	# fstab entries are needed. This file exists so the boot console does not show

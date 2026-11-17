@@ -20,6 +20,7 @@ PACKAGES=(
     ca-certificates
     curl
     doas
+    wpa-supplicant
 )
 
 printf '=== Building S.A.N.E Distro Packages ===\n'

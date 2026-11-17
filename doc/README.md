@@ -17,6 +17,7 @@ For a high-level overview, quick start guide, and configuration examples, see th
 | [package-manager.md](package-manager.md) | S.A.N.E package manager CLI (`spm`), database layout, locking, atomic transactions, and removal |
 | [toolchain-and-rootfs-from-source.md](toolchain-and-rootfs-from-source.md) | Comprehensive guide: hermetic musl toolchain, compiling BusyBox, Linux kernel, ninit, and rootfs assembly |
 | [glossary-i18n.md](glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
+| [networking.md](networking.md) | Phase B: `sane-net`, DNS/DHCP, Wi-Fi, reconnect, and outbound TLS |
 | [../SECURITY.md](../SECURITY.md) | Security policy and vulnerability disclosure procedures |
 | [../LICENSE](../LICENSE) | MIT License |
 
