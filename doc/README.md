@@ -73,7 +73,8 @@ To run `ninit` on a real system, install the compiled binary as `/sbin/init` and
 
 ## Status
 
-The current release is **v1.1.0**, and the boot banner reports `=== ninit start (PID 1) v1.1.0 ===`.
+The current release is **v1.2.0**, and the boot banner reports `=== ninit start (PID 1) v1.2.0 ===`.
+See [RELEASE-NOTES-v1.2.0.md](../RELEASE-NOTES-v1.2.0.md) and [CHANGELOG.md](../CHANGELOG.md) for details.
 
 Recent reliability enhancements include:
 - Topological sort bounded by `MAX_SERVICES` preventing stack overflow,
