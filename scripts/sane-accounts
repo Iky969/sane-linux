@@ -196,7 +196,9 @@ cmd_add_user() {
 		done
 		tmp=$(mktemp "$(dirname "$GROUP")/.sane-accounts.XXXXXX") || return 0
 		if [ "$created_group" -eq 1 ]; then
-			awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$GROUP" > "$tmp"
+			# The group was created for this account but is named independently
+			# ($group), so it must be removed by group name, not account name.
+			awk -v n="$group" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$GROUP" > "$tmp"
 		else
 			awk -v n="$name" 'BEGIN{FS=OFS=":"} {
 				if ($4!="") {
@@ -210,6 +212,10 @@ cmd_add_user() {
 			}' "$GROUP" > "$tmp"
 		fi
 		mv "$tmp" "$GROUP"
+		# mktemp files are 0600; restore the canonical modes after replacing
+		# passwd/group/shadow with those temp files.
+		chmod 0644 "$PASSWD" "$GROUP" 2>/dev/null || true
+		chmod 0600 "$SHADOW" 2>/dev/null || true
 		rmdir "$home" 2>/dev/null || true
 	}
 
