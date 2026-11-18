@@ -7,10 +7,16 @@
 set -eu
 
 PROG=${0##*/}
-RESOLV=/etc/resolv.conf
-RESOLV_DEFAULT=/etc/resolv.conf.default
-WPACONF=/etc/wpa_supplicant.conf
-CABUNDLE=/etc/ssl/certs/ca-certificates.crt
+# SANE_ROOT redirects every location sane-net reads or writes (tests stage a
+# temporary root). Trailing slashes are stripped and SANE_ROOT=/ normalizes to
+# the empty root, so an unset SANE_ROOT and SANE_ROOT=/ both yield the classic
+# absolute paths (/etc/resolv.conf, /run/udhcpc-<iface>.pid, ...).
+ROOT=${SANE_ROOT:-}
+ROOT=${ROOT%/}
+RESOLV=$ROOT/etc/resolv.conf
+RESOLV_DEFAULT=$ROOT/etc/resolv.conf.default
+WPACONF=$ROOT/etc/wpa_supplicant.conf
+CABUNDLE=$ROOT/etc/ssl/certs/ca-certificates.crt
 
 usage() {
 	cat <<EOF
@@ -68,18 +74,19 @@ write_resolv() {
 	for ns in "$@"; do
 		printf 'nameserver %s\n' "$ns" >> "$tmp"
 	done
-	chmod 0644 "$tmp"
-	mv "$tmp" "$file"
+	chmod 0644 "$tmp" || { rm -f "$tmp"; die "cannot set permissions on $tmp"; }
+	mv "$tmp" "$file" || { rm -f "$tmp"; die "cannot replace $file"; }
 }
 
 restore_default_resolv() {
 	# Replace $RESOLV with the shipped $RESOLV_DEFAULT, atomically. Prints a
 	# specific error and returns 1 on failure; the caller decides how to exit.
+	fault_inject resolv-write
 	[ -f "$RESOLV_DEFAULT" ] || { printf '%s: %s is missing\n' "$PROG" "$RESOLV_DEFAULT" >&2; return 1; }
 	dir=$(dirname "$RESOLV")
 	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || { printf '%s: cannot create temp file in %s\n' "$PROG" "$dir" >&2; return 1; }
 	cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; printf '%s: cannot read %s\n' "$PROG" "$RESOLV_DEFAULT" >&2; return 1; }
-	chmod 0644 "$tmp"
+	chmod 0644 "$tmp" || { rm -f "$tmp"; printf '%s: cannot set permissions on %s\n' "$PROG" "$tmp" >&2; return 1; }
 	mv "$tmp" "$RESOLV" || { rm -f "$tmp"; printf '%s: cannot replace %s\n' "$PROG" "$RESOLV" >&2; return 1; }
 }
 
@@ -105,7 +112,7 @@ cmd_static() {
 		fault_inject ip-addr
 		ip addr add "$ip_cidr" dev "$iface" || die "cannot add $ip_cidr to $iface"
 	fi
-	if ! ip route show 2>/dev/null | grep -q '^default '; then
+	if ! ip route show default dev "$iface" 2>/dev/null | grep -q '^default '; then
 		fault_inject route-add
 		ip route add default via "$gw" || die "cannot add default route via $gw"
 	fi
@@ -121,15 +128,14 @@ cmd_dhcp() {
 	fault_inject ip-link
 	ip link set "$iface" up
 	fault_inject udhcpc
-	exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
-		-s /usr/share/udhcpc/default.script
+	exec udhcpc -b -R -p "${ROOT}/run/udhcpc-${iface}.pid" -i "$iface" \
+		-s "${ROOT}/usr/share/udhcpc/default.script"
 }
 
 cmd_dns() {
 	[ "$#" -ge 1 ] || usage
 	if [ "$1" = "default" ]; then
-		fault_inject resolv-write
-		restore_default_resolv || die "cannot restore default resolver from $RESOLV_DEFAULT"
+		restore_default_resolv || exit 1
 		return 0
 	fi
 	write_resolv "$RESOLV" "$@"
@@ -188,11 +194,37 @@ cmd_tls_check() {
 	curl --cacert "$CABUNDLE" -fsSI --max-time 15 "$url" >/dev/null
 }
 
+lease_postcheck() {
+	# lease_postcheck IFACE -- bounded wait (max 5 polls, 1 s apart, stopping
+	# as soon as ready) for the lease to become visible: a global IPv4
+	# address on the interface and a default route via it. Once both appear,
+	# the verdict of the full check decides; if they never appear, return 1.
+	piface=$1
+	polls=0
+	while [ "$polls" -lt 5 ]; do
+		if ip -4 addr show dev "$piface" scope global 2>/dev/null | grep -q 'inet ' && \
+			ip route show default dev "$piface" 2>/dev/null | grep -q '^default '; then
+			if cmd_check "$piface"; then
+				return 0
+			fi
+			return 1
+		fi
+		polls=$((polls + 1))
+		if [ "$polls" -lt 5 ]; then
+			sleep 1
+		fi
+	done
+	return 1
+}
+
 cmd_reconnect() {
 	need ip; need udhcpc
 	[ "${1:-}" ] || usage
 	iface=$1; limit=${2:-30}
-	case "$limit" in ''|*[!0-9]*) die "seconds must be numeric" ;; esac
+	case "$limit" in
+		''|*[!0-9]*) die "seconds must be numeric" ;;
+		0[0-9]*) die "seconds must not have leading zeros" ;;
+	esac
 	# Once carrier is up, DHCP is retried a bounded number of times with a
 	# short backoff; every failed attempt restores the default resolver so a
 	# lost lease never leaves a stale /etc/resolv.conf behind.
@@ -203,9 +235,11 @@ cmd_reconnect() {
 		if ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
 			while [ "$dhcp_tries" -lt "$dhcp_max" ]; do
 				fault_inject udhcpc
-				if udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
-					-s /usr/share/udhcpc/default.script; then
-					exit 0
+				if udhcpc -b -R -p "${ROOT}/run/udhcpc-${iface}.pid" -i "$iface" \
+					-s "${ROOT}/usr/share/udhcpc/default.script"; then
+					if lease_postcheck "$iface"; then
+						exit 0
+					fi
 				fi
 				dhcp_tries=$((dhcp_tries + 1))
 				restore_default_resolv || \
@@ -225,8 +259,10 @@ cmd_reconnect() {
 }
 
 cmd_check() {
-	# check [IFACE] -- verify link UP, a default route and a usable resolver.
-	# Exits 0 only when all three hold; every failure prints its own message.
+	# check [IFACE] -- verify link UP, a global IPv4 address on the
+	# interface, a default route via that interface and a usable resolver.
+	# Exits 0 only when all hold; every failure prints its own message.
+	[ "$#" -le 1 ] || usage
 	need ip
 	iface=${1:-eth0}
 	rc=0
@@ -234,8 +270,12 @@ cmd_check() {
 		printf '%s: check: link %s is not UP\n' "$PROG" "$iface" >&2
 		rc=1
 	fi
-	if ! ip route show 2>/dev/null | grep -q '^default '; then
-		printf '%s: check: no default route\n' "$PROG" >&2
+	if ! ip -4 addr show dev "$iface" scope global 2>/dev/null | grep -q 'inet '; then
+		printf '%s: check: no global IPv4 address on %s\n' "$PROG" "$iface" >&2
+		rc=1
+	fi
+	if ! ip route show default dev "$iface" 2>/dev/null | grep -q '^default '; then
+		printf '%s: check: no default route on %s\n' "$PROG" "$iface" >&2
 		rc=1
 	fi
 	if [ ! -f "$RESOLV" ]; then
@@ -248,8 +288,8 @@ cmd_check() {
 	return "$rc"
 }
 
-cmd=${1:-}
-[ -n "$cmd" ] || usage
+[ "$#" -gt 0 ] || usage
+cmd=$1
 shift
 case "$cmd" in
 	link)      cmd_link "$@" ;;

@@ -32,10 +32,16 @@ EOF
 }
 
 mkstub ip 'printf "%s\n" "ip $*" >> "'"$LOG"'"
-if [ "$1" = link ] && [ "$2" = show ]; then
-  printf "2: eth0: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n"
-fi
+case "$*" in
+  *"link show dev eth0"*) printf "2: eth0: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n" ;;
+  addr\ add*) printf "inet %s scope global eth0\n" "$2" >> '"$T"'/ip-addr ;;
+  route\ add\ default\ via*) printf "default via %s dev eth0 proto static\n" "$4" >> '"$T"'/ip-route ;;
+  *"addr show dev eth0 scope global"*) cat '"$T"'/ip-addr 2>/dev/null ;;
+  *"route show default dev eth0"*) cat '"$T"'/ip-route 2>/dev/null ;;
+esac
 exit 0'
+: > "$T/ip-addr"
+: > "$T/ip-route"
 mkstub udhcpc 'printf "%s\n" "udhcpc $*" >> "'"$LOG"'"; exit 0'
 mkstub curl 'printf "%s\n" "curl $*" >> "'"$LOG"'"; exit 0'
 mkstub wpa_supplicant 'printf "%s\n" "wpa_supplicant $*" >> "'"$LOG"'"; exit 0'
@@ -101,6 +107,10 @@ check "hyphenated hostname written" sh -c \
 # --- DHCP / reconnect ------------------------------------------------------
 check "dhcp starts udhcpc with script" run_net dhcp eth0
 check "udhcpc uses default.script" grep -q 'udhcpc .*-s /usr/share/udhcpc/default.script' "$LOG"
+# Seed a lease state so the bounded post-check sees an address + default route
+# even if no earlier static configuration populated the stateful stub.
+printf 'inet 10.0.0.2/24 scope global eth0\n' > "$T/ip-addr"
+printf 'default via 10.0.0.1 dev eth0 proto static\n' > "$T/ip-route"
 check "reconnect starts DHCP when carrier is up" run_net reconnect eth0 2
 check "reconnect recorded a udhcpc call" sh -c \
 	"[ \$(grep -c '^udhcpc ' '$LOG') -ge 2 ]"

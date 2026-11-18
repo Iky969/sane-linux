@@ -143,4 +143,4 @@ test-lifecycle:
 test-installer installer-test: packages
 	sudo bash ./scripts/test-installer.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-reliability
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-network-fault test-reliability

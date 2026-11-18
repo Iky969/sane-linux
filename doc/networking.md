@@ -16,16 +16,29 @@ sane-net wifi IFACE SSID PSK                  WPA2 config + wpa_supplicant
 sane-net status [IFACE]                       addresses, routes, DNS
 sane-net tls-check URL                        HTTPS check with the CA bundle
 sane-net reconnect IFACE [SECONDS]            wait for carrier, restart DHCP
-sane-net check [IFACE]                        verify link UP, default route, DNS
+sane-net check [IFACE]                        verify link UP, IPv4, route, DNS
 ```
 
 All DNS input is validated (`[a-zA-Z0-9.:_-]` only) before being written, so a
 malformed DHCP response cannot inject shell syntax into `resolv.conf`.
 
+## Target-root paths
+
+`SANE_ROOT` prefixes every resolver, Wi-Fi configuration, CA-bundle, DHCP pid,
+and DHCP event-script path used by `sane-net`. An unset or empty value preserves
+the classic absolute paths. `SANE_ROOT=/` does the same, and one trailing slash
+is stripped from every other value, so `SANE_ROOT=/target/` uses paths such as
+`/target/etc/resolv.conf`, `/target/run/udhcpc-eth0.pid`, and
+`/target/usr/share/udhcpc/default.script` without a double slash. This is path
+redirection, not a `chroot`; tests use it to keep all I/O in a temporary root.
+
 ## Resolver handling
 
 - `/etc/resolv.conf` is always replaced **atomically** via `mktemp` + `mv`,
   mode `0644`. Readers never observe a half-written file.
+- Both direct resolver writes and default restoration remove their temporary
+  file and fail nonzero if `chmod` or `mv` fails, leaving the old resolver in
+  place. `dns default` reports the helper's specific error on one line.
 - The image ships `/etc/resolv.conf.default` (1.1.1.1, 8.8.8.8). The udhcpc
   event script restores it on `deconfig`, so a lost lease cannot leave the
   system with a stale resolver.
@@ -40,16 +53,24 @@ Boot runs `network:once:/bin/sh -c "... sane-net dhcp eth0"` from
 `/run/udhcpc-<iface>.pid`.
 
 `sane-net reconnect IFACE [SECONDS]` polls the link for carrier, bringing it
-up each iteration, then restarts DHCP. Once carrier is up, DHCP itself is
-retried up to 3 times with a short backoff; every failed attempt restores
-`/etc/resolv.conf.default` first, and a restore that itself fails is a hard
-error too. The command fails closed with a clear error when no carrier
-appears within the limit (default 30 s) or when DHCP keeps failing.
+up each iteration, then restarts DHCP. The carrier limit defaults to 30 seconds
+and accepts canonical nonnegative decimal values (including `0`); leading-zero
+forms such as `00`, `01`, `08`, and `09` are rejected. No carrier within the
+limit is a clear, fail-closed error.
 
-`sane-net check [IFACE]` (default `eth0`) verifies that the interface is UP,
-that a default route exists, and that `/etc/resolv.conf` is present with at
-least one `nameserver`; it exits 0 only when all three hold and prints a
-clear message for each failed condition.
+Once carrier is up, DHCP is attempted at most 3 times. Every `udhcpc` exit 0 is
+followed by a bounded lease post-check: at most 5 polls, one second apart, for
+a global IPv4 address and a default route on that interface. As soon as both
+appear, the full `sane-net check IFACE` runs. A missing address/route or failed
+full check makes that DHCP attempt fail; the default resolver is restored and
+a short backoff precedes the next attempt. A resolver restore failure is itself
+a hard error, and persistent DHCP/post-check failure exits nonzero.
+
+`sane-net check [IFACE]` (default `eth0`) accepts no more than one interface
+argument. It verifies all four of: link UP, a global IPv4 address on the
+interface, a default route on that same interface, and `/etc/resolv.conf`
+containing at least one `nameserver`. It exits 0 only when all four hold and
+prints a clear message for each failed condition.
 
 ## Wi-Fi
 
@@ -74,10 +95,11 @@ supported yet.
 so TLS verification never depends on a dynamic CA lookup. A missing CA bundle
 or a non-`https://` URL is a hard error.
 
-`static` fails closed when `ip addr add` or `ip route add` fails (idempotent
-checks prevent false failures on repeated runs). `dns default` restores the
-baseline through the same atomic `mktemp` + `mv` path as all other resolver
-writes.
+`static` fails closed when `ip addr add` or `ip route add` fails. Its
+idempotency checks query the requested interface, including a default-route
+query scoped with `dev IFACE`, so another interface's route cannot suppress a
+needed route mutation. `dns default` restores the baseline through the same
+atomic `mktemp` + `mv` path as all other resolver writes.
 
 ## Fault injection
 
@@ -96,7 +118,9 @@ value (or an unset variable) never triggers a fault:
 
 Faults are injected before side effects: a faulted operation leaves the
 existing `/etc/resolv.conf` untouched and records no `ip`/`udhcpc` call for
-the faulted step.
+the faulted step. The `resolv-write` check lives in the default-restore helper
+as well as the direct resolver writer, covering both `dns default` and resolver
+restoration during reconnect without a duplicate `cmd_dns` hook.
 
 ## Testing
 
@@ -104,3 +128,9 @@ the faulted step.
 `wpa_supplicant` through `PATH` and redirects all writable paths into a temp
 root, so no host network or host `/etc` is touched. It is wired into
 `make test`, `make test-network`, and CI.
+
+`scripts/test-network-fault.sh` (83 assertions) uses the same temporary-root
+approach for fault injection, cleanup-after-write-failure, DHCP retry/backoff,
+bounded and delayed lease post-checks, reconnect argument validation, and
+real-binary `SANE_ROOT` coverage. Its real-binary checks also assert that the
+host resolver checksum is unchanged.

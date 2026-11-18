@@ -1,10 +1,12 @@
 # Reliability (Phase C)
 
 Phase C adds a host-side, fail-closed reliability toolkit for S.A.N.E target
-roots. `scripts/sane-reliability` never touches the host `/etc` unless
-`--root /` is passed explicitly, and is POSIX `sh`. Snapshot and upgrade
-commands have no dependencies beyond coreutils and `sha256sum`; `net-recover`
-additionally resolves `sane-net` through `PATH`.
+roots selected by an absolute `--root DIR`. The tool is POSIX `sh`. Snapshot
+and upgrade commands have no dependencies beyond coreutils and `sha256sum`;
+`net-recover` additionally resolves `sane-net` through `PATH` and passes
+`SANE_ROOT="$ROOT"` explicitly to both network subcommands. An unset
+`SANE_ROOT` makes `sane-net` default to `/`; consequently, host paths under
+`/etc` are selected only when the effective target root is `/`.
 
 State lives under the target root:
 
@@ -42,7 +44,8 @@ start with `-`. Overwriting an existing tag requires `--force`.
 
 `verify TAG` re-checks every manifest entry before a snapshot is used. A
 corrupt or incomplete snapshot is never applied — `rollback`, `upgrade` and
-`recover` all call this check first (fail-closed). Manifest paths are validated
+upgrade recovery through `recover` all call this check first (fail-closed).
+Manifest paths are validated
 before hashing or applying: absolute paths and any `..` component are rejected,
 so a crafted manifest cannot write outside the target root. Manifests are
 NUL-delimited internally, so filenames containing spaces are handled correctly.
@@ -76,11 +79,12 @@ An upgrade payload is a directory containing the files to install and a
 5. writes `state=done` and logs the rollback tag.
 
 If any step fails, the recorded snapshot is restored immediately. On the next
-boot (or manually), `recover` re-reads the journal: `in-progress` triggers an
-automatic rollback to the recorded snapshot and sets `state=recovered`;
-`done`, `idle`, `rolled-back` and `recovered` are no-ops. This is the host-side
-counterpart of the existing ninit rescue-shell contract documented in
-[boot-pipeline.md](boot-pipeline.md#7-failure-recovery--rescue-shell-contract).
+boot (or manually), `recover` re-reads the journal: upgrade `in-progress`
+triggers an automatic rollback to the recorded snapshot and sets
+`state=recovered`; network `net-in-progress` follows the separate retry flow
+below. `done`, `idle`, `rolled-back` and `recovered` are no-ops. This is the
+host-side counterpart of the existing ninit rescue-shell contract documented
+in [boot-pipeline.md](boot-pipeline.md#7-failure-recovery--rescue-shell-contract).
 
 ### Network recovery
 
@@ -93,18 +97,34 @@ arguments are rejected before the journal or resolver is changed.
 A valid recovery runs in this order:
 
 1. initializes the reliability directories and logs the recovery start;
-2. writes `state=in-progress` to the journal before changing the resolver;
+2. atomically writes `state=net-in-progress` plus `net-iface=IFACE` to the
+   journal before changing the resolver, without an upgrade snapshot tag;
 3. stages `etc/resolv.conf.default` in the destination directory, applies mode
    `0644`, and atomically renames it to `etc/resolv.conf` under the target root;
-4. runs `sane-net reconnect IFACE`, resolving `sane-net` through `PATH`;
-5. writes `state=recovered` and logs completion only after reconnect succeeds.
+4. runs `SANE_ROOT="$ROOT" sane-net reconnect IFACE` through `PATH`;
+5. runs `SANE_ROOT="$ROOT" sane-net check IFACE` through `PATH`;
+6. writes `state=recovered`, retains `net-iface=IFACE`, and logs completion
+   only after both network commands succeed.
 
-A missing or unreadable default resolver, staging/rename failure, or failed
-reconnect produces a nonzero exit and an `ERROR` entry in `reliability.log`.
-The journal deliberately remains `in-progress` so the operation is visibly
-unfinished and can be retried. If reconnect itself fails, the default resolver
-has already been restored, but `state=recovered` is not written. An invalid
-interface is rejected before entering the `in-progress` state.
+`SANE_ROOT` is an inline environment assignment on each individual invocation,
+not a global export. It confines `sane-net` writable paths to the same target
+root as the resolver journal operation. `check` must observe link UP, an IPv4
+address and a default route for the specified interface, plus a usable
+resolver, before recovery can complete.
+
+A missing or unreadable default resolver, staging/rename failure, failed
+reconnect, or failed check produces a nonzero exit and an `ERROR` entry in
+`reliability.log`. The journal deliberately remains `net-in-progress` with its
+`net-iface` so the operation is visibly unfinished. If either network command
+fails, the default resolver has already been restored, but `state=recovered`
+is not written. An invalid interface is rejected before entering the
+`net-in-progress` state.
+
+Running plain `recover` with `state=net-in-progress` reads and validates the
+recorded interface, then invokes `cmd_net_recover --iface IFACE`; it does not
+require a snapshot tag. A retry with a working `sane-net` reconnect and check
+returns zero and finishes with `state=recovered` and the same `net-iface`.
+Missing or invalid recorded interfaces fail without invoking `sane-net`.
 
 ### Logging
 
@@ -128,7 +148,11 @@ target root (no root privileges, no host state touched). Its assertions cover
 snapshot integrity, force semantics, tag validation, mode-preserving rollback
 with safety snapshots, payload verification and path traversal, journal-driven
 recovery, network resolver recovery and reconnect failures, log levels and
-rotation, and backup/restore validation. `scripts/test-network-fault.sh`
+rotation, and backup/restore validation. Network recovery is tested both with
+controlled `sane-net` stubs and with the real repository `sane-net`, using only
+`ip`, `udhcpc` and `sleep` stubs. The latter checks per-interface IPv4/default
+route queries, target-resolver recovery, before/after host resolver SHA-256,
+and retry after reconnect or check failures. `scripts/test-network-fault.sh`
 stages all writable paths under another temporary root and uses stubbed network
 tools to verify fail-before-side-effect injection, reconnect retry/backoff,
 default-resolver restoration after DHCP failures, and connectivity checks.

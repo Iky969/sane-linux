@@ -26,9 +26,12 @@ UDHCPC_CALLS="$T/udhcpc-calls.log"
 UDHCPC_COUNT="$T/udhcpc-count"
 SLEEP_CALLS="$T/sleep-calls.log"
 RESOLVER_OBSERVED="$T/resolver-before-dhcp.log"
+POSTCHECK_STARTS="$T/postcheck-starts.log"
 CARRIER="$T/carrier"
 ADDR_PRESENT="$T/address-present"
+ADDR_POLLS="$T/address-polls"
 ROUTE_PRESENT="$T/route-present"
+ROUTE_DEV="$T/route-dev"
 
 mkstub() {
 	name=$1; body=$2
@@ -54,14 +57,23 @@ case "${1:-} ${2:-}" in
       printf "up\n" > "'"$CARRIER"'"
     fi
     ;;
+  "-4 addr")
+    count=$(cat "'"$ADDR_POLLS"'")
+    count=$((count + 1))
+    printf "%s\n" "$count" > "'"$ADDR_POLLS"'"
+    if [ "$count" -ge "${STUB_ADDR_DELAY:-0}" ] && [ "$(cat "'"$ADDR_PRESENT"'")" = yes ]; then
+      printf "    inet 10.0.0.2/24 scope global eth0\n"
+    fi
+    ;;
   "addr show")
     if [ "$(cat "'"$ADDR_PRESENT"'")" = yes ]; then
       printf "    inet 10.0.0.2/24 scope global eth0\n"
     fi
     ;;
   "route show")
-    if [ "$(cat "'"$ROUTE_PRESENT"'")" = yes ]; then
-      printf "default via 10.0.0.1 dev eth0\n"
+    route_dev=$(cat "'"$ROUTE_DEV"'")
+    if [ "$(cat "'"$ROUTE_PRESENT"'")" = yes ] && [ "${5:-}" = "$route_dev" ]; then
+      printf "default via 10.0.0.1 dev %s\n" "$route_dev"
     fi
     ;;
   "addr add"|"route add")
@@ -74,6 +86,8 @@ printf "udhcpc %s\n" "$*" >> "'"$UDHCPC_CALLS"'"
 count=$(cat "'"$UDHCPC_COUNT"'")
 count=$((count + 1))
 printf "%s\n" "$count" > "'"$UDHCPC_COUNT"'"
+queries=$(wc -l < "'"$IP_CALLS"'")
+printf "attempt=%s queries=%s\n" "$count" "$queries" >> "'"$POSTCHECK_STARTS"'"
 if [ "$count" -gt 1 ]; then
   if cmp -s "'"$T"'/etc/resolv.conf" "'"$T"'/etc/resolv.conf.default"; then
     resolver=default
@@ -110,10 +124,14 @@ reset_stubs() {
 	: > "$UDHCPC_CALLS"
 	: > "$SLEEP_CALLS"
 	: > "$RESOLVER_OBSERVED"
+	: > "$POSTCHECK_STARTS"
+	rm -f "$T/etc"/.resolv.conf.*
 	printf '0\n' > "$UDHCPC_COUNT"
 	printf 'up\n' > "$CARRIER"
 	printf 'no\n' > "$ADDR_PRESENT"
+	printf '0\n' > "$ADDR_POLLS"
 	printf 'no\n' > "$ROUTE_PRESENT"
+	printf 'eth0\n' > "$ROUTE_DEV"
 	printf 'nameserver 127.0.0.1\n' > "$T/etc/resolv.conf"
 	printf 'nameserver 1.1.1.1\n' > "$T/etc/resolv.conf.default"
 }
@@ -122,6 +140,20 @@ run_net() { sh "$STAGED" "$@"; }
 resolver_unchanged() { grep -q '^nameserver 127.0.0.1$' "$T/etc/resolv.conf" && \
 	[ "$(wc -l < "$T/etc/resolv.conf")" -eq 1 ]; }
 no_temp_files() { ! ls "$T/etc"/.resolv.conf.* >/dev/null 2>&1; }
+
+FAILBIN="$T/failbin"
+mkdir -p "$FAILBIN"
+REAL_CHMOD=$(command -v chmod)
+REAL_MV=$(command -v mv)
+set_fail_tool() {
+	tool=$1
+	rm -f "$FAILBIN/chmod" "$FAILBIN/mv"
+	ln -s "$REAL_CHMOD" "$FAILBIN/chmod"
+	ln -s "$REAL_MV" "$FAILBIN/mv"
+	rm -f "$FAILBIN/$tool"
+	printf '#!/bin/sh\nexit 1\n' > "$FAILBIN/$tool"
+	chmod 0755 "$FAILBIN/$tool"
+}
 
 check "sane-net fault test source is present" test -f "$NET"
 check "sane-net passes shell syntax" sh -n "$NET"
@@ -161,9 +193,60 @@ expect_fail "resolv-write fault aborts DNS update" \
 check "resolv-write fault leaves resolver bytes unchanged" resolver_unchanged
 check "resolv-write fault leaves no temporary resolver" no_temp_files
 
+reset_stubs
+set_fail_tool chmod
+expect_fail "DNS write chmod failure exits nonzero" \
+	env PATH="$FAILBIN:$PATH" sh "$STAGED" dns 9.9.9.9
+check "DNS write chmod failure leaves resolver unchanged" resolver_unchanged
+check "DNS write chmod failure removes temporary resolver" no_temp_files
+
+reset_stubs
+set_fail_tool mv
+expect_fail "DNS write rename failure exits nonzero" \
+	env PATH="$FAILBIN:$PATH" sh "$STAGED" dns 9.9.9.9
+check "DNS write rename failure leaves resolver unchanged" resolver_unchanged
+check "DNS write rename failure removes temporary resolver" no_temp_files
+
+reset_stubs
+set_fail_tool chmod
+expect_fail "default DNS chmod failure exits nonzero" \
+	env PATH="$FAILBIN:$PATH" sh "$STAGED" dns default
+check "default DNS chmod failure leaves resolver unchanged" resolver_unchanged
+check "default DNS chmod failure removes temporary resolver" no_temp_files
+
+reset_stubs
+set_fail_tool mv
+expect_fail "default DNS rename failure exits nonzero" \
+	env PATH="$FAILBIN:$PATH" sh "$STAGED" dns default
+check "default DNS rename failure leaves resolver unchanged" resolver_unchanged
+check "default DNS rename failure removes temporary resolver" no_temp_files
+
+reset_stubs
+expect_fail "resolv-write fault aborts default DNS restore" \
+	env SANE_NET_FAULT=resolv-write sh "$STAGED" dns default
+check "default DNS fault leaves resolver unchanged" resolver_unchanged
+check "default DNS fault leaves no temporary resolver" no_temp_files
+
+reset_stubs
+rm -f "$T/etc/resolv.conf.default"
+expect_fail "dns default fails when the default resolver is missing" \
+	sh -c "sh '$STAGED' dns default >/dev/null 2>'$T/dns-default.err'"
+check "missing default resolver prints exactly one stderr line" \
+	test "$(wc -l < "$T/dns-default.err")" -eq 1
+
+reset_stubs
+rm -f "$T/etc/resolv.conf.default"
+expect_fail "reconnect fails when DHCP and resolver restore fail" \
+	sh -c "env STUB_UDHCPC_FAILS=1 sh '$STAGED' reconnect eth0 6 >/dev/null 2>'$T/reconnect-restore.err'"
+check "reconnect reports the resolver restore failure branch" \
+	grep -q '^sane-net: DHCP failed on eth0 and restoring the default resolver failed$' \
+		"$T/reconnect-restore.err"
+
 # --- Reconnect retry and recovery ------------------------------------------
 reset_stubs
 printf 'down\n' > "$CARRIER"
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
 expect_ok "reconnect retries until the link recovers" run_net reconnect eth0 4
 check "reconnect polls the carrier more than once" \
 	sh -c "[ \$(grep -c '^ip link show dev eth0$' '$IP_CALLS') -ge 2 ]"
@@ -182,6 +265,8 @@ check "unrecovered reconnect never starts DHCP" \
 	sh -c "! grep -q '^udhcpc ' '$UDHCPC_CALLS'"
 
 reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
 expect_ok "reconnect retries DHCP failures then recovers" \
 	env STUB_UDHCPC_FAILS=2 sh "$STAGED" reconnect eth0 6
 check "DHCP recovery reaches the third attempt" \
@@ -205,6 +290,46 @@ check "persistent DHCP failure restores the default resolver" \
 check "failed DHCP retries wait through the sleep stub" \
 	sh -c "[ \$(grep -c '^sleep ' '$SLEEP_CALLS') -ge 1 ]"
 
+# --- Bounded DHCP lease post-check -----------------------------------------
+reset_stubs
+expect_fail "address-less lease post-check retries then fails closed" \
+	run_net reconnect eth0 6
+printf 'attempt=1 queries=1\nattempt=2 queries=6\nattempt=3 queries=11\n' > "$T/expected-postcheck"
+check "address-less post-check uses five queries before each retry" \
+	cmp -s "$T/expected-postcheck" "$POSTCHECK_STARTS"
+check "address-less post-check stops after five final queries" \
+	test "$(grep -c '^ip -4 addr show dev eth0 scope global$' "$IP_CALLS")" -eq 15
+check "address-less retries observe the restored default resolver" \
+	sh -c "grep -q '^attempt=2 resolver=default$' '$RESOLVER_OBSERVED' && grep -q '^attempt=3 resolver=default$' '$RESOLVER_OBSERVED'"
+check "address-less failure leaves the default resolver restored" \
+	sh -c "cmp -s '$T/etc/resolv.conf' '$T/etc/resolv.conf.default'"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+expect_fail "route-less lease post-check retries then fails closed" \
+	run_net reconnect eth0 6
+printf 'attempt=1 queries=1\nattempt=2 queries=11\nattempt=3 queries=21\n' > "$T/expected-postcheck"
+check "route-less post-check uses five query pairs before each retry" \
+	cmp -s "$T/expected-postcheck" "$POSTCHECK_STARTS"
+check "route-less post-check stops after five final query pairs" \
+	sh -c "test \"\$(grep -c '^ip -4 addr show dev eth0 scope global$' '$IP_CALLS')\" -eq 15 && test \"\$(grep -c '^ip route show default dev eth0$' '$IP_CALLS')\" -eq 15"
+check "route-less retries observe the restored default resolver" \
+	sh -c "grep -q '^attempt=2 resolver=default$' '$RESOLVER_OBSERVED' && grep -q '^attempt=3 resolver=default$' '$RESOLVER_OBSERVED'"
+check "route-less failure leaves the default resolver restored" \
+	sh -c "cmp -s '$T/etc/resolv.conf' '$T/etc/resolv.conf.default'"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_ok "delayed lease address succeeds after bounded polling" \
+	env STUB_ADDR_DELAY=2 sh "$STAGED" reconnect eth0 6
+check "delayed address runs post-check then full connectivity check" \
+	sh -c "test \"\$(cat '$ADDR_POLLS')\" -eq 3 && test \"\$(grep -c '^ip route show default dev eth0$' '$IP_CALLS')\" -eq 2"
+check "delayed address waits for exactly one poll interval" \
+	test "$(cat "$SLEEP_CALLS")" = "sleep 1"
+check "delayed address needs only one DHCP attempt" \
+	test "$(cat "$UDHCPC_COUNT")" -eq 1
+
 # --- Connectivity check -----------------------------------------------------
 reset_stubs
 printf 'yes\n' > "$ADDR_PRESENT"
@@ -219,6 +344,21 @@ printf 'down\n' > "$CARRIER"
 expect_fail "check fails when the link is down" run_net check eth0
 
 reset_stubs
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_fail "check fails without a global IPv4 address" run_net check eth0
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+printf 'eth1\n' > "$ROUTE_DEV"
+expect_fail "check ignores a default route on another interface" run_net check eth0
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_fail "check rejects extra arguments" run_net check eth0 extra
+
+reset_stubs
 printf 'yes\n' > "$ADDR_PRESENT"
 printf 'no\n' > "$ROUTE_PRESENT"
 expect_fail "check fails without a default route" run_net check eth0
@@ -228,6 +368,45 @@ printf 'yes\n' > "$ADDR_PRESENT"
 printf 'yes\n' > "$ROUTE_PRESENT"
 : > "$T/etc/resolv.conf"
 expect_fail "check fails without a nameserver" run_net check eth0
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_fail "reconnect rejects noncanonical leading-zero limit 08" run_net reconnect eth0 08
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_fail "reconnect rejects noncanonical leading-zero limit 09" run_net reconnect eth0 09
+
+# --- Real-binary SANE_ROOT handling ----------------------------------------
+ROOTFS="$T/rootfs"
+HOST_RESOLV_BEFORE=$(sha256sum /etc/resolv.conf)
+mkdir -p "$ROOTFS/etc"
+reset_stubs
+expect_ok "real binary writes DNS below trailing-slash SANE_ROOT" \
+	env SANE_ROOT="$ROOTFS/" sh "$NET" dns 9.9.9.9
+check "SANE_ROOT DNS write lands in the target root" \
+	grep -q '^nameserver 9.9.9.9$' "$ROOTFS/etc/resolv.conf"
+check "SANE_ROOT DNS write leaves the staged resolver untouched" resolver_unchanged
+
+reset_stubs
+expect_ok "real binary DHCP honors trailing-slash SANE_ROOT" \
+	env SANE_ROOT="$ROOTFS/" sh "$NET" dhcp eth0
+check "SANE_ROOT DHCP uses normalized pid and script paths" \
+	test "$(cat "$UDHCPC_CALLS")" = "udhcpc -b -R -p $ROOTFS/run/udhcpc-eth0.pid -i eth0 -s $ROOTFS/usr/share/udhcpc/default.script"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+printf 'nameserver 8.8.8.8\n' > "$ROOTFS/etc/resolv.conf"
+expect_ok "real binary reconnect honors trailing-slash SANE_ROOT" \
+	env SANE_ROOT="$ROOTFS/" sh "$NET" reconnect eth0 2
+check "SANE_ROOT reconnect uses normalized pid and script paths" \
+	test "$(cat "$UDHCPC_CALLS")" = "udhcpc -b -R -p $ROOTFS/run/udhcpc-eth0.pid -i eth0 -s $ROOTFS/usr/share/udhcpc/default.script"
+HOST_RESOLV_AFTER=$(sha256sum /etc/resolv.conf)
+check "real SANE_ROOT tests leave host resolver bytes unchanged" \
+	test "$HOST_RESOLV_BEFORE" = "$HOST_RESOLV_AFTER"
 
 printf '\nNetwork fault tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
