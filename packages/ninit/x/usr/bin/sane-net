@@ -25,12 +25,22 @@ Usage: $PROG <command> [args]
   status [IFACE]                       show addresses, routes and DNS
   tls-check URL                        verify HTTPS with the CA bundle
   reconnect IFACE [SECONDS]            wait for carrier, then restart DHCP
+  check [IFACE]                        verify link UP, default route and DNS
 EOF
 	exit 1
 }
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
+
+# Fault injection (network fault injection feature). When SANE_NET_FAULT
+# equals the named operation, fail closed BEFORE the external tool is run or
+# the resolver is touched. Any other value (or unset) is a no-op.
+fault_inject() {
+	[ "${SANE_NET_FAULT:-}" = "$1" ] || return 0
+	printf '%s: fault injection: %s\n' "$PROG" "$1" >&2
+	exit 1
+}
 
 # Escape a value for use inside a double-quoted wpa_supplicant.conf field.
 wpa_escape() {
@@ -47,6 +57,7 @@ valid_server() {
 
 write_resolv() {
 	# write_resolv FILE SERVER... -- atomic, mode 0644, no partial writes.
+	fault_inject resolv-write
 	file=$1; shift
 	[ "$#" -ge 1 ] || die "no DNS server given"
 	for ns in "$@"; do
@@ -61,14 +72,25 @@ write_resolv() {
 	mv "$tmp" "$file"
 }
 
+restore_default_resolv() {
+	# Replace $RESOLV with the shipped $RESOLV_DEFAULT, atomically. Prints a
+	# specific error and returns 1 on failure; the caller decides how to exit.
+	[ -f "$RESOLV_DEFAULT" ] || { printf '%s: %s is missing\n' "$PROG" "$RESOLV_DEFAULT" >&2; return 1; }
+	dir=$(dirname "$RESOLV")
+	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || { printf '%s: cannot create temp file in %s\n' "$PROG" "$dir" >&2; return 1; }
+	cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; printf '%s: cannot read %s\n' "$PROG" "$RESOLV_DEFAULT" >&2; return 1; }
+	chmod 0644 "$tmp"
+	mv "$tmp" "$RESOLV" || { rm -f "$tmp"; printf '%s: cannot replace %s\n' "$PROG" "$RESOLV" >&2; return 1; }
+}
+
 cmd_link() {
 	need ip
 	[ "${1:-}" ] || usage
 	iface=$1
 	case "${2:-}" in
 		'') ip link show dev "$iface" ;;
-		up) ip link set "$iface" up ;;
-		down) ip link set "$iface" down ;;
+		up) fault_inject ip-link; ip link set "$iface" up ;;
+		down) fault_inject ip-link; ip link set "$iface" down ;;
 		*) usage ;;
 	esac
 }
@@ -77,11 +99,14 @@ cmd_static() {
 	need ip
 	[ "$#" -ge 3 ] || usage
 	iface=$1; ip_cidr=$2; gw=$3; shift 3
+	fault_inject ip-link
 	ip link set "$iface" up || die "cannot bring up $iface"
 	if ! ip addr show dev "$iface" 2>/dev/null | grep -q "$ip_cidr"; then
+		fault_inject ip-addr
 		ip addr add "$ip_cidr" dev "$iface" || die "cannot add $ip_cidr to $iface"
 	fi
 	if ! ip route show 2>/dev/null | grep -q '^default '; then
+		fault_inject route-add
 		ip route add default via "$gw" || die "cannot add default route via $gw"
 	fi
 	if [ "$#" -gt 0 ]; then
@@ -93,7 +118,9 @@ cmd_dhcp() {
 	need ip; need udhcpc
 	[ "${1:-}" ] || usage
 	iface=$1
+	fault_inject ip-link
 	ip link set "$iface" up
+	fault_inject udhcpc
 	exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
 		-s /usr/share/udhcpc/default.script
 }
@@ -101,12 +128,8 @@ cmd_dhcp() {
 cmd_dns() {
 	[ "$#" -ge 1 ] || usage
 	if [ "$1" = "default" ]; then
-		[ -f "$RESOLV_DEFAULT" ] || die "$RESOLV_DEFAULT is missing"
-		dir=$(dirname "$RESOLV")
-		tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || die "cannot create temp file in $dir"
-		cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; die "cannot read $RESOLV_DEFAULT"; }
-		chmod 0644 "$tmp"
-		mv "$tmp" "$RESOLV"
+		fault_inject resolv-write
+		restore_default_resolv || die "cannot restore default resolver from $RESOLV_DEFAULT"
 		return 0
 	fi
 	write_resolv "$RESOLV" "$@"
@@ -122,6 +145,7 @@ cmd_wifi() {
 	case "$psk" in *[![:print:]]*) die "PSK contains non-printable characters" ;; esac
 	ssid_e=$(wpa_escape "$ssid")
 	psk_e=$(wpa_escape "$psk")
+	fault_inject ip-link
 	ip link set "$iface" up
 	tmp=$(mktemp "$(dirname "$WPACONF")/.wpa_supplicant.XXXXXX") || die "cannot create temp file"
 	cat > "$tmp" <<EOF
@@ -169,17 +193,59 @@ cmd_reconnect() {
 	[ "${1:-}" ] || usage
 	iface=$1; limit=${2:-30}
 	case "$limit" in ''|*[!0-9]*) die "seconds must be numeric" ;; esac
+	# Once carrier is up, DHCP is retried a bounded number of times with a
+	# short backoff; every failed attempt restores the default resolver so a
+	# lost lease never leaves a stale /etc/resolv.conf behind.
+	dhcp_max=3
+	dhcp_tries=0
 	i=0
 	while [ "$i" -lt "$limit" ]; do
 		if ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
-			exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
-				-s /usr/share/udhcpc/default.script
+			while [ "$dhcp_tries" -lt "$dhcp_max" ]; do
+				fault_inject udhcpc
+				if udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
+					-s /usr/share/udhcpc/default.script; then
+					exit 0
+				fi
+				dhcp_tries=$((dhcp_tries + 1))
+				restore_default_resolv || \
+					die "DHCP failed on $iface and restoring the default resolver failed"
+				if [ "$dhcp_tries" -lt "$dhcp_max" ]; then
+					sleep "$dhcp_tries"
+				fi
+			done
+			die "DHCP failed on $iface after ${dhcp_max} attempts; default resolver restored"
 		fi
+		fault_inject ip-link
 		ip link set "$iface" up 2>/dev/null || true
 		i=$((i + 1))
 		sleep 1
 	done
 	die "no carrier on $iface after ${limit}s"
+}
+
+cmd_check() {
+	# check [IFACE] -- verify link UP, a default route and a usable resolver.
+	# Exits 0 only when all three hold; every failure prints its own message.
+	need ip
+	iface=${1:-eth0}
+	rc=0
+	if ! ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
+		printf '%s: check: link %s is not UP\n' "$PROG" "$iface" >&2
+		rc=1
+	fi
+	if ! ip route show 2>/dev/null | grep -q '^default '; then
+		printf '%s: check: no default route\n' "$PROG" >&2
+		rc=1
+	fi
+	if [ ! -f "$RESOLV" ]; then
+		printf '%s: check: %s is missing\n' "$PROG" "$RESOLV" >&2
+		rc=1
+	elif ! grep -q '^nameserver ' "$RESOLV"; then
+		printf '%s: check: %s contains no nameserver entry\n' "$PROG" "$RESOLV" >&2
+		rc=1
+	fi
+	return "$rc"
 }
 
 cmd=${1:-}
@@ -194,5 +260,6 @@ case "$cmd" in
 	status)    cmd_status "$@" ;;
 	tls-check) cmd_tls_check "$@" ;;
 	reconnect) cmd_reconnect "$@" ;;
+	check)     cmd_check "$@" ;;
 	*) usage ;;
 esac

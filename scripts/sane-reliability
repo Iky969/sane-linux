@@ -25,6 +25,7 @@ Commands:
   rollback TAG                  restore a verified snapshot
   upgrade PAYLOAD_DIR           verify, snapshot, then commit a payload
   recover                       roll back an interrupted upgrade
+  net-recover [--iface IFACE]   restore default DNS and reconnect networking
   log LEVEL MESSAGE             append a structured log entry
   backup ARCHIVE [--force]      archive snapshots, journal and logs
   restore ARCHIVE               restore an archive into a target root
@@ -286,6 +287,62 @@ cmd_recover() {
 	recover_internal
 }
 
+valid_iface() {
+	case "$1" in
+		''|-*|*[!A-Za-z0-9_.-]*) return 1 ;;
+	esac
+	[ "${#1}" -le 15 ]
+}
+
+net_recover_fail() {
+	# Keep the in-progress journal intact so a later recovery can retry.
+	log_event ERROR "$1" || true
+	die "$1"
+}
+
+cmd_net_recover() {
+	nr_iface=eth0
+	case "$#" in
+		0) ;;
+		2)
+			[ "$1" = "--iface" ] || die "usage: net-recover [--iface IFACE]"
+			nr_iface=$2
+			;;
+		*) die "usage: net-recover [--iface IFACE]" ;;
+	esac
+	valid_iface "$nr_iface" || die "invalid network interface: $nr_iface"
+	cmd_init
+	log_event INFO "network recovery started for $nr_iface"
+	write_journal in-progress
+
+	nr_resolv="$ROOT/etc/resolv.conf"
+	nr_default="$ROOT/etc/resolv.conf.default"
+	nr_dir=$(dirname "$nr_resolv")
+	[ -f "$nr_default" ] || net_recover_fail "default resolver is missing: $nr_default"
+	[ -d "$nr_dir" ] || net_recover_fail "resolver directory is missing: $nr_dir"
+	nr_tmp=$(mktemp "$nr_dir/.sane-net-recover.XXXXXX") || \
+		net_recover_fail "cannot stage default resolver in $nr_dir"
+	if ! cat "$nr_default" > "$nr_tmp"; then
+		rm -f "$nr_tmp"
+		net_recover_fail "cannot read default resolver: $nr_default"
+	fi
+	if ! chmod 0644 "$nr_tmp"; then
+		rm -f "$nr_tmp"
+		net_recover_fail "cannot set resolver mode in $nr_dir"
+	fi
+	if ! mv "$nr_tmp" "$nr_resolv"; then
+		rm -f "$nr_tmp"
+		net_recover_fail "cannot install default resolver: $nr_resolv"
+	fi
+
+	if ! sane-net reconnect "$nr_iface"; then
+		net_recover_fail "sane-net reconnect failed for $nr_iface"
+	fi
+	write_journal recovered
+	log_event INFO "network recovery completed for $nr_iface"
+	note "network recovered on $nr_iface"
+}
+
 cmd_upgrade() {
 	[ "$#" -eq 1 ] || die "usage: upgrade PAYLOAD_DIR"
 	payload=$1
@@ -405,6 +462,7 @@ case "$CMD" in
 	rollback)      cmd_rollback "$@" ;;
 	upgrade)       cmd_upgrade "$@" ;;
 	recover)       cmd_recover "$@" ;;
+	net-recover)   cmd_net_recover "$@" ;;
 	log)           cmd_log "$@" ;;
 	backup)        cmd_backup "$@" ;;
 	restore)       cmd_restore "$@" ;;

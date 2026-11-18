@@ -2,8 +2,9 @@
 
 Phase C adds a host-side, fail-closed reliability toolkit for S.A.N.E target
 roots. `scripts/sane-reliability` never touches the host `/etc` unless
-`--root /` is passed explicitly, and is POSIX `sh` with no dependencies beyond
-coreutils and `sha256sum`.
+`--root /` is passed explicitly, and is POSIX `sh`. Snapshot and upgrade
+commands have no dependencies beyond coreutils and `sha256sum`; `net-recover`
+additionally resolves `sane-net` through `PATH`.
 
 State lives under the target root:
 
@@ -24,6 +25,7 @@ sane-reliability [--root DIR] verify TAG
 sane-reliability [--root DIR] rollback TAG
 sane-reliability [--root DIR] upgrade PAYLOAD_DIR
 sane-reliability [--root DIR] recover
+sane-reliability [--root DIR] net-recover [--iface IFACE]
 sane-reliability [--root DIR] log LEVEL MESSAGE
 sane-reliability [--root DIR] backup ARCHIVE [--force]
 sane-reliability [--root DIR] restore ARCHIVE
@@ -80,6 +82,30 @@ automatic rollback to the recorded snapshot and sets `state=recovered`;
 counterpart of the existing ninit rescue-shell contract documented in
 [boot-pipeline.md](boot-pipeline.md#7-failure-recovery--rescue-shell-contract).
 
+### Network recovery
+
+`net-recover [--iface IFACE]` recovers DNS and connectivity independently of an
+upgrade snapshot. The interface defaults to `eth0`; the only accepted option
+is `--iface IFACE`. Interface names are restricted to at most 15 ASCII
+alphanumeric, `_`, `.` or `-` characters and may not start with `-`. Invalid
+arguments are rejected before the journal or resolver is changed.
+
+A valid recovery runs in this order:
+
+1. initializes the reliability directories and logs the recovery start;
+2. writes `state=in-progress` to the journal before changing the resolver;
+3. stages `etc/resolv.conf.default` in the destination directory, applies mode
+   `0644`, and atomically renames it to `etc/resolv.conf` under the target root;
+4. runs `sane-net reconnect IFACE`, resolving `sane-net` through `PATH`;
+5. writes `state=recovered` and logs completion only after reconnect succeeds.
+
+A missing or unreadable default resolver, staging/rename failure, or failed
+reconnect produces a nonzero exit and an `ERROR` entry in `reliability.log`.
+The journal deliberately remains `in-progress` so the operation is visibly
+unfinished and can be retried. If reconnect itself fails, the default resolver
+has already been restored, but `state=recovered` is not written. An invalid
+interface is rejected before entering the `in-progress` state.
+
 ### Logging
 
 `log INFO|WARN|ERROR "message"` appends
@@ -98,10 +124,24 @@ archive, then copies the state and logs into the target root.
 ## Testing
 
 `scripts/test-reliability.sh` exercises every command against a temporary
-target root (no root privileges, no host state touched): 67 assertions cover
+target root (no root privileges, no host state touched). Its assertions cover
 snapshot integrity, force semantics, tag validation, mode-preserving rollback
 with safety snapshots, payload verification and path traversal, journal-driven
-recovery, log levels and rotation, and backup/restore validation. It is wired
+recovery, network resolver recovery and reconnect failures, log levels and
+rotation, and backup/restore validation. `scripts/test-network-fault.sh`
+stages all writable paths under another temporary root and uses stubbed network
+tools to verify fail-before-side-effect injection, reconnect retry/backoff,
+default-resolver restoration after DHCP failures, and connectivity checks.
+Neither suite changes the host `/etc` or host network state.
+
+Run both suites with:
+
+```
+sh scripts/test-network-fault.sh
+sh scripts/test-reliability.sh
+```
+
+The reliability suite is wired
 into `make test`, `make test-reliability`, and CI.
 
 ## Scope and boundaries

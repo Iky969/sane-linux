@@ -122,6 +122,81 @@ printf 'bad\n' > "$T/var/lib/sane/reliability/snapshots/broken2/etc/init.conf"
 printf 'state=in-progress\nsnapshot=broken2\n' > "$T/var/lib/sane/reliability/journal"
 expect_fail "recover rejects a corrupted snapshot" run recover
 
+# --- network recovery -------------------------------------------------------
+setup_net_recovery() {
+	base
+	run init
+	mkdir -p "$T/bin"
+	printf 'nameserver 1.1.1.1\n' > "$T/etc/resolv.conf.default"
+	printf 'nameserver 192.0.2.1\n' > "$T/etc/resolv.conf"
+	chmod 0600 "$T/etc/resolv.conf.default"
+	: > "$T/net-recover.calls"
+	cat > "$T/bin/sane-net" <<EOF
+#!/bin/sh
+printf 'sane-net %s\n' "\$*" >> '$T/net-recover.calls'
+grep -q '^state=in-progress\$' '$T/var/lib/sane/reliability/journal' || exit 90
+: > '$T/reconnect-saw-in-progress'
+grep -q '^nameserver 1.1.1.1\$' '$T/etc/resolv.conf' || exit 91
+[ "\${NET_RECONNECT_FAIL:-0}" != 1 ] || exit 42
+exit 0
+EOF
+	chmod 0755 "$T/bin/sane-net"
+}
+
+run_net_recover() {
+	env PATH="$T/bin:$PATH" sh "$TOOL" --root "$T" net-recover "$@"
+}
+
+run_net_recover_fail() {
+	env PATH="$T/bin:$PATH" NET_RECONNECT_FAIL=1 \
+		sh "$TOOL" --root "$T" net-recover "$@"
+}
+
+setup_net_recovery
+expect_ok "net-recover succeeds with default eth0" run_net_recover
+check "net-recover restores the default resolver" sh -c \
+	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf' && ! grep -q '192.0.2.1' '$T/etc/resolv.conf'"
+check "net-recover installs resolver with mode 0644" \
+	test "$(stat -c %a "$T/etc/resolv.conf")" = 644
+check "net-recover leaves journal recovered" sh -c \
+	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal'"
+check "net-recover records in-progress before reconnect" \
+	test -f "$T/reconnect-saw-in-progress"
+check "net-recover reconnects default eth0 through PATH stub" sh -c \
+	"grep -qx 'sane-net reconnect eth0' '$T/net-recover.calls'"
+check "net-recover logs successful recovery" sh -c \
+	"grep -q ' INFO .*recover' '$T/var/log/sane/reliability.log'"
+
+setup_net_recovery
+expect_ok "net-recover accepts an explicit interface" run_net_recover --iface wlan1
+check "net-recover forwards the explicit interface" sh -c \
+	"grep -qx 'sane-net reconnect wlan1' '$T/net-recover.calls'"
+
+setup_net_recovery
+expect_fail "net-recover fails closed when reconnect fails" run_net_recover_fail
+check "failed reconnect leaves journal in-progress" sh -c \
+	"grep -q '^state=in-progress$' '$T/var/lib/sane/reliability/journal'"
+check "failed reconnect still restores the default resolver" sh -c \
+	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf'"
+check "failed reconnect logs an ERROR" sh -c \
+	"grep -q ' ERROR .*reconnect.*eth0' '$T/var/log/sane/reliability.log'"
+
+setup_net_recovery
+rm -f "$T/etc/resolv.conf.default"
+expect_fail "net-recover rejects a missing default resolver" run_net_recover
+check "missing resolver leaves current resolver unchanged" sh -c \
+	"grep -q '^nameserver 192.0.2.1$' '$T/etc/resolv.conf'"
+check "missing resolver leaves journal in-progress" sh -c \
+	"grep -q '^state=in-progress$' '$T/var/lib/sane/reliability/journal'"
+check "missing resolver logs an ERROR and skips reconnect" sh -c \
+	"grep -q ' ERROR ' '$T/var/log/sane/reliability.log' && test ! -s '$T/net-recover.calls'"
+
+setup_net_recovery
+expect_fail "net-recover rejects an unsafe interface" run_net_recover --iface bad/iface
+check "invalid interface has no recovery side effects" sh -c \
+	"grep -q '^state=idle$' '$T/var/lib/sane/reliability/journal' && test ! -s '$T/net-recover.calls'"
+expect_fail "net-recover rejects unknown options" run_net_recover --force
+
 # --- logging ---------------------------------------------------------------
 base
 run init

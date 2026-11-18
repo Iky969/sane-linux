@@ -16,6 +16,7 @@ sane-net wifi IFACE SSID PSK                  WPA2 config + wpa_supplicant
 sane-net status [IFACE]                       addresses, routes, DNS
 sane-net tls-check URL                        HTTPS check with the CA bundle
 sane-net reconnect IFACE [SECONDS]            wait for carrier, restart DHCP
+sane-net check [IFACE]                        verify link UP, default route, DNS
 ```
 
 All DNS input is validated (`[a-zA-Z0-9.:_-]` only) before being written, so a
@@ -39,8 +40,16 @@ Boot runs `network:once:/bin/sh -c "... sane-net dhcp eth0"` from
 `/run/udhcpc-<iface>.pid`.
 
 `sane-net reconnect IFACE [SECONDS]` polls the link for carrier, bringing it
-up each iteration, then restarts DHCP. It fails closed with a clear error if
-no carrier appears within the limit (default 30 s).
+up each iteration, then restarts DHCP. Once carrier is up, DHCP itself is
+retried up to 3 times with a short backoff; every failed attempt restores
+`/etc/resolv.conf.default` first, and a restore that itself fails is a hard
+error too. The command fails closed with a clear error when no carrier
+appears within the limit (default 30 s) or when DHCP keeps failing.
+
+`sane-net check [IFACE]` (default `eth0`) verifies that the interface is UP,
+that a default route exists, and that `/etc/resolv.conf` is present with at
+least one `nameserver`; it exits 0 only when all three hold and prints a
+clear message for each failed condition.
 
 ## Wi-Fi
 
@@ -69,6 +78,25 @@ or a non-`https://` URL is a hard error.
 checks prevent false failures on repeated runs). `dns default` restores the
 baseline through the same atomic `mktemp` + `mv` path as all other resolver
 writes.
+
+## Fault injection
+
+`SANE_NET_FAULT` lets tests exercise failure paths without a real network.
+When it is set to one of the values below, the matching operation fails
+closed BEFORE the external tool runs or the resolver is written; any other
+value (or an unset variable) never triggers a fault:
+
+| Value | Operation that fails closed |
+| --- | --- |
+| `ip-link` | any `ip link set` mutation (`link up`/`down`, `static`, `dhcp`, `wifi`, `reconnect`) |
+| `ip-addr` | `ip addr add` in `static` |
+| `route-add` | `ip route add` in `static` |
+| `udhcpc` | the DHCP start in `dhcp` and `reconnect` |
+| `resolv-write` | every resolver write/restore, including `dns default` |
+
+Faults are injected before side effects: a faulted operation leaves the
+existing `/etc/resolv.conf` untouched and records no `ip`/`udhcpc` call for
+the faulted step.
 
 ## Testing
 
