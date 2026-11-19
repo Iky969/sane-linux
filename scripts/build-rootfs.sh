@@ -208,14 +208,19 @@ install_busybox() {
 		link_applet sbin "$a"
 	done
 	# /bin/sh is required: ninit executes every service command through /bin/sh -c.
-	[ -e "$ROOTFS/bin/sh" ] || ln -s /bin/busybox "$ROOTFS/bin/sh"
-	[ -x "$ROOTFS/bin/sh" ] || die "/bin/sh is missing from the rootfs"
+	# The link targets the guest's /bin/busybox and may be dangling on the build
+	# host, so detect it with -L too and never recreate an existing link.
+	[ -e "$ROOTFS/bin/sh" ] || [ -L "$ROOTFS/bin/sh" ] || ln -s /bin/busybox "$ROOTFS/bin/sh"
+	[ -x "$ROOTFS/bin/sh" ] || [ -L "$ROOTFS/bin/sh" ] || die "/bin/sh is missing from the rootfs"
 }
 
 link_applet() { # $1 = bin|sbin, $2 = applet name
 	d=$ROOTFS/$1
 	a=$2
-	[ -e "$d/$a" ] && return 0
+	# -L as well as -e: applet symlinks point at the guest's /bin/busybox,
+	# which need not resolve on the build host; an existing (even dangling)
+	# symlink must not be recreated.
+	{ [ -e "$d/$a" ] || [ -L "$d/$a" ]; } && return 0
 	if [ -n "${APPLET_LIST:-}" ] \
 	   && ! printf '%s\n' "$APPLET_LIST" | grep -qx "$a"; then
 		return 0   # applet is absent from this build
@@ -529,6 +534,12 @@ summary() {
 	info "init.conf  : $(grep -v '^#' "$ROOTFS/etc/init.conf" | grep . | head -n 1)"
 	info "boot in QEMU: sh ./scripts/run-qemu.sh"
 }
+
+# Allow sourcing for function definitions only, so regression tests can call
+# link_applet / install_busybox directly without running a full build.
+if [ "${BUILD_ROOTFS_LIB_ONLY:-0}" = 1 ]; then
+	return 0 2>/dev/null || exit 0
+fi
 
 if [ "$BUSYBOX_MODE" != prebuilt ]; then
 	need gcc "build-essential"
