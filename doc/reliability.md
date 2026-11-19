@@ -72,19 +72,40 @@ An upgrade payload is a directory containing the files to install and a
 
 `upgrade PAYLOAD_DIR`:
 
-1. verifies the payload manifest,
-2. takes an automatic `auto-pre-upgrade-<UTC>` snapshot,
+1. verifies the payload manifest and rejects any destination that would
+   traverse a symlink escaping the target root (see *Symlink containment*),
+2. takes an automatic `auto-pre-upgrade-<UTC>` snapshot covering **every
+   payload target path** in addition to the identity/config files and the
+   `spm` database: target files that already exist are copied into the
+   snapshot, and target files that do not yet exist are recorded in a
+   `new-files` list inside the snapshot,
 3. writes `state=in-progress` plus that tag to the journal,
-4. installs each payload file atomically,
+4. installs each payload file atomically (installation is **not** restricted
+   to the identity/config files),
 5. writes `state=done` and logs the rollback tag.
 
-If any step fails, the recorded snapshot is restored immediately. On the next
-boot (or manually), `recover` re-reads the journal: `in-progress` with a
-snapshot tag triggers an automatic upgrade rollback and sets
+If any step fails, the recorded snapshot is restored immediately. `rollback`
+and `recover` restore every snapshot file **and delete the `new-files`** the
+upgrade introduced, so the filesystem and the `spm` database stay consistent
+with the pre-upgrade state. New-file deletion honours symlink containment. On
+the next boot (or manually), `recover` re-reads the journal: `in-progress` with
+a snapshot tag triggers an automatic upgrade rollback and sets
 `state=recovered`; network `net-in-progress` follows the separate retry flow
-below. `done`, `idle`, `rolled-back` and `recovered` are no-ops. This is the
-host-side counterpart of the existing ninit rescue-shell contract documented
-in [boot-pipeline.md](boot-pipeline.md#7-failure-recovery--rescue-shell-contract).
+below. `done`, `idle`, `rolled-back` and `recovered` are no-ops.
+
+### Symlink containment
+
+Manifest path validation is textual (no absolute paths, no `..`), but a
+destination can still escape the target root through a symlinked directory
+component. Before any write, `upgrade`, `rollback` and `recover` walk **every
+component** of each destination path under `--root`. Each component that is a
+symlink is resolved with `readlink` (chains are followed with a bounded hop
+count, and `.`/`..` are collapsed with pure POSIX parameter expansion — no GNU
+`realpath` dependency, so the behaviour is identical on the BusyBox runtime).
+If any resolved path leaves the target root, the operation is rejected
+fail-closed and nothing is written. Symlinks that resolve **inside** the target
+root remain allowed. The same containment check guards `new-files` deletion so
+a rollback never removes a file through an escaping symlink.
 
 ### Network recovery
 
@@ -146,6 +167,37 @@ interface must still pass validation. `in-progress` with a snapshot tag keeps
 the existing upgrade rollback path. A modern `net-in-progress` journal without
 a valid `net-iface` remains an error; it is never silently defaulted to eth0.
 
+### Runtime recovery boot service
+
+Recovery is no longer host-side only: the target image installs a boot service
+that runs journal-driven recovery before user services. The service is
+`reliability:once`, defined as:
+
+```
+reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || echo "reliability: recover failed; continuing boot" >&2'
+```
+
+with `timeout=0`, which disables ninit's default 30 s once-service timeout so a
+slow recovery is not killed mid-transaction.
+
+Ordering: `network:once` and `recovery:once` (account recovery) carry
+`requires=reliability`; `firstboot` carries `requires=recovery`; `tty1`/console
+carry `requires=firstboot`. Consequently `reliability` runs **before** network,
+account recovery, firstboot and getty.
+
+Failure behaviour: ninit marks a once service `FAILED` on a nonzero exit and
+cancels its transitive dependents, so the wrapper deliberately exits `0` even
+when `recover` fails, emitting `reliability: recover failed; continuing boot`
+to stderr. Boot therefore continues to account recovery/firstboot — a recovery
+failure must **not** lock boot. A successful recovery is logged by
+`sane-reliability` itself (`INFO ... recovered`); a failure is logged `ERROR` in
+`/var/log/sane/reliability.log` in addition to the wrapper's stderr line.
+
+Install: `/usr/bin/sane-reliability` is installed mode `0755` by
+`build-rootfs.sh`, `make-image.sh` and `sane-install.sh` (the latter two use
+`$SUDO`). This complements the existing ninit rescue-shell contract documented
+in [boot-pipeline.md](boot-pipeline.md#7-failure-recovery--rescue-shell-contract).
+
 ### Logging
 
 `log INFO|WARN|ERROR "message"` appends
@@ -166,7 +218,11 @@ archive, then copies the state and logs into the target root.
 `scripts/test-reliability.sh` exercises every command against a temporary
 target root (no root privileges, no host state touched). Its assertions cover
 snapshot integrity, force semantics, tag validation, mode-preserving rollback
-with safety snapshots, payload verification and path traversal, journal-driven
+with safety snapshots, payload verification and path traversal, destination
+symlink containment (escaping top-level/nested/root-component/chain symlinks
+rejected with nothing written outside the root, internal-root symlinks allowed),
+pre-upgrade snapshot completeness and `new-files` deletion on rollback/recover
+including a mid-transaction failure, journal-driven
 recovery, network resolver recovery and reconnect failures, log levels and
 rotation, and backup/restore validation. Network recovery is tested both with
 controlled `sane-net` stubs and with the real repository `sane-net`, using only
@@ -198,11 +254,15 @@ into `make test`, `make test-reliability`, and CI.
 
 ## Scope and boundaries
 
-- The toolkit is host-side/build-time, like `spm` payload construction. It does
-  not add a new PID 1 service and does not alter the initramfs boot contract.
-- Snapshots cover configuration and the `spm` database, not arbitrary user
-  data under `/home` or whole disk images. A full-image rollback is out of
-  scope for Phase C.
+- The toolkit is usable host-side/build-time (like `spm` payload construction)
+  **and** at runtime: the target image installs the `reliability:once` boot
+  service that runs `recover` before user services (see *Runtime recovery boot
+  service*). It does not replace PID 1 or alter the initramfs boot contract; it
+  adds an ordered once-service within the existing ninit pipeline.
+- Manual snapshots cover the identity/config files and the `spm` database, not
+  arbitrary user data under `/home` or whole disk images. A pre-upgrade snapshot
+  additionally covers every payload target path (and records new files for
+  deletion on rollback). A full-image rollback is out of scope for Phase C.
 - `restore` replaces the reliability state but does not roll back already
   committed payload files; use `rollback` for that.
 - All destructive operations require an explicit tag, archive, or `--force`;

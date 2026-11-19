@@ -396,11 +396,16 @@ cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/fstab" >/dev/null
 /dev/vda1 /boot vfat rw 0 2
 EOF
 
+# Install the reliability toolkit used by the reliability boot service.
+$SUDO mkdir -p "$MNT_DIR/root/usr/bin"
+$SUDO install -m 0755 "$REPO_ROOT/scripts/sane-reliability" "$MNT_DIR/root/usr/bin/sane-reliability"
+
 # Configure /etc/init.conf
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/init.conf" >/dev/null
 # /etc/init.conf -- S.A.N.E Linux service supervision
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi"
-recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':timeout=0
+reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || echo "reliability: recover failed; continuing boot" >&2':timeout=0
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi":requires=reliability
+recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:timeout=0
 firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':requires=recovery:timeout=0
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot

@@ -22,6 +22,8 @@ from pathlib import Path
 ROOT_PW = "LifecycleRoot2026"
 USER_PW = "LifecycleUser2026"
 USER = "sane"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RELIABILITY_JOURNAL = "/var/lib/sane/reliability/journal"
 
 # A usable password hash is a complete SHA-512 crypt value, not a bare "$6$"
 # prefix left behind by an interrupted passwd. Mirrors valid_sha512_hash() in
@@ -131,6 +133,16 @@ class Image:
 
     def shadow(self):
         return self.cat("/etc/shadow")
+
+    def run_tool(self, args):
+        """Run scripts/sane-reliability against the mounted target root."""
+        loop = self._mount()
+        try:
+            tool = REPO_ROOT / "scripts" / "sane-reliability"
+            return run(sudo(["sh", str(tool), "--root", str(self.mnt)] + list(args)),
+                       check=True).stdout
+        finally:
+            self._unmount(loop)
 
 
 class Boot:
@@ -435,12 +447,39 @@ class Runner:
             self.stop(b2)
 
 
+    def scenario_8_reliability_recover_after_reboot(self):
+        self.check("S8 setup prerequisite is self-contained",
+                   self.ensure_setup("s8-setup"))
+        # Prepare an interrupted upgrade: a verified snapshot of the old state,
+        # a payload file already changed to the new version, and a journal that
+        # still says in-progress. The reliability boot service must roll back.
+        self.image.write("/etc/hostname", "S.A.N.E\n")
+        self.image.run_tool(["init"])
+        self.image.run_tool(["snapshot", "pre-upgrade"])
+        self.image.write("/etc/hostname", "INTERRUPTED-UPGRADE\n")
+        self.image.write(RELIABILITY_JOURNAL,
+                         "state=in-progress\nsnapshot=pre-upgrade\n", mode="0600")
+        self.check("S8 interrupted upgrade prepared",
+                   self.image.cat("/etc/hostname").strip() == "INTERRUPTED-UPGRADE"
+                   and "state=in-progress" in self.image.cat(RELIABILITY_JOURNAL))
+        b = Boot(self.image.path, self.logdir, "s8-reboot")
+        try:
+            ok = self.login(b)
+            self.check("S8 boot continues to login after reliability recover", ok, b.save())
+        finally:
+            self.stop(b)
+        self.check("S8 payload file restored to old version",
+                   self.image.cat("/etc/hostname").strip() == "S.A.N.E")
+        self.check("S8 journal marked recovered",
+                   "state=recovered" in self.image.cat(RELIABILITY_JOURNAL))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image", type=Path)
     ap.add_argument("--logdir", type=Path, default=Path("/tmp/sane-lifecycle-logs"))
-    ap.add_argument("--scenario", action="append", type=int, choices=range(1, 8),
-                    help="run only this scenario number (1-7), repeatable")
+    ap.add_argument("--scenario", action="append", type=int, choices=range(1, 9),
+                    help="run only this scenario number (1-8), repeatable")
     args = ap.parse_args()
     args.logdir.mkdir(parents=True, exist_ok=True)
     r = Runner(args.image.resolve(), args.logdir)
@@ -452,6 +491,7 @@ def main():
         5: r.scenario_5_normal_login,
         6: r.scenario_6_repeated_reboots,
         7: r.scenario_7_recovery,
+        8: r.scenario_8_reliability_recover_after_reboot,
     }
     wanted = args.scenario or list(scenarios)
     try:

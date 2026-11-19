@@ -91,6 +91,80 @@ valid_rel_path() {
 	return 0
 }
 
+normalize_path() {
+	# normalize_path ABS -- collapse '.' and '..' components of an absolute
+	# path using pure POSIX parameter expansion (no GNU realpath dependency).
+	np_in=$1
+	case "$np_in" in /*) ;; *) return 1 ;; esac
+	np_out=
+	np_rest=${np_in#/}
+	while [ -n "$np_rest" ]; do
+		case "$np_rest" in
+			*/*) np_comp=${np_rest%%/*}; np_rest=${np_rest#*/} ;;
+			*) np_comp=$np_rest; np_rest= ;;
+		esac
+		case "$np_comp" in
+			''|.) continue ;;
+			..) np_out=${np_out%/*} ;;
+			*) np_out="$np_out/$np_comp" ;;
+		esac
+	done
+	printf '%s\n' "${np_out:-/}"
+}
+
+symlink_safe_rel() {
+	# symlink_safe_rel REL -- fail closed if any component of ROOT/REL is a
+	# symlink whose resolution leaves ROOT. Walks each component physically,
+	# resolving symlink chains with readlink and a bounded hop count, and
+	# requires every resolved path to stay under ROOT. Internal-root symlinks
+	# are allowed. REL must already pass valid_rel_path (no '..'/absolute).
+	ssr_rel=$1
+	ssr_root=$ROOT
+	while [ "${ssr_root%/}" != "$ssr_root" ]; do ssr_root=${ssr_root%/}; done
+	ssr_cur=$ssr_root
+	ssr_rest=$ssr_rel
+	while [ -n "$ssr_rest" ]; do
+		case "$ssr_rest" in
+			*/*) ssr_comp=${ssr_rest%%/*}; ssr_rest=${ssr_rest#*/} ;;
+			*) ssr_comp=$ssr_rest; ssr_rest= ;;
+		esac
+		[ -n "$ssr_comp" ] || continue
+		ssr_cur="$ssr_cur/$ssr_comp"
+		ssr_hops=0
+		while [ -L "$ssr_cur" ]; do
+			ssr_hops=$((ssr_hops + 1))
+			[ "$ssr_hops" -le 40 ] || return 1
+			ssr_target=$(readlink "$ssr_cur" 2>/dev/null) || return 1
+			case "$ssr_target" in
+				/*) ssr_cur=$ssr_target ;;
+				*) ssr_cur="$(dirname "$ssr_cur")/$ssr_target" ;;
+			esac
+			ssr_cur=$(normalize_path "$ssr_cur") || return 1
+			case "$ssr_cur/" in
+				"$ssr_root/"*) ;;
+				*) return 1 ;;
+			esac
+		done
+	done
+	return 0
+}
+
+check_dest_symlinks() {
+	# check_dest_symlinks DIR -- pre-pass over a manifest: reject before any
+	# write if a destination would traverse a symlink escaping ROOT.
+	cds_dir=$1
+	while IFS= read -r cds_line; do
+		[ -n "$cds_line" ] || continue
+		cds_path=$(printf '%s\n' "$cds_line" | sed 's/^[^ ]*  //')
+		case "$cds_path" in
+			./meta|./manifest.sha256|./new-files|'') continue ;;
+		esac
+		cds_rel=${cds_path#./}
+		valid_rel_path "$cds_rel" || die "unsafe manifest path: $cds_path"
+		symlink_safe_rel "$cds_rel" || die "destination symlink escapes root: $cds_rel"
+	done < "$cds_dir/manifest.sha256"
+}
+
 validate_manifest() {
 	# validate_manifest DIR -- fail closed before hashing or applying entries
 	vm_dir=$1
@@ -99,7 +173,7 @@ validate_manifest() {
 		[ -n "$vm_line" ] || continue
 		vm_path=$(printf '%s\n' "$vm_line" | sed 's/^[^ ]*  //')
 		case "$vm_path" in
-			./meta|./manifest.sha256|'') continue ;;
+			./meta|./manifest.sha256|./new-files|'') continue ;;
 		esac
 		vm_rel=${vm_path#./}
 		valid_rel_path "$vm_rel" || die "unsafe manifest path: $vm_path"
@@ -123,8 +197,11 @@ unique_tag() {
 }
 
 do_snapshot() {
-	# do_snapshot TAG [force] -- internal, no logging
-	ds_tag=$1; ds_force=${2:-0}
+	# do_snapshot TAG [force] [extra-list] -- internal, no logging. extra-list
+	# is a file of relative payload target paths: existing targets are copied
+	# into the snapshot; absent targets are recorded in new-files for deletion
+	# on rollback/recover.
+	ds_tag=$1; ds_force=${2:-0}; ds_extra=${3:-}
 	valid_tag "$ds_tag" || die "invalid snapshot tag: $ds_tag"
 	ds_target="$SNAPS/$ds_tag"
 	[ -d "$ds_target" ] && [ "$ds_force" -ne 1 ] && die "snapshot already exists: $ds_tag"
@@ -139,6 +216,19 @@ do_snapshot() {
 	if [ -d "$ROOT/var/lib/spm" ]; then
 		mkdir -p "$ds_tmp/var/lib"
 		cp -a "$ROOT/var/lib/spm" "$ds_tmp/var/lib/" || { rm -rf -- "$ds_tmp"; die "cannot copy spm DB"; }
+	fi
+	if [ -n "$ds_extra" ] && [ -f "$ds_extra" ]; then
+		: > "$ds_tmp/new-files"
+		while IFS= read -r ds_rel; do
+			[ -n "$ds_rel" ] || continue
+			valid_rel_path "$ds_rel" || { rm -rf -- "$ds_tmp"; die "unsafe snapshot path: $ds_rel"; }
+			if [ -f "$ROOT/$ds_rel" ]; then
+				mkdir -p "$ds_tmp/$(dirname "$ds_rel")"
+				cp -p "$ROOT/$ds_rel" "$ds_tmp/$ds_rel" || { rm -rf -- "$ds_tmp"; die "cannot copy $ds_rel"; }
+			else
+				printf '%s\n' "$ds_rel" >> "$ds_tmp/new-files"
+			fi
+		done < "$ds_extra"
 	fi
 	printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$ds_tmp/meta"
 	write_manifest "$ds_tmp" || { rm -rf -- "$ds_tmp"; die "cannot write manifest"; }
@@ -235,11 +325,12 @@ restore_files_from() {
 	# restore_files_from DIR -- apply every manifest entry atomically
 	rf_dir=$1
 	validate_manifest "$rf_dir"
+	check_dest_symlinks "$rf_dir"
 	while IFS= read -r rf_line; do
 		[ -n "$rf_line" ] || continue
 		rf_path=$(printf '%s\n' "$rf_line" | sed 's/^[^ ]*  //')
 		case "$rf_path" in
-			./meta|./manifest.sha256|'') continue ;;
+			./meta|./manifest.sha256|./new-files|'') continue ;;
 		esac
 		rf_rel=${rf_path#./}
 		valid_rel_path "$rf_rel" || die "unsafe manifest path: $rf_path"
@@ -251,6 +342,17 @@ restore_files_from() {
 		cp -p "$rf_src" "$rf_tmp" || { rm -f "$rf_tmp"; die "cannot copy $rf_rel"; }
 		mv "$rf_tmp" "$rf_dst" || { rm -f "$rf_tmp"; die "cannot install $rf_rel"; }
 	done < "$rf_dir/manifest.sha256"
+	# Delete files the upgrade introduced (recorded in new-files), so a
+	# rollback/recover leaves the filesystem consistent with the snapshot.
+	# Deletion honours symlink containment: never rm through an escaping link.
+	if [ -f "$rf_dir/new-files" ]; then
+		while IFS= read -r rf_new; do
+			[ -n "$rf_new" ] || continue
+			valid_rel_path "$rf_new" || die "unsafe new-file path: $rf_new"
+			symlink_safe_rel "$rf_new" || die "new-file symlink escapes root: $rf_new"
+			rm -f "$ROOT/$rf_new"
+		done < "$rf_dir/new-files"
+	fi
 }
 
 cmd_rollback() {
@@ -384,9 +486,22 @@ cmd_upgrade() {
 	[ -f "$payload/manifest.sha256" ] || die "payload has no manifest.sha256"
 	(cd "$payload" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || die "payload integrity check failed"
 	validate_manifest "$payload"
+	check_dest_symlinks "$payload"
 	cmd_init
+	up_extra=$(mktemp "$STAGING/.upgrade-paths.XXXXXX") || die "cannot stage upgrade path list"
+	while IFS= read -r upe_line; do
+		[ -n "$upe_line" ] || continue
+		upe_path=$(printf '%s\n' "$upe_line" | sed 's/^[^ ]*  //')
+		case "$upe_path" in
+			./manifest.sha256|./meta|'') continue ;;
+		esac
+		upe_rel=${upe_path#./}
+		valid_rel_path "$upe_rel" || { rm -f "$up_extra"; die "unsafe manifest path: $upe_path"; }
+		printf '%s\n' "$upe_rel" >> "$up_extra"
+	done < "$payload/manifest.sha256"
 	tag=$(unique_tag "auto-pre-upgrade-$(date -u '+%Y%m%dT%H%M%SZ')")
-	do_snapshot "$tag" 0 || die "cannot create pre-upgrade snapshot"
+	do_snapshot "$tag" 0 "$up_extra" || { rm -f "$up_extra"; die "cannot create pre-upgrade snapshot"; }
+	rm -f "$up_extra"
 	write_journal in-progress "$tag"
 	while IFS= read -r up_line; do
 		[ -n "$up_line" ] || continue
