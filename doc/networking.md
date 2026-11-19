@@ -55,7 +55,9 @@ resolver/pid/config/script files are confined to the target root.
   event script restores it on `deconfig`, so a lost lease cannot leave the
   system with a stale resolver.
 - The `bound`/`renew` script writes `domain` (when supplied) and all `dns`
-  servers, and ignores invalid entries.
+  servers, and ignores entries that are not valid IPv4/IPv6 addresses. It uses
+  the same validation as `sane-net`, so a lease it writes always passes
+  `sane-net check` (a hostname nameserver from a DHCP server is dropped).
 
 ## DHCP and reconnect
 
@@ -152,7 +154,7 @@ restoration during reconnect without a duplicate `cmd_dns` hook.
 
 ## Testing
 
-`scripts/test-network.sh` (58 assertions) stubs `ip`, `udhcpc`, `curl`, and
+`scripts/test-network.sh` (60 assertions) stubs `ip`, `udhcpc`, `curl`, and
 `wpa_supplicant` through `PATH` and redirects all writable paths into a temp
 root, so no host network or host `/etc` is touched. It is wired into
 `make test`, `make test-network`, and CI.

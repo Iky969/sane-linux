@@ -156,6 +156,10 @@ check "udhcpc bound writes DNS atomically" env interface=eth0 ip=10.0.0.5 mask=2
 	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" bound
 check "bound DNS recorded" sh -c \
 	"grep -q '^nameserver 8.8.4.4$' '$UDHCP_ROOT/etc/resolv.conf'"
+check "udhcpc bound ignores a hostname nameserver" env interface=eth0 ip=10.0.0.5 mask=24 router=10.0.0.1 dns='dns.provider.net 8.8.4.4' \
+	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" bound
+check "event script writes only the valid IP, not the hostname" sh -c \
+	"! grep -q 'dns.provider.net' '$UDHCP_ROOT/etc/resolv.conf' && grep -q '^nameserver 8.8.4.4$' '$UDHCP_ROOT/etc/resolv.conf'"
 check "udhcpc deconfig restores default DNS" env interface=eth0 \
 	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" deconfig
 check "deconfig DNS restored" sh -c \
