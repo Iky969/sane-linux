@@ -72,6 +72,10 @@ rm -f "$ROOTFS/bin/sh"
 expect_fail "ensure_sh_link rejects a missing /bin/sh" ensure_sh_link
 
 # --- Part B: end-to-end prebuilt build (smoke) -------------------------------
+# Smoke test, NOT a bug reproduction: it exercises the dangling-symlink path
+# only when the build host lacks /bin/busybox. On hosts with busybox-static
+# (e.g. CI) the absolute links resolve and this is a happy-path build check.
+# The deterministic, host-independent regression for the bug is Part A/A2.
 BB="$REPO_ROOT/packages/busybox/x/bin/busybox"
 [ -x "$BB" ] || BB=$(command -v busybox || true)
 if [ -n "$BB" ] && [ -x "$BB" ]; then
