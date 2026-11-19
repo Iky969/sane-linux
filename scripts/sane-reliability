@@ -285,9 +285,13 @@ recover_internal() {
 			if [ -z "$tag" ]; then
 				# Legacy CLI wrote network recovery as plain in-progress.
 				nr_iface=$(journal_get net-iface)
-				nr_iface=${nr_iface:-eth0}
-				valid_iface "$nr_iface" || \
-					net_recover_fail "legacy network recovery has invalid interface: $nr_iface"
+				if [ -z "$nr_iface" ]; then
+					log_event WARN "legacy journal missing net-iface, defaulting to eth0"
+					nr_iface=eth0
+				else
+					valid_iface "$nr_iface" || \
+						net_recover_fail "legacy network recovery has invalid interface: $nr_iface"
+				fi
 				log_event WARN "migrating legacy in-progress network journal for $nr_iface"
 				cmd_net_recover --iface "$nr_iface"
 			else

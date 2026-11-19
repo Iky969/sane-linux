@@ -7,7 +7,9 @@ set -eu
 [ -n "${1:-}" ] || { printf 'Error: called without event\n' >&2; exit 1; }
 
 ROOT=${SANE_ROOT:-}
-ROOT=${ROOT%/}
+while [ "${ROOT%/}" != "$ROOT" ]; do
+	ROOT=${ROOT%/}
+done
 RESOLV_CONF="${ROOT}/etc/resolv.conf"
 RESOLV_DEFAULT="${ROOT}/etc/resolv.conf.default"
 

@@ -116,6 +116,11 @@ privileges (for example `CAP_NET_ADMIN`) and an intentionally selected
 interface. Tests simulate these operations with PATH stubs and temporary state.
 `check` must observe link UP, a global IPv4 address and a default route for
 that interface, plus a usable resolver, before recovery can complete.
+`check` is authoritative for DNS validity: if the restored default resolver or
+the DHCP lease contains an invalid nameserver (a hostname or a malformed IP
+address), `check` fails, `net-recover` logs an `ERROR`, and the journal stays
+`net-in-progress` with its `net-iface`. `state=recovered` is never written while
+DNS is invalid.
 
 A missing or unreadable default resolver, staging/rename failure, failed
 reconnect, or failed check produces a nonzero exit and an `ERROR` entry in
@@ -133,7 +138,10 @@ Missing or invalid recorded interfaces fail without invoking `sane-net`.
 For compatibility with the old CLI, a tagless `state=in-progress` journal is
 also treated as interrupted network recovery: `recover` logs a `WARN`
 migration, uses the recorded `net-iface` if present (otherwise `eth0`), and
-runs `cmd_net_recover`, which rewrites it to the new journal format. A legacy
+runs `cmd_net_recover`, which rewrites it to the new journal format. When
+`net-iface` is empty, it first logs `WARN legacy journal missing net-iface,
+defaulting to eth0` before selecting `eth0`; a recorded interface keeps the
+migration WARN and is used as-is. A legacy
 interface must still pass validation. `in-progress` with a snapshot tag keeps
 the existing upgrade rollback path. A modern `net-in-progress` journal without
 a valid `net-iface` remains an error; it is never silently defaulted to eth0.
@@ -168,7 +176,11 @@ DNS/domain installation, event address/route mutations and real `deconfig`
 restoration of the default resolver. The integration also checks per-interface IPv4/default
 route queries, target-resolver recovery, before/after host resolver SHA-256,
 and retry after reconnect or check failures. Legacy journal migration is also
-covered. `scripts/test-network-fault.sh`
+covered. Invalid-DNS regressions prove that a hostname or malformed IP
+nameserver blocks `state=recovered`: a strict stub check verifies the
+fail-closed journal/log behavior immediately, and a guarded real-integration
+case exercises the authoritative `sane-net check` once it validates nameservers
+as real IP addresses. `scripts/test-network-fault.sh`
 stages all writable paths under another temporary root and uses stubbed network
 tools to verify fail-before-side-effect injection, reconnect retry/backoff,
 default-resolver restoration after DHCP failures, and connectivity checks.

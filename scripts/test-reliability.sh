@@ -197,6 +197,8 @@ check "legacy migration records recovered default interface" sh -c \
 	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal' && ! grep -q '^snapshot=' '$T/var/lib/sane/reliability/journal'"
 check "legacy migration logs a WARN and uses default network calls" sh -c \
 	"grep -q ' WARN .*legacy.*eth0' '$T/var/log/sane/reliability.log' && grep -qx 'sane-net reconnect eth0 SANE_ROOT=$T' '$T/net-recover.calls' && grep -qx 'sane-net check eth0 SANE_ROOT=$T' '$T/net-recover.calls'"
+check "legacy empty net-iface logs the explicit defaulting WARN" \
+	grep -q ' WARN legacy journal missing net-iface, defaulting to eth0' "$T/var/log/sane/reliability.log"
 check "legacy migration never creates a snapshot" \
 	sh -c "test -z \"\$(ls -A '$T/var/lib/sane/reliability/snapshots')\""
 
@@ -207,6 +209,8 @@ check "legacy interface migration finishes recovered" sh -c \
 	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=wlan7$' '$T/var/lib/sane/reliability/journal'"
 check "legacy interface migration reconnects and checks recorded iface" sh -c \
 	"grep -qx 'sane-net reconnect wlan7 SANE_ROOT=$T' '$T/net-recover.calls' && grep -qx 'sane-net check wlan7 SANE_ROOT=$T' '$T/net-recover.calls'"
+check "legacy recorded interface does not log the defaulting WARN" \
+	sh -c "! grep -q 'legacy journal missing net-iface' '$T/var/log/sane/reliability.log'"
 
 setup_net_recovery
 expect_fail "net-recover fails closed when reconnect fails" run_net_recover_fail
@@ -264,6 +268,69 @@ expect_fail "recover rejects an invalid recorded network interface" \
 	run_recover_with_net_stub
 check "invalid recovery interface has no network calls" test ! -s "$T/net-recover.calls"
 
+# --- Invalid DNS must block recovery (strict stub check) --------------------
+setup_invalid_dns_recovery() {
+	base
+	run init
+	mkdir -p "$T/bin"
+	printf 'nameserver 1.1.1.1\n' > "$T/etc/resolv.conf.default"
+	printf 'nameserver 192.0.2.1\n' > "$T/etc/resolv.conf"
+	: > "$T/net-recover.calls"
+	cat > "$T/bin/sane-net" <<EOF
+#!/bin/sh
+printf 'sane-net %s SANE_ROOT=%s\n' "\$*" "\${SANE_ROOT:-}" >> '$T/net-recover.calls'
+[ "\${SANE_ROOT:-}" = '$T' ] || exit 92
+valid_ip() {
+  case "\$1" in
+    *:*) return 0 ;;
+  esac
+  set -- \$(printf '%s' "\$1" | tr '.' ' ')
+  [ "\$#" -eq 4 ] || return 1
+  for o in "\$@"; do
+    case "\$o" in ''|*[!0-9]*) return 1 ;; esac
+    [ "\$o" -le 255 ] || return 1
+  done
+  return 0
+}
+case "\${1:-}" in
+  reconnect) exit 0 ;;
+  check)
+    [ -f '$T/etc/resolv.conf' ] || exit 1
+    found=0
+    while IFS= read -r line; do
+      case "\$line" in
+        'nameserver '*)
+          ns=\${line#nameserver }
+          found=1
+          valid_ip "\$ns" || exit 1
+          ;;
+      esac
+    done < '$T/etc/resolv.conf'
+    [ "\$found" -eq 1 ] || exit 1
+    exit 0
+    ;;
+  *) exit 44 ;;
+esac
+EOF
+	chmod 0755 "$T/bin/sane-net"
+}
+
+setup_invalid_dns_recovery
+printf 'nameserver not-an-ip\n' > "$T/etc/resolv.conf.default"
+expect_fail "net-recover blocks recovery on an invalid DNS hostname" run_net_recover
+check "invalid DNS hostname leaves net-in-progress journal" sh -c \
+	"grep -q '^state=net-in-progress$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal'"
+check "invalid DNS hostname logs ERROR and never writes recovered" sh -c \
+	"grep -q ' ERROR .*check.*eth0' '$T/var/log/sane/reliability.log' && ! grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal'"
+
+setup_invalid_dns_recovery
+printf 'nameserver 999.1.1.1\n' > "$T/etc/resolv.conf.default"
+expect_fail "net-recover blocks recovery on a malformed IPv4 nameserver" run_net_recover
+check "malformed IPv4 leaves net-in-progress journal" sh -c \
+	"grep -q '^state=net-in-progress$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal'"
+check "malformed IPv4 logs ERROR and never writes recovered" sh -c \
+	"grep -q ' ERROR .*check.*eth0' '$T/var/log/sane/reliability.log' && ! grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal'"
+
 # --- Real sane-net and udhcpc event integration -----------------------------
 # Only ip, udhcpc and sleep are stubs. sane-net and default.script are real.
 DHCP_SCRIPT_SOURCE="$REPO_ROOT/packages/busybox/x/usr/share/udhcpc/default.script"
@@ -316,7 +383,7 @@ done
 [ -f "\$script" ] || exit 34
 [ "\${SANE_ROOT:-}" = '$T' ] || exit 35
 env SANE_ROOT='$T' interface=eth0 ip=198.51.100.20 mask=24 \
-  router=198.51.100.1 dns='9.9.9.9 1.0.0.1' domain=lease.test \
+  router=198.51.100.1 dns="\${DHCP_LEASE_DNS:-9.9.9.9 1.0.0.1}" domain=lease.test \
   sh "\$script" bound
 EOF
 	cat > "$T/realbin/sleep" <<'EOF'
@@ -380,6 +447,27 @@ check "real deconfig flushes the leased address in temp state" \
 HOST_RESOLV_AFTER_DECONFIG=$(sha256sum /etc/resolv.conf)
 check "bound and deconfig leave host resolver checksum unchanged" \
 	test "$HOST_RESOLV_BEFORE" = "$HOST_RESOLV_AFTER_DECONFIG"
+
+# Real integration: an invalid DNS lease must not be marked recovered.
+# This stays RED until sane-net check validates nameservers as real IP addresses.
+run_real_net_recovery_invalid_dns() {
+	require_root_aware_dhcp || return 1
+	env DHCP_LEASE_DNS='not-an-ip' PATH="$T/realbin:$PATH" \
+		sh "$TOOL" --root "$T" net-recover
+}
+
+setup_real_net_recovery
+printf 'nameserver not-an-ip\n' > "$T/etc/resolv.conf.default"
+HOST_RESOLV_BEFORE_INVALID=$(sha256sum /etc/resolv.conf)
+expect_fail "real sane-net check rejects an invalid DNS lease" \
+	run_real_net_recovery_invalid_dns
+check "invalid DNS lease leaves net-in-progress journal" sh -c \
+	"grep -q '^state=net-in-progress$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal'"
+check "invalid DNS lease logs ERROR and never writes recovered" sh -c \
+	"grep -q ' ERROR ' '$T/var/log/sane/reliability.log' && ! grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal'"
+HOST_RESOLV_AFTER_INVALID=$(sha256sum /etc/resolv.conf)
+check "invalid DNS integration leaves host resolver checksum unchanged" \
+	test "$HOST_RESOLV_BEFORE_INVALID" = "$HOST_RESOLV_AFTER_INVALID"
 
 # --- logging ---------------------------------------------------------------
 base

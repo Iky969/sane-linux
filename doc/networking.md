@@ -19,8 +19,11 @@ sane-net reconnect IFACE [SECONDS]            wait for carrier, restart DHCP
 sane-net check [IFACE]                        verify link UP, IPv4, route, DNS
 ```
 
-All DNS input is validated (`[a-zA-Z0-9.:_-]` only) before being written, so a
-malformed DHCP response cannot inject shell syntax into `resolv.conf`.
+All DNS input is validated as a literal IPv4 or IPv6 address before being
+written; hostnames, empty strings, and malformed addresses are rejected. This
+both prevents a malformed DHCP response from injecting shell syntax into
+`resolv.conf` and guarantees that any resolver `sane-net` writes will pass its
+own `check` (writer and checker share the same validation).
 
 ## Target-root paths
 
@@ -31,6 +34,9 @@ are stripped from every other value, so `SANE_ROOT=/target/` (or `/target///`)
 uses paths such as `/target/etc/resolv.conf`, `/target/run/udhcpc-eth0.pid`, and
 `/target/usr/share/udhcpc/default.script` without a double slash. This is path
 redirection, not a `chroot`; tests use it to keep all file I/O in a temporary root.
+A companion test hook, `SANE_PROC` (default `/proc`), lets the fault suite point
+the DHCP process-identity reads at a fake process tree so PID-reuse behavior is
+exercised deterministically and without privilege.
 
 **Scope:** `SANE_ROOT` redirects *file paths only*. The `ip` link/address/route
 mutations and the `udhcpc` client still act on the host's real interfaces, so
@@ -64,12 +70,20 @@ and accepts canonical nonnegative decimal values (including `0`); leading-zero
 forms such as `00`, `01`, `08`, and `09` are rejected. No carrier within the
 limit is a clear, fail-closed error.
 
-Once carrier is up, DHCP is attempted at most 3 times. Before each retry the
-previous attempt's client is stopped: `ROOT/run/udhcpc-IFACE.pid` is read, and a
-canonical numeric PID other than the shell's own is sent SIGTERM, waited on for
-a bounded interval, then SIGKILL only if still alive; the retry proceeds only
-once that PID is confirmed gone (otherwise fail closed). Stale, malformed,
-unreadable, or self pidfiles are removed/ignored without signalling. Every
+Once carrier is up, DHCP is attempted at most 3 times. Before **every** attempt
+(including the first, so a client left over from boot is also handled) any
+previous client for the interface is stopped. `ROOT/run/udhcpc-IFACE.pid` is
+read, and a canonical numeric PID other than the shell's own is considered.
+`kill -0` alone is not treated as proof of identity: the PID's executable name
+and start time are read from `/proc` and must identify a `udhcpc` process, and
+that identity is re-verified immediately before SIGTERM and again before any
+SIGKILL escalation, so a reused PID can never redirect a signal at a non-DHCP
+process. A verified client is sent SIGTERM, waited on for a bounded interval,
+then SIGKILL only if still alive; the attempt proceeds only once that PID is
+confirmed gone (otherwise fail closed). A pidfile whose PID is gone, malformed,
+self, or reused by a different executable is cleaned without signalling; an
+alive but unverifiable client fails closed so no second client is started on
+top of it. Every
 `udhcpc` exit 0 is followed by a bounded lease post-check: at most 5 polls, one
 second apart, for a global IPv4 address and a default route on that interface.
 As soon as both appear, the full `sane-net check IFACE` runs. A missing
@@ -81,8 +95,9 @@ exits nonzero.
 `sane-net check [IFACE]` (default `eth0`) accepts no more than one interface
 argument. It is IPv4-only and verifies all four of: link UP, a global IPv4
 address on the interface, a default route on that same interface, and
-`/etc/resolv.conf` containing at least one `nameserver` whose address begins
-with an alphanumeric character. It exits 0 only when all four hold and prints a
+`/etc/resolv.conf` containing at least one `nameserver` that is a valid IPv4 or
+IPv6 address (the same validation used when writing the resolver), and it rejects
+any invalid `nameserver` entry. It exits 0 only when all four hold and prints a
 clear message for each failed condition. It does not establish IPv6 connectivity.
 
 ## Wi-Fi
@@ -142,9 +157,13 @@ restoration during reconnect without a duplicate `cmd_dns` hook.
 root, so no host network or host `/etc` is touched. It is wired into
 `make test`, `make test-network`, and CI.
 
-`scripts/test-network-fault.sh` (110 assertions) uses the same temporary-root
+`scripts/test-network-fault.sh` (137 assertions) uses the same temporary-root
 approach for fault injection, cleanup-after-write-failure, DHCP retry/backoff,
-bounded and delayed lease post-checks, stopping the previous DHCP client before
-a retry (SIGTERM/SIGKILL with stale/malformed/self pidfile safety), reconnect
-argument validation, and real-binary `SANE_ROOT` coverage. Its real-binary
+bounded and delayed lease post-checks, nameserver validation (valid IPv4/IPv6
+accepted; hostnames, malformed and empty values rejected; writer output passes
+`check`), DHCP client lifecycle before the first attempt and on retry, and
+process-identity/PID-reuse safety (a reused or different-executable PID is never
+signalled, identity is re-checked before SIGKILL, and an alive-but-unverifiable
+client fails closed) via a fake `SANE_PROC` tree. It also covers reconnect
+argument validation and real-binary `SANE_ROOT` coverage. Its real-binary
 checks also assert that the host resolver checksum is unchanged.

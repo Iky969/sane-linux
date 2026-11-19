@@ -19,7 +19,7 @@ check() { d=$1; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 expect_ok() { d=$1; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi; }
 expect_fail() { d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
 
-mkdir -p "$T/bin" "$T/etc" "$T/etc/ssl/certs" "$T/run"
+mkdir -p "$T/bin" "$T/etc" "$T/etc/ssl/certs" "$T/run" "$T/proc"
 CALLS="$T/network-calls.log"
 IP_CALLS="$T/ip-calls.log"
 UDHCPC_CALLS="$T/udhcpc-calls.log"
@@ -105,11 +105,21 @@ esac
 if [ "${STUB_DHCP_LIVE:-0}" = 1 ]; then
   newpid=$((41000 + count))
   if [ -s "'"$LIVE_PIDS"'" ]; then
-    printf "overlap\n" >> "'"$CALLS"'"
-    exit 90
+    overlap=0
+    while IFS= read -r lp; do
+      [ -n "$lp" ] || continue
+      if [ "$(cat "'"$T"'/proc/$lp/comm" 2>/dev/null)" = udhcpc ]; then overlap=1; fi
+    done < "'"$LIVE_PIDS"'"
+    if [ "$overlap" = 1 ]; then
+      printf "overlap\n" >> "'"$CALLS"'"
+      exit 90
+    fi
   fi
   printf "%s\n" "$newpid" > "$pidfile"
   printf "%s\n" "$newpid" >> "'"$LIVE_PIDS"'"
+  mkdir -p "'"$T"'/proc/$newpid"
+  printf "udhcpc\n" > "'"$T"'/proc/$newpid/comm"
+  printf "%s (udhcpc) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 100 %s 1000 0\n" "$newpid" "$((10000 + newpid))" > "'"$T"'/proc/$newpid/stat"
   printf "live %s\n" "$newpid" >> "'"$CALLS"'"
 fi
 queries=$(wc -l < "'"$IP_CALLS"'")
@@ -139,7 +149,11 @@ if ! grep -qx "$pid" "'"$LIVE_PIDS"'" 2>/dev/null; then
   exit 1
 fi
 case "$sig:$pid" in
-  "-TERM:${STUB_IGNORE_TERM:-}") exit 0 ;;
+  "-TERM:${STUB_IGNORE_TERM:-}")
+    if [ "${STUB_REUSE_AFTER_TERM:-0}" = 1 ]; then
+      printf "other\n" > "'"$T"'/proc/$pid/comm"
+    fi
+    exit 0 ;;
   "-KILL:${STUB_IGNORE_KILL:-}") exit 0 ;;
 esac
 grep -vx "$pid" "'"$LIVE_PIDS"'" > "'"$LIVE_PIDS"'.next" 2>/dev/null || true
@@ -152,6 +166,8 @@ mkstub sleep 'printf "sleep %s\n" "$*" >> "'"$SLEEP_CALLS"'"; printf "sleep %s\n
 
 PATH="$T/bin:$BASE_PATH"
 export PATH
+# Fake /proc tree so process-identity checks are deterministic and unprivileged.
+export SANE_PROC="$T/proc"
 
 # Redirect every writable path. The stubs consume /run paths as strings only;
 # no command is allowed to touch the host resolver, routes, links or DHCP state.
@@ -176,6 +192,8 @@ reset_stubs() {
 	: > "$SELF_PID_FILE"
 	rm -f "$T/etc"/.resolv.conf.*
 	rm -f "$T/run"/udhcpc-*.pid
+	rm -rf "$T/proc"
+	mkdir -p "$T/proc"
 	printf '0\n' > "$UDHCPC_COUNT"
 	printf 'up\n' > "$CARRIER"
 	printf 'no\n' > "$ADDR_PRESENT"
@@ -438,6 +456,90 @@ for pidmode in self malformed stale; do
 	check "$pidmode pidfile never sends TERM or KILL" \
 		sh -c "! grep -Eq '^kill -(TERM|KILL) ' '$KILL_CALLS'"
 done
+
+# --- Nameserver validation (TODO-1) ----------------------------------------
+reset_stubs
+expect_ok "dns accepts a valid IPv4 nameserver" run_net dns 1.1.1.1
+expect_ok "dns accepts a valid IPv6 nameserver" run_net dns 2001:db8::1
+check "IPv6 nameserver written" grep -q '^nameserver 2001:db8::1$' "$T/etc/resolv.conf"
+expect_ok "dns accepts multiple nameservers" run_net dns 1.1.1.1 8.8.8.8
+check "both nameservers written" sh -c \
+	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf' && grep -q '^nameserver 8.8.8.8$' '$T/etc/resolv.conf'"
+expect_fail "dns rejects a hostname nameserver" run_net dns invalid.example
+expect_fail "dns rejects malformed IPv4" run_net dns 256.1.1.1
+expect_fail "dns rejects malformed IPv6" run_net dns 1::2::3
+expect_fail "dns rejects an empty nameserver" run_net dns ""
+expect_fail "dns with no server argument is rejected" run_net dns
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+expect_ok "a resolv.conf written by sane-net passes its own check" \
+	sh -c "sh '$STAGED' dns 9.9.9.9 && sh '$STAGED' check eth0"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+printf 'nameserver invalid.example\n' > "$T/etc/resolv.conf"
+expect_fail "check rejects a hostname nameserver" run_net check eth0
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+printf 'nameserver 2001:db8::1\n' > "$T/etc/resolv.conf"
+expect_ok "check accepts a valid IPv6 nameserver" run_net check eth0
+
+# --- DHCP client identity / PID reuse (TODO-2) -----------------------------
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+printf '41001\n' > "$T/run/udhcpc-eth0.pid"
+printf '41001\n' > "$LIVE_PIDS"
+mkdir -p "$T/proc/41001"
+printf 'sleep\n' > "$T/proc/41001/comm"
+printf '41001 (sleep) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 100 999 1000 0\n' > "$T/proc/41001/stat"
+expect_ok "reconnect succeeds without signalling a reused non-DHCP PID" run_net reconnect eth0 6
+check "no TERM or KILL sent to the reused PID" \
+	sh -c "! grep -Eq '^kill -(TERM|KILL) 41001' '$KILL_CALLS'"
+check "reused pidfile was cleaned" test ! -f "$T/run/udhcpc-eth0.pid"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+printf '41001\n' > "$T/run/udhcpc-eth0.pid"
+printf '41001\n' > "$LIVE_PIDS"
+if sh "$STAGED" reconnect eth0 6 >/dev/null 2>"$T/unverifiable.err"; then
+	fail "alive but unverifiable client fails closed"
+else
+	pass "alive but unverifiable client fails closed"
+fi
+check "unverifiable identity names the interface" \
+	grep -q 'cannot verify previous DHCP client identity on eth0' "$T/unverifiable.err"
+check "no new DHCP client started when identity is unverifiable" \
+	test "$(cat "$UDHCPC_COUNT")" -eq 0
+check "no signal sent to an unverifiable PID" \
+	sh -c "! grep -Eq '^kill -(TERM|KILL) ' '$KILL_CALLS'"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+expect_ok "identity change before SIGKILL avoids killing the reused PID" \
+	env STUB_DHCP_LIVE=1 STUB_IGNORE_TERM=41001 STUB_REUSE_AFTER_TERM=1 STUB_ADDR_DELAY=6 \
+		SANE_ROOT="$T" sh "$STAGED" reconnect eth0 6
+check "no SIGKILL was sent after the identity changed" \
+	sh -c "! grep -q '^kill -KILL 41001' '$KILL_CALLS'"
+check "a second DHCP attempt still proceeds after identity change" \
+	test "$(cat "$UDHCPC_COUNT")" -eq 2
+
+# --- DHCP lifecycle before the first attempt (TODO-3) ----------------------
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"; printf 'yes\n' > "$ROUTE_PRESENT"
+printf '41001\n' > "$T/run/udhcpc-eth0.pid"
+printf '41001\n' > "$LIVE_PIDS"
+mkdir -p "$T/proc/41001"
+printf 'udhcpc\n' > "$T/proc/41001/comm"
+printf '41001 (udhcpc) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 100 51001 1000 0\n' > "$T/proc/41001/stat"
+expect_ok "reconnect stops a boot-left client before the first attempt" run_net reconnect eth0 6
+check "boot-left client was TERMed" grep -q '^kill -TERM 41001' "$KILL_CALLS"
+check "boot-left client is dead afterwards" sh -c "! grep -qx 41001 '$LIVE_PIDS'"
+check "boot-left client stopped before the new udhcpc argv" sh -c '
+	term=$(grep -n "^kill -TERM 41001" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	new=$(grep -n "^udhcpc " "'"$CALLS"'" | sed -n "1s/:.*//p")
+	[ -n "$term" ] && [ -n "$new" ] && [ "$term" -lt "$new" ]'
 
 # --- Connectivity check -----------------------------------------------------
 reset_stubs

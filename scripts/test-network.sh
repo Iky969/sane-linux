@@ -112,9 +112,9 @@ check "dns default restores baseline" run_net dns default
 check "baseline resolver restored" sh -c \
 	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf'"
 check "dns default writes mode 0644" test "$(stat -c %a "$T/etc/resolv.conf")" = 644
-check "hyphenated hostnames accepted" run_net dns ns-1.example.test
-check "hyphenated hostname written" sh -c \
-	"grep -q '^nameserver ns-1.example.test$' '$T/etc/resolv.conf'"
+expect_fail "hostname nameserver rejected" run_net dns ns-1.example.test
+check "rejected hostname did not change resolv.conf" sh -c \
+	"! grep -q 'ns-1.example.test' '$T/etc/resolv.conf' && grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf'"
 
 # --- DHCP / reconnect ------------------------------------------------------
 check "dhcp starts udhcpc with script" run_net dhcp eth0
