@@ -19,7 +19,7 @@ check() { d=$1; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 expect_ok() { d=$1; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d"; fi; }
 expect_fail() { d=$1; shift; if "$@" >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
 
-mkdir -p "$T/bin" "$T/etc" "$T/etc/ssl/certs"
+mkdir -p "$T/bin" "$T/etc" "$T/etc/ssl/certs" "$T/run"
 CALLS="$T/network-calls.log"
 IP_CALLS="$T/ip-calls.log"
 UDHCPC_CALLS="$T/udhcpc-calls.log"
@@ -32,6 +32,9 @@ ADDR_PRESENT="$T/address-present"
 ADDR_POLLS="$T/address-polls"
 ROUTE_PRESENT="$T/route-present"
 ROUTE_DEV="$T/route-dev"
+LIVE_PIDS="$T/live-pids"
+KILL_CALLS="$T/kill-calls.log"
+SELF_PID_FILE="$T/self-pid"
 
 mkstub() {
 	name=$1; body=$2
@@ -53,6 +56,7 @@ case "${1:-} ${2:-}" in
     ;;
   "link set")
     printf "ip %s\n" "$*" >> "'"$CALLS"'"
+    if [ "${STUB_LINK_SET_FAIL:-0}" = 1 ]; then exit 1; fi
     if [ "${STUB_LINK_RECOVER:-1}" = 1 ] && [ "${4:-}" = up ]; then
       printf "up\n" > "'"$CARRIER"'"
     fi
@@ -86,6 +90,28 @@ printf "udhcpc %s\n" "$*" >> "'"$UDHCPC_CALLS"'"
 count=$(cat "'"$UDHCPC_COUNT"'")
 count=$((count + 1))
 printf "%s\n" "$count" > "'"$UDHCPC_COUNT"'"
+pidfile=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p) pidfile=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "${STUB_PID_MODE:-}" in
+  self) printf "%s\n" "$PPID" > "'"$SELF_PID_FILE"'"; printf "%s\n" "$PPID" > "$pidfile" ;;
+  malformed) printf "not-a-pid\n" > "$pidfile" ;;
+  stale) printf "49999\n" > "$pidfile" ;;
+esac
+if [ "${STUB_DHCP_LIVE:-0}" = 1 ]; then
+  newpid=$((41000 + count))
+  if [ -s "'"$LIVE_PIDS"'" ]; then
+    printf "overlap\n" >> "'"$CALLS"'"
+    exit 90
+  fi
+  printf "%s\n" "$newpid" > "$pidfile"
+  printf "%s\n" "$newpid" >> "'"$LIVE_PIDS"'"
+  printf "live %s\n" "$newpid" >> "'"$CALLS"'"
+fi
 queries=$(wc -l < "'"$IP_CALLS"'")
 printf "attempt=%s queries=%s\n" "$count" "$queries" >> "'"$POSTCHECK_STARTS"'"
 if [ "$count" -gt 1 ]; then
@@ -101,9 +127,28 @@ if [ "$count" -le "${STUB_UDHCPC_FAILS:-0}" ]; then
   exit 1
 fi
 exit "${STUB_UDHCPC_EXIT:-0}"'
+mkstub kill 'printf "kill %s\n" "$*" >> "'"$KILL_CALLS"'"
+printf "kill %s\n" "$*" >> "'"$CALLS"'"
+sig=$1
+pid=$2
+if [ "$sig" = "-0" ]; then
+  grep -qx "$pid" "'"$LIVE_PIDS"'" 2>/dev/null
+  exit $?
+fi
+if ! grep -qx "$pid" "'"$LIVE_PIDS"'" 2>/dev/null; then
+  exit 1
+fi
+case "$sig:$pid" in
+  "-TERM:${STUB_IGNORE_TERM:-}") exit 0 ;;
+  "-KILL:${STUB_IGNORE_KILL:-}") exit 0 ;;
+esac
+grep -vx "$pid" "'"$LIVE_PIDS"'" > "'"$LIVE_PIDS"'.next" 2>/dev/null || true
+mv "'"$LIVE_PIDS"'.next" "'"$LIVE_PIDS"'"
+printf "dead %s\n" "$pid" >> "'"$CALLS"'"
+exit 0'
 mkstub curl 'printf "curl %s\n" "$*" >> "'"$CALLS"'"; exit 0'
 mkstub wpa_supplicant 'printf "wpa_supplicant %s\n" "$*" >> "'"$CALLS"'"; exit 0'
-mkstub sleep 'printf "sleep %s\n" "$*" >> "'"$SLEEP_CALLS"'"; exit 0'
+mkstub sleep 'printf "sleep %s\n" "$*" >> "'"$SLEEP_CALLS"'"; printf "sleep %s\n" "$*" >> "'"$CALLS"'"; exit 0'
 
 PATH="$T/bin:$BASE_PATH"
 export PATH
@@ -111,7 +156,8 @@ export PATH
 # Redirect every writable path. The stubs consume /run paths as strings only;
 # no command is allowed to touch the host resolver, routes, links or DHCP state.
 STAGED="$T/sane-net"
-sed -e "s|^RESOLV=.*|RESOLV=$T/etc/resolv.conf|" \
+sed -e "s|^ROOT=.*|ROOT=$T|" \
+    -e "s|^RESOLV=.*|RESOLV=$T/etc/resolv.conf|" \
     -e "s|^RESOLV_DEFAULT=.*|RESOLV_DEFAULT=$T/etc/resolv.conf.default|" \
     -e "s|^WPACONF=.*|WPACONF=$T/etc/wpa_supplicant.conf|" \
     -e "s|^CABUNDLE=.*|CABUNDLE=$T/etc/ssl/certs/ca-certificates.crt|" \
@@ -125,7 +171,11 @@ reset_stubs() {
 	: > "$SLEEP_CALLS"
 	: > "$RESOLVER_OBSERVED"
 	: > "$POSTCHECK_STARTS"
+	: > "$KILL_CALLS"
+	: > "$LIVE_PIDS"
+	: > "$SELF_PID_FILE"
 	rm -f "$T/etc"/.resolv.conf.*
+	rm -f "$T/run"/udhcpc-*.pid
 	printf '0\n' > "$UDHCPC_COUNT"
 	printf 'up\n' > "$CARRIER"
 	printf 'no\n' > "$ADDR_PRESENT"
@@ -186,6 +236,18 @@ expect_fail "udhcpc fault aborts DHCP startup" \
 	env SANE_NET_FAULT=udhcpc sh "$STAGED" dhcp eth0
 check "udhcpc fault never invokes the DHCP client" \
 	sh -c "! grep -q '^udhcpc ' '$UDHCPC_CALLS'"
+
+reset_stubs
+expect_fail "dhcp fails closed when the link cannot be brought up" \
+	sh -c "env STUB_LINK_SET_FAIL=1 sh '$STAGED' dhcp eth0 >/dev/null 2>'$T/dhcp-link.err'"
+check "dhcp link failure names the interface" grep -q 'cannot bring up eth0' "$T/dhcp-link.err"
+check "dhcp link failure never starts udhcpc" sh -c "! grep -q '^udhcpc ' '$UDHCPC_CALLS'"
+
+reset_stubs
+expect_fail "wifi fails closed when the link cannot be brought up" \
+	sh -c "env STUB_LINK_SET_FAIL=1 sh '$STAGED' wifi eth0 home-net secretpass >/dev/null 2>'$T/wifi-link.err'"
+check "wifi link failure names the interface" grep -q 'cannot bring up eth0' "$T/wifi-link.err"
+check "wifi link failure never starts the supplicant" sh -c "! grep -q '^wpa_supplicant ' '$CALLS'"
 
 reset_stubs
 expect_fail "resolv-write fault aborts DNS update" \
@@ -330,6 +392,53 @@ check "delayed address waits for exactly one poll interval" \
 check "delayed address needs only one DHCP attempt" \
 	test "$(cat "$UDHCPC_COUNT")" -eq 1
 
+# --- DHCP client lifecycle on retry (P2a) ----------------------------------
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_ok "reconnect stops the previous DHCP client before retrying" \
+	env STUB_DHCP_LIVE=1 STUB_ADDR_DELAY=6 SANE_ROOT="$T" sh "$STAGED" reconnect eth0 6
+check "retry reaches a second DHCP attempt" test "$(cat "$UDHCPC_COUNT")" -eq 2
+check "old client is TERMed then dead before the new udhcpc argv" sh -c '
+	term=$(grep -n "^kill -TERM 41001$" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	dead=$(grep -n "^dead 41001$" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	new=$(grep -n "^udhcpc " "'"$CALLS"'" | sed -n "2s/:.*//p")
+	[ -n "$term" ] && [ -n "$dead" ] && [ -n "$new" ] && [ "$term" -lt "$dead" ] && [ "$dead" -lt "$new" ]'
+expect_fail "kill -0 on the old client PID fails after the retry" env kill -0 41001
+check "at most one DHCP client is live" test "$(wc -l < "$LIVE_PIDS")" -eq 1
+check "no client overlap was recorded" sh -c "! grep -q '^overlap$' '$CALLS'"
+
+reset_stubs
+expect_fail "TERM-resistant client is escalated to KILL before retry" \
+	env STUB_DHCP_LIVE=1 STUB_IGNORE_TERM=41001 SANE_ROOT="$T" sh "$STAGED" reconnect eth0 6
+check "TERM then KILL precede the new udhcpc argv" sh -c '
+	term=$(grep -n "^kill -TERM 41001$" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	kill=$(grep -n "^kill -KILL 41001$" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	new=$(grep -n "^udhcpc " "'"$CALLS"'" | sed -n "2s/:.*//p")
+	[ -n "$term" ] && [ -n "$kill" ] && [ -n "$new" ] && [ "$term" -lt "$kill" ] && [ "$kill" -lt "$new" ]'
+check "a bounded wait separates TERM and KILL" sh -c '
+	term=$(grep -n "^kill -TERM 41001$" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	kill=$(grep -n "^kill -KILL 41001$" "'"$CALLS"'" | sed -n "1s/:.*//p")
+	sed -n "${term},${kill}p" "'"$CALLS"'" | grep -q "^sleep "'
+
+reset_stubs
+expect_fail "unkillable client fails closed without starting a new client" \
+	sh -c "env STUB_DHCP_LIVE=1 STUB_IGNORE_TERM=41001 STUB_IGNORE_KILL=41001 SANE_ROOT='$T' sh '$STAGED' reconnect eth0 6 >/dev/null 2>'$T/stop-fail.err'"
+check "only the first DHCP client was started before fail-closed" \
+	test "$(cat "$UDHCPC_COUNT")" -eq 1
+check "stop failure names the interface" \
+	grep -q 'cannot stop previous DHCP client on eth0' "$T/stop-fail.err"
+
+for pidmode in self malformed stale; do
+	reset_stubs
+	printf 'yes\n' > "$ADDR_PRESENT"
+	printf 'yes\n' > "$ROUTE_PRESENT"
+	expect_ok "reconnect with a $pidmode pidfile retries safely" \
+		env STUB_PID_MODE="$pidmode" STUB_ADDR_DELAY=6 SANE_ROOT="$T" sh "$STAGED" reconnect eth0 6
+	check "$pidmode pidfile never sends TERM or KILL" \
+		sh -c "! grep -Eq '^kill -(TERM|KILL) ' '$KILL_CALLS'"
+done
+
 # --- Connectivity check -----------------------------------------------------
 reset_stubs
 printf 'yes\n' > "$ADDR_PRESENT"
@@ -372,6 +481,12 @@ expect_fail "check fails without a nameserver" run_net check eth0
 reset_stubs
 printf 'yes\n' > "$ADDR_PRESENT"
 printf 'yes\n' > "$ROUTE_PRESENT"
+printf 'nameserver -invalid\n' > "$T/etc/resolv.conf"
+expect_fail "check rejects a nameserver not starting alphanumeric" run_net check eth0
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
 expect_fail "reconnect rejects noncanonical leading-zero limit 08" run_net reconnect eth0 08
 
 reset_stubs
@@ -389,6 +504,12 @@ expect_ok "real binary writes DNS below trailing-slash SANE_ROOT" \
 check "SANE_ROOT DNS write lands in the target root" \
 	grep -q '^nameserver 9.9.9.9$' "$ROOTFS/etc/resolv.conf"
 check "SANE_ROOT DNS write leaves the staged resolver untouched" resolver_unchanged
+
+reset_stubs
+expect_ok "real binary strips all trailing slashes from SANE_ROOT" \
+	env SANE_ROOT="$ROOTFS///" sh "$NET" dns 8.8.4.4
+check "multi-slash SANE_ROOT DNS write lands in the target root" \
+	grep -q '^nameserver 8.8.4.4$' "$ROOTFS/etc/resolv.conf"
 
 reset_stubs
 expect_ok "real binary DHCP honors trailing-slash SANE_ROOT" \

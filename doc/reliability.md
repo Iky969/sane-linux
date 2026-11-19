@@ -79,8 +79,8 @@ An upgrade payload is a directory containing the files to install and a
 5. writes `state=done` and logs the rollback tag.
 
 If any step fails, the recorded snapshot is restored immediately. On the next
-boot (or manually), `recover` re-reads the journal: upgrade `in-progress`
-triggers an automatic rollback to the recorded snapshot and sets
+boot (or manually), `recover` re-reads the journal: `in-progress` with a
+snapshot tag triggers an automatic upgrade rollback and sets
 `state=recovered`; network `net-in-progress` follows the separate retry flow
 below. `done`, `idle`, `rolled-back` and `recovered` are no-ops. This is the
 host-side counterpart of the existing ninit rescue-shell contract documented
@@ -107,10 +107,15 @@ A valid recovery runs in this order:
    only after both network commands succeed.
 
 `SANE_ROOT` is an inline environment assignment on each individual invocation,
-not a global export. It confines `sane-net` writable paths to the same target
-root as the resolver journal operation. `check` must observe link UP, an IPv4
-address and a default route for the specified interface, plus a usable
-resolver, before recovery can complete.
+not a global export. It scopes file paths such as resolver configuration, the
+DHCP PID file and the udhcpc event script to the target root. It does **not**
+virtualize the network stack: `reconnect`, `default.script` and `check` still
+operate on the named host interface, including link/address/route operations,
+and launch udhcpc. Production use therefore requires real root/network
+privileges (for example `CAP_NET_ADMIN`) and an intentionally selected
+interface. Tests simulate these operations with PATH stubs and temporary state.
+`check` must observe link UP, a global IPv4 address and a default route for
+that interface, plus a usable resolver, before recovery can complete.
 
 A missing or unreadable default resolver, staging/rename failure, failed
 reconnect, or failed check produces a nonzero exit and an `ERROR` entry in
@@ -125,6 +130,13 @@ recorded interface, then invokes `cmd_net_recover --iface IFACE`; it does not
 require a snapshot tag. A retry with a working `sane-net` reconnect and check
 returns zero and finishes with `state=recovered` and the same `net-iface`.
 Missing or invalid recorded interfaces fail without invoking `sane-net`.
+For compatibility with the old CLI, a tagless `state=in-progress` journal is
+also treated as interrupted network recovery: `recover` logs a `WARN`
+migration, uses the recorded `net-iface` if present (otherwise `eth0`), and
+runs `cmd_net_recover`, which rewrites it to the new journal format. A legacy
+interface must still pass validation. `in-progress` with a snapshot tag keeps
+the existing upgrade rollback path. A modern `net-in-progress` journal without
+a valid `net-iface` remains an error; it is never silently defaulted to eth0.
 
 ### Logging
 
@@ -150,9 +162,13 @@ with safety snapshots, payload verification and path traversal, journal-driven
 recovery, network resolver recovery and reconnect failures, log levels and
 rotation, and backup/restore validation. Network recovery is tested both with
 controlled `sane-net` stubs and with the real repository `sane-net`, using only
-`ip`, `udhcpc` and `sleep` stubs. The latter checks per-interface IPv4/default
+`ip`, `udhcpc` and `sleep` stubs. The udhcpc stub parses `-s` and executes the
+real root-aware `default.script` for a lease event; the suite verifies target
+DNS/domain installation, event address/route mutations and real `deconfig`
+restoration of the default resolver. The integration also checks per-interface IPv4/default
 route queries, target-resolver recovery, before/after host resolver SHA-256,
-and retry after reconnect or check failures. `scripts/test-network-fault.sh`
+and retry after reconnect or check failures. Legacy journal migration is also
+covered. `scripts/test-network-fault.sh`
 stages all writable paths under another temporary root and uses stubbed network
 tools to verify fail-before-side-effect injection, reconnect retry/backoff,
 default-resolver restoration after DHCP failures, and connectivity checks.

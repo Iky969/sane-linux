@@ -34,9 +34,9 @@ EOF
 mkstub ip 'printf "%s\n" "ip $*" >> "'"$LOG"'"
 case "$*" in
   *"link show dev eth0"*) printf "2: eth0: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n" ;;
-  addr\ add*) printf "inet %s scope global eth0\n" "$2" >> '"$T"'/ip-addr ;;
-  route\ add\ default\ via*) printf "default via %s dev eth0 proto static\n" "$4" >> '"$T"'/ip-route ;;
-  *"addr show dev eth0 scope global"*) cat '"$T"'/ip-addr 2>/dev/null ;;
+  addr\ add*) printf "inet %s scope global eth0\n" "$3" >> '"$T"'/ip-addr ;;
+  route\ add\ default\ via*) printf "default via %s dev eth0 proto static\n" "$5" >> '"$T"'/ip-route ;;
+  *"addr show dev eth0"*) cat '"$T"'/ip-addr 2>/dev/null ;;
   *"route show default dev eth0"*) cat '"$T"'/ip-route 2>/dev/null ;;
 esac
 exit 0'
@@ -75,6 +75,18 @@ expect_fail "static without required args rejected" run_net static eth0 10.0.0.2
 check "static config succeeds" run_net static eth0 10.0.0.2/24 10.0.0.1 1.1.1.1 8.8.8.8
 check "static sets address" grep -q '^ip addr add 10.0.0.2/24 dev eth0$' "$LOG"
 check "static sets default route" grep -q '^ip route add default via 10.0.0.1$' "$LOG"
+check "repeating static config succeeds" \
+ run_net static eth0 10.0.0.2/24 10.0.0.1 1.1.1.1 8.8.8.8
+check "repeated static keeps exactly the right address" sh -c \
+ "[ \$(grep -c '^ip addr add ' '$LOG') -eq 1 ] && \
+  grep -qx '^ip addr add 10.0.0.2/24 dev eth0\$' '$LOG' && \
+  grep -qx 'inet 10.0.0.2/24 scope global eth0' '$T/ip-addr' && \
+  ! grep -q '^inet add ' '$T/ip-addr' && ! grep -q '^inet via ' '$T/ip-addr'"
+check "repeated static keeps exactly the right route" sh -c \
+ "[ \$(grep -c '^ip route add ' '$LOG') -eq 1 ] && \
+  grep -qx '^ip route add default via 10.0.0.1\$' '$LOG' && \
+  grep -qx 'default via 10.0.0.1 dev eth0 proto static' '$T/ip-route' && \
+  ! grep -q '^default via via ' '$T/ip-route' && ! grep -q '^default add ' '$T/ip-route'"
 mkdir -p "$T/failbin"
 cat > "$T/failbin/ip" <<'EOF'
 #!/bin/sh

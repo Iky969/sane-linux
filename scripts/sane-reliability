@@ -282,12 +282,21 @@ recover_internal() {
 			;;
 		in-progress)
 			tag=$(journal_get snapshot)
-			[ -n "$tag" ] || die "interrupted upgrade has no snapshot tag"
-			check_snapshot "$tag"
-			restore_files_from "$SNAPS/$tag"
-			write_journal recovered "$tag"
-			log_event WARN "recovered from interrupted upgrade using $tag"
-			note "recovered using '$tag'"
+			if [ -z "$tag" ]; then
+				# Legacy CLI wrote network recovery as plain in-progress.
+				nr_iface=$(journal_get net-iface)
+				nr_iface=${nr_iface:-eth0}
+				valid_iface "$nr_iface" || \
+					net_recover_fail "legacy network recovery has invalid interface: $nr_iface"
+				log_event WARN "migrating legacy in-progress network journal for $nr_iface"
+				cmd_net_recover --iface "$nr_iface"
+			else
+				check_snapshot "$tag"
+				restore_files_from "$SNAPS/$tag"
+				write_journal recovered "$tag"
+				log_event WARN "recovered from interrupted upgrade using $tag"
+				note "recovered using '$tag'"
+			fi
 			;;
 		*)
 			log_event INFO "no interrupted upgrade or network recovery"

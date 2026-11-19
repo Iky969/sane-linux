@@ -26,11 +26,17 @@ malformed DHCP response cannot inject shell syntax into `resolv.conf`.
 
 `SANE_ROOT` prefixes every resolver, Wi-Fi configuration, CA-bundle, DHCP pid,
 and DHCP event-script path used by `sane-net`. An unset or empty value preserves
-the classic absolute paths. `SANE_ROOT=/` does the same, and one trailing slash
-is stripped from every other value, so `SANE_ROOT=/target/` uses paths such as
-`/target/etc/resolv.conf`, `/target/run/udhcpc-eth0.pid`, and
+the classic absolute paths. `SANE_ROOT=/` does the same, and all trailing slashes
+are stripped from every other value, so `SANE_ROOT=/target/` (or `/target///`)
+uses paths such as `/target/etc/resolv.conf`, `/target/run/udhcpc-eth0.pid`, and
 `/target/usr/share/udhcpc/default.script` without a double slash. This is path
-redirection, not a `chroot`; tests use it to keep all I/O in a temporary root.
+redirection, not a `chroot`; tests use it to keep all file I/O in a temporary root.
+
+**Scope:** `SANE_ROOT` redirects *file paths only*. The `ip` link/address/route
+mutations and the `udhcpc` client still act on the host's real interfaces, so
+`dhcp`, `static`, `wifi`, `reconnect`, and the reliability `net-recover` flow
+require the usual network privileges regardless of `SANE_ROOT`. Only the
+resolver/pid/config/script files are confined to the target root.
 
 ## Resolver handling
 
@@ -58,19 +64,26 @@ and accepts canonical nonnegative decimal values (including `0`); leading-zero
 forms such as `00`, `01`, `08`, and `09` are rejected. No carrier within the
 limit is a clear, fail-closed error.
 
-Once carrier is up, DHCP is attempted at most 3 times. Every `udhcpc` exit 0 is
-followed by a bounded lease post-check: at most 5 polls, one second apart, for
-a global IPv4 address and a default route on that interface. As soon as both
-appear, the full `sane-net check IFACE` runs. A missing address/route or failed
-full check makes that DHCP attempt fail; the default resolver is restored and
-a short backoff precedes the next attempt. A resolver restore failure is itself
-a hard error, and persistent DHCP/post-check failure exits nonzero.
+Once carrier is up, DHCP is attempted at most 3 times. Before each retry the
+previous attempt's client is stopped: `ROOT/run/udhcpc-IFACE.pid` is read, and a
+canonical numeric PID other than the shell's own is sent SIGTERM, waited on for
+a bounded interval, then SIGKILL only if still alive; the retry proceeds only
+once that PID is confirmed gone (otherwise fail closed). Stale, malformed,
+unreadable, or self pidfiles are removed/ignored without signalling. Every
+`udhcpc` exit 0 is followed by a bounded lease post-check: at most 5 polls, one
+second apart, for a global IPv4 address and a default route on that interface.
+As soon as both appear, the full `sane-net check IFACE` runs. A missing
+address/route or failed full check makes that DHCP attempt fail; the default
+resolver is restored and a short backoff precedes the next attempt. A resolver
+restore failure is itself a hard error, and persistent DHCP/post-check failure
+exits nonzero.
 
 `sane-net check [IFACE]` (default `eth0`) accepts no more than one interface
-argument. It verifies all four of: link UP, a global IPv4 address on the
-interface, a default route on that same interface, and `/etc/resolv.conf`
-containing at least one `nameserver`. It exits 0 only when all four hold and
-prints a clear message for each failed condition.
+argument. It is IPv4-only and verifies all four of: link UP, a global IPv4
+address on the interface, a default route on that same interface, and
+`/etc/resolv.conf` containing at least one `nameserver` whose address begins
+with an alphanumeric character. It exits 0 only when all four hold and prints a
+clear message for each failed condition. It does not establish IPv6 connectivity.
 
 ## Wi-Fi
 
@@ -124,13 +137,14 @@ restoration during reconnect without a duplicate `cmd_dns` hook.
 
 ## Testing
 
-`scripts/test-network.sh` (55 assertions) stubs `ip`, `udhcpc`, `curl`, and
+`scripts/test-network.sh` (58 assertions) stubs `ip`, `udhcpc`, `curl`, and
 `wpa_supplicant` through `PATH` and redirects all writable paths into a temp
 root, so no host network or host `/etc` is touched. It is wired into
 `make test`, `make test-network`, and CI.
 
-`scripts/test-network-fault.sh` (83 assertions) uses the same temporary-root
+`scripts/test-network-fault.sh` (110 assertions) uses the same temporary-root
 approach for fault injection, cleanup-after-write-failure, DHCP retry/backoff,
-bounded and delayed lease post-checks, reconnect argument validation, and
-real-binary `SANE_ROOT` coverage. Its real-binary checks also assert that the
-host resolver checksum is unchanged.
+bounded and delayed lease post-checks, stopping the previous DHCP client before
+a retry (SIGTERM/SIGKILL with stale/malformed/self pidfile safety), reconnect
+argument validation, and real-binary `SANE_ROOT` coverage. Its real-binary
+checks also assert that the host resolver checksum is unchanged.

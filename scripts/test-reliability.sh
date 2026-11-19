@@ -190,6 +190,25 @@ check "net-recover preserves explicit interface in recovered journal" \
 	grep -q '^net-iface=wlan1$' "$T/var/lib/sane/reliability/journal"
 
 setup_net_recovery
+printf 'state=in-progress\n' > "$T/var/lib/sane/reliability/journal"
+expect_ok "recover migrates a tagless legacy journal to eth0" \
+	run_recover_with_net_stub
+check "legacy migration records recovered default interface" sh -c \
+	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal' && ! grep -q '^snapshot=' '$T/var/lib/sane/reliability/journal'"
+check "legacy migration logs a WARN and uses default network calls" sh -c \
+	"grep -q ' WARN .*legacy.*eth0' '$T/var/log/sane/reliability.log' && grep -qx 'sane-net reconnect eth0 SANE_ROOT=$T' '$T/net-recover.calls' && grep -qx 'sane-net check eth0 SANE_ROOT=$T' '$T/net-recover.calls'"
+check "legacy migration never creates a snapshot" \
+	sh -c "test -z \"\$(ls -A '$T/var/lib/sane/reliability/snapshots')\""
+
+setup_net_recovery
+printf 'state=in-progress\nnet-iface=wlan7\n' > "$T/var/lib/sane/reliability/journal"
+expect_ok "recover honors a legacy recorded interface" run_recover_with_net_stub
+check "legacy interface migration finishes recovered" sh -c \
+	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=wlan7$' '$T/var/lib/sane/reliability/journal'"
+check "legacy interface migration reconnects and checks recorded iface" sh -c \
+	"grep -qx 'sane-net reconnect wlan7 SANE_ROOT=$T' '$T/net-recover.calls' && grep -qx 'sane-net check wlan7 SANE_ROOT=$T' '$T/net-recover.calls'"
+
+setup_net_recovery
 expect_fail "net-recover fails closed when reconnect fails" run_net_recover_fail
 check "failed reconnect leaves network journal and interface" sh -c \
 	"grep -q '^state=net-in-progress$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal'"
@@ -235,30 +254,48 @@ expect_fail "net-recover rejects an unsafe interface" run_net_recover --iface ba
 check "invalid interface has no recovery side effects" sh -c \
 	"grep -q '^state=idle$' '$T/var/lib/sane/reliability/journal' && test ! -s '$T/net-recover.calls'"
 expect_fail "net-recover rejects unknown options" run_net_recover --force
+printf 'state=net-in-progress\n' > "$T/var/lib/sane/reliability/journal"
+expect_fail "recover rejects a missing network interface" \
+	run_recover_with_net_stub
+check "missing network interface stays safe and unrecovered" sh -c \
+	"test ! -s '$T/net-recover.calls' && grep -q '^state=net-in-progress$' '$T/var/lib/sane/reliability/journal'"
 printf 'state=net-in-progress\nnet-iface=bad/iface\n' > "$T/var/lib/sane/reliability/journal"
 expect_fail "recover rejects an invalid recorded network interface" \
 	run_recover_with_net_stub
 check "invalid recovery interface has no network calls" test ! -s "$T/net-recover.calls"
 
-# --- Real sane-net integration ---------------------------------------------
-# Only ip, udhcpc and sleep are stubs. sane-net itself is the repository file.
+# --- Real sane-net and udhcpc event integration -----------------------------
+# Only ip, udhcpc and sleep are stubs. sane-net and default.script are real.
+DHCP_SCRIPT_SOURCE="$REPO_ROOT/packages/busybox/x/usr/share/udhcpc/default.script"
 setup_real_net_recovery() {
 	base
 	run init
-	mkdir -p "$T/realbin"
+	mkdir -p "$T/realbin" "$T/usr/share/udhcpc"
 	printf 'nameserver 1.1.1.1\n' > "$T/etc/resolv.conf.default"
 	printf 'nameserver 192.0.2.10\n' > "$T/etc/resolv.conf"
 	: > "$T/real-network.calls"
+	printf 'no\n' > "$T/dhcp-address-present"
+	printf 'no\n' > "$T/dhcp-route-present"
 	ln -s "$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" "$T/realbin/sane-net"
+	ln -s "$DHCP_SCRIPT_SOURCE" "$T/usr/share/udhcpc/default.script"
 	cat > "$T/realbin/ip" <<EOF
 #!/bin/sh
 printf 'ip %s\n' "\$*" >> '$T/real-network.calls'
 case "\$*" in
   'link show dev eth0')
     printf '2: eth0: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n' ;;
+  'link set eth0 up') ;;
+  'addr flush dev eth0')
+    printf 'no\n' > '$T/dhcp-address-present' ;;
+  'addr add 198.51.100.20/24 dev eth0')
+    printf 'yes\n' > '$T/dhcp-address-present' ;;
   '-4 addr show dev eth0 scope global')
+    [ "\$(cat '$T/dhcp-address-present')" = yes ] || exit 1
     printf '    inet 198.51.100.20/24 brd 198.51.100.255 scope global eth0\n' ;;
+  'route add default via 198.51.100.1 dev eth0')
+    printf 'yes\n' > '$T/dhcp-route-present' ;;
   'route show default dev eth0')
+    [ "\$(cat '$T/dhcp-route-present')" = yes ] || exit 1
     printf 'default via 198.51.100.1 dev eth0\n' ;;
   *) exit 1 ;;
 esac
@@ -267,7 +304,20 @@ EOF
 	cat > "$T/realbin/udhcpc" <<EOF
 #!/bin/sh
 printf 'udhcpc %s\n' "\$*" >> '$T/real-network.calls'
-exit 0
+script=
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in
+    -s) [ "\$#" -ge 2 ] || exit 31; script=\$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$script" ] || exit 32
+[ "\$script" = '$T/usr/share/udhcpc/default.script' ] || exit 33
+[ -f "\$script" ] || exit 34
+[ "\${SANE_ROOT:-}" = '$T' ] || exit 35
+env SANE_ROOT='$T' interface=eth0 ip=198.51.100.20 mask=24 \
+  router=198.51.100.1 dns='9.9.9.9 1.0.0.1' domain=lease.test \
+  sh "\$script" bound
 EOF
 	cat > "$T/realbin/sleep" <<'EOF'
 #!/bin/sh
@@ -276,27 +326,44 @@ EOF
 	chmod 0755 "$T/realbin/ip" "$T/realbin/udhcpc" "$T/realbin/sleep"
 }
 
-run_real_net_recovery() {
-	# Refuse to execute a dependency without root-aware resolver paths: the
-	# integration test must fail safely, never fall back to writing host /etc.
+require_root_aware_dhcp() {
+	# Fail safely if either real script can still resolve host /etc paths.
 	grep -q 'SANE_ROOT' "$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" && \
 		grep -Eq 'RESOLV=.*ROOT|RESOLV=.*root' \
-			"$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" || {
-		printf '%s\n' 'sane-net lacks SANE_ROOT resolver support' >&2
+			"$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" && \
+		grep -q 'SANE_ROOT' "$DHCP_SCRIPT_SOURCE" && \
+		grep -Eq 'RESOLV_CONF=.*ROOT|RESOLV_CONF=.*root' "$DHCP_SCRIPT_SOURCE" || {
+		printf '%s\n' 'real networking lacks SANE_ROOT resolver support' >&2
 		return 1
 	}
+}
+
+run_real_net_recovery() {
+	require_root_aware_dhcp || return 1
 	env PATH="$T/realbin:$PATH" sh "$TOOL" --root "$T" net-recover
+}
+
+run_real_dhcp_deconfig() {
+	require_root_aware_dhcp || return 1
+	env PATH="$T/realbin:$PATH" SANE_ROOT="$T" interface=eth0 \
+		sh "$T/usr/share/udhcpc/default.script" deconfig
 }
 
 setup_real_net_recovery
 HOST_RESOLV_BEFORE=$(sha256sum /etc/resolv.conf)
-expect_ok "real sane-net reconnect and check honor SANE_ROOT" \
+expect_ok "real reconnect invokes default.script for a DHCP lease" \
 	run_real_net_recovery
-HOST_RESOLV_AFTER=$(sha256sum /etc/resolv.conf)
-check "real integration leaves host resolver checksum unchanged" \
-	test "$HOST_RESOLV_BEFORE" = "$HOST_RESOLV_AFTER"
-check "real integration restores target default resolver" \
-	sh -c "cmp -s '$T/etc/resolv.conf' '$T/etc/resolv.conf.default'"
+HOST_RESOLV_AFTER_BOUND=$(sha256sum /etc/resolv.conf)
+check "real DHCP bound leaves host resolver checksum unchanged" \
+	test "$HOST_RESOLV_BEFORE" = "$HOST_RESOLV_AFTER_BOUND"
+check "real udhcpc parses and invokes the root-aware event script" \
+	grep -q -- "-s $T/usr/share/udhcpc/default.script" "$T/real-network.calls"
+check "real DHCP bound writes both lease nameservers" sh -c \
+	"grep -q '^nameserver 9.9.9.9$' '$T/etc/resolv.conf' && grep -q '^nameserver 1.0.0.1$' '$T/etc/resolv.conf'"
+check "real DHCP bound writes lease domain and removes old resolver" sh -c \
+	"grep -q '^domain lease.test$' '$T/etc/resolv.conf' && ! grep -q '192.0.2.10' '$T/etc/resolv.conf'"
+check "real event script performs temp-root address and route mutations" sh -c \
+	"grep -qx 'ip addr add 198.51.100.20/24 dev eth0' '$T/real-network.calls' && grep -qx 'ip route add default via 198.51.100.1 dev eth0' '$T/real-network.calls'"
 check "real post-check requires IPv4 on the requested interface twice" sh -c \
 	"test \"\$(grep -cx 'ip -4 addr show dev eth0 scope global' '$T/real-network.calls')\" -ge 2"
 check "real post-check uses per-interface default route twice" sh -c \
@@ -305,6 +372,14 @@ check "real integration never uses a bare route query" \
 	sh -c "! grep -qx 'ip route show' '$T/real-network.calls'"
 check "real integration recovered the expected interface" sh -c \
 	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal'"
+expect_ok "real default.script deconfig succeeds" run_real_dhcp_deconfig
+check "real deconfig restores target default resolver" \
+	sh -c "cmp -s '$T/etc/resolv.conf' '$T/etc/resolv.conf.default'"
+check "real deconfig flushes the leased address in temp state" \
+	grep -q '^no$' "$T/dhcp-address-present"
+HOST_RESOLV_AFTER_DECONFIG=$(sha256sum /etc/resolv.conf)
+check "bound and deconfig leave host resolver checksum unchanged" \
+	test "$HOST_RESOLV_BEFORE" = "$HOST_RESOLV_AFTER_DECONFIG"
 
 # --- logging ---------------------------------------------------------------
 base

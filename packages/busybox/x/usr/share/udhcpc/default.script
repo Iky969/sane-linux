@@ -6,8 +6,10 @@ set -eu
 
 [ -n "${1:-}" ] || { printf 'Error: called without event\n' >&2; exit 1; }
 
-RESOLV_CONF="/etc/resolv.conf"
-RESOLV_DEFAULT="/etc/resolv.conf.default"
+ROOT=${SANE_ROOT:-}
+ROOT=${ROOT%/}
+RESOLV_CONF="${ROOT}/etc/resolv.conf"
+RESOLV_DEFAULT="${ROOT}/etc/resolv.conf.default"
 
 valid_server() {
 	case "$1" in
