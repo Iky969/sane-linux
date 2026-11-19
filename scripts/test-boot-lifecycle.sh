@@ -1,10 +1,11 @@
 #!/bin/sh
 # Boot and lifecycle regression suite for S.A.N.E Linux.
 #
-# Boots a persistent disk image in QEMU and drives the console through seven
+# Boots a persistent disk image in QEMU and drives the console through eight
 # scenarios: first boot with no default credentials, interrupted setup, reboot
-# before setup, wrong-password retry, normal login, repeated reboots, and
-# recovery from a corrupted account configuration.
+# before setup, wrong-password retry, normal login, repeated reboots,
+# recovery from a corrupted account configuration, and reliability rollback
+# of an interrupted upgrade after reboot.
 set -eu
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)

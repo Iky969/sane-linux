@@ -589,5 +589,137 @@ expect_ok "second rollback in the same second succeeds" run rollback golden
 check "two distinct safety snapshots exist" sh -c \
 	"[ \$(ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-rollback-* 2>/dev/null | wc -l) -ge 2 ]"
 
+# --- P1-A: destination symlink containment ---------------------------------
+# A payload/rollback destination must never traverse a symlink that resolves
+# outside the target root. Internal-root symlinks remain allowed.
+base
+run init
+OUTSIDE=$(mktemp -d)
+rm -rf "$T/etc"
+ln -s "$OUTSIDE" "$T/etc"
+mkdir -p "$T/payload/etc"
+printf 'pwned\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+expect_fail "upgrade rejects a top-level etc symlink escaping root" run upgrade "$T/payload"
+check "escaping etc symlink wrote nothing outside root" test ! -e "$OUTSIDE/init.conf"
+rm -rf "$OUTSIDE"
+
+base
+run init
+OUTSIDE=$(mktemp -d)
+ln -s "$OUTSIDE" "$T/etc/sub"
+mkdir -p "$T/payload/etc/sub"
+printf 'pwned\n' > "$T/payload/etc/sub/file"
+(cd "$T/payload" && sha256sum etc/sub/file > manifest.sha256)
+expect_fail "upgrade rejects a nested symlink escaping root" run upgrade "$T/payload"
+check "nested symlink escape wrote nothing outside root" test ! -e "$OUTSIDE/file"
+rm -rf "$OUTSIDE"
+
+base
+run init
+OUTSIDE=$(mktemp -d)
+ln -s "$OUTSIDE" "$T/usr"
+mkdir -p "$T/payload/usr/bin"
+printf 'pwned\n' > "$T/payload/usr/bin/prog"
+(cd "$T/payload" && sha256sum usr/bin/prog > manifest.sha256)
+expect_fail "upgrade rejects a root-component symlink escaping root" run upgrade "$T/payload"
+check "root-component symlink escape wrote nothing outside root" test ! -e "$OUTSIDE/bin"
+rm -rf "$OUTSIDE"
+
+base
+run init
+OUTSIDE=$(mktemp -d)
+rm -rf "$T/etc"
+ln -s "$OUTSIDE" "$T/mid"
+ln -s mid "$T/etc"
+mkdir -p "$T/payload/etc"
+printf 'pwned\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+expect_fail "upgrade rejects a symlink chain escaping root" run upgrade "$T/payload"
+check "symlink chain escape wrote nothing outside root" test ! -e "$OUTSIDE/init.conf"
+rm -rf "$OUTSIDE"
+
+base
+run init
+run snapshot golden
+OUTSIDE=$(mktemp -d)
+rm -rf "$T/etc"
+ln -s "$OUTSIDE" "$T/etc"
+expect_fail "rollback rejects an escaping destination symlink" run rollback golden
+check "rollback escape wrote nothing outside root" test ! -e "$OUTSIDE/init.conf"
+rm -rf "$OUTSIDE"
+
+base
+run init
+mkdir -p "$T/etc-real"
+printf 'network:once:/bin/true\n' > "$T/etc-real/init.conf"
+rm -rf "$T/etc"
+ln -s etc-real "$T/etc"
+mkdir -p "$T/payload/etc"
+printf 'network:once:/bin/sleep 5\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+expect_ok "upgrade allows an internal-root etc symlink" run upgrade "$T/payload"
+check "internal-root symlink upgrade wrote through the link" sh -c \
+	"grep -q '/bin/sleep 5' '$T/etc-real/init.conf'"
+
+# --- P1-B: pre-upgrade snapshot completeness / new-files -------------------
+pre_upgrade_tag() {
+	ls "$T/var/lib/sane/reliability/snapshots" | grep '^auto-pre-upgrade-' | head -n1
+}
+
+base
+run init
+mkdir -p "$T/usr/bin"
+printf 'old-prog\n' > "$T/usr/bin/prog"
+mkdir -p "$T/payload/usr/bin"
+printf 'new-prog\n' > "$T/payload/usr/bin/prog"
+(cd "$T/payload" && sha256sum usr/bin/prog > manifest.sha256)
+expect_ok "upgrade replaces a file outside STATE_FILES" run upgrade "$T/payload"
+check "upgrade installed the new non-state file" grep -q '^new-prog$' "$T/usr/bin/prog"
+expect_ok "rollback restores the replaced non-state file" run rollback "$(pre_upgrade_tag)"
+check "rollback restored the old non-state content" grep -q '^old-prog$' "$T/usr/bin/prog"
+
+base
+run init
+mkdir -p "$T/payload/usr/bin"
+printf 'brand-new\n' > "$T/payload/usr/bin/newprog"
+(cd "$T/payload" && sha256sum usr/bin/newprog > manifest.sha256)
+expect_ok "upgrade adds a new file" run upgrade "$T/payload"
+check "upgrade created the new file" test -f "$T/usr/bin/newprog"
+check "pre-upgrade snapshot records the new file" sh -c \
+	"grep -qx 'usr/bin/newprog' '$T/var/lib/sane/reliability/snapshots/$(pre_upgrade_tag)/new-files'"
+expect_ok "rollback after adding a new file succeeds" run rollback "$(pre_upgrade_tag)"
+check "rollback deleted the newly added file" test ! -e "$T/usr/bin/newprog"
+
+base
+run init
+mkdir -p "$T/usr/bin"
+printf 'old-prog\n' > "$T/usr/bin/prog"
+mkdir -p "$T/payload/usr/bin"
+printf 'new-prog\n' > "$T/payload/usr/bin/prog"
+printf 'new-file\n' > "$T/payload/usr/bin/added"
+(cd "$T/payload" && sha256sum usr/bin/prog usr/bin/added > manifest.sha256)
+expect_ok "upgrade installs a replacement and a new file" run upgrade "$T/payload"
+printf 'state=in-progress\nsnapshot=%s\n' "$(pre_upgrade_tag)" \
+	> "$T/var/lib/sane/reliability/journal"
+expect_ok "recover rolls back an interrupted upgrade" run recover
+check "recover restored the replaced file" grep -q '^old-prog$' "$T/usr/bin/prog"
+check "recover deleted the newly added file" test ! -e "$T/usr/bin/added"
+check "recover journal records recovered" sh -c \
+	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal'"
+
+base
+run init
+mkdir -p "$T/usr/bin"
+printf 'old-prog\n' > "$T/usr/bin/prog"
+printf 'blocker\n' > "$T/usr/local"
+mkdir -p "$T/payload/usr/bin" "$T/payload/usr/local/bin"
+printf 'new-prog\n' > "$T/payload/usr/bin/prog"
+printf 'late\n' > "$T/payload/usr/local/bin/late"
+(cd "$T/payload" && sha256sum usr/bin/prog usr/local/bin/late > manifest.sha256)
+expect_fail "upgrade fails mid-transaction and auto-recovers" run upgrade "$T/payload"
+check "mid-transaction failure restored the replaced file" grep -q '^old-prog$' "$T/usr/bin/prog"
+check "mid-transaction failure left no partial new file" test ! -e "$T/usr/local/bin/late"
+
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
