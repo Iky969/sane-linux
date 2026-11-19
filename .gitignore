@@ -3,6 +3,10 @@
 /ninit.exe
 /ninit-test
 
+# artefak Python (py_compile / harness)
+__pycache__/
+*.pyc
+
 # core dump dari uji PID 1
 /core
 /core.*

@@ -182,7 +182,7 @@ slow recovery is not killed mid-transaction.
 
 Ordering: `network:once` and `recovery:once` (account recovery) carry
 `requires=reliability`; `firstboot` carries `requires=recovery`; `tty1`/console
-carry `require=firstboot`. Consequently `reliability` runs **before** network,
+carry `requires=firstboot`. Consequently `reliability` runs **before** network,
 account recovery, firstboot and getty.
 
 Failure behaviour: ninit marks a once service `FAILED` on a nonzero exit and
