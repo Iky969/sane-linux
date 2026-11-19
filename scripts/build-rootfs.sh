@@ -211,7 +211,21 @@ install_busybox() {
 	# The link targets the guest's /bin/busybox and may be dangling on the build
 	# host, so detect it with -L too and never recreate an existing link.
 	[ -e "$ROOTFS/bin/sh" ] || [ -L "$ROOTFS/bin/sh" ] || ln -s /bin/busybox "$ROOTFS/bin/sh"
-	[ -x "$ROOTFS/bin/sh" ] || [ -L "$ROOTFS/bin/sh" ] || die "/bin/sh is missing from the rootfs"
+	ensure_sh_link
+}
+
+ensure_sh_link() {
+	# Validate that /bin/sh will actually run in the guest. A host-resolvable
+	# executable is fine; otherwise the link must point at the guest's
+	# /bin/busybox and that busybox must be installed and executable. This does
+	# not dereference the (possibly dangling) link on the build host, and it is
+	# not satisfied by a link to an arbitrary absent target.
+	[ -x "$ROOTFS/bin/sh" ] && return 0
+	if [ -L "$ROOTFS/bin/sh" ] && [ -x "$ROOTFS/bin/busybox" ] &&
+		[ "$(readlink "$ROOTFS/bin/sh")" = "/bin/busybox" ]; then
+		return 0
+	fi
+	die "/bin/sh is missing or not a usable busybox link in the rootfs"
 }
 
 link_applet() { # $1 = bin|sbin, $2 = applet name

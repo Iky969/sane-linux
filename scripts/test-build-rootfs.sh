@@ -3,8 +3,12 @@
 #
 # Covers the prebuilt-busybox dangling-symlink bug: applet symlinks target the
 # guest's /bin/busybox, which need not resolve on the build host. The guards
-# must detect an existing (even dangling) symlink with -L and never recreate it.
-# Runs without root and without touching the host /etc or /bin.
+# must detect an existing (even dangling) symlink with -L and never recreate it,
+# and /bin/sh must still be validated as a usable busybox link.
+#
+# Part A/A2 are deterministic and host-independent (they do not rely on whether
+# the build host happens to have /bin/busybox). Part B is an end-to-end smoke
+# test of the prebuilt build. Runs without root and without touching host state.
 set -u
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -19,20 +23,21 @@ trap cleanup EXIT HUP INT TERM
 pass() { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 fail() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1" >&2; }
 check() { d=$1; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
+expect_fail() { d=$1; shift; if ( "$@" ) >/dev/null 2>&1; then fail "$d"; else pass "$d"; fi; }
 
 check "build-rootfs.sh is present" test -f "$BUILD"
 check "build-rootfs.sh passes shell syntax" sh -n "$BUILD"
 
-# --- Part A: link_applet idempotency over a dangling symlink (host-independent)
-# Source only the function definitions.
+# Source only the function definitions. The sourced script sets -eu; drop -e so
+# a failing probe below is reported by the harness instead of aborting it.
 # shellcheck disable=SC1090
 BUILD_ROOTFS_LIB_ONLY=1 . "$BUILD"
+set +e
 
+# --- Part A: link_applet idempotency over a dangling symlink -----------------
 ROOTFS="$T/a"
 mkdir -p "$ROOTFS/bin"
 APPLET_LIST="sh"
-# A dangling symlink stands in for a guest-only /bin/busybox link on a host
-# that has no /bin/busybox.
 ln -s "/nonexistent-sane-busybox-target" "$ROOTFS/bin/sh"
 if link_applet bin sh; then
 	pass "link_applet does not fail on an existing dangling symlink"
@@ -42,11 +47,31 @@ fi
 check "dangling symlink was not replaced" \
 	test "$(readlink "$ROOTFS/bin/sh")" = "/nonexistent-sane-busybox-target"
 rm -f "$ROOTFS/bin/sh"
-link_applet bin sh
-check "link_applet creates the applet symlink when absent" test -L "$ROOTFS/bin/sh"
+if link_applet bin sh; then
+	pass "link_applet creates the applet symlink when absent"
+else
+	fail "link_applet creates the applet symlink when absent"
+fi
+check "created applet symlink is present" test -L "$ROOTFS/bin/sh"
 
-# --- Part B: end-to-end prebuilt build (reproduces the bug when host /bin/busybox
-# is absent, because the absolute applet symlinks then dangle).
+# --- Part A2: ensure_sh_link validates a usable busybox link (host-independent)
+ROOTFS="$T/sh"
+mkdir -p "$ROOTFS/bin"
+printf '#!/bin/sh\n' > "$ROOTFS/bin/busybox"
+chmod 0755 "$ROOTFS/bin/busybox"
+ln -s /bin/busybox "$ROOTFS/bin/sh"
+if ensure_sh_link; then
+	pass "ensure_sh_link accepts a /bin/busybox link with executable busybox"
+else
+	fail "ensure_sh_link accepts a /bin/busybox link with executable busybox"
+fi
+rm -f "$ROOTFS/bin/sh"
+ln -s "/nonexistent-sane-other-target" "$ROOTFS/bin/sh"
+expect_fail "ensure_sh_link rejects a link to a non-busybox absent target" ensure_sh_link
+rm -f "$ROOTFS/bin/sh"
+expect_fail "ensure_sh_link rejects a missing /bin/sh" ensure_sh_link
+
+# --- Part B: end-to-end prebuilt build (smoke) -------------------------------
 BB="$REPO_ROOT/packages/busybox/x/bin/busybox"
 [ -x "$BB" ] || BB=$(command -v busybox || true)
 if [ -n "$BB" ] && [ -x "$BB" ]; then
@@ -64,8 +89,8 @@ if [ -n "$BB" ] && [ -x "$BB" ]; then
 	else
 		fail "prebuilt rootfs build succeeds"
 	fi
-	check "prebuilt build has no 'File exists' symlink error" \
-		sh -c "! grep -q 'File exists' '$T/build.log'"
+	check "prebuilt build has no ln 'File exists' symlink error" \
+		sh -c "! grep -q 'ln:.*File exists' '$T/build.log'"
 	check "prebuilt rootfs /bin/sh is a symlink" test -L "$T/distro/rootfs/bin/sh"
 	check "prebuilt rootfs /bin/busybox is executable" test -x "$T/distro/rootfs/bin/busybox"
 	check "prebuilt initramfs was created" test -s "$T/distro/initramfs.cpio.gz"
