@@ -59,7 +59,14 @@ image intended for distribution.**
 ## Password management
 
 - Active passwords are stored as SHA-512 crypt (`$6$<salt>$<hash>`) in
-  `/etc/shadow`; `/etc/passwd` only contains the `x` placeholder.
+  `/etc/shadow`; `/etc/passwd` only contains the `x` placeholder. The
+  `validate` command accepts only a *complete* `$6$` hash for an active
+  account; a bare `$6$` prefix from an interrupted `passwd`, or another
+  algorithm such as `$5$` or `$y$`, is rejected. `sane-account-recovery`
+  therefore rebuilds such an active hash with a fresh `$6$` value. This is
+  deliberate: the BusyBox-only rootfs ships SHA-512 crypt only. Do not run
+  `validate`/`recover` against a rootfs that depends on a different active
+  hash algorithm without updating the validator and recovery script first.
 - New accounts are created **locked** (`!` prefix) and must be assigned a
   password explicitly. `unlock` refuses a lock marker without a real hash,
   so an empty (passwordless) shadow field can never be produced.

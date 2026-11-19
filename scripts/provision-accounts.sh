@@ -22,8 +22,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 ACCOUNTS="$SCRIPT_DIR/sane-accounts"
 FIRSTBOOT="$SCRIPT_DIR/sane-firstboot"
+RECOVERY="$SCRIPT_DIR/sane-account-recovery"
 [ -f "$ACCOUNTS" ] || ACCOUNTS=/usr/bin/sane-accounts
 [ -f "$FIRSTBOOT" ] || FIRSTBOOT=/usr/bin/sane-firstboot
+[ -f "$RECOVERY" ] || RECOVERY=/usr/bin/sane-account-recovery
 
 # Baseline: no public password, accounts locked until first boot.
 $SUDO sh "$ACCOUNTS" --root "$TARGET" --force --firstboot init
@@ -39,6 +41,7 @@ fi
 $SUDO mkdir -p "$TARGET/usr/bin"
 $SUDO install -m 0755 "$ACCOUNTS" "$TARGET/usr/bin/sane-accounts"
 $SUDO install -m 0755 "$FIRSTBOOT" "$TARGET/usr/bin/sane-firstboot"
+$SUDO install -m 0755 "$RECOVERY" "$TARGET/usr/bin/sane-account-recovery"
 
 # Recheck the resulting policy (owner checks are skipped when sudo is used for
 # writes because the files may legitimately be owned by the build user).

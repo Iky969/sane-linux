@@ -53,12 +53,18 @@ ask_password() {
 			return 0
 		fi
 		printf 'ERROR: password was rejected (too weak?). Try again.\n'
+		rm -f /etc/passwd+ /etc/shadow+
 	done
 }
 
 printf '\n=== S.A.N.E Linux first boot ===\n'
 printf 'Set a password for root and for the daily user "sane".\n'
 printf 'The sane account is in wheel and may use doas after authentication.\n\n'
+
+# A previous interrupted passwd run can leave these temp files behind; BusyBox
+# refuses to continue while they exist, which would trap first boot in a retry
+# loop with no way to set a password.
+rm -f /etc/passwd+ /etc/shadow+
 
 if ! ask_password root; then
 	printf 'FATAL: could not read the root password from the console.\n' >&2

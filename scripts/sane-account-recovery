@@ -1,0 +1,45 @@
+#!/bin/sh
+# sane-account-recovery -- boot-time guard against broken identity files.
+#
+# Runs as a `once` service before firstboot/getty. A corrupt passwd, group,
+# shadow or doas.conf must never lock the console out: validate first, and
+# rebuild from the baseline if validation fails.
+set -u
+# Overridable for unit tests; production uses the installed CLI and shell.
+CLI=${SANE_ACCOUNTS_CLI:-/usr/bin/sane-accounts}
+FALLBACK_SHELL=${SANE_RECOVERY_SHELL:-/bin/sh}
+
+# Older images may ship a BusyBox without awk/mktemp symlinks. sane-accounts
+# needs both for validation and for its atomic file rewrites.
+for applet in awk mktemp; do
+    command -v "$applet" >/dev/null 2>&1 && continue
+    if [ -x /bin/busybox ]; then
+        BIN_DIR=${SANE_RECOVERY_BIN_DIR:-/usr/bin}
+        ln -sf /bin/busybox "$BIN_DIR/$applet" 2>/dev/null \
+            || ln -sf /bin/busybox "/bin/$applet" 2>/dev/null || true
+    fi
+done
+
+if [ ! -x "$CLI" ]; then
+    printf 'recovery: %s missing; cannot validate accounts\n' "$CLI" >&2
+    exit 0
+fi
+
+if "$CLI" --skip-owner-check validate >/dev/null 2>&1; then
+    exit 0
+fi
+
+printf '=== S.A.N.E account recovery: identity files invalid ===\n'
+# Trust assumption: the console is a locally trusted channel (physical access
+# or a trusted VM console). Falling back to an unauthenticated shell is only
+# safe under that assumption; it is intentional so a broken image never becomes
+# a permanent lockout. Do not expose this console on an untrusted network.
+"$CLI" --skip-owner-check recover || {
+    printf 'recovery: rebuild failed; dropping to console shell\n' >&2
+    exec "$FALLBACK_SHELL" -i
+}
+"$CLI" --skip-owner-check validate || {
+    printf 'recovery: validation still failing; dropping to console shell\n' >&2
+    exec "$FALLBACK_SHELL" -i
+}
+exit 0
