@@ -108,9 +108,6 @@ test-accounts:
 test-pkg:
 	bash ./scripts/test-build-package.sh
 
-test-accounts:
-	sh ./scripts/test-accounts.sh
-
 test-network:
 	sh ./scripts/test-network.sh
 
