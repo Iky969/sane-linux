@@ -7,10 +7,22 @@
 set -eu
 
 PROG=${0##*/}
-RESOLV=/etc/resolv.conf
-RESOLV_DEFAULT=/etc/resolv.conf.default
-WPACONF=/etc/wpa_supplicant.conf
-CABUNDLE=/etc/ssl/certs/ca-certificates.crt
+# SANE_ROOT redirects every location sane-net reads or writes (tests stage a
+# temporary root). All trailing slashes are stripped and SANE_ROOT=/ normalizes
+# to the empty root, so an unset SANE_ROOT and SANE_ROOT=/ both yield the classic
+# absolute paths (/etc/resolv.conf, /run/udhcpc-<iface>.pid, ...). The normalized
+# value is re-exported so child tools (udhcpc and its event script) inherit it.
+ROOT=${SANE_ROOT:-}
+while [ "${ROOT%/}" != "$ROOT" ]; do
+	ROOT=${ROOT%/}
+done
+export SANE_ROOT="$ROOT"
+# SANE_PROC is a test hook for the process-identity source; production uses /proc.
+PROC=${SANE_PROC:-/proc}
+RESOLV=$ROOT/etc/resolv.conf
+RESOLV_DEFAULT=$ROOT/etc/resolv.conf.default
+WPACONF=$ROOT/etc/wpa_supplicant.conf
+CABUNDLE=$ROOT/etc/ssl/certs/ca-certificates.crt
 
 usage() {
 	cat <<EOF
@@ -25,6 +37,7 @@ Usage: $PROG <command> [args]
   status [IFACE]                       show addresses, routes and DNS
   tls-check URL                        verify HTTPS with the CA bundle
   reconnect IFACE [SECONDS]            wait for carrier, then restart DHCP
+  check [IFACE]                        verify link UP, default route and DNS
 EOF
 	exit 1
 }
@@ -32,21 +45,114 @@ EOF
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
+# Fault injection (network fault injection feature). When SANE_NET_FAULT
+# equals the named operation, fail closed BEFORE the external tool is run or
+# the resolver is touched. Any other value (or unset) is a no-op.
+fault_inject() {
+	[ "${SANE_NET_FAULT:-}" = "$1" ] || return 0
+	printf '%s: fault injection: %s\n' "$PROG" "$1" >&2
+	exit 1
+}
+
 # Escape a value for use inside a double-quoted wpa_supplicant.conf field.
 wpa_escape() {
 	printf '%s' "$1" | sed 's/[\\"]/\\&/g'
 }
 
-valid_server() {
-	# IPv4, IPv6 or hostname; allow hyphens inside names but not as a prefix.
+# --- Nameserver validation --------------------------------------------------
+# A nameserver must be a literal IPv4 or IPv6 address. Hostnames, empty
+# strings and malformed addresses are rejected so a resolv.conf written here
+# always passes `check` (writer and checker share this exact validation).
+
+valid_ipv4() {
+	# Dotted quad; each octet 0-255 with no leading zeros (except "0").
 	case "$1" in
-		''|-*|*[!a-zA-Z0-9.:_-]*) return 1 ;;
-		*) return 0 ;;
+		[0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+		*) return 1 ;;
 	esac
+	case "$1" in *[!0-9.]*) return 1 ;; esac
+	_a=${1%%.*}; _r=${1#*.}
+	_b=${_r%%.*}; _r=${_r#*.}
+	_c=${_r%%.*}; _d=${_r#*.}
+	case "$_d" in *.*) return 1 ;; esac
+	for _o in "$_a" "$_b" "$_c" "$_d"; do
+		case "$_o" in
+			''|*[!0-9]*) return 1 ;;
+			0) ;;
+			0*) return 1 ;;
+		esac
+		[ "${#_o}" -le 3 ] || return 1
+		[ "$_o" -le 255 ] || return 1
+	done
+	return 0
+}
+
+# Count/validate colon-separated hex groups in $1 (no '::'); an IPv4 tail
+# counts as two groups. Sets _v6_count; returns 1 on any invalid group.
+_v6_groups() {
+	_v6_count=0
+	_g=$1
+	while [ -n "$_g" ]; do
+		case "$_g" in
+			*:*) _part=${_g%%:*}; _g=${_g#*:} ;;
+			*)   _part=$_g; _g= ;;
+		esac
+		if [ -z "$_g" ]; then
+			case "$_part" in
+				*.*)
+					valid_ipv4 "$_part" || return 1
+					_v6_count=$((_v6_count + 2))
+					return 0
+					;;
+			esac
+		fi
+		case "$_part" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+		[ "${#_part}" -le 4 ] || return 1
+		_v6_count=$((_v6_count + 1))
+	done
+	return 0
+}
+
+valid_ipv6() {
+	case "$1" in *:*) ;; *) return 1 ;; esac
+	case "$1" in *[!0-9a-fA-F:.]*) return 1 ;; esac
+	# At most one '::' compression marker.
+	_tmp=$1; _dc=0
+	while :; do
+		case "$_tmp" in
+			*::*) _dc=$((_dc + 1)); _tmp=${_tmp#*::} ;;
+			*) break ;;
+		esac
+	done
+	[ "$_dc" -le 1 ] || return 1
+	if [ "$_dc" -eq 1 ]; then
+		_left=${1%%::*}
+		_right=${1#*::}
+		case "$_left" in *:) return 1 ;; esac
+		case "$_right" in :*) return 1 ;; esac
+		_v6_groups "$_left" || return 1
+		_lc=$_v6_count
+		_v6_groups "$_right" || return 1
+		_rc=$_v6_count
+		# Compression must stand for at least one zero group.
+		[ "$((_lc + _rc))" -lt 8 ] || return 1
+		return 0
+	fi
+	case "$1" in :*|*:) return 1 ;; esac
+	_v6_groups "$1" || return 1
+	[ "$_v6_count" -eq 8 ] || return 1
+	return 0
+}
+
+valid_server() {
+	valid_ipv4 "$1" && return 0
+	valid_ipv6 "$1" && return 0
+	return 1
 }
 
 write_resolv() {
 	# write_resolv FILE SERVER... -- atomic, mode 0644, no partial writes.
+	fault_inject resolv-write
 	file=$1; shift
 	[ "$#" -ge 1 ] || die "no DNS server given"
 	for ns in "$@"; do
@@ -57,8 +163,20 @@ write_resolv() {
 	for ns in "$@"; do
 		printf 'nameserver %s\n' "$ns" >> "$tmp"
 	done
-	chmod 0644 "$tmp"
-	mv "$tmp" "$file"
+	chmod 0644 "$tmp" || { rm -f "$tmp"; die "cannot set permissions on $tmp"; }
+	mv "$tmp" "$file" || { rm -f "$tmp"; die "cannot replace $file"; }
+}
+
+restore_default_resolv() {
+	# Replace $RESOLV with the shipped $RESOLV_DEFAULT, atomically. Prints a
+	# specific error and returns 1 on failure; the caller decides how to exit.
+	fault_inject resolv-write
+	[ -f "$RESOLV_DEFAULT" ] || { printf '%s: %s is missing\n' "$PROG" "$RESOLV_DEFAULT" >&2; return 1; }
+	dir=$(dirname "$RESOLV")
+	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || { printf '%s: cannot create temp file in %s\n' "$PROG" "$dir" >&2; return 1; }
+	cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; printf '%s: cannot read %s\n' "$PROG" "$RESOLV_DEFAULT" >&2; return 1; }
+	chmod 0644 "$tmp" || { rm -f "$tmp"; printf '%s: cannot set permissions on %s\n' "$PROG" "$tmp" >&2; return 1; }
+	mv "$tmp" "$RESOLV" || { rm -f "$tmp"; printf '%s: cannot replace %s\n' "$PROG" "$RESOLV" >&2; return 1; }
 }
 
 cmd_link() {
@@ -67,8 +185,8 @@ cmd_link() {
 	iface=$1
 	case "${2:-}" in
 		'') ip link show dev "$iface" ;;
-		up) ip link set "$iface" up ;;
-		down) ip link set "$iface" down ;;
+		up) fault_inject ip-link; ip link set "$iface" up ;;
+		down) fault_inject ip-link; ip link set "$iface" down ;;
 		*) usage ;;
 	esac
 }
@@ -77,11 +195,14 @@ cmd_static() {
 	need ip
 	[ "$#" -ge 3 ] || usage
 	iface=$1; ip_cidr=$2; gw=$3; shift 3
+	fault_inject ip-link
 	ip link set "$iface" up || die "cannot bring up $iface"
 	if ! ip addr show dev "$iface" 2>/dev/null | grep -q "$ip_cidr"; then
+		fault_inject ip-addr
 		ip addr add "$ip_cidr" dev "$iface" || die "cannot add $ip_cidr to $iface"
 	fi
-	if ! ip route show 2>/dev/null | grep -q '^default '; then
+	if ! ip route show default dev "$iface" 2>/dev/null | grep -q '^default '; then
+		fault_inject route-add
 		ip route add default via "$gw" || die "cannot add default route via $gw"
 	fi
 	if [ "$#" -gt 0 ]; then
@@ -93,20 +214,17 @@ cmd_dhcp() {
 	need ip; need udhcpc
 	[ "${1:-}" ] || usage
 	iface=$1
-	ip link set "$iface" up
-	exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
-		-s /usr/share/udhcpc/default.script
+	fault_inject ip-link
+	ip link set "$iface" up || die "cannot bring up $iface"
+	fault_inject udhcpc
+	exec udhcpc -b -R -p "${ROOT}/run/udhcpc-${iface}.pid" -i "$iface" \
+		-s "${ROOT}/usr/share/udhcpc/default.script"
 }
 
 cmd_dns() {
 	[ "$#" -ge 1 ] || usage
 	if [ "$1" = "default" ]; then
-		[ -f "$RESOLV_DEFAULT" ] || die "$RESOLV_DEFAULT is missing"
-		dir=$(dirname "$RESOLV")
-		tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || die "cannot create temp file in $dir"
-		cat "$RESOLV_DEFAULT" > "$tmp" || { rm -f "$tmp"; die "cannot read $RESOLV_DEFAULT"; }
-		chmod 0644 "$tmp"
-		mv "$tmp" "$RESOLV"
+		restore_default_resolv || exit 1
 		return 0
 	fi
 	write_resolv "$RESOLV" "$@"
@@ -122,7 +240,8 @@ cmd_wifi() {
 	case "$psk" in *[![:print:]]*) die "PSK contains non-printable characters" ;; esac
 	ssid_e=$(wpa_escape "$ssid")
 	psk_e=$(wpa_escape "$psk")
-	ip link set "$iface" up
+	fault_inject ip-link
+	ip link set "$iface" up || die "cannot bring up $iface"
 	tmp=$(mktemp "$(dirname "$WPACONF")/.wpa_supplicant.XXXXXX") || die "cannot create temp file"
 	cat > "$tmp" <<EOF
 ctrl_interface=/run/wpa_supplicant
@@ -164,17 +283,157 @@ cmd_tls_check() {
 	curl --cacert "$CABUNDLE" -fsSI --max-time 15 "$url" >/dev/null
 }
 
+lease_postcheck() {
+	# lease_postcheck IFACE -- bounded wait (max 5 polls, 1 s apart, stopping
+	# as soon as ready) for the lease to become visible: a global IPv4
+	# address on the interface and a default route via it. Once both appear,
+	# the verdict of the full check decides; if they never appear, return 1.
+	piface=$1
+	polls=0
+	while [ "$polls" -lt 5 ]; do
+		if ip -4 addr show dev "$piface" scope global 2>/dev/null | grep -q 'inet ' && \
+			ip route show default dev "$piface" 2>/dev/null | grep -q '^default '; then
+			if cmd_check "$piface"; then
+				return 0
+			fi
+			return 1
+		fi
+		polls=$((polls + 1))
+		if [ "$polls" -lt 5 ]; then
+			sleep 1
+		fi
+	done
+	return 1
+}
+
+# --- DHCP client identity ---------------------------------------------------
+# kill -0 alone is not proof that a PID is our DHCP client: PIDs are reused.
+# Identity is (executable name, start time) read from PROC. Return codes:
+#   0 -> confirmed udhcpc, start time printed on stdout
+#   1 -> a readable but different executable (PID reused by another process)
+#   2 -> alive but identity cannot be read/verified
+dhcp_client_starttime() {
+	_pid=$1
+	[ -r "$PROC/$_pid/comm" ] || return 2
+	_comm=$(cat "$PROC/$_pid/comm" 2>/dev/null) || return 2
+	[ "$_comm" = "udhcpc" ] || return 1
+	[ -r "$PROC/$_pid/stat" ] || return 2
+	_stat=$(cat "$PROC/$_pid/stat" 2>/dev/null) || return 2
+	# /proc/PID/stat: "pid (comm) state ... starttime(field 22) ...". Strip up
+	# to the last ") " so a comm containing spaces/parens cannot shift fields.
+	_rest=${_stat##*) }
+	set -- $_rest
+	[ "$#" -ge 20 ] || return 2
+	printf '%s\n' "${20}"
+	return 0
+}
+
+stop_previous_dhcp() {
+	# stop_previous_dhcp IFACE -- stop the DHCP client recorded for IFACE
+	# before (re)starting one. Only signal a PID whose identity is verified as
+	# udhcpc; re-verify immediately before SIGTERM and again before SIGKILL so
+	# PID reuse can never redirect a signal at a non-DHCP process. Stale or
+	# reused pidfiles are cleaned without signalling; an alive but unverifiable
+	# client fails closed so no second client is started on top of it.
+	siface=$1
+	pidfile="${ROOT}/run/udhcpc-${siface}.pid"
+	[ -f "$pidfile" ] || return 0
+	if [ ! -r "$pidfile" ]; then rm -f "$pidfile"; return 0; fi
+	old_pid=
+	IFS= read -r old_pid < "$pidfile" || { rm -f "$pidfile"; return 0; }
+	case "$old_pid" in ''|*[!0-9]*|0*) rm -f "$pidfile"; return 0 ;; esac
+	if [ "$old_pid" = "$$" ]; then rm -f "$pidfile"; return 0; fi
+	if ! env kill -0 "$old_pid" 2>/dev/null; then rm -f "$pidfile"; return 0; fi
+	if old_start=$(dhcp_client_starttime "$old_pid"); then _irc=0; else _irc=$?; fi
+	case "$_irc" in
+		0) ;;
+		1) rm -f "$pidfile"; return 0 ;;
+		*)
+			printf '%s: cannot verify previous DHCP client identity on %s\n' "$PROG" "$siface" >&2
+			return 1
+			;;
+	esac
+	# Re-verify identity immediately before SIGTERM.
+	if cur_start=$(dhcp_client_starttime "$old_pid"); then _crc=0; else _crc=$?; fi
+	if [ "$_crc" -eq 1 ]; then rm -f "$pidfile"; return 0; fi
+	if [ "$_crc" -ne 0 ]; then
+		printf '%s: cannot verify previous DHCP client identity on %s\n' "$PROG" "$siface" >&2
+		return 1
+	fi
+	if [ "$cur_start" != "$old_start" ]; then rm -f "$pidfile"; return 0; fi
+	if ! env kill -TERM "$old_pid" 2>/dev/null; then
+		if env kill -0 "$old_pid" 2>/dev/null; then
+			printf '%s: cannot stop previous DHCP client on %s\n' "$PROG" "$siface" >&2
+			return 1
+		fi
+		rm -f "$pidfile"; return 0
+	fi
+	waited=0
+	while env kill -0 "$old_pid" 2>/dev/null; do
+		waited=$((waited + 1))
+		if [ "$waited" -ge 5 ]; then
+			# Re-verify identity before escalating to SIGKILL.
+			if cur_start=$(dhcp_client_starttime "$old_pid"); then _crc=0; else _crc=$?; fi
+			if [ "$_crc" -eq 1 ]; then rm -f "$pidfile"; return 0; fi
+			if [ "$_crc" -ne 0 ]; then
+				printf '%s: cannot verify previous DHCP client identity on %s\n' "$PROG" "$siface" >&2
+				return 1
+			fi
+			if [ "$cur_start" != "$old_start" ]; then rm -f "$pidfile"; return 0; fi
+			env kill -KILL "$old_pid" 2>/dev/null || true
+			break
+		fi
+		sleep 1
+	done
+	waited=0
+	while env kill -0 "$old_pid" 2>/dev/null; do
+		waited=$((waited + 1))
+		if [ "$waited" -ge 5 ]; then
+			printf '%s: cannot stop previous DHCP client on %s\n' "$PROG" "$siface" >&2
+			return 1
+		fi
+		sleep 1
+	done
+	rm -f "$pidfile"
+	return 0
+}
+
 cmd_reconnect() {
 	need ip; need udhcpc
 	[ "${1:-}" ] || usage
 	iface=$1; limit=${2:-30}
-	case "$limit" in ''|*[!0-9]*) die "seconds must be numeric" ;; esac
+	case "$limit" in
+		''|*[!0-9]*) die "seconds must be numeric" ;;
+		0[0-9]*) die "seconds must not have leading zeros" ;;
+	esac
+	# Once carrier is up, DHCP is retried a bounded number of times with a
+	# short backoff; every failed attempt restores the default resolver so a
+	# lost lease never leaves a stale /etc/resolv.conf behind. Any client left
+	# from a previous attempt (or from boot) is stopped before each new one.
+	dhcp_max=3
+	dhcp_tries=0
 	i=0
 	while [ "$i" -lt "$limit" ]; do
 		if ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
-			exec udhcpc -b -R -p "/run/udhcpc-${iface}.pid" -i "$iface" \
-				-s /usr/share/udhcpc/default.script
+			while [ "$dhcp_tries" -lt "$dhcp_max" ]; do
+				fault_inject udhcpc
+				stop_previous_dhcp "$iface" || exit 1
+				if udhcpc -b -R -p "${ROOT}/run/udhcpc-${iface}.pid" -i "$iface" \
+					-s "${ROOT}/usr/share/udhcpc/default.script"; then
+					if lease_postcheck "$iface"; then
+						exit 0
+					fi
+				fi
+				dhcp_tries=$((dhcp_tries + 1))
+				restore_default_resolv || \
+					die "DHCP failed on $iface and restoring the default resolver failed"
+				if [ "$dhcp_tries" -lt "$dhcp_max" ]; then
+					sleep "$dhcp_tries"
+				fi
+			done
+			die "DHCP failed on $iface after ${dhcp_max} attempts; default resolver restored"
 		fi
+		fault_inject ip-link
 		ip link set "$iface" up 2>/dev/null || true
 		i=$((i + 1))
 		sleep 1
@@ -182,8 +441,54 @@ cmd_reconnect() {
 	die "no carrier on $iface after ${limit}s"
 }
 
-cmd=${1:-}
-[ -n "$cmd" ] || usage
+cmd_check() {
+	# check [IFACE] -- verify link UP, a global IPv4 address on the
+	# interface, a default route via that interface and a usable resolver.
+	# Exits 0 only when all hold; every failure prints its own message.
+	[ "$#" -le 1 ] || usage
+	need ip
+	iface=${1:-eth0}
+	rc=0
+	if ! ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
+		printf '%s: check: link %s is not UP\n' "$PROG" "$iface" >&2
+		rc=1
+	fi
+	if ! ip -4 addr show dev "$iface" scope global 2>/dev/null | grep -q 'inet '; then
+		printf '%s: check: no global IPv4 address on %s\n' "$PROG" "$iface" >&2
+		rc=1
+	fi
+	if ! ip route show default dev "$iface" 2>/dev/null | grep -q '^default '; then
+		printf '%s: check: no default route on %s\n' "$PROG" "$iface" >&2
+		rc=1
+	fi
+	if [ ! -f "$RESOLV" ]; then
+		printf '%s: check: %s is missing\n' "$PROG" "$RESOLV" >&2
+		rc=1
+	else
+		_dns_valid=0
+		while IFS= read -r _line || [ -n "$_line" ]; do
+			case "$_line" in
+				'nameserver '*)
+					_ns=${_line#nameserver }
+					if valid_server "$_ns"; then
+						_dns_valid=1
+					else
+						printf '%s: check: invalid nameserver in %s: %s\n' "$PROG" "$RESOLV" "$_ns" >&2
+						rc=1
+					fi
+					;;
+			esac
+		done < "$RESOLV"
+		if [ "$_dns_valid" -eq 0 ]; then
+			printf '%s: check: %s contains no valid nameserver\n' "$PROG" "$RESOLV" >&2
+			rc=1
+		fi
+	fi
+	return "$rc"
+}
+
+[ "$#" -gt 0 ] || usage
+cmd=$1
 shift
 case "$cmd" in
 	link)      cmd_link "$@" ;;
@@ -194,5 +499,6 @@ case "$cmd" in
 	status)    cmd_status "$@" ;;
 	tls-check) cmd_tls_check "$@" ;;
 	reconnect) cmd_reconnect "$@" ;;
+	check)     cmd_check "$@" ;;
 	*) usage ;;
 esac

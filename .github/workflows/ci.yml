@@ -64,6 +64,9 @@ jobs:
       - name: Phase B networking (sane-net, DNS, DHCP, TLS)
         run: sh ./scripts/test-network.sh
 
+      - name: Network fault injection & recovery suite
+        run: sh ./scripts/test-network-fault.sh
+
       - name: Phase C reliability suite
         run: sh ./scripts/test-reliability.sh
 

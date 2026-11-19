@@ -32,10 +32,16 @@ EOF
 }
 
 mkstub ip 'printf "%s\n" "ip $*" >> "'"$LOG"'"
-if [ "$1" = link ] && [ "$2" = show ]; then
-  printf "2: eth0: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n"
-fi
+case "$*" in
+  *"link show dev eth0"*) printf "2: eth0: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n" ;;
+  addr\ add*) printf "inet %s scope global eth0\n" "$3" >> '"$T"'/ip-addr ;;
+  route\ add\ default\ via*) printf "default via %s dev eth0 proto static\n" "$5" >> '"$T"'/ip-route ;;
+  *"addr show dev eth0"*) cat '"$T"'/ip-addr 2>/dev/null ;;
+  *"route show default dev eth0"*) cat '"$T"'/ip-route 2>/dev/null ;;
+esac
 exit 0'
+: > "$T/ip-addr"
+: > "$T/ip-route"
 mkstub udhcpc 'printf "%s\n" "udhcpc $*" >> "'"$LOG"'"; exit 0'
 mkstub curl 'printf "%s\n" "curl $*" >> "'"$LOG"'"; exit 0'
 mkstub wpa_supplicant 'printf "%s\n" "wpa_supplicant $*" >> "'"$LOG"'"; exit 0'
@@ -69,6 +75,18 @@ expect_fail "static without required args rejected" run_net static eth0 10.0.0.2
 check "static config succeeds" run_net static eth0 10.0.0.2/24 10.0.0.1 1.1.1.1 8.8.8.8
 check "static sets address" grep -q '^ip addr add 10.0.0.2/24 dev eth0$' "$LOG"
 check "static sets default route" grep -q '^ip route add default via 10.0.0.1$' "$LOG"
+check "repeating static config succeeds" \
+ run_net static eth0 10.0.0.2/24 10.0.0.1 1.1.1.1 8.8.8.8
+check "repeated static keeps exactly the right address" sh -c \
+ "[ \$(grep -c '^ip addr add ' '$LOG') -eq 1 ] && \
+  grep -qx '^ip addr add 10.0.0.2/24 dev eth0\$' '$LOG' && \
+  grep -qx 'inet 10.0.0.2/24 scope global eth0' '$T/ip-addr' && \
+  ! grep -q '^inet add ' '$T/ip-addr' && ! grep -q '^inet via ' '$T/ip-addr'"
+check "repeated static keeps exactly the right route" sh -c \
+ "[ \$(grep -c '^ip route add ' '$LOG') -eq 1 ] && \
+  grep -qx '^ip route add default via 10.0.0.1\$' '$LOG' && \
+  grep -qx 'default via 10.0.0.1 dev eth0 proto static' '$T/ip-route' && \
+  ! grep -q '^default via via ' '$T/ip-route' && ! grep -q '^default add ' '$T/ip-route'"
 mkdir -p "$T/failbin"
 cat > "$T/failbin/ip" <<'EOF'
 #!/bin/sh
@@ -94,13 +112,17 @@ check "dns default restores baseline" run_net dns default
 check "baseline resolver restored" sh -c \
 	"grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf'"
 check "dns default writes mode 0644" test "$(stat -c %a "$T/etc/resolv.conf")" = 644
-check "hyphenated hostnames accepted" run_net dns ns-1.example.test
-check "hyphenated hostname written" sh -c \
-	"grep -q '^nameserver ns-1.example.test$' '$T/etc/resolv.conf'"
+expect_fail "hostname nameserver rejected" run_net dns ns-1.example.test
+check "rejected hostname did not change resolv.conf" sh -c \
+	"! grep -q 'ns-1.example.test' '$T/etc/resolv.conf' && grep -q '^nameserver 1.1.1.1$' '$T/etc/resolv.conf'"
 
 # --- DHCP / reconnect ------------------------------------------------------
 check "dhcp starts udhcpc with script" run_net dhcp eth0
 check "udhcpc uses default.script" grep -q 'udhcpc .*-s /usr/share/udhcpc/default.script' "$LOG"
+# Seed a lease state so the bounded post-check sees an address + default route
+# even if no earlier static configuration populated the stateful stub.
+printf 'inet 10.0.0.2/24 scope global eth0\n' > "$T/ip-addr"
+printf 'default via 10.0.0.1 dev eth0 proto static\n' > "$T/ip-route"
 check "reconnect starts DHCP when carrier is up" run_net reconnect eth0 2
 check "reconnect recorded a udhcpc call" sh -c \
 	"[ \$(grep -c '^udhcpc ' '$LOG') -ge 2 ]"
@@ -134,6 +156,10 @@ check "udhcpc bound writes DNS atomically" env interface=eth0 ip=10.0.0.5 mask=2
 	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" bound
 check "bound DNS recorded" sh -c \
 	"grep -q '^nameserver 8.8.4.4$' '$UDHCP_ROOT/etc/resolv.conf'"
+check "udhcpc bound ignores a hostname nameserver" env interface=eth0 ip=10.0.0.5 mask=24 router=10.0.0.1 dns='dns.provider.net 8.8.4.4' \
+	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" bound
+check "event script writes only the valid IP, not the hostname" sh -c \
+	"! grep -q 'dns.provider.net' '$UDHCP_ROOT/etc/resolv.conf' && grep -q '^nameserver 8.8.4.4$' '$UDHCP_ROOT/etc/resolv.conf'"
 check "udhcpc deconfig restores default DNS" env interface=eth0 \
 	sh "$UDHCP_ROOT/usr/share/udhcpc/default.script" deconfig
 check "deconfig DNS restored" sh -c \

@@ -52,7 +52,8 @@ TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-confi
                 scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
                 scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
                 scripts/test-state-machine.sh scripts/test-accounts.sh \
-                scripts/test-network.sh scripts/test-reliability.sh
+                scripts/test-network.sh scripts/test-network-fault.sh \
+                scripts/test-reliability.sh
 
 test: $(TESTBIN)
 	@PRE_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
@@ -107,20 +108,17 @@ test-accounts:
 test-pkg:
 	bash ./scripts/test-build-package.sh
 
-test-accounts:
-	sh ./scripts/test-accounts.sh
-
 test-network:
 	sh ./scripts/test-network.sh
 
 test-reliability:
 	sh ./scripts/test-reliability.sh
 
+test-network-fault:
+	sh ./scripts/test-network-fault.sh
+
 test-spm:
 	bash ./scripts/test-spm.sh
-
-test-reliability:
-	sh ./scripts/test-reliability.sh
 
 image: packages
 	sudo bash ./scripts/make-image.sh
@@ -142,4 +140,4 @@ test-lifecycle:
 test-installer installer-test: packages
 	sudo bash ./scripts/test-installer.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-reliability
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-network-fault test-reliability

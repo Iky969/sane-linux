@@ -25,6 +25,7 @@ Commands:
   rollback TAG                  restore a verified snapshot
   upgrade PAYLOAD_DIR           verify, snapshot, then commit a payload
   recover                       roll back an interrupted upgrade
+  net-recover [--iface IFACE]   restore default DNS and reconnect networking
   log LEVEL MESSAGE             append a structured log entry
   backup ARCHIVE [--force]      archive snapshots, journal and logs
   restore ARCHIVE               restore an archive into a target root
@@ -202,11 +203,12 @@ cmd_verify() {
 }
 
 write_journal() {
-	# write_journal STATE TAG -- atomic, mode 0600
-	st=$1; tag=${2:-}
+	# write_journal STATE [TAG] [IFACE] -- atomic, mode 0600
+	st=$1; tag=${2:-}; journal_iface=${3:-}
 	tmp=$(mktemp "$STATE/.journal.XXXXXX") || die "cannot create journal temp"
 	printf 'state=%s\n' "$st" > "$tmp"
 	[ -n "$tag" ] && printf 'snapshot=%s\n' "$tag" >> "$tmp"
+	[ -n "$journal_iface" ] && printf 'net-iface=%s\n' "$journal_iface" >> "$tmp"
 	printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$tmp"
 	mv "$tmp" "$JOURNAL"
 	chmod 0600 "$JOURNAL"
@@ -271,19 +273,108 @@ cmd_rollback() {
 
 recover_internal() {
 	state=$(journal_get state)
-	[ "$state" = "in-progress" ] || { log_event INFO "no interrupted upgrade to recover"; return 0; }
-	tag=$(journal_get snapshot)
-	[ -n "$tag" ] || die "interrupted upgrade has no snapshot tag"
-	check_snapshot "$tag"
-	restore_files_from "$SNAPS/$tag"
-	write_journal recovered "$tag"
-	log_event WARN "recovered from interrupted upgrade using $tag"
-	note "recovered using '$tag'"
+	case "$state" in
+		net-in-progress)
+			nr_iface=$(journal_get net-iface)
+			valid_iface "$nr_iface" || \
+				net_recover_fail "interrupted network recovery has invalid interface: ${nr_iface:-missing}"
+			cmd_net_recover --iface "$nr_iface"
+			;;
+		in-progress)
+			tag=$(journal_get snapshot)
+			if [ -z "$tag" ]; then
+				# Legacy CLI wrote network recovery as plain in-progress.
+				nr_iface=$(journal_get net-iface)
+				if [ -z "$nr_iface" ]; then
+					log_event WARN "legacy journal missing net-iface, defaulting to eth0"
+					nr_iface=eth0
+				else
+					valid_iface "$nr_iface" || \
+						net_recover_fail "legacy network recovery has invalid interface: $nr_iface"
+				fi
+				log_event WARN "migrating legacy in-progress network journal for $nr_iface"
+				cmd_net_recover --iface "$nr_iface"
+			else
+				check_snapshot "$tag"
+				restore_files_from "$SNAPS/$tag"
+				write_journal recovered "$tag"
+				log_event WARN "recovered from interrupted upgrade using $tag"
+				note "recovered using '$tag'"
+			fi
+			;;
+		*)
+			log_event INFO "no interrupted upgrade or network recovery"
+			return 0
+			;;
+	esac
 }
 
 cmd_recover() {
 	cmd_init
 	recover_internal
+}
+
+valid_iface() {
+	case "$1" in
+		''|-*|*[!A-Za-z0-9_.-]*) return 1 ;;
+	esac
+	[ "${#1}" -le 15 ]
+}
+
+net_recover_fail() {
+	# Keep the network journal intact so a later recovery can retry.
+	log_event ERROR "$1" || true
+	die "$1"
+}
+
+cmd_net_recover() {
+	nr_iface=eth0
+	case "$ROOT" in
+		/*) ;;
+		*) die "--root must be an absolute path" ;;
+	esac
+	case "$#" in
+		0) ;;
+		2)
+			[ "$1" = "--iface" ] || die "usage: net-recover [--iface IFACE]"
+			nr_iface=$2
+			;;
+		*) die "usage: net-recover [--iface IFACE]" ;;
+	esac
+	valid_iface "$nr_iface" || die "invalid network interface: $nr_iface"
+	cmd_init
+	log_event INFO "network recovery started for $nr_iface"
+	write_journal net-in-progress "" "$nr_iface"
+
+	nr_resolv="$ROOT/etc/resolv.conf"
+	nr_default="$ROOT/etc/resolv.conf.default"
+	nr_dir=$(dirname "$nr_resolv")
+	[ -f "$nr_default" ] || net_recover_fail "default resolver is missing: $nr_default"
+	[ -d "$nr_dir" ] || net_recover_fail "resolver directory is missing: $nr_dir"
+	nr_tmp=$(mktemp "$nr_dir/.sane-net-recover.XXXXXX") || \
+		net_recover_fail "cannot stage default resolver in $nr_dir"
+	if ! cat "$nr_default" > "$nr_tmp"; then
+		rm -f "$nr_tmp"
+		net_recover_fail "cannot read default resolver: $nr_default"
+	fi
+	if ! chmod 0644 "$nr_tmp"; then
+		rm -f "$nr_tmp"
+		net_recover_fail "cannot set resolver mode in $nr_dir"
+	fi
+	if ! mv "$nr_tmp" "$nr_resolv"; then
+		rm -f "$nr_tmp"
+		net_recover_fail "cannot install default resolver: $nr_resolv"
+	fi
+
+	if ! SANE_ROOT="$ROOT" sane-net reconnect "$nr_iface"; then
+		net_recover_fail "sane-net reconnect failed for $nr_iface"
+	fi
+	if ! SANE_ROOT="$ROOT" sane-net check "$nr_iface"; then
+		net_recover_fail "sane-net check failed for $nr_iface"
+	fi
+	write_journal recovered "" "$nr_iface"
+	log_event INFO "network recovery completed for $nr_iface"
+	note "network recovered on $nr_iface"
 }
 
 cmd_upgrade() {
@@ -405,6 +496,7 @@ case "$CMD" in
 	rollback)      cmd_rollback "$@" ;;
 	upgrade)       cmd_upgrade "$@" ;;
 	recover)       cmd_recover "$@" ;;
+	net-recover)   cmd_net_recover "$@" ;;
 	log)           cmd_log "$@" ;;
 	backup)        cmd_backup "$@" ;;
 	restore)       cmd_restore "$@" ;;
