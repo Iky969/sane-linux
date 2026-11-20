@@ -29,6 +29,11 @@ for applet in awk mktemp; do
             if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
                 ln -s "$BUSYBOX" "$dest" 2>/dev/null && break
             elif [ -L "$dest" ]; then
+                # -ef is supported by every target shell (dash, BusyBox ash,
+                # bash). A stat-based inode comparison would add an external
+                # dependency this guard cannot assume: it runs precisely when
+                # applets are missing from the image.
+                # shellcheck disable=SC3013
                 [ "$dest" -ef "$BUSYBOX" ] && break
                 ln -sfn "$BUSYBOX" "$dest" 2>/dev/null && break
             fi

@@ -13,7 +13,7 @@
 #   lock NAME | unlock NAME      prefix/remove the shadow lock marker
 #   list                         list accounts
 #   validate                     audit files, hashes and doas policy
-#   recover                      rebuild broken identity files without lockout
+#   recover                      repair identity files without lockout (merge)
 #
 set -eu
 
@@ -41,7 +41,7 @@ Commands:
   unlock NAME                   unlock an account
   list                          list accounts
   validate                      audit account files and doas policy
-  recover                       rebuild broken identity files; re-run firstboot if needed
+  recover                       repair broken identity files (merge); re-run firstboot if needed
 EOF
 }
 
@@ -152,8 +152,14 @@ set_field() {
 }
 
 next_id() {
-	# next_id FILE -- smallest free id >= 1000
-	awk -F: 'BEGIN{m=999} $3+0>m {m=$3+0} END{print m+1}' "$1"
+	# next_id FILE -- smallest free id in 1000..65534. First-free scan,
+	# not max+1: a high-uid import (e.g. nobody 65534) must not exhaust
+	# the range, and gaps below the maximum are reused. Prints nothing
+	# when the whole range is in use; callers report a clean error.
+	awk -F: '{used[$3+0]=1} END{
+		for (i = 1000; i <= 65534; i++)
+			if (!(i in used)) { print i; exit }
+	}' "$1"
 }
 
 cmd_init() {
@@ -219,6 +225,7 @@ cmd_add_user() {
 
 	if [ -z "$uid" ]; then
 		uid=$(next_id "$PASSWD")
+		[ -n "$uid" ] || die "no free uid in range 1000..65534"
 	fi
 	case "$uid" in
 		''|*[!0-9]*) die "uid must be numeric: $uid" ;;
@@ -238,6 +245,7 @@ cmd_add_user() {
 			gid=$uid
 		else
 			gid=$(next_id "$GROUP")
+			[ -n "$gid" ] || die "no free gid in range 1000..65534"
 		fi
 		if awk -F: -v g="$gid" '$3==g {found=1} END{exit !found}' "$GROUP"; then
 			die "gid already in use: $gid"
@@ -377,7 +385,7 @@ cmd_del_user() {
 		case "$name" in
 			''|*/*|.|..) die "unsafe home name: $name" ;;
 		esac
-		[ -d "$HOME_BASE/$name" ] && rm -rf -- "$HOME_BASE/$name"
+		[ -d "$HOME_BASE/$name" ] && rm -rf -- "${HOME_BASE:?}/${name:?}"
 	fi
 	chmod 0644 "$PASSWD" "$GROUP"; chmod 0600 "$SHADOW"
 	note "removed $name"
@@ -444,6 +452,42 @@ cmd_list() {
 FAIL=0
 audit_fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 
+# doas policy scans shared by validate and recover so both enforce the
+# identical rule boundary. Both scans stop BEFORE the first 'cmd' or 'as'
+# token: everything after a terminator is a command argument or target
+# identity, not a doas option (a command argument named 'nopass' is not a
+# passwordless grant). Inline comments are stripped first so comment text
+# is never a grant, and tokens are compared strictly so a setenv value
+# like X=nopass is not mistaken for the nopass option.
+# Boundary (documented, not a bug): the terminators are case-sensitive
+# lowercase; a lowercase env var named "as" or "cmd" inside setenv { } is
+# a pathological case that ends the scan early (e.g.
+# "permit setenv { as } :wheel" is rejected by the effective-rule scan).
+doas_has_nopass() {
+	awk '{sub(/#.*/, "")} $1 == "permit" {
+		for (i = 2; i <= NF; i++) {
+			if ($i == "cmd" || $i == "as") break
+			if ($i == "nopass") bad = 1
+		}
+	} END {exit !bad}' "$1"
+}
+
+doas_has_effective_wheel() {
+	# ONE permit rule with :wheel as the identity suffices for the whole
+	# file; a :wheel that is only a command argument does not count.
+	awk '{sub(/#.*/, "")} $1 == "permit" {
+		for (i = 2; i <= NF; i++) {
+			if ($i == "cmd" || $i == "as") break
+			if ($i == ":wheel") found = 1
+		}
+	} END {exit !found}' "$1"
+}
+
+doas_policy_ok() {
+	if doas_has_nopass "$1"; then return 1; fi
+	doas_has_effective_wheel "$1"
+}
+
 cmd_validate() {
 	ensure_etc
 	MARK="$ETC/.sane-firstboot-done"
@@ -492,28 +536,17 @@ cmd_validate() {
 		audit_fail "wheel group does not include 'sane'"
 	fi
 
-	# Scan every token after 'permit', not just the first: options may be
-	# reordered (permit persist nopass :wheel). Strip inline comments first
-	# so comment text is not a grant, and compare tokens strictly so a
-	# setenv value like X=nopass is not mistaken for the nopass option.
-	if awk '{sub(/#.*/, "")} $1 == "permit" {
-		for (i = 2; i <= NF; i++) if ($i == "nopass") bad = 1
-	} END {exit !bad}' "$DOAS_CONF"; then
+	# Scan every option token after 'permit', not just the first: options
+	# may be reordered (permit persist nopass :wheel). The scan shares the
+	# effective-rule boundary below: tokens after the first 'cmd'/'as' are
+	# command arguments, not options (see doas_has_nopass).
+	if doas_has_nopass "$DOAS_CONF"; then
 		audit_fail "doas.conf grants 'nopass' (passwordless escalation)"
 	fi
 	# Effective-rule token scan: ONE permit rule with :wheel as the
-	# identity suffices for the whole file. The scan stops BEFORE the
-	# first 'cmd' or 'as' token, so a :wheel that is only a command
-	# argument does not count. Boundary (documented, not a bug): the
-	# terminators are case-sensitive lowercase; a lowercase env var named
-	# "as" or "cmd" inside setenv { } is a pathological case that ends the
-	# scan early (e.g. "permit setenv { as } :wheel" is rejected).
-	if ! awk '{sub(/#.*/, "")} $1 == "permit" {
-		for (i = 2; i <= NF; i++) {
-			if ($i == "cmd" || $i == "as") break
-			if ($i == ":wheel") found = 1
-		}
-	} END {exit !found}' "$DOAS_CONF"; then
+	# identity suffices for the whole file (see doas_has_effective_wheel
+	# for the documented cmd/as terminator boundary).
+	if ! doas_has_effective_wheel "$DOAS_CONF"; then
 		audit_fail "doas.conf has no effective permit rule for :wheel"
 	fi
 	if [ -e "$ROOT/usr/bin/doas" ]; then
@@ -546,11 +579,150 @@ cmd_validate() {
 	note "account policy validation passed"
 }
 
+# Structural audits for recover's targeted checks. They mirror
+# cmd_validate's numeric/duplicate/uid-0 audits and additionally flag
+# conflicts a merge could otherwise introduce: a non-baseline line
+# holding a baseline id (root 0, sane 1000, wheel gid 10) or a duplicated
+# baseline name would leave a duplicate id after the baseline is ensured,
+# i.e. a state that still fails validation. Recover must never produce one.
+passwd_structurally_ok() {
+	awk -F: '
+		$3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ { bad = 1 }
+		$1 != "root" && $3 == 0 { bad = 1 }
+		$1 != "sane" && $3 == 1000 { bad = 1 }
+		{ if (seen[$3]++) bad = 1 }
+		$1 == "root" { rc++ }
+		$1 == "sane" { sc++ }
+		END { if (rc > 1 || sc > 1) bad = 1; exit bad }
+	' "$1"
+}
+
+group_structurally_ok() {
+	awk -F: '
+		$3 !~ /^[0-9]+$/ { bad = 1 }
+		$1 != "root" && $3 == 0 { bad = 1 }
+		$1 != "wheel" && $3 == 10 { bad = 1 }
+		$1 != "sane" && $3 == 1000 { bad = 1 }
+		{ if (seen[$3]++) bad = 1 }
+		$1 == "root" { rc++ }
+		$1 == "wheel" { wc++ }
+		$1 == "sane" { sc++ }
+		END { if (rc > 1 || wc > 1 || sc > 1) bad = 1; exit bad }
+	' "$1"
+}
+
+merge_passwd() {
+	# Ensure root/sane match the baseline exactly (replace the line when
+	# present, append when missing); every other line survives byte-for-byte.
+	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	if ! awk -F: '
+		$1 == "root" { print "root:x:0:0:root:/root:/bin/sh"; r = 1; next }
+		$1 == "sane" { print "sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh"; s = 1; next }
+		{ print }
+		END {
+			if (!r) print "root:x:0:0:root:/root:/bin/sh"
+			if (!s) print "sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh"
+		}' "$PASSWD" > "$tmp"; then
+		rm -f "$tmp"
+		die "failed to merge $PASSWD"
+	fi
+	mv "$tmp" "$PASSWD"
+}
+
+merge_group() {
+	# Ensure root/wheel/sane exist with baseline gids and wheel contains
+	# root and sane. Existing memberships and all non-baseline lines are
+	# preserved; missing baseline groups are appended.
+	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	if ! awk -F: 'BEGIN { OFS = ":" }
+		$1 == "root" { $2 = "x"; $3 = "0"; print; r = 1; next }
+		$1 == "sane" { $2 = "x"; $3 = "1000"; print; s = 1; next }
+		$1 == "wheel" {
+			$2 = "x"; $3 = "10"
+			k = split($4, a, ","); out = ""; c = 0; hr = 0; hs = 0
+			for (i = 1; i <= k; i++) {
+				if (a[i] == "") continue
+				if (a[i] == "root") hr = 1
+				if (a[i] == "sane") hs = 1
+				out = out (c ? "," : "") a[i]; c++
+			}
+			if (!hr) { out = out (c ? "," : "") "root"; c++ }
+			if (!hs) { out = out (c ? "," : "") "sane"; c++ }
+			$4 = out
+			print; w = 1; next
+		}
+		{ print }
+		END {
+			if (!r) print "root:x:0:"
+			if (!w) print "wheel:x:10:root,sane"
+			if (!s) print "sane:x:1000:"
+		}' "$GROUP" > "$tmp"; then
+		rm -f "$tmp"
+		die "failed to merge $GROUP"
+	fi
+	mv "$tmp" "$GROUP"
+}
+
+rebuild_passwd() {
+	# Baseline template + every non-baseline line of the old file that is
+	# itself valid and conflict-free: 7 fields, numeric uid/gid, uid >=
+	# 1000, uid and name unique against the template and already-restored
+	# lines. Conflicting or malformed lines are dropped.
+	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	printf 'root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh\n' > "$tmp"
+	if [ -f "$PASSWD" ]; then
+		if ! awk -F: '
+			BEGIN { seen[0] = 1; seen[1000] = 1; names["root"] = 1; names["sane"] = 1 }
+			$1 == "root" || $1 == "sane" { next }
+			NF != 7 { next }
+			$3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ { next }
+			$3 + 0 < 1000 { next }
+			seen[$3]++ { next }
+			names[$1]++ { next }
+			{ print }
+		' "$PASSWD" >> "$tmp"; then
+			rm -f "$tmp"
+			die "failed to rebuild $PASSWD"
+		fi
+	fi
+	mv "$tmp" "$PASSWD"
+}
+
+rebuild_group() {
+	# Same policy as rebuild_passwd: baseline template + valid,
+	# conflict-free non-baseline groups (4 fields, numeric gid >= 1000,
+	# unique gid and name).
+	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	printf 'root:x:0:\nwheel:x:10:root,sane\nsane:x:1000:\n' > "$tmp"
+	if [ -f "$GROUP" ]; then
+		if ! awk -F: '
+			BEGIN { seen[0] = 1; seen[10] = 1; seen[1000] = 1
+				names["root"] = 1; names["wheel"] = 1; names["sane"] = 1 }
+			$1 == "root" || $1 == "wheel" || $1 == "sane" { next }
+			NF != 4 { next }
+			$3 !~ /^[0-9]+$/ { next }
+			$3 + 0 < 1000 { next }
+			seen[$3]++ { next }
+			names[$1]++ { next }
+			{ print }
+		' "$GROUP" >> "$tmp"; then
+			rm -f "$tmp"
+			die "failed to rebuild $GROUP"
+		fi
+	fi
+	mv "$tmp" "$GROUP"
+}
+
 cmd_recover() {
-	# Never leave the system locked out: rebuild the four identity files from
-	# the baseline template, then preserve hashes that are still usable.
-	# If no valid root hash survives, remove the firstboot marker so the
-	# console setup runs again on this boot.
+	# Merge, not rewrite (X6): repair each identity file individually and
+	# preserve everything still valid. A structurally sound passwd/group is
+	# merged (baseline ensured, extra lines and memberships kept); only a
+	# structurally corrupt one is rebuilt from the template with valid,
+	# conflict-free extra lines restored. A policy-compliant doas.conf is
+	# preserved and only its mode/owner is repaired. shadow is always
+	# rebuilt from the locked baseline with usable root/sane hashes
+	# restored. If no valid root/sane hash survives, remove the firstboot
+	# marker so the console setup runs again on this boot.
 	ensure_etc
 	ROOT_HASH_OLD=
 	SANE_HASH_OLD=
@@ -563,11 +735,48 @@ cmd_recover() {
 		valid_sha512_hash "$h" && SANE_HASH_OLD=$h
 	fi
 
-	FIRSTBOOT=1
-	cmd_init --force
+	# doas.conf: keep policy-compliant content, repair mode/owner only.
+	if [ -f "$DOAS_CONF" ] && doas_policy_ok "$DOAS_CONF"; then
+		chmod 0600 "$DOAS_CONF"
+		[ "$(id -u)" = 0 ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
+		printf 'recover: doas.conf preserved (policy ok; mode/owner repaired)\n'
+	else
+		printf 'permit persist :wheel\n' > "$DOAS_CONF"
+		chmod 0600 "$DOAS_CONF"
+		[ "$(id -u)" = 0 ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
+		printf 'recover: doas.conf rebuilt from baseline (missing or policy violation)\n'
+	fi
+
+	if [ -f "$PASSWD" ] && passwd_structurally_ok "$PASSWD"; then
+		merge_passwd
+		printf 'recover: passwd merged (root/sane ensured; extra entries preserved)\n'
+	else
+		rebuild_passwd
+		printf 'recover: passwd rebuilt from baseline (structural corruption; valid extra entries restored)\n'
+	fi
+
+	if [ -f "$GROUP" ] && group_structurally_ok "$GROUP"; then
+		merge_group
+		printf 'recover: group merged (root/wheel/sane ensured; extra entries preserved)\n'
+	else
+		rebuild_group
+		printf 'recover: group rebuilt from baseline (structural corruption; valid extra entries restored)\n'
+	fi
+
+	# shadow: locked baseline + usable root/sane hashes (unchanged policy).
+	printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$SHADOW"
 	[ -n "$ROOT_HASH_OLD" ] && set_field "$SHADOW" root 2 "$ROOT_HASH_OLD"
 	[ -n "$SANE_HASH_OLD" ] && set_field "$SHADOW" sane 2 "$SANE_HASH_OLD"
+	if [ -n "$ROOT_HASH_OLD" ] || [ -n "$SANE_HASH_OLD" ]; then
+		printf 'recover: shadow rebuilt from baseline (usable root/sane hashes preserved)\n'
+	else
+		printf 'recover: shadow rebuilt from baseline (no usable root/sane hash)\n'
+	fi
+
+	chmod 0644 "$PASSWD" "$GROUP"
 	chmod 0600 "$SHADOW" "$DOAS_CONF"
+	mkdir -p "$HOME_BASE/sane"
+	chmod 0750 "$HOME_BASE/sane"
 
 	MARK="$ETC/.sane-firstboot-done"
 	if [ -z "$ROOT_HASH_OLD" ] || [ -z "$SANE_HASH_OLD" ]; then
@@ -578,7 +787,7 @@ cmd_recover() {
 		chmod 0600 "$MARK"
 		printf 'recover: preserved usable password hashes\n'
 	fi
-	note "identity files rebuilt under $ETC"
+	note "identity recovery complete under $ETC"
 }
 
 case "$CMD" in
