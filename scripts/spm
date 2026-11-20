@@ -41,6 +41,7 @@ Subcommands:
   query <path>             Find which package provides a given file path
   install <archive>        Install an .spm package atomically with checksum verification
   remove <pkg-name>        Safely remove a package and clean empty directories bottom-up
+  validate-source <dir>    Read-only shared audit of a package source tree (x/ + .META)
 
 Options:
   -f, --force              Force removal of packages marked base=true
@@ -87,7 +88,7 @@ while [ $nargs -gt 0 ]; do
             printf 'spm 1.2.0 (S.A.N.E Package Manager)\n'
             exit 0
             ;;
-        init|list|info|query|install|remove)
+        init|list|info|query|install|remove|validate-source)
             if [ -z "$SUBCOMMAND" ]; then
                 SUBCOMMAND="$arg"
             else
@@ -102,8 +103,9 @@ done
 
 [ -n "$SUBCOMMAND" ] || { usage >&2; exit 1; }
 
-# Normalize TARGET_ROOT
-if [ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "/" ]; then
+# Normalize TARGET_ROOT -- never create a target root for the read-only
+# validate-source subcommand.
+if [ -n "$TARGET_ROOT" ] && [ "$TARGET_ROOT" != "/" ] && [ "$SUBCOMMAND" != "validate-source" ]; then
     mkdir -p "$TARGET_ROOT"
     TARGET_ROOT="$(cd "$TARGET_ROOT" && pwd -P)"
     TARGET_ROOT="${TARGET_ROOT%/}"
@@ -118,6 +120,7 @@ RDEPS_DIR="${SPM_DB_DIR}/rdeps"
 WORLD_FILE="${SPM_DB_DIR}/world"
 STAGING_BASE="${SPM_DB_DIR}/staging"
 LOCK_FILE="${SPM_DB_DIR}/spm.lock"
+VALIDATE_SOURCE_TMP=""
 
 # Locking management via flock(1)
 LOCK_FD=9
@@ -168,10 +171,10 @@ do_rollback() {
     # Restore database state from snapshot
     if [ -n "$pkg" ]; then
         if [ -f "$rjournal/had_installed_pkg" ]; then
-            rm -rf "$INSTALLED_DIR/$pkg"
+            rm -rf "${INSTALLED_DIR:?}/${pkg:?}"
             cp -a "$rjournal/installed_pkg" "$INSTALLED_DIR/$pkg" 2>/dev/null || true
         elif [ -f "$rjournal/no_installed_pkg" ]; then
-            rm -rf "$INSTALLED_DIR/$pkg" 2>/dev/null || true
+            rm -rf "${INSTALLED_DIR:?}/${pkg:?}" 2>/dev/null || true
         fi
     fi
 
@@ -196,6 +199,7 @@ do_rollback() {
 }
 
 cleanup_all() {
+    [ -z "$VALIDATE_SOURCE_TMP" ] || { rm -f "$VALIDATE_SOURCE_TMP"; VALIDATE_SOURCE_TMP=""; }
     if [ "${IN_TRANSACTION:-false}" = true ]; then
         IN_TRANSACTION=false
         do_rollback "${CURRENT_STAGING_DIR:-}" "${CURRENT_PKG_NAME:-}"
@@ -600,15 +604,83 @@ verify_destination_path_safety() {
     done
 }
 
-# Helper to validate service snippets in staging
+# Privileged doas is NEVER granted by a generic archive. These helpers only
+# recognize an already-provisioned, root-owned 4755 regular file and let a
+# byte-identical validated replacement be skipped (no chmod/chown ever).
+# stat is called here so unprivileged tests can supply a synthetic owner via
+# an audited PATH stub; production uses the real stat.
+doas_stat_state() {
+    stat -c '%u:%g %a' "$1" 2>/dev/null || printf 'unknown unknown\n'
+}
+
+doas_existing_is_trusted() {
+    local path="$1"
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    [ "$(doas_stat_state "$path")" = '0:0 4755' ]
+}
+
+# Called after staging extraction + checksum/parity validation, BEFORE any
+# target file or database record changes. Sets DOAS_SKIP_REPLACE=true only
+# for an identical, regular, validated staged file replacing a trusted one.
+DOAS_SKIP_REPLACE=false
+doas_preflight() {
+    local staging_root="$1" pkg="$2"
+    local rel="usr/bin/doas"
+    local target="${TARGET_ROOT}/usr/bin/doas"
+    local staged="$staging_root/x/$rel"
+    local staged_in_pkg=false
+    grep -qxF "$rel" "$staging_root/.META/files" && staged_in_pkg=true
+    DOAS_SKIP_REPLACE=false
+
+    local existing_trusted=false
+    doas_existing_is_trusted "$target" && existing_trusted=true
+
+    # Pruning a trusted provisioned binary on upgrade is a privilege change.
+    if [ "$existing_trusted" = true ] && [ "$staged_in_pkg" = false ] &&
+       [ -f "$INSTALLED_DIR/$pkg/files.list" ] &&
+       grep -qxF '/usr/bin/doas' "$INSTALLED_DIR/$pkg/files.list"; then
+        die "Refusing to prune pre-provisioned privileged /usr/bin/doas; provision the privileged binary via a trusted image or an administrator-controlled path"
+    fi
+    [ "$staged_in_pkg" = true ] || return 0
+
+    # Reuse trusted path containment for direct parent components; a
+    # symlinked stage component must not redirect the exception.
+    verify_destination_path_safety "$rel"
+    local comp
+    for comp in "$staging_root/x/usr" "$staging_root/x/usr/bin"; do
+        [ -L "$comp" ] && die "Refusing doas replacement through a symlinked stage component: $comp"
+    done
+
+    [ "$existing_trusted" = true ] || return 0
+    if [ -L "$staged" ] || [ ! -f "$staged" ]; then
+        die "Refusing to replace pre-provisioned privileged /usr/bin/doas with a non-regular staged file; provision via a trusted image or an administrator-controlled path"
+    fi
+    if ! cmp -s "$staged" "$target"; then
+        die "Staged /usr/bin/doas differs from the pre-provisioned privileged binary; provision the privileged binary via a trusted image or an administrator-controlled path"
+    fi
+    DOAS_SKIP_REPLACE=true
+    log "Pre-provisioned privileged doas is byte-identical; skipping replacement (inode and mode preserved)"
+}
+
+# Helper to validate service snippets in a staging/source tree.
+# READ-ONLY by contract: never chmod, write, or create anything here. Mode
+# normalization lives in normalize_service_snippet_modes, called only after
+# validation on a trusted builder/extraction path.
 validate_service_snippets() {
     local staging_root="$1"
     local service_dir="$staging_root/x/usr/share/ninit/services"
     [ -d "$service_dir" ] || return 0
 
+    local sfile sname line_count content tok key val
+    local user_seen=false group_seen=false user_val="" group_val=""
+    # Ordinary arguments may be balanced double- or single-quoted strings,
+    # or plain tokens (now including '='). No shell evaluation is performed.
+    local sq="'"
+    local arg_pat="(\"[^\"]*\"|${sq}[^${sq}]*${sq}|[a-zA-Z0-9_/.=+-]+)"
+    local syntax_re="^([a-zA-Z0-9_-]+:)?(once|respawn):[a-zA-Z0-9_/.-]+([[:space:]]+${arg_pat})*([[:space:]]*:[a-zA-Z0-9_=., -]+)*$"
+
     for sfile in "$service_dir"/*; do
         [ -e "$sfile" ] || [ -L "$sfile" ] || continue
-        local sname
         sname="$(basename "$sfile")"
 
         if [ -L "$sfile" ]; then
@@ -616,42 +688,79 @@ validate_service_snippets() {
         fi
         [ -f "$sfile" ] || die "Service snippet is not a regular file: $sname"
         case "$sname" in
-            *.service)
-                ;;
-            *)
-                die "Service snippet filename must end in .service: $sname"
-                ;;
+            *.service) ;;
+            *) die "Service snippet filename must end in .service: $sname" ;;
         esac
 
-        # Enforce non-executable 0644 permissions
-        chmod 0644 "$sfile"
-
-        # Check line count: strictly single line
-        local line_count
+        # Enforce non-executable 0644 permissions AFTER validation only.
         line_count="$(grep -c '^' "$sfile" || true)"
         [ "$line_count" -le 1 ] || die "Service snippet must be strictly a single definition line: $sname (found $line_count lines)"
 
-        local content
         content="$(tr -d '\r\n' < "$sfile")"
         [ -n "$content" ] || die "Service snippet is empty: $sname"
 
-        # Regex syntax check: (name:)?(once|respawn):<command> [args] [options...]
-        # Options allow :deps=..., :user=..., :group=..., :memory_max=..., etc.
-        if ! echo "$content" | grep -qE '^([a-zA-Z0-9_-]+:)?(once|respawn):[a-zA-Z0-9_/.-]+([[:space:]][a-zA-Z0-9_/.-]+)*(:[a-zA-Z0-9_=., -]+)*$'; then
+        if ! printf '%s\n' "$content" | grep -qE "$syntax_re"; then
             die "Invalid service snippet syntax in $sname: must match '[(<name>):](once|respawn):<cmd> [<args>...]'"
         fi
 
         # Check forbidden dangerous keywords
         for forbidden in "/run/initctl" "reboot" "poweroff" "halt" "kill" "signal"; do
-            if echo "$content" | grep -qw "$forbidden"; then
+            if printf '%s\n' "$content" | grep -qw "$forbidden"; then
                 die "Forbidden keyword '$forbidden' detected in service snippet: $sname"
             fi
         done
 
-        # Check forbidden shell metacharacters
-        if echo "$content" | grep -qE '[|><;&`$]'; then
+        # Check forbidden shell metacharacters (unchanged legacy policy)
+        if printf '%s\n' "$content" | grep -qE '[|><;&`$]'; then
             die "Forbidden shell metacharacters detected in service snippet: $sname"
         fi
+
+        # Tail options: strict key vocabulary, migration hint for legacy :deps=.
+        user_seen=false
+        group_seen=false
+        user_val=""
+        group_val=""
+        for tok in $content; do
+            case "$tok" in
+                :*=*)
+                    key="${tok%%=*}"
+                    key="${key#:}"
+                    val="${tok#*=}"
+                    case "$key" in
+                        requires|memory_max|cpu_max|pids_max|timeout|grace|user|group) ;;
+                        *)
+                            die "Unknown service option ':$key' in $sname; valid options: :requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group= (use :requires= for dependencies)"
+                            ;;
+                    esac
+                    case "$key" in
+                        user)  user_seen=true;  user_val="$val" ;;
+                        group) group_seen=true; group_val="$val" ;;
+                    esac
+                    ;;
+            esac
+        done
+        if [ "$group_seen" = true ] && [ "$user_seen" = false ]; then
+            die "':group=' requires ':user=' in $sname"
+        fi
+        if [ "$user_seen" = true ] && [ -z "$user_val" ]; then
+            die "':user=' must not be empty in $sname"
+        fi
+        if [ "$group_seen" = true ] && [ -z "$group_val" ]; then
+            die "':group=' must not be empty in $sname"
+        fi
+    done
+}
+
+# Mode normalization is intentionally separate from validation: only call
+# this on an already-validated source (builder) or staged payload (install).
+normalize_service_snippet_modes() {
+    local staging_root="$1"
+    local service_dir="$staging_root/x/usr/share/ninit/services"
+    [ -d "$service_dir" ] || return 0
+    local sfile
+    for sfile in "$service_dir"/*; do
+        [ -f "$sfile" ] && [ ! -L "$sfile" ] || continue
+        chmod 0644 "$sfile"
     done
 }
 
@@ -922,7 +1031,9 @@ cmd_install() {
         else
             # Path unrecorded in providers
             if [ -e "$disk_path" ] || [ -L "$disk_path" ]; then
-                if [ "$pkg_base" = "true" ]; then
+                if [ "$norm_path" = "/usr/bin/doas" ] && doas_existing_is_trusted "$disk_path"; then
+                    log "Pre-provisioned privileged doas detected; deferring to post-staging byte preflight"
+                elif [ "$pkg_base" = "true" ]; then
                     log "Base package '$pkg_name' claiming pre-existing unowned file: $norm_path"
                 else
                     rm -f "$tmp_files"
@@ -960,11 +1071,17 @@ cmd_install() {
     # Cryptographic SHA-256 verification of regular files (fail-closed, 1:1 match)
     verify_payload_checksums "$STAGING_DIR"
 
-    # Validate declarative ninit service snippets
+    # Validate declarative ninit service snippets, then normalize modes only
+    # on this already-validated staging payload.
     validate_service_snippets "$STAGING_DIR" || {
         rm -rf "$STAGING_DIR"
         die "Service snippet validation failed"
     }
+    normalize_service_snippet_modes "$STAGING_DIR"
+
+    # Post-validation, pre-mutation preflight for privileged doas. Any
+    # rejection here leaves executable files and records untouched.
+    doas_preflight "$STAGING_DIR" "$pkg_name"
 
     log "Step 5/6: Committing files atomically via rename(2) avoiding ETXTBSY..."
     local ROLLBACK_JOURNAL="$STAGING_DIR/.journal"
@@ -1047,6 +1164,12 @@ cmd_install() {
                 local dst_path="${TARGET_ROOT}/$fline"
                 local dst_dir
                 dst_dir="$(dirname "$dst_path")"
+
+                # Trusted identical doas: keep original inode/mode/bytes but
+                # still record the path in files.list/providers below.
+                if [ "$fline" = "usr/bin/doas" ] && [ "$DOAS_SKIP_REPLACE" = true ]; then
+                    continue
+                fi
 
                 mkdir -p "$dst_dir" || rollback_transaction
 
@@ -1334,6 +1457,66 @@ cmd_remove() {
     release_lock
 }
 
+# Subcommand: validate-source -- READ-ONLY shared policy for package sources.
+# No lock, no DB init, no TARGET_ROOT creation, no source writes or chmod.
+cmd_validate_source() {
+    [ $# -ge 1 ] || die "Usage: spm validate-source DIR"
+    local source_dir="$1"
+    [ -d "$source_dir" ] || die "Source directory does not exist: $source_dir"
+    [ -d "$source_dir/x" ] || die "Source missing payload root: x/"
+    [ -d "$source_dir/.META" ] || die "Source missing metadata directory: .META/"
+    [ -f "$source_dir/.META/package" ] || die "Source missing mandatory .META/package"
+
+    VALIDATE_SOURCE_TMP="$(mktemp "${TMPDIR:-/tmp}/spm-src.XXXXXX")" || die "Cannot create temporary list"
+
+    # .META: strictly regular files/directories, zero symlinks, no traversal.
+    find "$source_dir/.META" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
+    local entry rel
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        rel="${entry#$source_dir/.META/}"
+        case "$rel" in
+            *..*|*//*) die "Path traversal detected in .META entry: $rel" ;;
+        esac
+        [ ! -L "$entry" ] || die "Symlinks are strictly forbidden in .META directory: $rel"
+        [ -f "$entry" ] || [ -d "$entry" ] || die "Special file detected in .META directory: $rel"
+    done < "$VALIDATE_SOURCE_TMP"
+
+    # x/ payload: the same path invariants and symlink policy as the archive
+    # walker. Never dereference a symlink while auditing path components.
+    find "$source_dir/x" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        rel="${entry#$source_dir/x/}"
+        [ "$rel" != "$entry" ] || continue
+        case "$rel" in
+            /*) die "Invalid source entry with leading slash: $rel" ;;
+        esac
+        if printf '%s\n' "$rel" | grep -qE '(^|/)\.\.(/|$)'; then
+            die "Path traversal detected in source entry: $rel"
+        fi
+        case "$rel" in
+            *//*|*/./*|*/.) die "Invalid dot component in source entry: $rel" ;;
+        esac
+        if [ -L "$entry" ]; then
+            verify_symlink_safety "./x/$rel" "$(readlink "$entry")"
+        fi
+    done < "$VALIDATE_SOURCE_TMP"
+    rm -f "$VALIDATE_SOURCE_TMP"
+    VALIDATE_SOURCE_TMP=""
+
+    # Refuse symlinked components on the path to service snippets before the
+    # (read-only) snippet validator reads any file through that path.
+    local probe="$source_dir" part
+    for part in x usr share ninit services; do
+        probe="$probe/$part"
+        [ -L "$probe" ] && die "Symlinked component in service path: $probe"
+    done
+
+    validate_service_snippets "$source_dir" || die "Service snippet validation failed"
+    log "Source tree validated by spm (read-only): $source_dir"
+}
+
 # Main dispatcher
 case "$SUBCOMMAND" in
     init)
@@ -1353,6 +1536,9 @@ case "$SUBCOMMAND" in
         ;;
     remove)
         cmd_remove "$@"
+        ;;
+    validate-source)
+        cmd_validate_source "$@"
         ;;
     *)
         die "Unknown subcommand: $SUBCOMMAND (see --help)"

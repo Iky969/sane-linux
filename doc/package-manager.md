@@ -8,7 +8,7 @@ This document defines the formal architecture, flat-file database layout, concur
 
 ## 1. Executive Summary & Core Tenets
 
-The S.A.N.E Package Manager (`spm`) is a lightweight, standalone, POSIX-compliant package management system written in Bash. It provides deterministic package lifecycle management, atomic transactions, cryptographic integrity verification, and safe uninstallation for S.A.N.E Linux appliances and distributions.
+The S.A.N.E Package Manager (`spm`) is a lightweight, standalone package management system for S.A.N.E Linux. It provides deterministic package lifecycle management, atomic transactions, cryptographic integrity verification, and safe uninstallation for S.A.N.E Linux appliances and distributions. `spm` is POSIX-style `/bin/sh` (uses `local`, supported by dash, ash and BusyBox ash); `build-package.sh` and its test harness use Bash.
 
 ### Core Architectural Tenets
 1. **Offline-First & Self-Contained**: `spm` operates entirely offline without mandatory network repositories or daemon dependencies. Packages are distributed as local cryptographically verified `.spm.tar.xz` (or `.spm.tar.gz`) containers.
@@ -256,6 +256,31 @@ spm remove sane-hello [--root <path>]
   respawn:/usr/sbin/sshd -D
   sane-hello:once:/usr/bin/sane-hello:memory_max=8M:timeout=10
   ```
+- Ordinary command arguments may be quoted with balanced single or double
+  quotes (quoted strings may contain spaces) or contain `=`; quotes are never
+  evaluated or executed. No new shell syntax is recognized.
+- The tail carries only these colon-separated keys: `:requires=`,
+  `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`, `:grace=`, `:user=`,
+  `:group=`. Unknown or legacy keys (notably `:deps=`) are rejected with the
+  full vocabulary and a `:requires=` migration hint. Empty `:user=`/`:group=`
+  and a `:group=` without `:user=` are rejected.
+- Snippet content is validated at packaging time by the **shared validator**
+  in `spm` (also used during installation). Packaging only validates the
+  file; it does **not** wire the service. Adding the service to
+  `/etc/init.conf` remains an explicit action of the rootfs/image builder.
+  Mode `0644` normalization is applied only after validation, on the
+  validated source (builder) or staged payload (installer) path.
+
+### Shared source audit (`spm validate-source DIR`)
+`spm validate-source DIR` is a read-only audit of a package source tree
+(`x/` + `.META/`): path invariants (no leading slash, traversal, dot or empty
+components), the same symlink policy as the archive walker (absolute targets
+only from the system allowlist; `/etc/hostname` and other unsupported
+absolute targets are rejected; valid internal relative links roundtrip),
+zero symlinks in `.META/`, and the shared snippet grammar above. It never
+takes a lock, creates a target root or DB, writes the source, or normalizes
+snippet modes. `build-package.sh` invokes it from its own script directory
+before any source mutation, so builder and installer enforce one policy.
 
 ### Forbidden Pattern Checks
 `spm` rejects any package containing a service snippet that contains:
@@ -265,6 +290,31 @@ spm remove sane-hello [--root <path>]
 
 ### Hook Ban
 `spm` strictly forbids pre-install or post-install shell hooks. `spm` never writes to `/run/initctl` or signals PID 1. Services become active only when explicitly added to `/etc/init.conf` and the system restarts.
+
+### Privileged `doas` preservation (no auto-grant)
+Generic SPM archives are unprivileged: package names, paths, hashes or base
+bits never grant setuid/setgid, and `build-package.sh` strips setuid/setgid
+from packed files. Archive setuid/setgid rejection and trusted image
+provisioning remain in force.
+
+A pre-provisioned `/usr/bin/doas` that is a regular (non-symlink), root-owned,
+mode `4755` file is treated as trusted. After staging and checksum/parity
+validation, but before any target file or database record changes, `spm`
+preflights any install/upgrade touching that path:
+
+- staged file is a validated regular file with **identical bytes** → the
+  replacement is skipped, preserving the original inode, mode and bytes;
+  `files.list`, providers and records are still written;
+- staged bytes differ, the replacement is not a regular file, or an upgrade
+  would prune the trusted binary → rejected before any executable or record
+  changes, with a diagnostic to provision the privileged binary via a trusted
+  image or an administrator-controlled path;
+- a fresh install with no pre-provisioned privileged `doas` remains
+  unprivileged — no `chmod +s` or `chown` is ever applied to generic archive
+  payloads.
+
+Direct parent components must be non-symlinks at stage and target for the
+preservation path; the trusted destination containment check is reused.
 
 ---
 

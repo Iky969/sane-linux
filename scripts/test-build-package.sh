@@ -677,6 +677,70 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
+# Test 13: Shared validator agreement (build-package delegates to spm)
+# -----------------------------------------------------------------------------
+test_shared_validator_agreement() {
+    local tdir="$TEST_TMP/shared_validator"
+    local src="$tdir/src" out="$tdir/out"
+    mkdir -p "$src/x/usr/bin" "$src/.META" "$out"
+    cat > "$src/.META/package" <<'EOF'
+name=shared-validator
+version=1.0.0
+arch=x86_64
+description=Shared validator agreement
+base=false
+EOF
+    printf 'tool\n' > "$src/x/usr/bin/tool"
+    chmod 755 "$src/x/usr/bin/tool"
+
+    if ! "$BUILD_PKG" --source "$src" --output "$out" >/dev/null 2>"$tdir/err"; then
+        test_fail "Shared validator agreement" "baseline build rejected: $(cat "$tdir/err")"
+        return
+    fi
+
+    mkdir -p "$src/x/usr/share/ninit/services"
+    local svc="$src/x/usr/share/ninit/services/v.service"
+
+    # Legacy key: both builder and spm must reject (single vocabulary).
+    printf 'respawn:/bin/true :deps=base\n' > "$svc"
+    if "$BUILD_PKG" --source "$src" --output "$out" >/dev/null 2>&1; then
+        test_fail "Shared validator agreement" "builder accepted legacy :deps= snippet"
+        return
+    fi
+    if sh "$REPO_ROOT/scripts/spm" validate-source "$src" >/dev/null 2>&1; then
+        test_fail "Shared validator agreement" "spm validator accepted legacy :deps= snippet"
+        return
+    fi
+
+    # Quoted argument with '=' must be accepted by both paths.
+    printf 'respawn:/bin/echo "hello world" status=ok\n' > "$svc"
+    if ! "$BUILD_PKG" --source "$src" --output "$out" >/dev/null 2>"$tdir/err"; then
+        test_fail "Shared validator agreement" "builder rejected quoted argument: $(cat "$tdir/err")"
+        return
+    fi
+    if ! sh "$REPO_ROOT/scripts/spm" validate-source "$src" >/dev/null 2>&1; then
+        test_fail "Shared validator agreement" "spm rejected quoted argument"
+        return
+    fi
+
+    # Absolute target outside the allowlist is rejected by the builder too;
+    # a valid internal relative symlink roundtrips.
+    ln -s /etc/hostname "$src/x/usr/bin/hostlink"
+    if "$BUILD_PKG" --source "$src" --output "$out" >/dev/null 2>&1; then
+        test_fail "Shared validator agreement" "builder accepted /etc/hostname symlink target"
+        return
+    fi
+    rm -f "$src/x/usr/bin/hostlink"
+    ln -s tool "$src/x/usr/bin/hostlink"
+    if ! "$BUILD_PKG" --source "$src" --output "$out" >/dev/null 2>"$tdir/err"; then
+        test_fail "Shared validator agreement" "builder rejected internal symlink: $(cat "$tdir/err")"
+        return
+    fi
+
+    test_pass "Shared validator agreement: single snippet vocabulary and symlink policy in builder and spm"
+}
+
+# -----------------------------------------------------------------------------
 # Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -693,6 +757,7 @@ main() {
     test_recipe_build
     test_busybox_static_elf
     test_disk_tools_static_elf
+    test_shared_validator_agreement
 
     printf '\n=== Test Summary: %d passed, %d failed ===\n' "$PASSED_COUNT" "$FAILED_COUNT"
     if [ "$FAILED_COUNT" -gt 0 ]; then
