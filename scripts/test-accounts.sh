@@ -243,6 +243,51 @@ printf 'permit :wheel cmd /usr/bin/echo x # nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate ignores nopass in an inline comment after cmd arguments" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
+# Round 1.5 setenv-aware scan: "as" and "cmd" inside a setenv { } block are
+# environment variable names, NOT the cmd/as option terminators. The scans
+# must skip the whole block, then resume for nopass / :wheel.
+base
+printf 'permit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after a setenv { as } block" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { cmd } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after a setenv { cmd } block" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { as } :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts :wheel identity after a setenv { as } block" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { as } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts a cmd argument after a setenv { as } block" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Multi-rule bypass: a valid wheel rule on one line must not mask a nopass
+# grant hidden after a setenv block on another line.
+base
+printf 'permit persist :wheel\npermit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a multi-rule nopass grant after setenv { as }" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { cmd } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a multi-rule nopass grant after setenv { cmd }" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { as } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts a multi-rule cmd argument after setenv { as }" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { cmd } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts a multi-rule cmd argument after setenv { cmd }" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
 # Effective-rule scan (r1B-498): whole-file cases, no extra base rule.
 # A valid doas rule may carry options the old fixed regex cannot parse
 # (setenv braces); :wheel must be the identity, i.e. appear BEFORE the
@@ -530,6 +575,36 @@ check "recover clears done marker when sane hash is lost" \
 	test ! -f "$T/etc/.sane-firstboot-done"
 check "recover restores sane to locked baseline" sh -c \
 	"grep -q '^sane:!:19700:' '$T/etc/shadow'"
+
+# Round 1.5 recover: doas_policy_ok must detect nopass grants hidden after
+# setenv blocks, including the multi-rule file the base tool preserves.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'permit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_ok "recover succeeds on a single-rule setenv nopass violation" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover replaces a single-rule setenv nopass policy" sh -c \
+	"grep -q '^permit persist :wheel$' '$T/etc/doas.conf' && ! grep -q 'nopass' '$T/etc/doas.conf'"
+check "recover repairs doas.conf mode after a setenv policy rebuild" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+expect_ok "validate passes after the single-rule setenv rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'permit persist :wheel\npermit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_ok "recover succeeds on a multi-rule setenv nopass bypass" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover rebuilds a preserved multi-rule nopass bypass" sh -c \
+	"grep -q '^permit persist :wheel$' '$T/etc/doas.conf' && ! grep -q 'nopass' '$T/etc/doas.conf'"
+check "recover repairs mode for a multi-rule bypass rebuild" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+expect_ok "validate passes after the multi-rule bypass rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 printf '\n--- recover merge semantics (X6) ---\n'
 # recover must MERGE, not rewrite: a validation failure caused by a mode

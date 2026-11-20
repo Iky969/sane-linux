@@ -120,7 +120,7 @@ supplementary group. `validate` checks modes, ownership of doas files,
 numeric/duplicate UIDs and GIDs, absence of a second UID 0, empty password
 fields, SHA-512 (or locked) hashes, `wheel` membership, and an effective
 `permit ... :wheel` rule with no `nopass`. Wired into `make test` and CI
-(`scripts/test-accounts.sh`, 220 assertions; 222 when run as root).
+(`scripts/test-accounts.sh`, 236 assertions; 238 when run as root).
 
 ### Recovery semantics (`recover`)
 
@@ -163,14 +163,20 @@ repairs dangling or wrong symlinks, and leaves correct symlinks untouched
   run any command as root; the credential is cached per session.
 - The binary is setuid root (`4755`) and the config is `0600` root:root.
   `validate` rejects wrong modes, non-root ownership, missing or ineffective
-  permit rules, and any `permit` rule carrying a `nopass` option token in
-  any position before the first `cmd`/`as` terminator (e.g.
-  `permit persist nopass :wheel`). Tokens after `cmd`/`as` are command
-  arguments, not options: `permit :wheel cmd /usr/bin/echo nopass` is a
-  valid rule. Comment text and `setenv` values such as `X=nopass` are not
-  grants and are accepted. The same `cmd`/`as` boundary applies to the
-  effective `:wheel` scan and to `recover`'s decision to preserve
-  `doas.conf`.
+  permit rules, and any `permit` rule carrying a `nopass` option token
+  before the first `cmd`/`as` terminator OUTSIDE a `setenv { ... }` block
+  (e.g. `permit persist nopass :wheel`). A `setenv` block is skipped as a
+  whole: names such as `as` or `cmd` inside the braces are environment
+  variables, NOT terminators. Therefore `permit setenv { as } nopass :wheel`
+  is a real passwordless grant and is rejected, while
+  `permit setenv { as } :wheel` is a valid identity rule and is accepted.
+  Tokens after a `cmd`/`as` terminator are command arguments, not options:
+  `permit :wheel cmd /usr/bin/echo nopass` and
+  `permit setenv { as } :wheel cmd /usr/bin/echo nopass` are both valid.
+  Comment text and `setenv` values such as `X=nopass` are not grants and
+  are accepted. The same scan rules apply to the effective `:wheel` check
+  and to `recover`'s decision to preserve `doas.conf`; a valid rule on one
+  line cannot mask a nopass grant hidden in a `setenv` block on another.
 - Do not add wildcard `nopass` rules: they defeat the password prompt.
 
 ## Security boundaries

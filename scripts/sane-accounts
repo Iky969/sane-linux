@@ -453,19 +453,26 @@ FAIL=0
 audit_fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 
 # doas policy scans shared by validate and recover so both enforce the
-# identical rule boundary. Both scans stop BEFORE the first 'cmd' or 'as'
-# token: everything after a terminator is a command argument or target
-# identity, not a doas option (a command argument named 'nopass' is not a
-# passwordless grant). Inline comments are stripped first so comment text
-# is never a grant, and tokens are compared strictly so a setenv value
-# like X=nopass is not mistaken for the nopass option.
-# Boundary (documented, not a bug): the terminators are case-sensitive
-# lowercase; a lowercase env var named "as" or "cmd" inside setenv { } is
-# a pathological case that ends the scan early (e.g.
-# "permit setenv { as } :wheel" is rejected by the effective-rule scan).
+# identical rule boundary. Inline comments are stripped first so comment
+# text is never a grant, and tokens are compared strictly so a setenv value
+# like X=nopass is not mistaken for the nopass option. A setenv { ... }
+# block is skipped as a whole: "as" and "cmd" INSIDE the braces are
+# environment variable names, not option terminators, so a nopass after the
+# closing brace is still an option. The remaining boundary: a literal cmd
+# or as token OUTSIDE a setenv block ends the option part; everything after
+# it is a command argument or target identity, not a doas option. Examples:
+#   "permit setenv { as } :wheel cmd /usr/bin/echo nopass" -> valid
+#   "permit setenv { as } nopass :wheel" -> a nopass grant, rejected
+#   "permit setenv { as } :wheel" -> valid :wheel identity, accepted
 doas_has_nopass() {
 	awk '{sub(/#.*/, "")} $1 == "permit" {
+		in_setenv = 0
 		for (i = 2; i <= NF; i++) {
+			if (in_setenv) {
+				if ($i ~ /\}$/) in_setenv = 0
+				continue
+			}
+			if ($i == "setenv") { in_setenv = 1; continue }
 			if ($i == "cmd" || $i == "as") break
 			if ($i == "nopass") bad = 1
 		}
@@ -476,7 +483,13 @@ doas_has_effective_wheel() {
 	# ONE permit rule with :wheel as the identity suffices for the whole
 	# file; a :wheel that is only a command argument does not count.
 	awk '{sub(/#.*/, "")} $1 == "permit" {
+		in_setenv = 0
 		for (i = 2; i <= NF; i++) {
+			if (in_setenv) {
+				if ($i ~ /\}$/) in_setenv = 0
+				continue
+			}
+			if ($i == "setenv") { in_setenv = 1; continue }
 			if ($i == "cmd" || $i == "as") break
 			if ($i == ":wheel") found = 1
 		}
