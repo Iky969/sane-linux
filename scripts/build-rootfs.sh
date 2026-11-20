@@ -21,6 +21,11 @@
 #   EXTRA_FSTAB=<file>       file contents appended to the resulting /etc/fstab
 #                            (both for scripts/test-integration.sh)
 #
+# Ownership: a root build leaves the rootfs root-owned (doas keeps 4755) and
+# hands only initramfs/vmlinuz back to SUDO_USER. A non-root build completes
+# with a warning; rebuild as root (and use sudo for clean-distro) before
+# deploying the image.
+#
 # Requires: gcc + static libc, curl, tar, bzip2, cpio; root for mknod /dev.
 #
 # Note: the busybox steps are requested explicitly (make defconfig, make
@@ -34,7 +39,11 @@
 
 set -eu
 
+# CDPATH= is an intentional env-prefix: it stops CDPATH from redirecting cd.
+# shellcheck disable=SC1007
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# CDPATH= is an intentional env-prefix: it stops CDPATH from redirecting cd.
+# shellcheck disable=SC1007
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 DISTRO_DIR=${DISTRO_DIR:-$REPO_ROOT/distro}
@@ -370,6 +379,11 @@ install_networking() {
 		fi
 	fi
 
+	# ninit network CLI applets used by the network:once service
+	mkdir -p "$ROOTFS/usr/bin"
+	install -m 0755 "$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" "$ROOTFS/usr/bin/sane-net"
+	install -m 0755 "$REPO_ROOT/packages/ninit/x/usr/bin/sane-ctl" "$ROOTFS/usr/bin/sane-ctl"
+
 	# wpa-supplicant (Wi-Fi)
 	WPA_DIR="$REPO_ROOT/packages/wpa-supplicant"
 	if [ ! -x "$WPA_DIR/x/usr/bin/wpa_supplicant" ] && [ -x "$WPA_DIR/build.sh" ]; then
@@ -431,7 +445,7 @@ write_etc() {
 	log "writing /etc (init.conf, passwd, group, shadow, doas.conf, issue, hostname, fstab)"
 	cat > "$ROOTFS/etc/init.conf" <<'EOF'
 reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || echo "reliability: recover failed; continuing boot" >&2':timeout=0
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi":requires=reliability
+network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi":requires=reliability
 recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:timeout=0
 firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':requires=recovery:timeout=0
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
@@ -595,5 +609,17 @@ pack_initramfs
 summary
 
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-	chown -R "$SUDO_USER:$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")" "$DISTRO_DIR" 2>/dev/null || true
+	# Hand back ONLY the output artifacts created by the root build. Never
+	# sweep the rootfs: chown -R clears doas' setuid bit and rewrites the
+	# ownership of root-owned identity files to the builder user.
+	artifact_owner="$SUDO_USER:$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")"
+	for artifact in "$DISTRO_DIR/initramfs.cpio.gz" "$INITRAMFS" "$DISTRO_DIR"/vmlinuz*; do
+		[ -e "$artifact" ] || continue
+		chown "$artifact_owner" "$artifact" || \
+			die "cannot chown output artifact '$artifact' to $artifact_owner"
+	done
+elif [ "$(id -u)" -ne 0 ]; then
+	# A non-root build still completes, but its rootfs is builder-owned and
+	# setuid doas is ineffective: say so loudly instead of failing silently.
+	printf 'WARNING: rootfs ownership: built without root; rootfs files stay owned by the builder, setuid doas is not effective, and the image needs a root build before deployment\n' >&2
 fi

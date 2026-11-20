@@ -805,6 +805,8 @@ check "reliability:once wiring carries timeout=0" sh -c \
 	"grep -q '^reliability:once:.*:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
 check "reliability:once wiring byte-identical across the 3 builders" sh -c \
 	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^5f794f774c3989b8282b0a493ea2584b'"
+check "network:once wiring byte-identical across the 3 builders" sh -c \
+	"grep -h 'network:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^77a839731687c05b1e0fe2e0f1d0810a'"
 rel_cmd=${rel_line#reliability:once:}
 rel_cmd=${rel_cmd%:timeout=0}
 rel_stub_cmd=$(printf '%s\n' "$rel_cmd" | sed "s|/usr/bin/sane-reliability|$T/stub-reliability|")
