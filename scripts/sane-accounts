@@ -492,10 +492,28 @@ cmd_validate() {
 		audit_fail "wheel group does not include 'sane'"
 	fi
 
-	if grep -qE '^[[:space:]]*permit[[:space:]]+nopass' "$DOAS_CONF"; then
+	# Scan every token after 'permit', not just the first: options may be
+	# reordered (permit persist nopass :wheel). Strip inline comments first
+	# so comment text is not a grant, and compare tokens strictly so a
+	# setenv value like X=nopass is not mistaken for the nopass option.
+	if awk '{sub(/#.*/, "")} $1 == "permit" {
+		for (i = 2; i <= NF; i++) if ($i == "nopass") bad = 1
+	} END {exit !bad}' "$DOAS_CONF"; then
 		audit_fail "doas.conf grants 'nopass' (passwordless escalation)"
 	fi
-	if ! grep -qE '^[[:space:]]*permit([[:space:]]+[a-z]+)*[[:space:]]+:wheel([[:space:]]|$)' "$DOAS_CONF"; then
+	# Effective-rule token scan: ONE permit rule with :wheel as the
+	# identity suffices for the whole file. The scan stops BEFORE the
+	# first 'cmd' or 'as' token, so a :wheel that is only a command
+	# argument does not count. Boundary (documented, not a bug): the
+	# terminators are case-sensitive lowercase; a lowercase env var named
+	# "as" or "cmd" inside setenv { } is a pathological case that ends the
+	# scan early (e.g. "permit setenv { as } :wheel" is rejected).
+	if ! awk '{sub(/#.*/, "")} $1 == "permit" {
+		for (i = 2; i <= NF; i++) {
+			if ($i == "cmd" || $i == "as") break
+			if ($i == ":wheel") found = 1
+		}
+	} END {exit !found}' "$DOAS_CONF"; then
 		audit_fail "doas.conf has no effective permit rule for :wheel"
 	fi
 	if [ -e "$ROOT/usr/bin/doas" ]; then

@@ -1,12 +1,23 @@
 # Reliability (Phase C)
 
-Phase C adds a host-side, fail-closed reliability toolkit for S.A.N.E target
-roots selected by an absolute `--root DIR`. The tool is POSIX `sh`. Snapshot
-and upgrade commands have no dependencies beyond coreutils and `sha256sum`;
-`net-recover` additionally resolves `sane-net` through `PATH` and passes
-`SANE_ROOT="$ROOT"` explicitly to both network subcommands. An unset
-`SANE_ROOT` makes `sane-net` default to `/`; consequently, host paths under
-`/etc` are selected only when the effective target root is `/`.
+Phase C adds a fail-closed reliability toolkit for S.A.N.E target roots
+selected by an absolute `--root DIR`. It is usable host-side/build-time
+(like `spm` payload construction) **and** at runtime: the target image
+installs a `reliability:once` boot service that runs journal-driven
+`recover` before user services (see *Runtime recovery boot service*). The
+tool is POSIX `sh`. `--root` is canonicalized at entry to a physical
+directory with `cd -P` + `pwd` (no `realpath` dependency): symlinked roots
+resolve to their canonical target, and a root that does not exist yet —
+including a dangling symlink root — is resolved through its nearest
+existing ancestor (symlink components of the remaining tail are expanded
+with bounded readlink hops) so `init` can create it. Nothing is created
+during canonicalization itself, so malformed commands still fail before
+any write. Snapshot and upgrade commands have no dependencies beyond
+coreutils and `sha256sum`; `net-recover` additionally resolves `sane-net`
+through `PATH` and passes `SANE_ROOT="$ROOT"` explicitly to both network
+subcommands. An unset `SANE_ROOT` makes `sane-net` default to `/`;
+consequently, host paths under `/etc` are selected only when the effective
+target root is `/`.
 
 State lives under the target root:
 
@@ -15,6 +26,7 @@ State lives under the target root:
 | `/var/lib/sane/reliability/snapshots/<tag>/` | Verified state snapshots |
 | `/var/lib/sane/reliability/staging/` | Reserved for staged payloads |
 | `/var/lib/sane/reliability/journal` | Upgrade/recovery state (`0600`) |
+| `/var/lib/sane/reliability/lock/` | Mutator exclusion lock (holder `pid` file) |
 | `/var/log/sane/reliability.log` | Structured event log (rotated at 64 KiB) |
 
 ## Commands
@@ -46,9 +58,14 @@ start with `-`. Overwriting an existing tag requires `--force`.
 corrupt or incomplete snapshot is never applied — `rollback`, `upgrade` and
 upgrade recovery through `recover` all call this check first (fail-closed).
 Manifest paths are validated
-before hashing or applying: absolute paths and any `..` component are rejected,
-so a crafted manifest cannot write outside the target root. Manifests are
-NUL-delimited internally, so filenames containing spaces are handled correctly.
+before hashing or applying: absolute paths and any `..` component are rejected.
+After one conventional leading `./` is stripped, whole `.` components (including
+`a/./b`, a second leading `./`, or trailing `/.`) and empty components such as
+`a//b` are also rejected as non-canonical spellings. They are not normalized
+before validation; both validation and installation use the same relative
+string, so a crafted manifest cannot write outside the target root or bypass
+lexical protected-path checks. Manifests are NUL-delimited internally, so
+filenames containing spaces are handled correctly.
 
 ### Rollback and safety snapshots
 
@@ -59,6 +76,47 @@ modes. The journal records `state=rolled-back` and the tag used. Safety tags
 get a numeric suffix on collision, so two rollbacks in the same second never
 clash. `--force` swaps snapshots via rename-aside/install/delete rather than
 deleting first, so a failed move cannot destroy the previous snapshot.
+
+### State lock and crash-window self-heal
+
+All mutating commands (`snapshot`, `rollback`, `upgrade`, `recover`,
+`net-recover`, `backup`, `restore`) serialize on an atomic `mkdir` lock at
+`var/lib/sane/reliability/lock`, acquired once at the top-level command
+entry. The holder writes its PID to `lock/pid`. Acquisition retries every
+0.1 s and fails closed after 30 s (`timed out waiting for reliability
+lock`); the `SANE_RELIABILITY_LOCK_TIMEOUT` environment variable overrides
+the timeout in seconds for tests — the production default stays 30 s.
+`init`, `list`, `verify` and `log` never take the lock.
+
+Nested mutator calls inside one process (`recover` invoking the network
+recovery internally, `rollback`/`upgrade` invoking the snapshot helper)
+reuse the held lock: the lock is reentrant by PID, and only the top-level
+acquisition owns the EXIT-trap release. The lock is released on every exit
+path (success, `die`, `set -e` abort, HUP/INT/TERM) and only while
+`lock/pid` still equals the exiting process's PID. A SIGKILLed holder
+leaves the lock behind; that is what stale detection is for.
+
+Stale locks: if `kill -0` on the recorded PID fails (dead or garbage PID),
+the lock is stolen by atomically renaming it to `lock.stale.<pid>` and
+removing the aside; a process that loses the rename race loops and
+re-evaluates. A lock without a PID file gets a 1 s grace window (the holder
+may be between `mkdir` and the PID write) before it is treated as crash
+residue and stolen. Limits: stale detection is `kill -0` based, so a
+**reused PID** of a dead holder can look alive and delay acquisition up to
+the timeout — fail-closed, and a live same-user holder's lock is never
+wrongfully stolen. `kill -0` also fails with `EPERM` across users, so the
+tool assumes single-user/root operation on the state it protects.
+
+Crash-window self-heal: `snapshot --force` swaps via rename-aside /
+install / delete with a **deterministic** aside name `.old.<tag>` (the tag
+is validated, so it is filename-safe). A crash between the two renames
+would otherwise lose the old snapshot, so every lock-holding mutator —
+including `recover`, the boot path — first runs `heal_snapshot_swaps`: for
+each `.old.<tag>`, if the live tag is missing the aside is renamed back; if
+the live tag exists the aside is redundant and removed. Orphaned `.tmp.*`
+staging directories are removed too — the exclusive lock guarantees they
+belong to no live writer. Healing never runs in the lock-free read-only
+commands (`init`, `list`, `verify`, `log`).
 
 ### Upgrades and recovery
 
@@ -92,6 +150,14 @@ the next boot (or manually), `recover` re-reads the journal: `in-progress` with
 a snapshot tag triggers an automatic upgrade rollback and sets
 `state=recovered`; network `net-in-progress` follows the separate retry flow
 below. `done`, `idle`, `rolled-back` and `recovered` are no-ops.
+
+Self-state protection: an upgrade payload may not target the reliability
+state itself (`var/lib/sane/reliability/`, including the journal and
+snapshots) or the tool binary (`usr/bin/sane-reliability`). Such a payload
+is rejected with a specific error before any file is written — no safety
+snapshot, no journal change, no partial install. The restriction applies to
+**payload targets only**; the internal pre-upgrade snapshot mechanism (the
+extra target list and `new-files` recording) is deliberately not blocked.
 
 ### Symlink containment
 
@@ -157,12 +223,15 @@ require a snapshot tag. A retry with a working `sane-net` reconnect and check
 returns zero and finishes with `state=recovered` and the same `net-iface`.
 Missing or invalid recorded interfaces fail without invoking `sane-net`.
 For compatibility with the old CLI, a tagless `state=in-progress` journal is
-also treated as interrupted network recovery: `recover` logs a `WARN`
+also treated as interrupted network recovery. This is an explicit ambiguity
+boundary: a tagless `in-progress` journal could be a legacy network recovery
+or an upgrade that lost its snapshot tag, and the tool assumes the legacy
+network meaning. `recover` logs a `WARN`
 migration, uses the recorded `net-iface` if present (otherwise `eth0`), and
 runs `cmd_net_recover`, which rewrites it to the new journal format. When
-`net-iface` is empty, it first logs `WARN legacy journal missing net-iface,
-defaulting to eth0` before selecting `eth0`; a recorded interface keeps the
-migration WARN and is used as-is. A legacy
+`net-iface` is absent or empty, it first logs `WARN legacy journal missing
+net-iface, defaulting to eth0` before selecting `eth0`; a recorded interface
+keeps the migration WARN and is used as-is. A legacy
 interface must still pass validation. `in-progress` with a snapshot tag keeps
 the existing upgrade rollback path. A modern `net-in-progress` journal without
 a valid `net-iface` remains an error; it is never silently defaulted to eth0.
@@ -193,6 +262,18 @@ failure must **not** lock boot. A successful recovery is logged by
 `sane-reliability` itself (`INFO ... recovered`); a failure is logged `ERROR` in
 `/var/log/sane/reliability.log` in addition to the wrapper's stderr line.
 
+#### Spawn-failure boundary
+
+The fail-open wrapper guards the **exit code** of `recover`, not the spawn
+of the service itself. If the reliability service cannot be spawned at all
+(for example `/bin/sh` cannot be executed), ninit marks `reliability`
+`FAILED` and cancels its transitive dependents — including `network`,
+`recovery`, `firstboot` and the getty/console chain. ninit's rescue mode
+covers configuration failures (broken config, missing dependencies,
+cycles), not runtime spawn failures. This boundary is accepted: a broken
+`/bin/sh` would also fail getty directly, so the console would be
+unavailable regardless of where the reliability service sits in the graph.
+
 Install: `/usr/bin/sane-reliability` is installed mode `0755` by
 `build-rootfs.sh`, `make-image.sh` and `sane-install.sh` (the latter two use
 `$SUDO`). This complements the existing ninit rescue-shell contract documented
@@ -208,10 +289,28 @@ entry is written. Reliability commands log their own lifecycle events.
 ### Backup and restore
 
 `backup ARCHIVE.tar.gz` archives the reliability state and log directory from
-the target root; it refuses to overwrite unless `--force` is given. `restore`
-extracts to a temporary directory, rejects absolute/traversal member names and
-absolute or escaping symlinks, verifies every snapshot manifest inside the
-archive, then copies the state and logs into the target root.
+the target root; it refuses to overwrite unless `--force` is given.
+Trust boundary: `ARCHIVE` is an operator-controlled host path, intentionally
+**not** confined to `--root` — it may legitimately live outside the target
+root. Backup/restore are administrative, root-only operations in production;
+the archive path is trusted operator input, while the archive *content*
+remains fully validated.
+
+`restore` extracts to a temporary directory, rejects absolute/traversal
+member names, and walks every symlink chain with a bounded hop count (40)
+against the staging root: absolute targets and chains resolving outside the
+staging root are rejected fail-closed before anything is installed, while
+internal relative chains (including `..` that normalizes back inside the
+staging root) are allowed. It then verifies every snapshot manifest inside
+the archive and copies the state and logs into the target root.
+
+Restore **resets the journal**: after the copy it forces `state=idle`
+(state only, no snapshot tag or interface), never trusting the archived
+journal. Consequence: an archive captured mid-upgrade carries a legitimate
+`state=in-progress` + `snapshot=X`, and restore **discards that in-progress
+state** — the next `recover` is a no-op and snapshot X is never applied.
+Restore is therefore **not** a mid-upgrade operation; use `rollback` or
+`recover` to finish or undo an interrupted upgrade.
 
 ## Testing
 
@@ -240,6 +339,16 @@ as real IP addresses. `scripts/test-network-fault.sh`
 stages all writable paths under another temporary root and uses stubbed network
 tools to verify fail-before-side-effect injection, reconnect retry/backoff,
 default-resolver restoration after DHCP failures, and connectivity checks.
+The reliability suite also covers the state lock (live-holder contention
+fails closed within a test-shortened `SANE_RELIABILITY_LOCK_TIMEOUT`, retry
+after release, stale dead/garbage-PID steal, pidless grace steal, no lock
+left behind on any failed operation, and the nested `recover` → network
+recovery path finishing without self-deadlock), crash-window swap self-heal
+(injected rename failures between the two swap moves, manual crash state,
+redundant-aside discard, orphan staging cleanup, read-only commands never
+healing or locking), restore journal-trust and symlink-chain containment,
+upgrade self-state protection with zero-write assertions, and root
+canonicalization (symlinked, dangling-symlink and fresh-leaf roots).
 Neither suite changes the host `/etc` or host network state.
 
 Run both suites with:
@@ -263,7 +372,13 @@ into `make test`, `make test-reliability`, and CI.
   arbitrary user data under `/home` or whole disk images. A pre-upgrade snapshot
   additionally covers every payload target path (and records new files for
   deletion on rollback). A full-image rollback is out of scope for Phase C.
-- `restore` replaces the reliability state but does not roll back already
-  committed payload files; use `rollback` for that.
+- `restore` replaces the reliability state and forces the journal to idle,
+  discarding any archived in-progress state (see *Backup and restore*); it
+  does not roll back already committed payload files; use `rollback` for
+  that.
+- Mutators are serialized by the state lock; a concurrent mutator fails
+  closed after the lock timeout rather than interleaving writes. Stale
+  detection is PID-liveness based and carries the pid-reuse and cross-user
+  limits described in *State lock and crash-window self-heal*.
 - All destructive operations require an explicit tag, archive, or `--force`;
   malformed inputs fail before any file is modified.

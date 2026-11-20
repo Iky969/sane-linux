@@ -8,15 +8,31 @@ set -u
 # Overridable for unit tests; production uses the installed CLI and shell.
 CLI=${SANE_ACCOUNTS_CLI:-/usr/bin/sane-accounts}
 FALLBACK_SHELL=${SANE_RECOVERY_SHELL:-/bin/sh}
+BUSYBOX=${SANE_RECOVERY_BUSYBOX:-/bin/busybox}
 
 # Older images may ship a BusyBox without awk/mktemp symlinks. sane-accounts
 # needs both for validation and for its atomic file rewrites.
+# PR #31 policy: never clobber an existing regular file. Create the link
+# only when the path is fully absent ([ ! -e ] && [ ! -L ]); repair an
+# existing symlink ([ -L ], including a dangling one); a symlink already
+# resolving to busybox is left untouched. A regular file occupying the
+# path is skipped (it may be a real tool). The /bin fallback applies only
+# when a link attempt fails (e.g. unwritable directory), same policy.
 for applet in awk mktemp; do
     command -v "$applet" >/dev/null 2>&1 && continue
-    if [ -x /bin/busybox ]; then
+    if [ -x "$BUSYBOX" ]; then
         BIN_DIR=${SANE_RECOVERY_BIN_DIR:-/usr/bin}
-        ln -sf /bin/busybox "$BIN_DIR/$applet" 2>/dev/null \
-            || ln -sf /bin/busybox "/bin/$applet" 2>/dev/null || true
+        for dest in "$BIN_DIR/$applet" "/bin/$applet"; do
+            if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+                break
+            fi
+            if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+                ln -s "$BUSYBOX" "$dest" 2>/dev/null && break
+            elif [ -L "$dest" ]; then
+                [ "$dest" -ef "$BUSYBOX" ] && break
+                ln -sfn "$BUSYBOX" "$dest" 2>/dev/null && break
+            fi
+        done
     fi
 done
 
