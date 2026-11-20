@@ -10,7 +10,7 @@ filesystems declared in `/etc/fstab`, and orchestrates clean system shutdown.
 
 This repository contains the complete S.A.N.E Linux distribution:
 - **`ninit`**: A compact, static init system (PID 1) in [`ninit.c`](ninit.c) (±3100 lines) with cgroup v2 resource limits, fail-closed privilege drop (`:user=`/`:group=`), line-by-line `/run/initctl` IPC, stop grace escalation, and supervised emergency shell.
-- **`spm`**: S.A.N.E Package Manager ([`scripts/spm`](scripts/spm)), a POSIX `/bin/sh` package manager featuring atomic staging via `rename(2)` / anti-`ETXTBSY`, cryptographic verification, power-cut journal recovery, and reverse dependency tracking.
+- **`spm`**: S.A.N.E Package Manager ([`scripts/spm`](scripts/spm)), a POSIX `/bin/sh` package manager featuring atomic staging via `rename(2)` / anti-`ETXTBSY`, SHA-256 integrity verification against the checksum manifest bundled in the same archive (corruption detection, **not** signature verification — see [SECURITY.md](SECURITY.md)), power-cut journal recovery, and reverse dependency tracking.
 - **Distro & Image Builder**: Automated rootfs builder (`scripts/build-rootfs.sh`), GPT disk image generator (`scripts/make-image.sh`), and offline live installer (`scripts/sane-install.sh`) supporting dual Limine BIOS and UEFI GPT boots.
 
 The event loop is built on `ppoll`, keeping init responsive to signals even during rapid service respawn loops.
@@ -32,8 +32,8 @@ The event loop is built on `ppoll`, keeping init responsive to signals even duri
 - **Filesystem Mounting (`/etc/fstab`)**: mounts filesystems with flags and data options (`size=`, `mode=`, `uid=`, ...) forwarded to `mount()`; `defaults` is ignored like in `mount(8)`.
 - **Dual Logging**: outputs to `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus a `/run/log.fifo` path capturing service stdout/stderr with a `[service]` prefix.
 - **IPC (`/run/initctl`)**: line-by-line command handling for `poweroff`, `reboot`, `force-poweroff`, and `force-reboot`, preventing dropped commands on multi-line writes.
-- **Privilege Separation (`:user=`, `:group=`)**: drops privileges cleanly to unprivileged users/groups defined in `/etc/passwd` and `/etc/group` prior to executing service payloads, failing closed on lookup errors.
-- **`sane-ctl` Daemon Control**: unified CLI tool to `start`, `stop`, `restart`, `status`, and `reload` daemons over `/run/initctl` FIFO with state tracking in `/run/ninit-*.state` and stop grace timeout escalation.
+- **Privilege Separation (`:user=`, `:group=`)**: services run as `root` by default; `:user=` drops to an unprivileged user from `/etc/passwd`. `:group=` is optional and must be paired with `:user=` (group-only is rejected fail-closed). Supplementary groups are dropped (`setgroups`). Lookup errors fail closed.
+- **`sane-ctl` Daemon Control**: unified CLI tool to `start`, `stop`, `restart`, and `status` daemons over `/run/initctl` FIFO with state tracking in `/run/ninit-*.state` and stop grace timeout escalation.
 - **S.A.N.E Package Manager (`spm`)**: POSIX `/bin/sh` package manager supporting atomic `rename(2)` staging, binary active replacement (anti-`ETXTBSY`), reverse dependency protection, archive hardening, and power-cut journal recovery.
 - **Live Installer & Dual Boot**: guest offline live installer (`sane-install.sh`) supporting dual Limine BIOS (MBR/GPT) and UEFI (ESP FAT32) with GPT `PARTUUID` root partition resolution.
 - **Static Binary**: builds cleanly with `gcc -static`, requiring only libc.
@@ -64,22 +64,38 @@ Requires `build-essential` and (for testing) `busybox-static`:
 sudo apt-get install build-essential busybox-static python3
 
 make          # Build static binary ./ninit
-make lint     # Run pattern linter and format string verifier
-make test     # Smoke test + SIGTERM + config + QEMU harness fixture (requires root/sudo for namespaces)
+make lint     # Pattern/format linters + ShellCheck gate on 11 production scripts
+make test     # 12 suites: 7 root-required + 5 unprivileged (root/sudo for namespaces)
 make rootfs   # Build minimal distro rootfs + initramfs (static BusyBox, ninit as PID 1)
 make qemu     # Boot rootfs in QEMU with serial console (requires qemu-system-x86)
 make clean    # Remove build artifacts
 ```
 
-`make test` executes six automated test suites. The first five set up a temporary rootfs (using BusyBox as `/bin/sh`) and run `ninit` as PID 1 in isolated PID and mount namespaces:
+`make test` runs all **12** suites from `TEST_SCRIPTS` with `./ninit-test`
+(`-DNINIT_TESTING` per-run cgroup isolation): **7 require root/sudo** because
+they launch PID 1 in isolated namespaces and exercise cgroups, and **5 run
+unprivileged** against temporary roots. The separate QEMU integration boot
+(`make integration`) and lifecycle/image suites are not part of `make test`.
+
+Root-required (7):
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — Startup banner, event loop readiness (`main loop ready`), service startup, `graceful shutdown`, zero respawns after shutdown, and shutdown latency < 5000 ms.
 - **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — Verifies that `SIGTERM` actually reaches service processes (trap executes, `exit status=0x0` rather than `0x9`, clean child signal mask, shutdown completes before the 5-second grace window expires).
 - **[`scripts/test-config.sh`](scripts/test-config.sh)** — Topological sort of `:requires=` (diamond dependencies `a→b,c ; b→c` and dense configurations up to 64 services without stack overflow), unreadable config / missing dependencies / cycle detection triggering `FATAL` + rescue shell (signal mask cleared so Ctrl+C works), and line-by-line `/run/initctl` reading (`poweroff\nreboot` executes only `poweroff`).
-- **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — Validates the test harness itself: console logs with crashed or respawning console services are strictly flagged as FAIL. Runs against log fixtures via `REPORT_ONLY=1` without requiring root or QEMU.
 - **[`scripts/test-spawn-failure.sh`](scripts/test-spawn-failure.sh)** — Spawn failure paths: dependency cancellation propagation on respawn paths, fork EAGAIN retry limits on `once` services, and process group liveness probing before the final SIGKILL.
 - **[`scripts/test-cgroup-limits.sh`](scripts/test-cgroup-limits.sh)** — Cgroup v2 resource limits: memory limits & deterministic OOM (`memory_max`), process limits (`pids_max`), orphan cleanup on respawn (`cgroup.kill`), and cgroup leaf lifecycle verification.
-- **[`scripts/test-integration.sh`](scripts/test-integration.sh)** — Cross-layer integration with a real QEMU boot: verifies `/etc/fstab` mounts (data options, octal escapes, duplicate mountpoints) visible from `/proc/mounts`, all mounts completed before services start, and full boot verification (`make integration`).
+- **[`scripts/test-respawn-cleanup.sh`](scripts/test-respawn-cleanup.sh)** — Respawn cleanup and grandchild containment: orphaned process trees are killed with their cgroup leaf on respawn; generation counters reset cleanly (T12).
+- **[`scripts/test-state-machine.sh`](scripts/test-state-machine.sh)** — Formal state-machine transitions and telemetry across boot, stop, respawn and shutdown (T10/T11/T13).
+
+Unprivileged (5):
+
+- **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — Validates the test harness itself: console logs with crashed or respawning console services are strictly flagged as FAIL. Runs against log fixtures via `REPORT_ONLY=1` without requiring root or QEMU.
+- **[`scripts/test-accounts.sh`](scripts/test-accounts.sh)** — Phase A account lifecycle and policy: `sane-accounts`, merge-based recovery, `doas` vocabulary and first-free UID allocation; runs against a temporary target root.
+- **[`scripts/test-network.sh`](scripts/test-network.sh)** — Phase B networking: `sane-net`, DNS/DHCP, Wi-Fi and outbound TLS helpers.
+- **[`scripts/test-network-fault.sh`](scripts/test-network-fault.sh)** — Network fault injection and recovery paths for the reconnect/TLS stack.
+- **[`scripts/test-reliability.sh`](scripts/test-reliability.sh)** — Phase C: snapshots, verified rollback, staged upgrades, crash-window recovery, backup and restore.
+
+Separately, **[`scripts/test-integration.sh`](scripts/test-integration.sh)** performs the cross-layer `fstab` ↔ kernel ↔ services check in one real QEMU boot (`make integration`), and `make test-lifecycle` drives the seven QEMU account-lifecycle scenarios.
 
 Detailed outputs and test explanations are available in [doc/build-and-test.md](doc/build-and-test.md).
 

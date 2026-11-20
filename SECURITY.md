@@ -52,7 +52,7 @@ This is an independent open-source project without a formal SLA. Reports are typ
 
 ## Threat Model & Operational Security Notes
 
-- `ninit` runs as PID 1 with UID 0 and **without** privilege dropping. Every service command in `/etc/init.conf` is executed as `root` via `/bin/sh -c` — service configurations are treated as *trusted input*.
+- `ninit` itself runs as PID 1 with UID 0. Service commands in `/etc/init.conf` run as **root by default**; `:user=` (plus an optional, paired `:group=`) drops a service to an unprivileged user, and group-only configurations are rejected fail-closed. Supplementary groups are dropped via `setgroups()`. `/etc/init.conf` remains trusted, root-authored input — privilege drop is an opt-in hardening measure, not a sandbox.
 - `/run` is mounted as `tmpfs` and the control FIFO is created with `0600` permissions owned by root; only root processes may dispatch commands to `/run/initctl`.
 - Service output is read from `/run/log.fifo` non-blockingly; runaway services cannot stall init by filling the FIFO buffer.
 - **Cgroup v2 provides resource containment, not a process isolation sandbox.**

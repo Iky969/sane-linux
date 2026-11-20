@@ -17,19 +17,66 @@ make            # -> ./ninit (gcc -static -O2 -Wall)
 - On distributions without static glibc (e.g. Alpine): `make CC=musl-gcc`.
 - `make clean` removes `./ninit`. Build artifacts are ignored by `.gitignore`.
 
+## Building the Distro Rootfs
+
+Root build leaves the rootfs root-owned so doas stays 4755 and identity files stay root-owned; only the initramfs.cpio.gz and vmlinuz* output artifacts are handed back to SUDO_USER. Non-root builds finish with an explicit ownership warning (rootfs files stay builder-owned, setuid doas is not effective) and are not deployable until rebuilt as root; clean-distro management of distro/ may need sudo.
+
 ## Automated Test Suites
 
 ```bash
-make lint                              # Run Python pattern linter & format string verifier
-make test                              # Runs the primary test suites (suite 7 requires QEMU: make integration)
-sudo sh ./scripts/smoke-test.sh        # 1) PID 1 smoke test
-sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM propagation to services
-sudo sh ./scripts/test-config.sh       # 3) Dependency sort + rescue mode + initctl
-sh ./scripts/test-qemu-report.sh       # 4) run-qemu.sh harness fixture validation (no root required)
-sudo sh ./scripts/test-spawn-failure.sh # 5) Spawn failure paths (fork EAGAIN + respawn dependency cancellation)
-sudo sh ./scripts/test-cgroup-limits.sh # 6) Cgroup v2 limits, validation & orphan lifecycle
-sudo sh ./scripts/test-integration.sh  # 7) Cross-layer integration via real QEMU boot (make integration)
+make lint                              # Python pattern/format linters + ShellCheck gate (11 production scripts)
+make lint-shell                        # ShellCheck gate alone (fail-closed on any warning)
+make test                              # 12 suites from TEST_SCRIPTS: 7 root-required + 5 unprivileged
+sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh        # 1) PID 1 smoke test (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-sigterm.sh      # 2) SIGTERM propagation to services (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-config.sh       # 3) Dependency sort + rescue mode + initctl (root)
+sh ./scripts/test-qemu-report.sh                            # 4) run-qemu.sh harness fixture validation (no root)
+sudo -E BIN=./ninit-test sh ./scripts/test-spawn-failure.sh # 5) Spawn failure paths (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-cgroup-limits.sh # 6) Cgroup v2 limits & orphan lifecycle (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-respawn-cleanup.sh # 7) Respawn cleanup & grandchild containment (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-state-machine.sh  # 8) State machine & telemetry (root)
+sh ./scripts/test-accounts.sh                               # 9) Account lifecycle & policy (no root)
+sh ./scripts/test-network.sh                                # 10) Networking: sane-net, DNS/DHCP, TLS (no root)
+sh ./scripts/test-network-fault.sh                          # 11) Network fault injection & recovery (no root)
+sh ./scripts/test-reliability.sh                            # 12) Snapshots, rollback, upgrades, recovery (no root)
+# Separate, not part of make test:
+make integration                       # real QEMU boot: fstab <-> kernel <-> services
+make test-lifecycle                    # seven QEMU account-lifecycle scenarios
 ```
+
+ShellCheck gate details: `make lint-shell` runs
+`shellcheck -S warning -e SC3043,SC3013` over exactly the 11 production shell
+scripts (`build-package.sh`, `build-rootfs.sh`, `make-image.sh`,
+`provision-accounts.sh`, `run-qemu.sh`, `sane-account-recovery`, `sane-accounts`,
+`sane-firstboot`, `sane-install.sh`, `sane-reliability`, `spm`). Test, smoke,
+fuzz helpers and Python files are intentionally excluded. `SC3043` (`local`)
+and `SC3013` (`-ef`) are documented exclusions: undefined in strict POSIX but
+supported by all target shells (dash, ash, BusyBox sh). Info/style severities
+are not gated; any warning fails the build.
+
+### Measured suite counts (final pass)
+
+Measured at branch head with `export PATH=/usr/sbin:/sbin:$PATH`. Privileged
+suites use `sudo -n -E` and the strict `ninit-test` binary; the two package
+suites run from a fresh scratch copy because `test-build-package.sh` rebuilds
+BusyBox inputs (never run it in the shared checkout).
+
+| Suite | Invocation | Measured result |
+|---|---|---|
+| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 237 passed, 0 failed |
+| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 239 passed, 0 failed |
+| Reliability | `sh scripts/test-reliability.sh` | 418 passed, 0 failed |
+| SPM | `bash scripts/test-spm.sh` | 36 passed, 0 failed |
+| Build package | `bash scripts/test-build-package.sh` (scratch) | 13 passed, 0 failed |
+| Build rootfs | `sh scripts/test-build-rootfs.sh` (scratch) | 25 passed, 0 failed |
+| Config / initctl | `sudo -n -E BIN=./ninit-test sh scripts/test-config.sh` | 159 `[ OK ]`, 0 `[ FAIL ]` |
+| QEMU report harness | `sh scripts/test-qemu-report.sh` | 21 `[ OK ]`, RESULT: PASS |
+| Networking | `sh scripts/test-network.sh` | 60 passed, 0 failed |
+| Network faults | `sh scripts/test-network-fault.sh` | 137 passed, 0 failed |
+
+The remaining root-required suites print their own pass/fail counts; CI runs
+the full 12-suite battery. Counts are re-measured at the final verification
+pass rather than copied from older documentation.
 
 ### 1. PID 1 Smoke Test (`scripts/smoke-test.sh`)
 
@@ -216,10 +263,12 @@ Full init logs are recorded in `/tmp/myrootfs/var/log/ninit.log`.
 
 ## CI Workflow (`.github/workflows/ci.yml`)
 
-Runs on `ubuntu-latest` with SHA-pinned actions across three jobs:
+Runs on `ubuntu-latest` with SHA-pinned actions across five jobs:
 - `security-scan`: Scans git history for secret leaks using Gitleaks (`gitleaks-action`).
-- `build-and-smoke-test`: Installs dependencies (`build-essential`, `busybox-static`, `python3`) → `make` → verifies static binary via `readelf` (asserts no `INTERP`) → `make lint` → runs test suites (`smoke-test.sh`, `test-sigterm.sh`, `test-config.sh`, `test-qemu-report.sh`, `test-spawn-failure.sh`, `test-cgroup-limits.sh`) → rebuilds under `CFLAGS="-static -O2 -Wall -Werror"`.
-- `rootfs-distro`: Validates distro builder and QEMU boot paths: installs dependencies → `sudo sh ./scripts/build-rootfs.sh` → boots QEMU (`sudo SECS=20 sh ./scripts/run-qemu.sh`) → runs cross-layer integration boot (`sudo SECS=40 sh ./scripts/test-integration.sh`).
+- `build-and-smoke-test`: Installs dependencies (`build-essential`, `busybox-static`, `python3`, `shellcheck`, …) → `make` → verifies static binary via `readelf` (asserts no `INTERP`) → `make lint` (pattern/format + `lint-shell`) and a dedicated `make lint-shell` step → runs all 12 `make test` suites (7 privileged via `sudo -E BIN=./ninit-test`, 5 unprivileged: qemu-report, accounts, network, network-fault, reliability) → fuzz harness → rebuilds under `CFLAGS="-static -O2 -Wall -Werror -fstack-protector-strong"`.
+- `rootfs-distro`: Validates distro builder and QEMU boot paths: installs dependencies → `sudo sh ./scripts/build-rootfs.sh` → boots QEMU (`sudo SECS=20 sh ./scripts/run-qemu.sh`) → runs cross-layer integration boot (`sudo SECS=40 sh ./scripts/test-integration.sh`) → panic-path regression.
+- `boot-lifecycle`: Builds the disk image and runs the seven QEMU account-lifecycle scenarios (`make test-lifecycle`).
+- `clawrza-packages`: Builds the three self-hosting recipe packages and installs them with `spm` into a temporary root, verifying payload checksums.
 
 ## Troubleshooting
 

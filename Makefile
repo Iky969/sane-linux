@@ -16,7 +16,9 @@
 #   make test-lifecycle  boot/account lifecycle scenarios in QEMU (requires
 #                   root, QEMU, losetup and a built disk image)
 #   make fuzz       ASan+UBSan fuzz harness for config/fstab/initctl parsers
-#   make lint       run python linter on log patterns, markers, and format specifiers
+#   make lint       run pattern/format linters + ShellCheck production-script gate
+#                   (SC3043 local and SC3013 -ef are documented exclusions;
+#                    info/style severities are not gated)
 #   make packages   build all base S.A.N.E distro packages (.spm.tar.xz)
 #   make test-pkg   run package builder test suite
 #   make clean      remove built binary
@@ -95,6 +97,19 @@ clean-distro:
 lint:
 	python3 ./scripts/lint-log-patterns.py
 	python3 ./scripts/verify-format-strings.py
+	$(MAKE) lint-shell
+
+# Real, failing gate over the 11 production shell scripts. Test, smoke, fuzz
+# and Python helpers are intentionally NOT included. -S warning gates warnings
+# only (info/style are not gated). SC3043 (local) and SC3013 (-ef) are excluded
+# because they are undefined in strict POSIX sh yet supported by every target
+# shell: dash, ash and BusyBox sh. Any other warning must fail the build.
+lint-shell:
+	shellcheck -S warning -e SC3043,SC3013 \
+		scripts/build-package.sh scripts/build-rootfs.sh scripts/make-image.sh \
+		scripts/provision-accounts.sh scripts/run-qemu.sh scripts/sane-account-recovery \
+		scripts/sane-accounts scripts/sane-firstboot scripts/sane-install.sh \
+		scripts/sane-reliability scripts/spm
 
 packages: $(BIN)
 	bash ./packages/build-all.sh
@@ -143,4 +158,4 @@ test-lifecycle:
 test-installer installer-test: packages
 	sudo bash ./scripts/test-installer.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-network-fault test-build-rootfs test-reliability
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint lint-shell packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-network-fault test-build-rootfs test-reliability
