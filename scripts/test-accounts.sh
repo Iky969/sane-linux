@@ -214,6 +214,40 @@ printf 'permit persist :wheel # nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate ignores nopass in an inline comment" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
+# Effective-rule scan (r1B-498): whole-file cases, no extra base rule.
+# A valid doas rule may carry options the old fixed regex cannot parse
+# (setenv braces); :wheel must be the identity, i.e. appear BEFORE the
+# first 'cmd'/'as' terminator, not as a command argument.
+base
+printf 'permit setenv { PATH } :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts setenv-brace rule for :wheel (whole file)" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel as root\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts :wheel before the as terminator (whole file)" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit root cmd /bin/foo :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects :wheel as a cmd argument (whole file)" \
+	"no effective permit rule" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'deny :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects deny-only policy (whole file)" \
+	"no effective permit rule" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf '# permit :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate does not count a commented permit rule (whole file)" \
+	"no effective permit rule" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { PATH } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "nopass gate still wins over effective-rule scan (whole file)" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
 base
 chmod 0755 "$T/usr/bin/doas"
 expect_fail "validate rejects non-setuid doas binary" sh "$ACCOUNTS" --root "$T" $VFLAGS validate

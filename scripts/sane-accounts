@@ -501,7 +501,19 @@ cmd_validate() {
 	} END {exit !bad}' "$DOAS_CONF"; then
 		audit_fail "doas.conf grants 'nopass' (passwordless escalation)"
 	fi
-	if ! grep -qE '^[[:space:]]*permit([[:space:]]+[a-z]+)*[[:space:]]+:wheel([[:space:]]|$)' "$DOAS_CONF"; then
+	# Effective-rule token scan: ONE permit rule with :wheel as the
+	# identity suffices for the whole file. The scan stops BEFORE the
+	# first 'cmd' or 'as' token, so a :wheel that is only a command
+	# argument does not count. Boundary (documented, not a bug): the
+	# terminators are case-sensitive lowercase; a lowercase env var named
+	# "as" or "cmd" inside setenv { } is a pathological case that ends the
+	# scan early (e.g. "permit setenv { as } :wheel" is rejected).
+	if ! awk '{sub(/#.*/, "")} $1 == "permit" {
+		for (i = 2; i <= NF; i++) {
+			if ($i == "cmd" || $i == "as") break
+			if ($i == ":wheel") found = 1
+		}
+	} END {exit !found}' "$DOAS_CONF"; then
 		audit_fail "doas.conf has no effective permit rule for :wheel"
 	fi
 	if [ -e "$ROOT/usr/bin/doas" ]; then
