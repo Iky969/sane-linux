@@ -2,11 +2,14 @@
 """
 scripts/lint-log-patterns.py: Lint test log patterns and ninit.c strings.
 
-Ensures:
+Enforces:
 1. Zero Indonesian words in ninit.c init_log and enter_rescue_mode strings.
-2. Zero leftover Indonesian words in scripts/*.sh assertions (check_in, absent_in, check, check_absent).
-3. Positive test assertions match valid substrings in ninit.c.
-4. Negative assertions (absent_in / check_absent) do NOT search for dead untranslated patterns (preventing false greens).
+2. Zero Indonesian words in scripts/*.sh assertion patterns (check_in,
+   absent_in, check, check_absent, wait_for).
+3. Zero legacy Indonesian result markers in non-comment lines of scripts/*.sh.
+
+Assertion patterns are not cross-checked against ninit.c strings; that
+contract is not implemented by this linter.
 """
 
 import sys

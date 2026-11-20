@@ -1318,6 +1318,127 @@ else
 	bad "udhcpc default.script failed"
 fi
 
+# ------------------------------------------------------------- scenario 18
+printf '\n== 18. CRLF init.conf line ending (X4) ==\n'
+start_root crlfconf
+LOG21="$LOG"
+# A trailing CR must be stripped with the newline; otherwise it becomes part
+# of the redirect target and the marker lands in a CR-suffixed file.
+printf 'crlfserv:once:/bin/sh -c "echo CRLF_RAN > /var/crlf.marker"\r\n' \
+	> "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop ready'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit did not reach the main loop on the CRLF init.conf scenario"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "CRLF service starts" 'ninit: started crlfserv (pid'
+if [ -f "$ROOT/var/crlf.marker" ] && grep -q '^CRLF_RAN$' "$ROOT/var/crlf.marker"; then
+	ok "CRLF service wrote its marker to the exact (CR-free) path"
+else
+	bad "CRLF service marker missing at the exact path (CR leaked into the command)"
+fi
+check_absent "CRLF service did not exit 127" 'exit status=0x7f'
+started_crlf=$(grep -c 'ninit: started crlfserv (pid' "$LOG" || true)
+if [ "$started_crlf" -eq 1 ]; then ok "CRLF once service started exactly once (no crash loop)"; else bad "CRLF once service started $started_crlf times"; fi
+
+# ------------------------------------------------------------- scenario 19
+printf '\n== 19. CRLF fstab line ending (X4) ==\n'
+start_root crlffstab
+LOG22="$LOG"
+mkdir -p "$ROOT/mnt"
+# A true CRLF line ending: with the four-field form the CR sits in the
+# options field, so pre-fix parses "size=1M\r" as mount data and fails;
+# post-fix strips it with the newline and mounts normally.
+printf 'tmpfs /mnt/crlf tmpfs size=1M\r\n' > "$ROOT/etc/fstab"
+printf 'crlfdump:once:cat /proc/mounts > /var/crlf.mounts\n' > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'main loop ready'; then
+	sed 's/^/  | /' "$LOG"
+	fail "ninit did not reach the main loop on the CRLF fstab scenario"
+fi
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "CRLF fstab entry mounted at the exact path" 'mount tmpfs -> /mnt/crlf (tmpfs) \[data: size=1M\] ok'
+if [ -f "$ROOT/var/crlf.mounts" ] && grep -q ' /mnt/crlf ' "$ROOT/var/crlf.mounts"; then
+	ok "guest /proc/mounts shows the exact CR-free mountpoint"
+else
+	bad "guest /proc/mounts missing the exact CR-free mountpoint"
+fi
+check_absent "CRLF fstab entry caused no mount failure" 'fstab: mount .* failed'
+
+# ------------------------------------------------------------- scenario 20
+printf '\n== 20. unknown mode rejected fail-closed (F3) ==\n'
+start_root badmode
+LOG23="$LOG"
+cat > "$ROOT/etc/init.conf" <<'EOCFG'
+typo:respawne:echo MODE_RAN > /var/mode.marker
+dependent:once:echo DEP_RAN > /var/dep.marker:requires=typo
+EOCFG
+
+run_init
+wait_for 'main loop ready' || wait_for 'rescue mode' || true
+# Pre-fix starts the dependent only after the typo service exits; give its
+# marker a bounded window so the negative assertion is not timing-dependent.
+i=0
+while [ "$i" -lt 30 ] && [ ! -f "$ROOT/var/dep.marker" ] && ! grep -q 'rescue mode' "$LOG"; do
+	sleep 0.1
+	i=$((i + 1))
+done
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "unknown mode parse err with rejection reason" "Parse err: unknown mode 'respawne' for 'typo', entry rejected"
+check_absent "rejected typo service never started" 'ninit: started typo'
+check "dependent follows the missing-dependency path" "FATAL: Dependency 'typo' for 'dependent' not found"
+if [ -f "$ROOT/var/mode.marker" ]; then bad "unknown-mode service ran anyway"; else ok "unknown-mode service never ran"; fi
+if [ -f "$ROOT/var/dep.marker" ]; then bad "dependent of a rejected service ran"; else ok "dependent of a rejected service never ran"; fi
+
+# ------------------------------------------------------------- scenario 21
+printf '\n== 21. group-only option rejected; paired user+group still works (X7) ==\n'
+start_root grouponly
+LOG24="$LOG"
+cp "$BUSYBOX" "$ROOT/bin/id"
+chmod 0777 "$ROOT/var"
+cat > "$ROOT/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+EOF
+cat > "$ROOT/etc/group" <<'EOF'
+root:x:0:
+nogroup:x:65534:
+EOF
+cat > "$ROOT/etc/init.conf" <<'EOF'
+grponly:once:/bin/sh -c "echo GROUPONLY_RAN > /var/grponly.marker":group=nogroup
+paired:once:/bin/sh -c "/bin/id -u > /var/paired.uid && /bin/id -g > /var/paired.gid":user=nobody:group=nogroup
+stopper:once:/bin/sh -c "/bin/sleep 1 && echo poweroff > /run/initctl":requires=paired
+EOF
+
+run_init
+wait_for 'graceful shutdown' || true
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "group-only parse err with rejection reason" "Parse err: group option on service 'grponly' requires user option, entry rejected"
+check_absent "group-only service never started (no uid 0 fail-open)" 'ninit: started grponly'
+if [ -f "$ROOT/var/grponly.marker" ]; then bad "group-only service ran as uid 0"; else ok "group-only service did not run"; fi
+check "paired user+group service still starts" 'ninit: started paired'
+if [ -f "$ROOT/var/paired.uid" ] && [ "$(cat "$ROOT/var/paired.uid")" = 65534 ] && \
+   [ -f "$ROOT/var/paired.gid" ] && [ "$(cat "$ROOT/var/paired.gid")" = 65534 ]; then
+	ok "paired user=nobody:group=nogroup still drops uid/gid to 65534"
+else
+	bad "paired user+group service failed privilege drop"
+fi
+
 # --------------------------------------------------------------- summary
 printf '\n== log 1a (dependency order) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -1360,6 +1481,14 @@ printf '\n== log 16 (sane-ctl) ==\n'
 sed 's/^/  | /' "$LOG19"
 printf '\n== log 17 (sane-net) ==\n'
 sed 's/^/  | /' "$LOG20"
+printf '\n== log 18 (CRLF init.conf) ==\n'
+sed 's/^/  | /' "$LOG21"
+printf '\n== log 19 (CRLF fstab) ==\n'
+sed 's/^/  | /' "$LOG22"
+printf '\n== log 20 (unknown mode) ==\n'
+sed 's/^/  | /' "$LOG23"
+printf '\n== log 21 (group-only rejection) ==\n'
+sed 's/^/  | /' "$LOG24"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nRESULT: PASS (all checks)\n'
