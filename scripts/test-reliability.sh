@@ -975,20 +975,21 @@ check "redundant aside removed" test ! -e \
 check "live tag untouched by the discard" test -d \
 	"$T/var/lib/sane/reliability/snapshots/golden2"
 
-# Read-only commands never heal and never take the lock.
+# Every command takes the lock (round 1 F5-lock): list heals the crash aside
+# exactly like a mutator, and releases the lock again on exit.
 base
 run init
 run snapshot golden3
 mv "$T/var/lib/sane/reliability/snapshots/golden3" \
 	"$T/var/lib/sane/reliability/snapshots/.old.golden3"
 expect_ok "list runs while a crash aside exists" run list
-check "list did not heal the aside (read-only)" test -d \
+check "list heals the aside (every command takes the lock)" test ! -d \
 	"$T/var/lib/sane/reliability/snapshots/.old.golden3"
-check "list did not restore the tag (read-only)" test ! -d \
+check "list restored the tag via heal" test -d \
 	"$T/var/lib/sane/reliability/snapshots/golden3"
-check "list created no lock" test ! -e "$T/var/lib/sane/reliability/lock"
-expect_ok "snapshot heals after read-only commands" run snapshot healtrigger
-check "mutator heal restored golden3" test -d \
+check "list leaves no lock after exit" test ! -e "$T/var/lib/sane/reliability/lock"
+expect_ok "snapshot still succeeds after list healed" run snapshot healtrigger
+check "mutator heal kept golden3 restored" test -d \
 	"$T/var/lib/sane/reliability/snapshots/golden3"
 
 # Addendum: nested mutator path (recover -> cmd_net_recover) must not
@@ -1200,6 +1201,423 @@ check "fresh leaf init reports the canonical path" sh -c \
 	"sh '$TOOL' -v --root '$T/ancestor-link/newroot' init | grep -q 'reliability state initialised in $T/real-ancestor/newroot/var/lib/sane/reliability'"
 expect_fail "relative --root still rejected" sh -c \
 	"sh '$TOOL' --root relative-dir init"
+
+# --- Round 1 X5: tag grammar rejects '.' and '..' ----------------------------
+# '.' and '..' always fail inside do_snapshot (the swap renames cannot move a
+# dot directory); reject them up front with the invalid-tag reason. '.hidden'
+# stays legal. Reason assertions matter: the pre-fix code also fails these
+# commands, but with the wrong error ('snapshot already exists').
+base
+run init
+if sh "$TOOL" --root "$T" snapshot . 2>"$T/dot.err"; then
+	fail "snapshot rejects the dot tag"
+else
+	pass "snapshot rejects the dot tag"
+fi
+check "dot tag rejection names the invalid-tag reason" \
+	grep -q 'invalid snapshot tag' "$T/dot.err"
+if sh "$TOOL" --root "$T" snapshot .. 2>"$T/dotdot.err"; then
+	fail "snapshot rejects the dot-dot tag"
+else
+	pass "snapshot rejects the dot-dot tag"
+fi
+check "dot-dot tag rejection names the invalid-tag reason" \
+	grep -q 'invalid snapshot tag' "$T/dotdot.err"
+if sh "$TOOL" --root "$T" snapshot . --force 2>"$T/dotforce.err"; then
+	fail "forced snapshot rejects the dot tag"
+else
+	pass "forced snapshot rejects the dot tag"
+fi
+check "forced dot rejection names the invalid-tag reason" \
+	grep -q 'invalid snapshot tag' "$T/dotforce.err"
+check "dot/dot-dot rejection left no staging residue" sh -c \
+	"! ls -d '$T/var/lib/sane/reliability/snapshots'/.tmp.* >/dev/null 2>&1 && ! ls -d '$T/var/lib/sane/reliability/snapshots'/.old.* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+expect_ok "hidden dotfile tag remains legal" run snapshot .hidden
+check "hidden tag snapshot created" test -d \
+	"$T/var/lib/sane/reliability/snapshots/.hidden"
+
+# --- Round 1 X10: list shows user dot-tags, hides only internal dot-dirs -----
+base
+run init
+run snapshot .hidden
+mkdir -p "$T/var/lib/sane/reliability/snapshots/.tmp.junk" \
+	"$T/var/lib/sane/reliability/snapshots/.old.junk"
+sh "$TOOL" --root "$T" list > "$T/list.out"
+check "list shows a user dot-tag snapshot" grep -q '^\.hidden' "$T/list.out"
+check "list hides internal .tmp staging dirs" sh -c \
+	"! grep -q '\.tmp' '$T/list.out'"
+check "list hides internal .old aside dirs" sh -c \
+	"! grep -q '\.old' '$T/list.out'"
+
+# --- Round 1 F1: one grammar for manifest writer and verifier ----------------
+# GNU sha256sum escapes backslash/newline names with a leading backslash;
+# valid_rel_path rejects backslash, so such a snapshot could never verify.
+# The writer must refuse the snapshot cleanly (no residue, state untouched).
+base
+run init
+printf 'backslash-name\n' > "$T/var/lib/spm/installed/demo/back\\slash"
+if sh "$TOOL" --root "$T" snapshot badbs 2>"$T/bs.err"; then
+	fail "snapshot rejects a backslash filename in the spm DB"
+else
+	pass "snapshot rejects a backslash filename in the spm DB"
+fi
+check "backslash rejection names the manifest grammar reason" \
+	grep -q 'manifest grammar' "$T/bs.err"
+check "backslash rejection left no snapshot residue" sh -c \
+	"test ! -e '$T/var/lib/sane/reliability/snapshots/badbs' && ! ls -d '$T/var/lib/sane/reliability/snapshots'/.tmp.* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+check "backslash rejection left the journal idle" \
+	grep -q '^state=idle$' "$T/var/lib/sane/reliability/journal"
+rm -f "$T/var/lib/spm/installed/demo/back\\slash"
+expect_ok "mutator still works after the rejected snapshot" run snapshot afterbs
+
+base
+run init
+nlname=$(printf 'new\nline')
+printf 'newline-name\n' > "$T/var/lib/spm/installed/demo/$nlname"
+if sh "$TOOL" --root "$T" snapshot badnl 2>"$T/nl.err"; then
+	fail "snapshot rejects a newline filename in the spm DB"
+else
+	pass "snapshot rejects a newline filename in the spm DB"
+fi
+check "newline rejection names the manifest grammar reason" \
+	grep -q 'manifest grammar' "$T/nl.err"
+check "newline rejection left no snapshot residue" sh -c \
+	"test ! -e '$T/var/lib/sane/reliability/snapshots/badnl' && ! ls -d '$T/var/lib/sane/reliability/snapshots'/.tmp.* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+
+# Legal-but-unusual names (spaces) must roundtrip snapshot -> verify -> rollback.
+base
+run init
+printf 'spaced-content\n' > "$T/var/lib/spm/installed/demo/has space.txt"
+expect_ok "spaced-name snapshot created" run snapshot spacedrt
+expect_ok "spaced-name snapshot verifies" run verify spacedrt
+printf 'mutated\n' > "$T/var/lib/spm/installed/demo/has space.txt"
+expect_ok "spaced-name rollback succeeds" run rollback spacedrt
+check "spaced-name rollback restored the content" \
+	grep -q '^spaced-content$' "$T/var/lib/spm/installed/demo/has space.txt"
+
+# --- Round 1 P2: snapshots preserve symlink type and target ------------------
+base
+run init
+printf 'real-host\n' > "$T/etc/hostname.real"
+ln -s hostname.real "$T/etc/hostname"
+ln -s version "$T/var/lib/spm/installed/demo/version.link"
+mkdir -p "$T/usr/bin"
+printf 'old-prog\n' > "$T/usr/bin/prog.real"
+ln -s prog.real "$T/usr/bin/prog"
+expect_ok "snapshot with symlinks succeeds" run snapshot sym
+check "snapshot records the symlinks metadata file" \
+	test -f "$T/var/lib/sane/reliability/snapshots/sym/symlinks"
+check "symlinks metadata records the etc state symlink" sh -c \
+	"grep -qx 'etc/hostname' '$T/var/lib/sane/reliability/snapshots/sym/symlinks' && grep -qx 'hostname.real' '$T/var/lib/sane/reliability/snapshots/sym/symlinks'"
+check "symlinks metadata records the spm DB symlink" sh -c \
+	"grep -qx 'var/lib/spm/installed/demo/version.link' '$T/var/lib/sane/reliability/snapshots/sym/symlinks'"
+check "snapshot did not dereference the etc symlink into a regular copy" \
+	test ! -e "$T/var/lib/sane/reliability/snapshots/sym/etc/hostname"
+expect_ok "verify accepts a snapshot with symlinks metadata" run verify sym
+# Upgrade replaces all three symlinks with regular files.
+mkdir -p "$T/payload/etc" "$T/payload/var/lib/spm/installed/demo" "$T/payload/usr/bin"
+printf 'new-host\n' > "$T/payload/etc/hostname"
+printf 'new-db-link\n' > "$T/payload/var/lib/spm/installed/demo/version.link"
+printf 'new-prog\n' > "$T/payload/usr/bin/prog"
+(cd "$T/payload" && sha256sum etc/hostname var/lib/spm/installed/demo/version.link usr/bin/prog > manifest.sha256)
+expect_ok "upgrade replaces symlink targets with regular files" run upgrade "$T/payload"
+check "upgrade turned the etc symlink into a regular file" sh -c \
+	"test -f '$T/etc/hostname' && test ! -L '$T/etc/hostname'"
+# The pre-upgrade snapshot covers STATE_FILES, the spm DB and every payload
+# target (extra-list), so rolling it back must recreate all three symlinks.
+expect_ok "rollback restores the symlink state" run rollback "$(pre_upgrade_tag)"
+check "rollback recreated the etc symlink" test -L "$T/etc/hostname"
+check "rollback preserved the etc symlink target" \
+	test "$(readlink "$T/etc/hostname")" = hostname.real
+check "rollback restored the etc symlink target content" \
+	grep -q '^real-host$' "$T/etc/hostname"
+check "rollback recreated the spm DB symlink" test -L \
+	"$T/var/lib/spm/installed/demo/version.link"
+check "rollback preserved the spm DB symlink target" \
+	test "$(readlink "$T/var/lib/spm/installed/demo/version.link")" = version
+check "rollback recreated the payload-target symlink" test -L "$T/usr/bin/prog"
+check "rollback preserved the payload-target symlink target" \
+	test "$(readlink "$T/usr/bin/prog")" = prog.real
+check "rollback restored the payload symlink target content" \
+	grep -q '^old-prog$' "$T/usr/bin/prog"
+
+# A dangling state symlink is recorded and recreated verbatim.
+base
+run init
+ln -s absent-target "$T/etc/fstab"
+expect_ok "snapshot records a dangling state symlink" run snapshot dangling
+rm -f "$T/etc/fstab"
+printf 'regular-now\n' > "$T/etc/fstab"
+expect_ok "rollback over a replaced dangling symlink succeeds" run rollback dangling
+check "rollback recreated the dangling symlink" test -L "$T/etc/fstab"
+check "rollback preserved the dangling target" \
+	test "$(readlink "$T/etc/fstab")" = absent-target
+
+# An absolute target inside ROOT is preserved verbatim.
+base
+run init
+printf 'real-host\n' > "$T/etc/hostname.real"
+ln -s "$T/etc/hostname.real" "$T/etc/hostname"
+expect_ok "snapshot with an absolute internal symlink target" run snapshot absym
+rm -f "$T/etc/hostname"
+printf 'regular-now\n' > "$T/etc/hostname"
+expect_ok "rollback recreates the absolute internal symlink" run rollback absym
+check "absolute internal target preserved verbatim" \
+	test "$(readlink "$T/etc/hostname")" = "$T/etc/hostname.real"
+
+# Crafted symlinks metadata with an escaping target must be rejected
+# fail-closed (manifest regenerated so integrity passes and the target
+# check is the deciding gate).
+base
+run init
+run snapshot craftsym
+printf 'host-regular\n' > "$T/etc/hostname"
+printf 'etc/hostname\n/etc/passwd\n' \
+	> "$T/var/lib/sane/reliability/snapshots/craftsym/symlinks"
+(cd "$T/var/lib/sane/reliability/snapshots/craftsym" && \
+	find . -type f ! -name manifest.sha256 -print0 | \
+	LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
+if sh "$TOOL" --root "$T" rollback craftsym 2>"$T/craftabs.err"; then
+	fail "rollback rejects an absolute symlink target escaping root"
+else
+	pass "rollback rejects an absolute symlink target escaping root"
+fi
+check "absolute escaping target names the symlink target reason" \
+	grep -q 'symlink target escapes root' "$T/craftabs.err"
+check "absolute escaping target left the destination untouched" sh -c \
+	"test -f '$T/etc/hostname' && test ! -L '$T/etc/hostname' && grep -q '^host-regular$' '$T/etc/hostname'"
+
+base
+run init
+run snapshot craftrel
+printf 'host-regular\n' > "$T/etc/hostname"
+printf 'etc/hostname\n../../outside\n' \
+	> "$T/var/lib/sane/reliability/snapshots/craftrel/symlinks"
+(cd "$T/var/lib/sane/reliability/snapshots/craftrel" && \
+	find . -type f ! -name manifest.sha256 -print0 | \
+	LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
+if sh "$TOOL" --root "$T" rollback craftrel 2>"$T/craftrel.err"; then
+	fail "rollback rejects a relative symlink target escaping root"
+else
+	pass "rollback rejects a relative symlink target escaping root"
+fi
+check "relative escaping target names the symlink target reason" \
+	grep -q 'symlink target escapes root' "$T/craftrel.err"
+check "relative escaping target created no symlink" sh -c \
+	"test -f '$T/etc/hostname' && test ! -L '$T/etc/hostname' && grep -q '^host-regular$' '$T/etc/hostname'"
+
+# --- Round 1 F4: verify-at-use closes the payload TOCTOU window --------------
+# (a) The payload-swap fault hook mutates one payload file after the
+# pre-check; the apply loop must re-hash, abort and recover exactly.
+base
+run init
+printf 'pre-upgrade-bytes\n' > "$T/etc/init.conf"
+cp "$T/etc/init.conf" "$T/pre-upgrade.copy"
+mkdir -p "$T/payload/etc" "$T/payload/usr/bin"
+printf 'new-init\n' > "$T/payload/etc/init.conf"
+printf 'new-prog\n' > "$T/payload/usr/bin/prog"
+(cd "$T/payload" && sha256sum etc/init.conf usr/bin/prog > manifest.sha256)
+if env SANE_RELIABILITY_FAULT=payload-swap sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/swap.err"; then
+	fail "verify-at-use aborts an upgrade whose payload changed after pre-check"
+else
+	pass "verify-at-use aborts an upgrade whose payload changed after pre-check"
+fi
+check "payload-swap abort names the changed payload file" \
+	grep -q 'payload changed during upgrade' "$T/swap.err"
+check "payload-swap abort rolled back to exact pre-upgrade bytes" \
+	cmp -s "$T/etc/init.conf" "$T/pre-upgrade.copy"
+check "payload-swap abort left the journal recovered" \
+	grep -q '^state=recovered$' "$T/var/lib/sane/reliability/journal"
+check "payload-swap abort installed no payload file" test ! -e "$T/usr/bin/prog"
+check "payload-swap abort left no lock residue" sh -c \
+	"test ! -e '$T/var/lib/sane/reliability/lock' && ! ls -d '$T/var/lib/sane/reliability/lock.stale.'* >/dev/null 2>&1"
+check "payload-swap abort left no staging temp files" sh -c \
+	"! ls '$T/var/lib/sane/reliability/staging'/.upgrade* >/dev/null 2>&1 && ! ls '$T/etc/.sane-rel.'* '$T/usr/bin/.sane-rel.'* >/dev/null 2>&1"
+check "payload-swap hook really fired (not vacuous)" \
+	grep -q 'fault injection: payload-swap' "$T/swap.err"
+
+# (b) Any other fault value (or unset) is a complete no-op.
+base
+run init
+mkdir -p "$T/payload/etc"
+printf 'new-init\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+expect_ok "unrelated fault value is a no-op" \
+	env SANE_RELIABILITY_FAULT=other-fault sh "$TOOL" --root "$T" upgrade "$T/payload"
+check "no-op fault upgrade committed" grep -q '^new-init$' "$T/etc/init.conf"
+check "no-op fault upgrade journal done" \
+	grep -q '^state=done$' "$T/var/lib/sane/reliability/journal"
+expect_ok "unset fault env upgrades normally" run upgrade "$T/payload"
+
+# (c) Bad-hash payload: the pre-check keeps the legacy error contract and
+# writes nothing to the target.
+base
+run init
+mkdir -p "$T/payload/etc"
+printf 'new-init\n' > "$T/payload/etc/init.conf"
+printf '%s  ./etc/init.conf\n' \
+	"0000000000000000000000000000000000000000000000000000000000000000" \
+	> "$T/payload/manifest.sha256"
+if sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/badhash.err"; then
+	fail "bad-hash payload rejected at pre-check"
+else
+	pass "bad-hash payload rejected at pre-check"
+fi
+check "bad-hash rejection keeps the legacy error contract" \
+	grep -q 'payload integrity check failed' "$T/badhash.err"
+check "bad-hash rejection wrote nothing to the target" sh -c \
+	"grep -q '^network:once:/bin/true$' '$T/etc/init.conf' && grep -q '^state=idle$' '$T/var/lib/sane/reliability/journal' && ! ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-upgrade-* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+
+# (d) Manifest swap after the pre-check cannot redirect the upgrade: every
+# consumer reads the one staged copy. The sha256sum shim swaps the payload
+# manifest right after the first -c invocation (the pre-check).
+base
+run init
+mkdir -p "$T/payload/etc" "$T/evil" "$T/bin"
+printf 'legit-new\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+printf 'evil-new\n' > "$T/evil/evil.conf"
+REAL_SHA=$(command -v sha256sum)
+cat > "$T/bin/sha256sum" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = -c ] && [ ! -f "$T/manifest-swap.done" ]; then
+	"$REAL_SHA" "\$@"
+	rc=\$?
+	printf '%s  ./evil.conf\n' "\$("$REAL_SHA" "$T/evil/evil.conf" | cut -d' ' -f1)" > "$T/payload/manifest.sha256"
+	cp "$T/evil/evil.conf" "$T/payload/evil.conf"
+	: > "$T/manifest-swap.done"
+	exit \$rc
+fi
+exec "$REAL_SHA" "\$@"
+EOF
+chmod 0755 "$T/bin/sha256sum"
+expect_ok "manifest swap after pre-check cannot redirect the upgrade" \
+	env PATH="$T/bin:$PATH" sh "$TOOL" --root "$T" upgrade "$T/payload"
+check "manifest swap actually fired (not vacuous)" test -f "$T/manifest-swap.done"
+check "staged manifest installed the original payload file" \
+	grep -q '^legit-new$' "$T/etc/init.conf"
+check "swapped-in evil file was never installed" test ! -e "$T/evil.conf"
+
+# --- Round 1 F5-lock: every command serializes on the state lock -------------
+base
+run init
+run snapshot lockbase
+mkdir -p "$T/var/lib/sane/reliability/lock"
+sleep 300 &
+RL_HOLDER=$!
+printf '%s\n' "$RL_HOLDER" > "$T/var/lib/sane/reliability/lock/pid"
+contended_read_case() {
+	crc_desc=$1; shift
+	if env SANE_RELIABILITY_LOCK_TIMEOUT=1 sh "$TOOL" --root "$T" "$@" 2>"$T/readlock.err"; then
+		fail "contended $crc_desc fails closed on the state lock"
+	else
+		pass "contended $crc_desc fails closed on the state lock"
+	fi
+	check "contended $crc_desc names the lock timeout" \
+		grep -q 'timed out waiting for reliability lock' "$T/readlock.err"
+}
+contended_read_case "init" init
+contended_read_case "list" list
+contended_read_case "verify" verify lockbase
+contended_read_case "log" log INFO contended-message
+check "contended log wrote no log entry" sh -c \
+	"! grep -q 'contended-message' '$T/var/log/sane/reliability.log'"
+check "live holder lock untouched by read commands" \
+	grep -qx "$RL_HOLDER" "$T/var/lib/sane/reliability/lock/pid"
+kill "$RL_HOLDER" 2>/dev/null
+wait "$RL_HOLDER" 2>/dev/null
+rm -rf -- "$T/var/lib/sane/reliability/lock"
+expect_ok "list succeeds once the lock is released" run list
+expect_ok "log succeeds once the lock is released" run log INFO after-release
+
+# Auto-init behavior of list/verify/log is unchanged.
+base
+expect_ok "list still auto-inits a fresh root" run list
+check "list auto-init created the state" test -d \
+	"$T/var/lib/sane/reliability/snapshots"
+expect_ok "log still auto-inits a fresh root" run log INFO hello
+base
+expect_fail "verify on a fresh root rejects the unknown tag" run verify missing
+check "verify auto-init created the state" test -d \
+	"$T/var/lib/sane/reliability/snapshots"
+
+# --- Round 1 F5-backup: lock state never travels through backup/restore ------
+# (a) The tool's own backup excludes the lock; restore leaves no residue and
+# the next mutator acquires the lock immediately.
+base
+run init
+run snapshot keeplock
+run backup "$T/lockbackup.tar.gz"
+check "backup archive contains no lock entries" sh -c \
+	"! tar -tzf '$T/lockbackup.tar.gz' | grep -q 'var/lib/sane/reliability/lock'"
+T2=$(mktemp -d)
+mkdir -p "$T2/etc"
+expect_ok "restore of a lock-free archive succeeds" sh -c \
+	"sh '$TOOL' --root '$T2' restore '$T/lockbackup.tar.gz'"
+check "restore left no lock residue" sh -c \
+	"test ! -e '$T2/var/lib/sane/reliability/lock' && ! ls -d '$T2/var/lib/sane/reliability/lock.stale.'* >/dev/null 2>&1"
+expect_ok "next mutator acquires the lock immediately after restore" \
+	env SANE_RELIABILITY_LOCK_TIMEOUT=1 sh "$TOOL" --root "$T2" snapshot nextlock
+check "post-restore snapshot created" test -d \
+	"$T2/var/lib/sane/reliability/snapshots/nextlock"
+rm -rf -- "$T2"
+
+# (b) An old/crafted archive carrying lock/pid with a LIVE pid (plus a
+# lock.stale.* residue) is accepted, but its lock entries are stripped:
+# the next mutator must not wait on the archived pid.
+base
+run init
+run snapshot craftlock
+run backup "$T/craftbase.tar.gz"
+mkdir -p "$T/craft"
+tar -xzf "$T/craftbase.tar.gz" -C "$T/craft"
+sleep 300 &
+CRAFT_HOLDER=$!
+mkdir -p "$T/craft/var/lib/sane/reliability/lock" \
+	"$T/craft/var/lib/sane/reliability/lock.stale.4242"
+printf '%s\n' "$CRAFT_HOLDER" > "$T/craft/var/lib/sane/reliability/lock/pid"
+printf '%s\n' "$CRAFT_HOLDER" > "$T/craft/var/lib/sane/reliability/lock.stale.4242/pid"
+tar -czf "$T/crafted-lock.tar.gz" -C "$T/craft" var
+T2=$(mktemp -d)
+mkdir -p "$T2/etc"
+expect_ok "restore accepts an old archive carrying lock entries" sh -c \
+	"sh '$TOOL' --root '$T2' restore '$T/crafted-lock.tar.gz'"
+check "restore stripped the archived live-pid lock and stale residue" sh -c \
+	"test ! -e '$T2/var/lib/sane/reliability/lock' && ! ls -d '$T2/var/lib/sane/reliability/lock.stale.'* >/dev/null 2>&1"
+CL_START=$(date +%s)
+expect_ok "mutator after crafted restore does not wait on the archived pid" \
+	env SANE_RELIABILITY_LOCK_TIMEOUT=1 sh "$TOOL" --root "$T2" snapshot aftercraft
+CL_END=$(date +%s)
+check "post-crafted-restore lock acquisition is immediate" \
+	test $((CL_END - CL_START)) -le 1
+check "crafted restore brought the snapshot itself" test -d \
+	"$T2/var/lib/sane/reliability/snapshots/craftlock"
+kill "$CRAFT_HOLDER" 2>/dev/null
+wait "$CRAFT_HOLDER" 2>/dev/null
+rm -rf -- "$T2"
+
+# (c) Contention: restore cannot break through a live lock (existing
+# mutator contract, pattern of the P2-3 contention case above).
+base
+run init
+run snapshot keepcont
+run backup "$T/contbackup.tar.gz"
+mkdir -p "$T/var/lib/sane/reliability/lock"
+sleep 300 &
+RC_HOLDER=$!
+printf '%s\n' "$RC_HOLDER" > "$T/var/lib/sane/reliability/lock/pid"
+if env SANE_RELIABILITY_LOCK_TIMEOUT=1 sh "$TOOL" --root "$T" restore "$T/contbackup.tar.gz" 2>"$T/restlock.err"; then
+	fail "restore cannot break a live lock"
+else
+	pass "restore cannot break a live lock"
+fi
+check "contended restore names the lock timeout" \
+	grep -q 'timed out waiting for reliability lock' "$T/restlock.err"
+check "contended restore left the live holder lock untouched" \
+	grep -qx "$RC_HOLDER" "$T/var/lib/sane/reliability/lock/pid"
+kill "$RC_HOLDER" 2>/dev/null
+wait "$RC_HOLDER" 2>/dev/null
+rm -rf -- "$T/var/lib/sane/reliability/lock"
 
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
