@@ -569,6 +569,80 @@ with tarfile.open(sys.argv[1], 'w:gz') as tf:
 PY
 expect_fail "restore rejects a traversal member in the archive" run restore "$T/traversal.tar.gz"
 
+# --- Restore hardening: journal trust + symlink chain containment -----------
+# (a) An archive captured mid-upgrade carries state=in-progress + snapshot=X.
+# Restore must force the journal to idle (state only) so the next recover
+# cannot roll the freshly restored state back to X.
+base
+run init
+run snapshot archx
+printf 'mutated-after-snapshot\n' > "$T/etc/init.conf"
+printf 'state=in-progress\nsnapshot=archx\n' > "$T/var/lib/sane/reliability/journal"
+run backup "$T/inprogress.tar.gz"
+T2=$(mktemp -d)
+mkdir -p "$T2/etc"
+printf 't2-original\n' > "$T2/etc/init.conf"
+expect_ok "restore forces an archived in-progress journal to idle" sh -c \
+	"sh '$TOOL' --root '$T2' restore '$T/inprogress.tar.gz'"
+check "restored journal is idle without snapshot tag or interface" sh -c \
+	"grep -q '^state=idle$' '$T2/var/lib/sane/reliability/journal' && ! grep -q '^snapshot=' '$T2/var/lib/sane/reliability/journal' && ! grep -q '^net-iface=' '$T2/var/lib/sane/reliability/journal'"
+check "restore brings the archived snapshot itself" test -d \
+	"$T2/var/lib/sane/reliability/snapshots/archx"
+expect_ok "recover after restore is a no-op" sh -c \
+	"sh '$TOOL' --root '$T2' recover"
+check "no-op recover leaves the target file untouched" \
+	grep -q '^t2-original$' "$T2/etc/init.conf"
+check "no-op recover keeps the journal idle" \
+	grep -q '^state=idle$' "$T2/var/lib/sane/reliability/journal"
+check "archived snapshot was never applied after restore" sh -c \
+	"! grep -q 'recovered from interrupted upgrade' '$T2/var/log/sane/reliability.log' && ! grep -q 'rollback to' '$T2/var/log/sane/reliability.log'"
+rm -rf -- "$T2"
+
+# (b) A relative symlink chain that escapes the staging root must be rejected
+# with a specific reason, and nothing may be installed over existing state.
+base
+run init
+run snapshot existing
+mkdir -p "$T/evil/var/lib/sane/reliability/snapshots" "$T/evil/var/log/sane"
+ln -s b "$T/evil/var/a"
+ln -s ../../outside "$T/evil/var/b"
+printf 'log\n' > "$T/evil/var/log/sane/reliability.log"
+tar -czf "$T/evil-chain.tar.gz" -C "$T/evil" var
+: > "$T/restore.err"
+find "$T" -mindepth 1 ! -name before.list ! -name after.list | LC_ALL=C sort > "$T/before.list"
+if sh "$TOOL" --root "$T" restore "$T/evil-chain.tar.gz" 2>"$T/restore.err"; then
+	fail "restore rejects an escaping relative symlink chain"
+else
+	pass "restore rejects an escaping relative symlink chain"
+fi
+check "escaping chain rejection names the symlink chain reason" \
+	grep -q 'unsafe symlink chain in archive' "$T/restore.err"
+find "$T" -mindepth 1 ! -name before.list ! -name after.list | LC_ALL=C sort > "$T/after.list"
+check "rejected chain restore installed nothing and kept existing state" \
+	cmp -s "$T/before.list" "$T/after.list"
+check "rejected chain restore left the journal idle" \
+	grep -q '^state=idle$' "$T/var/lib/sane/reliability/journal"
+
+# (c) An internal relative chain (including '..' that stays inside the staging
+# root after normalization) must be accepted and installed.
+base
+mkdir -p "$T/good/var/lib/sane/reliability/snapshots/sub" "$T/good/var/log/sane"
+ln -s sub/b "$T/good/var/lib/sane/reliability/snapshots/a"
+ln -s ../c "$T/good/var/lib/sane/reliability/snapshots/sub/b"
+printf 'internal-payload\n' > "$T/good/var/lib/sane/reliability/snapshots/c"
+printf 'log\n' > "$T/good/var/log/sane/reliability.log"
+tar -czf "$T/internal-chain.tar.gz" -C "$T/good" var
+T2=$(mktemp -d)
+expect_ok "restore accepts an internal relative symlink chain" sh -c \
+	"sh '$TOOL' --root '$T2' restore '$T/internal-chain.tar.gz'"
+check "internal chain symlinks installed with targets preserved" sh -c \
+	"test -L '$T2/var/lib/sane/reliability/snapshots/a' && test -L '$T2/var/lib/sane/reliability/snapshots/sub/b' && [ \"\$(readlink '$T2/var/lib/sane/reliability/snapshots/a')\" = sub/b ] && [ \"\$(readlink '$T2/var/lib/sane/reliability/snapshots/sub/b')\" = ../c ]"
+check "internal chain final file installed" \
+	grep -q '^internal-payload$' "$T2/var/lib/sane/reliability/snapshots/c"
+check "internal chain restore ends with an idle journal" \
+	grep -q '^state=idle$' "$T2/var/lib/sane/reliability/journal"
+rm -rf -- "$T2"
+
 # Force replacement must not destroy the old snapshot before the new one is in place.
 base
 run init

@@ -554,6 +554,30 @@ cmd_backup() {
 	note "backup written to $archive"
 }
 
+restore_link_safe() {
+	# restore_link_safe LINK -- fail closed if LINK's target is absolute or
+	# its resolved chain leaves the restore staging root (rt_tmp). Walks the
+	# chain with a bounded hop count like symlink_safe_rel; internal relative
+	# chains (including '..' that normalizes back inside rt_tmp) are allowed.
+	rls_cur=$1
+	rls_hops=0
+	while [ -L "$rls_cur" ]; do
+		rls_hops=$((rls_hops + 1))
+		[ "$rls_hops" -le 40 ] || return 1
+		rls_target=$(readlink "$rls_cur" 2>/dev/null) || return 1
+		case "$rls_target" in
+			/*) return 1 ;;
+			*) rls_cur="$(dirname "$rls_cur")/$rls_target" ;;
+		esac
+		rls_cur=$(normalize_path "$rls_cur") || return 1
+		case "$rls_cur/" in
+			"$rt_tmp/"*) ;;
+			*) return 1 ;;
+		esac
+	done
+	return 0
+}
+
 cmd_restore() {
 	[ "$#" -eq 1 ] || die "usage: restore ARCHIVE"
 	archive=$1
@@ -574,15 +598,15 @@ cmd_restore() {
 		{ rm -rf -- "$rt_tmp"; die "cannot extract archive"; }
 	[ -d "$rt_tmp/var/lib/sane/reliability/snapshots" ] || \
 		{ rm -rf -- "$rt_tmp"; die "archive has no reliability snapshots"; }
-	# Reject absolute or escaping symlinks before anything is installed.
+	# Reject absolute targets and symlink chains that leave the staging root
+	# before anything is installed. Each chain is walked with a bounded hop
+	# count (like symlink_safe_rel); internal relative chains, including '..'
+	# that normalizes back inside the staging root, are allowed.
 	find "$rt_tmp" -type l -print > "$rt_tmp/links"
 	while IFS= read -r rt_link; do
 		[ -n "$rt_link" ] || continue
-		rt_target=$(readlink "$rt_link" 2>/dev/null || true)
-		case "$rt_target" in
-			/*|..|../*|*../*) \
-				{ rm -rf -- "$rt_tmp"; die "unsafe symlink in archive: $rt_target"; } ;;
-		esac
+		restore_link_safe "$rt_link" || \
+			{ rm -rf -- "$rt_tmp"; die "unsafe symlink chain in archive: $rt_link"; }
 	done < "$rt_tmp/links"
 	# Verify every snapshot manifest found in the archive.
 	find "$rt_tmp/var/lib/sane/reliability/snapshots" -name manifest.sha256 -print > "$rt_tmp/manifests"
@@ -598,6 +622,12 @@ cmd_restore() {
 		{ rm -rf -- "$rt_tmp"; die "cannot restore state"; }
 	cp -a "$rt_tmp/var/log/sane/." "$LOGDIR/" || \
 		{ rm -rf -- "$rt_tmp"; die "cannot restore logs"; }
+	# Never trust the archived journal: an archive captured mid-upgrade carries
+	# state=in-progress + snapshot=X, and the next recover would force a
+	# rollback to X over the freshly restored state. Restore is a terminal
+	# operation: force the journal to idle (state only, no tag or interface).
+	write_journal idle || \
+		{ rm -rf -- "$rt_tmp"; die "cannot reset journal after restore"; }
 	rm -rf -- "$rt_tmp"
 	log_event INFO "archive restored"
 	note "archive restored into $ROOT"
