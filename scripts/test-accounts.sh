@@ -516,5 +516,114 @@ run_wrapper >/dev/null 2>&1
 check "wrapper drops to shell when rebuild fails" \
 	test "$(grep -c 'fallback shell reached' "$T/cli-calls")" -eq 1
 
+printf '\n--- reliability:once fail-open wrapper (extracted wiring) ---\n'
+# Extract the LIVE reliability:once command from build-rootfs.sh instead of
+# hardcoding a copy, so wiring drift is caught here. Only the absolute tool
+# path is redirected to a stub; the /bin/sh -c structure, the fail-open
+# || echo branch and :timeout=0 stay verbatim. The stub performs no host
+# operations (it only exits with the requested code).
+rel_line=$(grep '^reliability:once:' "$REPO_ROOT/scripts/build-rootfs.sh")
+check "reliability:once wiring present in build-rootfs.sh" test -n "$rel_line"
+check "reliability:once wiring carries timeout=0" sh -c \
+	"grep -q '^reliability:once:.*:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
+check "reliability:once wiring byte-identical across the 3 builders" sh -c \
+	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^5f794f774c3989b8282b0a493ea2584b'"
+rel_cmd=${rel_line#reliability:once:}
+rel_cmd=${rel_cmd%:timeout=0}
+rel_stub_cmd=$(printf '%s\n' "$rel_cmd" | sed "s|/usr/bin/sane-reliability|$T/stub-reliability|")
+
+run_rel_wrapper() {
+	printf '#!/bin/sh\nexit %s\n' "$1" > "$T/stub-reliability"
+	chmod +x "$T/stub-reliability"
+	REL_ERR=$(eval "$rel_stub_cmd" 2>&1 >/dev/null)
+	REL_RC=$?
+}
+
+run_rel_wrapper 1
+check "fail-open wrapper exits 0 when recover fails" test "$REL_RC" -eq 0
+case "$REL_ERR" in
+	*'reliability: recover failed; continuing boot'*)
+		pass "fail-open wrapper cites continue-boot notice on stderr" ;;
+	*) fail "fail-open wrapper missing continue-boot notice: $REL_ERR" ;;
+esac
+
+run_rel_wrapper 0
+check "wrapper exits 0 when recover succeeds" test "$REL_RC" -eq 0
+check "wrapper stays silent when recover succeeds" test -z "$REL_ERR"
+
+printf '\n--- recover data-loss boundary (root+sane only, by design) ---\n'
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+sh "$ACCOUNTS" --root "$T" add-user extra 1010 --skip-chown >/dev/null
+printf 'garbage\n' > "$T/etc/passwd"
+expect_ok "recover rebuilds corrupted passwd with an extra account present" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the data-loss rebuild" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "recover restores root and sane" sh -c \
+	"grep -q '^root:' '$T/etc/passwd' && grep -q '^sane:' '$T/etc/passwd'"
+check "recover preserves the usable root and sane hashes" sh -c \
+	"grep -q '^root:[\$]6[\$]' '$T/etc/shadow' && grep -q '^sane:[\$]6[\$]' '$T/etc/shadow'"
+check "extra account passwd entry is lost by design" sh -c \
+	"! grep -q '^extra:' '$T/etc/passwd'"
+check "extra account group is lost by design" sh -c \
+	"! grep -q '^extra:' '$T/etc/group'"
+check "extra account shadow entry is lost by design" sh -c \
+	"! grep -q '^extra:' '$T/etc/shadow'"
+check "extra home directory survives as an orphan" test -d "$T/home/extra"
+
+printf '\n--- recovery applet symlink guard (PR #31 policy) ---\n'
+# The guard only runs when awk/mktemp are absent from PATH and a busybox
+# binary exists. Restrict PATH to a dir holding just ln, and point the
+# busybox path at a stub, so the loop runs hermetically inside $T and can
+# never touch host /bin or /usr/bin.
+mkdir -p "$T/gbin" "$T/pathbin"
+ln -s "$(command -v ln)" "$T/pathbin/ln"
+printf '#!/bin/sh\nexit 0\n' > "$T/stub-busybox"
+chmod +x "$T/stub-busybox"
+printf '#!/bin/sh\nexit 0\n' > "$T/guard-cli"
+chmod +x "$T/guard-cli"
+
+run_guard() {
+	PATH="$T/pathbin" \
+	SANE_RECOVERY_BUSYBOX="$T/stub-busybox" \
+	SANE_RECOVERY_BIN_DIR="$T/gbin" \
+	SANE_ACCOUNTS_CLI="$T/guard-cli" \
+		/bin/sh "$WRAPPER"
+}
+
+# 1. anti-clobber: an existing regular file must survive byte-for-byte.
+printf 'precious awk bytes\n' > "$T/gbin/awk"
+cp "$T/gbin/awk" "$T/awk-expected"
+expect_ok "applet guard run exits 0 with a regular file present" run_guard
+check "regular file at BIN_DIR/awk is not replaced by a symlink" sh -c \
+	"[ -f '$T/gbin/awk' ] && [ ! -L '$T/gbin/awk' ]"
+check "regular file at BIN_DIR/awk keeps its bytes" cmp -s "$T/gbin/awk" "$T/awk-expected"
+
+# 2. absent path: the busybox symlink is created (awk and mktemp).
+rm -f "$T/gbin/awk" "$T/gbin/mktemp"
+expect_ok "applet guard run exits 0 with absent paths" run_guard
+check "absent BIN_DIR/awk becomes a busybox symlink" sh -c \
+	"[ -L '$T/gbin/awk' ] && [ \"\$(readlink '$T/gbin/awk')\" = '$T/stub-busybox' ]"
+check "absent BIN_DIR/mktemp becomes a busybox symlink" sh -c \
+	"[ -L '$T/gbin/mktemp' ] && [ \"\$(readlink '$T/gbin/mktemp')\" = '$T/stub-busybox' ]"
+
+# 3. dangling symlink: repaired to the busybox target.
+rm -f "$T/gbin/awk"
+ln -s "$T/no-such-target" "$T/gbin/awk"
+expect_ok "applet guard run exits 0 with a dangling symlink" run_guard
+check "dangling BIN_DIR/awk symlink is repaired" sh -c \
+	"[ -L '$T/gbin/awk' ] && [ \"\$(readlink '$T/gbin/awk')\" = '$T/stub-busybox' ]"
+
+# 4. correct symlink: left alone (same target AND same inode).
+rm -f "$T/gbin/awk"
+ln -s "$T/stub-busybox" "$T/gbin/awk"
+awk_inode=$(stat -c %i "$T/gbin/awk")
+expect_ok "applet guard run exits 0 with a correct symlink" run_guard
+check "correct BIN_DIR/awk symlink keeps its target" sh -c \
+	"[ -L '$T/gbin/awk' ] && [ \"\$(readlink '$T/gbin/awk')\" = '$T/stub-busybox' ]"
+check "correct BIN_DIR/awk symlink is not recreated" \
+	test "$(stat -c %i "$T/gbin/awk")" = "$awk_inode"
+
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

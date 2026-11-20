@@ -116,7 +116,21 @@ supplementary group. `validate` checks modes, ownership of doas files,
 numeric/duplicate UIDs and GIDs, absence of a second UID 0, empty password
 fields, SHA-512 (or locked) hashes, `wheel` membership, and an effective
 `permit ... :wheel` rule with no `nopass`. Wired into `make test` and CI
-(`scripts/test-accounts.sh`, 92 assertions; 94 when run as root).
+(`scripts/test-accounts.sh`, 165 assertions; 167 when run as root).
+
+### Recovery scope and data loss (`recover`)
+
+`recover` (and the boot-time `sane-account-recovery` wrapper that calls it)
+rebuilds passwd/group/shadow/doas.conf from the baseline template, which
+contains **only `root` and `sane`**, then restores any still-usable root/sane
+hashes. Additional accounts created with `add-user` are therefore **lost by
+design** when a recovery rebuild runs — a deliberate lockout-prevention
+trade-off, not a bug. Their home directories remain on disk, but the
+accounts no longer exist; recreate them after recovery. The wrapper also
+ensures `awk`/`mktemp` applet links exist for the rebuild: it never clobbers
+an existing regular file, creates a link only when the path is absent,
+repairs dangling or wrong symlinks, and leaves correct symlinks untouched
+(the PR #31 policy).
 
 ## Privilege escalation (`doas`)
 
