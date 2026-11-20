@@ -58,9 +58,14 @@ start with `-`. Overwriting an existing tag requires `--force`.
 corrupt or incomplete snapshot is never applied — `rollback`, `upgrade` and
 upgrade recovery through `recover` all call this check first (fail-closed).
 Manifest paths are validated
-before hashing or applying: absolute paths and any `..` component are rejected,
-so a crafted manifest cannot write outside the target root. Manifests are
-NUL-delimited internally, so filenames containing spaces are handled correctly.
+before hashing or applying: absolute paths and any `..` component are rejected.
+After one conventional leading `./` is stripped, whole `.` components (including
+`a/./b`, a second leading `./`, or trailing `/.`) and empty components such as
+`a//b` are also rejected as non-canonical spellings. They are not normalized
+before validation; both validation and installation use the same relative
+string, so a crafted manifest cannot write outside the target root or bypass
+lexical protected-path checks. Manifests are NUL-delimited internally, so
+filenames containing spaces are handled correctly.
 
 ### Rollback and safety snapshots
 

@@ -129,12 +129,13 @@ cmd_init() {
 }
 
 valid_rel_path() {
-	# Reject absolute paths, '..' components and NUL/backslash tricks.
+	# Reject absolute paths, traversal, non-canonical dot/empty components
+	# and NUL/backslash tricks.
 	case "$1" in
 		''|.|/*|*'\'*|*..*) return 1 ;;
 	esac
 	case "/$1/" in
-		*/../*) return 1 ;;
+		*/../*|*/./*|*//*) return 1 ;;
 	esac
 	return 0
 }

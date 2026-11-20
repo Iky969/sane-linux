@@ -1064,6 +1064,104 @@ expect_ok "upgrade allows a sibling prefix outside the protected dir" run upgrad
 check "sibling-prefix payload installed" \
 	grep -q '^sibling$' "$T/var/lib/sane/reliability-other/file"
 
+# --- Final P2: reject non-canonical relative paths ---------------------------
+# Deleting the dot-component or empty-component checks in valid_rel_path must
+# make these cases fail: the kernel would otherwise resolve a different lexical
+# spelling onto protected reliability state or the running tool.
+noncanonical_upgrade_case() {
+	nuc_spell=$1
+	base
+	run init
+	mkdir -p "$T/usr/bin"
+	printf 'original-tool\n' > "$T/usr/bin/sane-reliability"
+	mkdir -p "$T/payload/$(dirname "$nuc_spell")"
+	printf 'pwned\n' > "$T/payload/$nuc_spell"
+	(cd "$T/payload" && sha256sum "$nuc_spell" > manifest.sha256)
+	if sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/noncanonical.err"; then
+		fail "upgrade rejects non-canonical protected target: $nuc_spell"
+	else
+		pass "upgrade rejects non-canonical protected target: $nuc_spell"
+	fi
+	check "non-canonical rejection names unsafe manifest path: $nuc_spell" \
+		grep -q 'unsafe manifest path' "$T/noncanonical.err"
+	check "non-canonical rejection leaves journal idle: $nuc_spell" \
+		grep -q '^state=idle$' "$T/var/lib/sane/reliability/journal"
+	check "non-canonical rejection leaves target config unchanged: $nuc_spell" \
+		grep -q '^network:once:/bin/true$' "$T/etc/init.conf"
+	check "non-canonical rejection creates no pre-upgrade snapshot: $nuc_spell" sh -c \
+		"! ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-upgrade-* >/dev/null 2>&1"
+	check "non-canonical rejection leaves tool bytes intact: $nuc_spell" \
+		grep -q '^original-tool$' "$T/usr/bin/sane-reliability"
+	check "non-canonical rejection leaves no lock: $nuc_spell" \
+		test ! -e "$T/var/lib/sane/reliability/lock"
+}
+
+noncanonical_upgrade_case 'var/./lib/sane/reliability/journal'
+noncanonical_upgrade_case 'var//lib/sane/reliability/journal'
+noncanonical_upgrade_case 'usr/./bin/sane-reliability'
+noncanonical_upgrade_case 'usr/bin//sane-reliability'
+noncanonical_upgrade_case 'var/./lib/sane/reliability/snapshots/evil'
+check "non-canonical snapshot target was not planted" \
+	test ! -e "$T/var/lib/sane/reliability/snapshots/evil"
+
+# A second leading './' survives the single call-site strip and must be caught.
+noncanonical_upgrade_case '././foo'
+check "doubly-prefixed dot path did not install its payload" test ! -e "$T/foo"
+
+# A trailing dot component cannot be a regular upgrade payload file. Exercise
+# the same validator through the new-files rollback consumer instead, and
+# require its specific validation reason so an unrelated rm failure cannot pass.
+base
+run init
+run snapshot trailing-dot
+printf 'foo/.\n' > "$T/var/lib/sane/reliability/snapshots/trailing-dot/new-files"
+if sh "$TOOL" --root "$T" rollback trailing-dot 2>"$T/trailing-dot.err"; then
+	fail "rollback rejects a trailing dot component in new-files"
+else
+	pass "rollback rejects a trailing dot component in new-files"
+fi
+check "trailing dot rejection names the new-file validation reason" \
+	grep -q 'unsafe new-file path: foo/\.' "$T/trailing-dot.err"
+
+# Dotfiles are not dot components: both a root dotfile and a nested dotfile
+# remain valid, alongside an ordinary etc/init.conf upgrade.
+base
+run init
+mkdir -p "$T/payload/etc"
+printf 'root-dotfile\n' > "$T/payload/.hidden"
+printf 'nested-dotfile\n' > "$T/payload/etc/.hidden"
+printf 'network:once:/bin/sleep 5\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum .hidden etc/.hidden etc/init.conf > manifest.sha256)
+expect_ok "upgrade accepts dotfiles and a normal config payload" run upgrade "$T/payload"
+check "root dotfile payload installed" grep -q '^root-dotfile$' "$T/.hidden"
+check "nested dotfile payload installed" grep -q '^nested-dotfile$' "$T/etc/.hidden"
+check "normal config payload still committed" grep -q '/bin/sleep 5' "$T/etc/init.conf"
+
+canonical_self_state_case() {
+	css_spell=$1
+	base
+	run init
+	mkdir -p "$T/usr/bin"
+	printf 'original-tool\n' > "$T/usr/bin/sane-reliability"
+	mkdir -p "$T/payload/$(dirname "$css_spell")"
+	printf 'pwned\n' > "$T/payload/$css_spell"
+	(cd "$T/payload" && sha256sum "$css_spell" > manifest.sha256)
+	if sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/canonical-self.err"; then
+		fail "canonical protected target remains rejected: $css_spell"
+	else
+		pass "canonical protected target remains rejected: $css_spell"
+	fi
+	check "canonical target keeps self-state reason: $css_spell" \
+		grep -q 'payload targets protected reliability state' "$T/canonical-self.err"
+	check "canonical target is not rejected as merely unsafe: $css_spell" \
+		sh -c "! grep -q 'unsafe manifest path' '$T/canonical-self.err'"
+	check "canonical self-state rejection remains zero-write: $css_spell" sh -c \
+		"grep -q '^state=idle$' '$T/var/lib/sane/reliability/journal' && grep -q '^original-tool$' '$T/usr/bin/sane-reliability' && ! ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-upgrade-* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+}
+
+canonical_self_state_case 'var/lib/sane/reliability/journal'
+canonical_self_state_case 'usr/bin/sane-reliability'
+
 # --- P3b: ROOT canonicalization (D4) -----------------------------------------
 # --root resolves to the canonical physical dir (cd -P + pwd); fresh roots
 # (including dangling symlink roots) still work for init.
