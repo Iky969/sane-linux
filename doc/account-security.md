@@ -124,7 +124,9 @@ fields, SHA-512 (or locked) hashes, `wheel` membership, and an effective
   run any command as root; the credential is cached per session.
 - The binary is setuid root (`4755`) and the config is `0600` root:root.
   `validate` rejects wrong modes, non-root ownership, missing or ineffective
-  permit rules, and any `permit nopass` grant.
+  permit rules, and any `permit` rule carrying a `nopass` token in any
+  position after the keyword (e.g. `permit persist nopass :wheel`). Comment
+  text and `setenv` values such as `X=nopass` are not grants and are accepted.
 - Do not add wildcard `nopass` rules: they defeat the password prompt.
 
 ## Security boundaries

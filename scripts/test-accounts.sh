@@ -39,6 +39,20 @@ expect_fail() {
 	if "$@" >/dev/null 2>&1; then fail "$desc"; else pass "$desc"; fi
 }
 
+# Fail-closed with a reason: the command must exit non-zero AND its stderr
+# must cite the given pattern, so a failure for an unrelated reason (e.g.
+# the effective-rule check) cannot masquerade as the asserted rejection.
+expect_fail_msg() {
+	desc=$1; msg=$2; shift 2
+	if err=$("$@" 2>&1 >/dev/null); then
+		fail "$desc"
+	elif printf '%s\n' "$err" | grep -q "$msg"; then
+		pass "$desc"
+	else
+		fail "$desc"
+	fi
+}
+
 base() {
 	[ -n "$T" ] && rm -rf -- "$T"
 	T=$(mktemp -d)
@@ -152,6 +166,53 @@ expect_fail "validate rejects permissive doas.conf mode" sh "$ACCOUNTS" --root "
 base
 printf 'permit nopass :wheel\n' > "$T/etc/doas.conf"
 expect_fail "validate rejects passwordless doas grant" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# nopass must be rejected in EVERY token position after 'permit', not just
+# immediately after the keyword (options may be reordered). The stderr
+# assertion proves the nopass scan fired, not some unrelated check.
+base
+printf 'permit persist nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after persist option" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit keepenv nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after keepenv option" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { PATH } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after setenv block" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Conversely, 'nopass' that is not a grant token must not fail the scan:
+# comment text and setenv VALUES are not options. The setenv lines cannot
+# satisfy the effective-rule regex, so those files also keep the valid base
+# rule; the property under test is the nopass token scan, not that regex.
+base
+printf 'permit persist :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts plain permit persist :wheel" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\n# permit nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate ignores nopass in a comment line" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv X=nopass :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts nopass as a setenv value (X=nopass)" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { PATH=nopass } :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts nopass as a brace setenv value (PATH=nopass)" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel # nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate ignores nopass in an inline comment" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
 chmod 0755 "$T/usr/bin/doas"
