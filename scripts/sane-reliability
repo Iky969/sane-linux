@@ -35,6 +35,52 @@ EOF
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 note() { [ "$VERBOSE" -eq 1 ] && printf 'ok: %s\n' "$*"; return 0; }
 
+canonicalize_root() {
+	# Resolve ROOT to a canonical physical path with cd -P + pwd (POSIX, no
+	# realpath dependency). A brand-new root may not exist yet (D4: init
+	# creates it): resolve the nearest existing ancestor physically, then walk
+	# the remaining tail component by component, expanding symlinks with a
+	# bounded hop count so the canonical path never traverses a link (a
+	# dangling root symlink resolves to its absent target). Nothing is created
+	# here, so malformed commands still fail before any write.
+	cr_path=$ROOT
+	while [ "${cr_path%/}" != "$cr_path" ]; do cr_path=${cr_path%/}; done
+	[ -n "$cr_path" ] || cr_path=/
+	cr_tail=
+	while [ ! -d "$cr_path" ]; do
+		cr_tail="/${cr_path##*/}$cr_tail"
+		cr_path=${cr_path%/*}
+		[ -n "$cr_path" ] || cr_path=/
+	done
+	cr_base=$(cd -P "$cr_path" && pwd) || die "cannot resolve --root: $ROOT"
+	cr_rest=${cr_tail#/}
+	cr_hops=0
+	while [ -n "$cr_rest" ]; do
+		case "$cr_rest" in
+			*/*) cr_comp=${cr_rest%%/*}; cr_rest=${cr_rest#*/} ;;
+			*) cr_comp=$cr_rest; cr_rest= ;;
+		esac
+		case "$cr_comp" in
+			''|.) continue ;;
+			..) cr_base=${cr_base%/*}; [ -n "$cr_base" ] || cr_base=/; continue ;;
+		esac
+		if [ -L "$cr_base/$cr_comp" ]; then
+			cr_hops=$((cr_hops + 1))
+			[ "$cr_hops" -le 40 ] || die "too many symlink hops in --root: $ROOT"
+			cr_target=$(readlink "$cr_base/$cr_comp" 2>/dev/null) || \
+				die "cannot read root symlink: $cr_base/$cr_comp"
+			[ -n "$cr_target" ] || die "empty root symlink target: $cr_base/$cr_comp"
+			case "$cr_target" in
+				/*) cr_base=/; cr_rest="${cr_target#/}/$cr_rest" ;;
+				*) cr_rest="$cr_target/$cr_rest" ;;
+			esac
+			continue
+		fi
+		cr_base="$cr_base/$cr_comp"
+	done
+	ROOT=$cr_base
+}
+
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 		--root) [ "$#" -ge 2 ] || die "--root needs a directory"; ROOT=$2; shift 2 ;;
@@ -53,11 +99,13 @@ case "$ROOT" in
 	/*) ;;
 	*) die "--root must be an absolute path" ;;
 esac
+canonicalize_root
 
 STATE="$ROOT/var/lib/sane/reliability"
 SNAPS="$STATE/snapshots"
 STAGING="$STATE/staging"
 JOURNAL="$STATE/journal"
+LOCK_DIR="$STATE/lock"
 LOGDIR="$ROOT/var/log/sane"
 LOGFILE="$LOGDIR/reliability.log"
 MAX_LOG_BYTES=65536
@@ -233,10 +281,12 @@ do_snapshot() {
 	printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$ds_tmp/meta"
 	write_manifest "$ds_tmp" || { rm -rf -- "$ds_tmp"; die "cannot write manifest"; }
 	# Swap atomically: rename the old snapshot aside, install the new one,
-	# then delete the old one. A failed install restores the original.
+	# then delete the old one. A failed install restores the original. The
+	# aside name is deterministic (.old.<tag>, tag already validated) so a
+	# crash between the two renames is healable by heal_snapshot_swaps.
 	if [ -d "$ds_target" ]; then
-		ds_old=$(mktemp -d "$SNAPS/.old.XXXXXX") || { rm -rf -- "$ds_tmp"; die "cannot stage old snapshot"; }
-		rmdir "$ds_old" || { rm -rf -- "$ds_tmp"; die "cannot stage old snapshot"; }
+		ds_old="$SNAPS/.old.$ds_tag"
+		[ -e "$ds_old" ] && rm -rf -- "$ds_old"
 		if ! mv "$ds_target" "$ds_old"; then
 			rm -rf -- "$ds_tmp"; die "cannot move old snapshot aside"
 		fi
@@ -497,6 +547,15 @@ cmd_upgrade() {
 		esac
 		upe_rel=${upe_path#./}
 		valid_rel_path "$upe_rel" || { rm -f "$up_extra"; die "unsafe manifest path: $upe_path"; }
+		# Self-state protection (D7): an upgrade payload may not target the
+		# reliability state (journal/snapshots) or the tool itself. This
+		# restricts PAYLOAD targets only; the internal snapshot extra-list /
+		# new-files mechanism in do_snapshot is deliberately not blocked.
+		case "$upe_rel" in
+			var/lib/sane/reliability|var/lib/sane/reliability/*|usr/bin/sane-reliability)
+				rm -f "$up_extra"
+				die "payload targets protected reliability state: $upe_rel" ;;
+		esac
 		printf '%s\n' "$upe_rel" >> "$up_extra"
 	done < "$payload/manifest.sha256"
 	tag=$(unique_tag "auto-pre-upgrade-$(date -u '+%Y%m%dT%H%M%SZ')")
@@ -633,17 +692,125 @@ cmd_restore() {
 	note "archive restored into $ROOT"
 }
 
+heal_snapshot_swaps() {
+	# Complete or discard interrupted --force swaps. Called ONLY while the
+	# state lock is held (mutator entry, including recover's boot path), so
+	# every .old.<tag> aside and .tmp.* staging dir here is crash residue:
+	# the exclusive lock guarantees no live writer owns them. Never called
+	# from the lock-free read-only commands (init/list/verify/log).
+	for hs_old in "$SNAPS"/.old.*; do
+		[ -d "$hs_old" ] || continue
+		hs_tag=${hs_old##*/}
+		hs_tag=${hs_tag#.old.}
+		case "$hs_tag" in
+			''|.|..) rm -rf -- "$hs_old"; continue ;;
+		esac
+		if ! valid_tag "$hs_tag"; then
+			rm -rf -- "$hs_old"
+			continue
+		fi
+		if [ -d "$SNAPS/$hs_tag" ]; then
+			# Install completed before the crash: the aside is redundant.
+			rm -rf -- "$hs_old"
+		else
+			# Install never happened: restore the old snapshot.
+			mv "$hs_old" "$SNAPS/$hs_tag" || \
+				die "cannot heal interrupted snapshot swap: $hs_tag"
+		fi
+	done
+	for hs_tmp in "$SNAPS"/.tmp.*; do
+		[ -d "$hs_tmp" ] || continue
+		rm -rf -- "$hs_tmp"
+	done
+}
+
+release_lock() {
+	# EXIT-trap release, owned by the top-level acquisition only. Remove the
+	# lock only if this process still owns it (lock/pid == $$); a lock stolen
+	# or held by anyone else is never touched.
+	lk_rel_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+	if [ "$lk_rel_pid" = "$$" ]; then
+		rm -rf -- "$LOCK_DIR"
+	fi
+}
+
+acquire_lock() {
+	# Atomic mkdir lock for ALL mutators, acquired ONLY at the top-level
+	# dispatcher entry. Nested mutator calls in the same process (recover ->
+	# cmd_net_recover, rollback/upgrade -> do_snapshot) never re-acquire: the
+	# pid check below makes the lock reentrant by pid, and the EXIT-trap
+	# release belongs to the top-level acquisition alone.
+	#
+	# Stale handling: a lock whose pid is dead (kill -0 fails) or garbage is
+	# stolen via an atomic mv aside; the mv loser loops and re-evaluates.
+	# A pidless lock gets a 1s grace (the holder may be between mkdir and the
+	# pid write) before it is treated as crash residue and stolen.
+	#
+	# Limits (documented in doc/reliability.md): stale detection is kill -0
+	# based, so a REUSED pid of a dead holder can look alive and delay
+	# acquisition up to the timeout (fail-closed, never a wrongful steal of a
+	# live same-user holder); kill -0 also fails with EPERM across users, so
+	# the tool assumes single-user/root operation on the state it protects.
+	LOCK_TIMEOUT=${SANE_RELIABILITY_LOCK_TIMEOUT:-30}
+	case "$LOCK_TIMEOUT" in
+		''|*[!0-9]*|0) die "invalid SANE_RELIABILITY_LOCK_TIMEOUT: $LOCK_TIMEOUT" ;;
+	esac
+	lk_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+	[ "$lk_pid" = "$$" ] && return 0
+	mkdir -p "$STATE" || die "cannot create reliability state for locking"
+	lk_tries=0
+	lk_empty=0
+	lk_max=$((LOCK_TIMEOUT * 10))
+	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+		lk_tries=$((lk_tries + 1))
+		[ "$lk_tries" -le "$lk_max" ] || \
+			die "timed out waiting for reliability lock: $LOCK_DIR"
+		lk_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+		[ "$lk_pid" = "$$" ] && return 0
+		lk_stale=0
+		case "$lk_pid" in
+			'') lk_empty=$((lk_empty + 1))
+			    [ "$lk_empty" -ge 10 ] && lk_stale=1 ;;
+			*[!0-9]*) lk_stale=1 ;;
+			*) lk_empty=0
+			   kill -0 "$lk_pid" 2>/dev/null || lk_stale=1 ;;
+		esac
+		if [ "$lk_stale" = 1 ]; then
+			if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
+				rm -rf -- "$LOCK_DIR.stale.$$"
+			else
+				sleep 0.1
+			fi
+		else
+			sleep 0.1
+		fi
+	done
+	printf '%s\n' "$$" > "$LOCK_DIR/pid"
+	trap release_lock EXIT
+	trap 'exit 1' HUP INT TERM
+	heal_snapshot_swaps
+}
+
 case "$CMD" in
 	init)          cmd_init "$@" ;;
-	snapshot)      cmd_snapshot "$@" ;;
 	list)          cmd_list "$@" ;;
 	verify)        cmd_verify "$@" ;;
-	rollback)      cmd_rollback "$@" ;;
-	upgrade)       cmd_upgrade "$@" ;;
-	recover)       cmd_recover "$@" ;;
-	net-recover)   cmd_net_recover "$@" ;;
 	log)           cmd_log "$@" ;;
-	backup)        cmd_backup "$@" ;;
-	restore)       cmd_restore "$@" ;;
+	snapshot|rollback|upgrade|recover|net-recover|backup|restore)
+		# All mutators serialize on the state lock. Acquisition happens only
+		# here, at the top-level entry; the EXIT-trap release belongs to this
+		# acquisition alone. Nested mutator calls within the process reuse the
+		# held lock (reentrant by pid) and never re-acquire or release it.
+		acquire_lock
+		case "$CMD" in
+			snapshot)    cmd_snapshot "$@" ;;
+			rollback)    cmd_rollback "$@" ;;
+			upgrade)     cmd_upgrade "$@" ;;
+			recover)     cmd_recover "$@" ;;
+			net-recover) cmd_net_recover "$@" ;;
+			backup)      cmd_backup "$@" ;;
+			restore)     cmd_restore "$@" ;;
+		esac
+		;;
 	*) usage >&2; die "unknown command: $CMD" ;;
 esac

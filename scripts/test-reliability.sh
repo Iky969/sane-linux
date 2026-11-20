@@ -795,5 +795,313 @@ expect_fail "upgrade fails mid-transaction and auto-recovers" run upgrade "$T/pa
 check "mid-transaction failure restored the replaced file" grep -q '^old-prog$' "$T/usr/bin/prog"
 check "mid-transaction failure left no partial new file" test ! -e "$T/usr/local/bin/late"
 
+# --- P2-3: state lock + crash-window swap self-heal --------------------------
+# Mutators serialize on mkdir "$STATE/lock" (pid file, 30s default timeout,
+# SANE_RELIABILITY_LOCK_TIMEOUT override for tests). Stale locks (dead pid)
+# are stolen atomically; every exit path must release the lock.
+base
+run init
+mkdir -p "$T/var/lib/sane/reliability/lock"
+sleep 300 &
+HOLDER_PID=$!
+printf '%s\n' "$HOLDER_PID" > "$T/var/lib/sane/reliability/lock/pid"
+LOCK_START=$(date +%s)
+if env SANE_RELIABILITY_LOCK_TIMEOUT=1 sh "$TOOL" --root "$T" snapshot contended 2>"$T/lock.err"; then
+	fail "concurrent writer fails closed while a live pid holds the lock"
+else
+	pass "concurrent writer fails closed while a live pid holds the lock"
+fi
+LOCK_END=$(date +%s)
+LOCK_ELAPSED=$((LOCK_END - LOCK_START))
+check "lock timeout names the lock in stderr" \
+	grep -q 'timed out waiting for reliability lock' "$T/lock.err"
+check "lock wait is bounded by the override, not instant or 30s" \
+	test "$LOCK_ELAPSED" -ge 1 -a "$LOCK_ELAPSED" -le 4
+check "live holder lock is untouched" \
+	grep -qx "$HOLDER_PID" "$T/var/lib/sane/reliability/lock/pid"
+check "contended snapshot was not created" test ! -d \
+	"$T/var/lib/sane/reliability/snapshots/contended"
+kill "$HOLDER_PID" 2>/dev/null
+wait "$HOLDER_PID" 2>/dev/null
+rm -rf -- "$T/var/lib/sane/reliability/lock"
+expect_ok "writer retries successfully after the lock is released" run snapshot contended
+check "retry created the snapshot" test -d \
+	"$T/var/lib/sane/reliability/snapshots/contended"
+check "no lock remains after the retry" test ! -e "$T/var/lib/sane/reliability/lock"
+
+base
+run init
+mkdir -p "$T/var/lib/sane/reliability/lock"
+sleep 0 &
+STALE_PID=$!
+wait "$STALE_PID" 2>/dev/null
+printf '%s\n' "$STALE_PID" > "$T/var/lib/sane/reliability/lock/pid"
+expect_ok "stale lock with a dead pid is stolen" run snapshot stolen
+check "stolen-lock snapshot created" test -d \
+	"$T/var/lib/sane/reliability/snapshots/stolen"
+check "no lock.stale residue after the steal" sh -c \
+	"! ls -d '$T/var/lib/sane/reliability/lock.stale.'* >/dev/null 2>&1"
+check "no lock remains after the stale steal" test ! -e "$T/var/lib/sane/reliability/lock"
+
+base
+run init
+mkdir -p "$T/var/lib/sane/reliability/lock"
+printf 'not-a-pid\n' > "$T/var/lib/sane/reliability/lock/pid"
+expect_ok "stale lock with a garbage pid is stolen" run snapshot garbage
+check "garbage-pid steal created the snapshot" test -d \
+	"$T/var/lib/sane/reliability/snapshots/garbage"
+
+base
+run init
+mkdir -p "$T/var/lib/sane/reliability/lock"
+expect_ok "pidless crash lock is stolen after the grace window" run snapshot pidless
+check "pidless steal created the snapshot" test -d \
+	"$T/var/lib/sane/reliability/snapshots/pidless"
+check "no lock remains after the pidless steal" test ! -e "$T/var/lib/sane/reliability/lock"
+
+base
+run init
+run snapshot keep
+mkdir -p "$T/payload/etc"
+printf 'x\n' > "$T/payload/etc/init.conf"
+printf '%s  ./etc/init.conf\n' \
+	"0000000000000000000000000000000000000000000000000000000000000000" \
+	> "$T/payload/manifest.sha256"
+expect_fail "failed upgrade (integrity) rejects the payload" run upgrade "$T/payload"
+check "no lock left after the failed upgrade" test ! -e "$T/var/lib/sane/reliability/lock"
+expect_fail "failed rollback (unknown tag) rejects" run rollback missing
+check "no lock left after the failed rollback" test ! -e "$T/var/lib/sane/reliability/lock"
+expect_fail "failed restore (missing archive) rejects" run restore "$T/nope.tar.gz"
+check "no lock left after the failed restore" test ! -e "$T/var/lib/sane/reliability/lock"
+expect_fail "failed snapshot (invalid tag) rejects" run snapshot ../escape
+check "no lock left after the failed snapshot" test ! -e "$T/var/lib/sane/reliability/lock"
+
+# (a) Inject a failure between the two swap renames (mv shim ala spm test 28):
+# the install rename fails once; the undo rename passes, old snapshot intact.
+base
+run init
+printf 'original-content\n' > "$T/etc/init.conf"
+run snapshot victim
+printf 'new-content\n' > "$T/etc/init.conf"
+mkdir -p "$T/bin"
+REAL_MV=$(command -v mv)
+cat > "$T/bin/mv" <<EOF
+#!/bin/sh
+src=\$1; last=""
+for arg in "\$@"; do last=\$arg; done
+case "\$src" in
+*/.tmp.*)
+	case "\$last" in
+	"$T/var/lib/sane/reliability/snapshots/"*)
+		if [ ! -f "$T/mv-fail.done" ]; then
+			: > "$T/mv-fail.done"
+			echo "injected mv failure" >&2
+			exit 1
+		fi ;;
+	esac ;;
+esac
+exec "$REAL_MV" "\$@"
+EOF
+chmod 0755 "$T/bin/mv"
+if env PATH="$T/bin:$PATH" sh "$TOOL" --root "$T" snapshot victim --force >"$T/mv.out" 2>&1; then
+	fail "forced snapshot fails closed when the install rename fails"
+else
+	pass "forced snapshot fails closed when the install rename fails"
+fi
+check "mv fault injection actually fired (not vacuous)" test -f "$T/mv-fail.done"
+check "old snapshot intact after the failed install rename" \
+	grep -q '^original-content$' "$T/var/lib/sane/reliability/snapshots/victim/etc/init.conf"
+check "no .old aside left after the undo rename" sh -c \
+	"! ls -d '$T/var/lib/sane/reliability/snapshots/.old.'* >/dev/null 2>&1"
+check "no lock left after the failed forced snapshot" test ! -e "$T/var/lib/sane/reliability/lock"
+
+# (a2) Both install and undo renames fail: the deterministic .old.<tag> aside
+# survives the crash window and the next lock-holding mutator heals it.
+base
+run init
+printf 'original-content\n' > "$T/etc/init.conf"
+run snapshot victim
+printf 'new-content\n' > "$T/etc/init.conf"
+mkdir -p "$T/bin"
+REAL_MV=$(command -v mv)
+cat > "$T/bin/mv" <<EOF
+#!/bin/sh
+last=""
+for arg in "\$@"; do last=\$arg; done
+case "\$last" in
+"$T/var/lib/sane/reliability/snapshots/victim")
+	echo "injected mv failure" >&2
+	exit 1 ;;
+esac
+exec "$REAL_MV" "\$@"
+EOF
+chmod 0755 "$T/bin/mv"
+expect_fail "forced snapshot dies when install and undo renames both fail" \
+	env PATH="$T/bin:$PATH" sh "$TOOL" --root "$T" snapshot victim --force
+check "crash window left the deterministic aside" test -d \
+	"$T/var/lib/sane/reliability/snapshots/.old.victim"
+check "crash window lost the live tag" test ! -d \
+	"$T/var/lib/sane/reliability/snapshots/victim"
+check "no lock left after the crash-window failure" test ! -e "$T/var/lib/sane/reliability/lock"
+expect_ok "recover heals the interrupted swap (boot path)" run recover
+check "heal restored the old snapshot content" \
+	grep -q '^original-content$' "$T/var/lib/sane/reliability/snapshots/victim/etc/init.conf"
+check "heal removed the aside" test ! -e \
+	"$T/var/lib/sane/reliability/snapshots/.old.victim"
+
+# (b) Manual crash state: .old.T present, T missing, orphan .tmp.* staging.
+base
+run init
+run snapshot golden
+mkdir -p "$T/var/lib/sane/reliability/snapshots/.tmp.orphan"
+printf 'junk\n' > "$T/var/lib/sane/reliability/snapshots/.tmp.orphan/junk"
+mv "$T/var/lib/sane/reliability/snapshots/golden" \
+	"$T/var/lib/sane/reliability/snapshots/.old.golden"
+expect_ok "recover heals a manual crash state" run recover
+check "heal restored the missing tag from the aside" \
+	grep -q '^network:once:/bin/true$' "$T/var/lib/sane/reliability/snapshots/golden/etc/init.conf"
+check "heal removed the orphan staging dir" test ! -e \
+	"$T/var/lib/sane/reliability/snapshots/.tmp.orphan"
+
+# Redundant aside (install completed before the crash): heal discards it.
+base
+run init
+run snapshot golden2
+mkdir -p "$T/var/lib/sane/reliability/snapshots/.old.golden2"
+printf 'stale-aside\n' > "$T/var/lib/sane/reliability/snapshots/.old.golden2/marker"
+expect_ok "mutator discards a redundant aside when the tag exists" run snapshot trigger
+check "redundant aside removed" test ! -e \
+	"$T/var/lib/sane/reliability/snapshots/.old.golden2"
+check "live tag untouched by the discard" test -d \
+	"$T/var/lib/sane/reliability/snapshots/golden2"
+
+# Read-only commands never heal and never take the lock.
+base
+run init
+run snapshot golden3
+mv "$T/var/lib/sane/reliability/snapshots/golden3" \
+	"$T/var/lib/sane/reliability/snapshots/.old.golden3"
+expect_ok "list runs while a crash aside exists" run list
+check "list did not heal the aside (read-only)" test -d \
+	"$T/var/lib/sane/reliability/snapshots/.old.golden3"
+check "list did not restore the tag (read-only)" test ! -d \
+	"$T/var/lib/sane/reliability/snapshots/golden3"
+check "list created no lock" test ! -e "$T/var/lib/sane/reliability/lock"
+expect_ok "snapshot heals after read-only commands" run snapshot healtrigger
+check "mutator heal restored golden3" test -d \
+	"$T/var/lib/sane/reliability/snapshots/golden3"
+
+# Addendum: nested mutator path (recover -> cmd_net_recover) must not
+# self-deadlock on the lock; it finishes well under the short override.
+setup_net_recovery
+printf 'state=net-in-progress\nnet-iface=eth0\n' > "$T/var/lib/sane/reliability/journal"
+NEST_START=$(date +%s)
+if env PATH="$T/bin:$PATH" SANE_RELIABILITY_LOCK_TIMEOUT=2 sh "$TOOL" --root "$T" recover >"$T/nested.out" 2>&1; then
+	pass "nested recover under a short lock timeout avoids self-deadlock"
+else
+	fail "nested recover under a short lock timeout avoids self-deadlock"
+fi
+NEST_END=$(date +%s)
+NEST_ELAPSED=$((NEST_END - NEST_START))
+check "nested recover finished under the lock timeout" test "$NEST_ELAPSED" -lt 2
+check "nested recover completed the network journal" sh -c \
+	"grep -q '^state=recovered$' '$T/var/lib/sane/reliability/journal' && grep -q '^net-iface=eth0$' '$T/var/lib/sane/reliability/journal'"
+check "nested recover left no lock" test ! -e "$T/var/lib/sane/reliability/lock"
+check "nested path really ran reconnect and check" sh -c \
+	"grep -qx 'sane-net reconnect eth0 SANE_ROOT=$T' '$T/net-recover.calls' && grep -qx 'sane-net check eth0 SANE_ROOT=$T' '$T/net-recover.calls'"
+
+# --- P3a: upgrade self-state protection (D7) ---------------------------------
+# Payload targets under var/lib/sane/reliability/ and usr/bin/sane-reliability
+# are rejected with zero writes; internal snapshot extra-list stays unblocked.
+base
+run init
+mkdir -p "$T/payload/etc" "$T/payload/var/lib/sane/reliability"
+printf 'network:once:/bin/sleep 5\n' > "$T/payload/etc/init.conf"
+printf 'pwned-journal\n' > "$T/payload/var/lib/sane/reliability/journal"
+(cd "$T/payload" && sha256sum etc/init.conf var/lib/sane/reliability/journal > manifest.sha256)
+if sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/self.err"; then
+	fail "upgrade rejects payload targeting the reliability journal"
+else
+	pass "upgrade rejects payload targeting the reliability journal"
+fi
+check "self-state rejection names the protected path" \
+	grep -q 'payload targets protected reliability state: var/lib/sane/reliability/journal' "$T/self.err"
+check "self-state rejection wrote nothing (zero-write)" sh -c \
+	"grep -q '^network:once:/bin/true$' '$T/etc/init.conf' && grep -q '^state=idle$' '$T/var/lib/sane/reliability/journal' && ! ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-upgrade-* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+
+base
+run init
+mkdir -p "$T/usr/bin" "$T/payload/usr/bin"
+printf 'original-tool\n' > "$T/usr/bin/sane-reliability"
+printf 'evil-tool\n' > "$T/payload/usr/bin/sane-reliability"
+(cd "$T/payload" && sha256sum usr/bin/sane-reliability > manifest.sha256)
+if sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/self2.err"; then
+	fail "upgrade rejects self-overwrite of usr/bin/sane-reliability"
+else
+	pass "upgrade rejects self-overwrite of usr/bin/sane-reliability"
+fi
+check "self-overwrite rejection names the protected tool path" \
+	grep -q 'payload targets protected reliability state: usr/bin/sane-reliability' "$T/self2.err"
+check "self-overwrite wrote nothing" sh -c \
+	"grep -q '^original-tool$' '$T/usr/bin/sane-reliability' && test ! -e '$T/var/lib/sane/reliability/lock'"
+
+base
+run init
+mkdir -p "$T/payload/etc"
+printf 'network:once:/bin/sleep 5\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+expect_ok "normal upgrade outside protected paths still works (D7)" run upgrade "$T/payload"
+check "normal upgrade committed the payload" grep -q '/bin/sleep 5' "$T/etc/init.conf"
+check "normal upgrade kept the extra-list snapshot mechanism" sh -c \
+	"ls -d '$T/var/lib/sane/reliability/snapshots'/auto-pre-upgrade-* >/dev/null 2>&1"
+
+base
+run init
+mkdir -p "$T/payload/var/lib/sane/reliability-other"
+printf 'sibling\n' > "$T/payload/var/lib/sane/reliability-other/file"
+(cd "$T/payload" && sha256sum var/lib/sane/reliability-other/file > manifest.sha256)
+expect_ok "upgrade allows a sibling prefix outside the protected dir" run upgrade "$T/payload"
+check "sibling-prefix payload installed" \
+	grep -q '^sibling$' "$T/var/lib/sane/reliability-other/file"
+
+# --- P3b: ROOT canonicalization (D4) -----------------------------------------
+# --root resolves to the canonical physical dir (cd -P + pwd); fresh roots
+# (including dangling symlink roots) still work for init.
+base
+CANON=$(mktemp -d "$T/canon.XXXXXX")
+ln -s "$CANON" "$T/rootlink"
+expect_ok "init resolves a symlinked root to the canonical dir" sh -c \
+	"sh '$TOOL' --root '$T/rootlink' init"
+check "state created in the canonical target" test -d \
+	"$CANON/var/lib/sane/reliability/snapshots"
+check "init reports the canonical state path" sh -c \
+	"sh '$TOOL' -v --root '$T/rootlink' init | grep -q 'reliability state initialised in $CANON/var/lib/sane/reliability'"
+expect_ok "mutator works through the symlinked root" sh -c \
+	"sh '$TOOL' --root '$T/rootlink' snapshot canon"
+check "snapshot landed in the canonical target" test -d \
+	"$CANON/var/lib/sane/reliability/snapshots/canon"
+
+base
+ln -s "$T/fresh-target" "$T/dangling"
+expect_ok "init accepts a dangling symlink root (D4)" sh -c \
+	"sh '$TOOL' --root '$T/dangling' init"
+check "state created at the canonical target of the dangling root" test -d \
+	"$T/fresh-target/var/lib/sane/reliability/snapshots"
+check "dangling root symlink preserved" test -L "$T/dangling"
+check "dangling root init reports the canonical path" sh -c \
+	"sh '$TOOL' -v --root '$T/dangling' init | grep -q 'reliability state initialised in $T/fresh-target/var/lib/sane/reliability'"
+
+base
+mkdir -p "$T/real-ancestor"
+ln -s "$T/real-ancestor" "$T/ancestor-link"
+expect_ok "init accepts a fresh leaf under a symlinked ancestor" sh -c \
+	"sh '$TOOL' --root '$T/ancestor-link/newroot' init"
+check "state created at the canonical fresh leaf" test -d \
+	"$T/real-ancestor/newroot/var/lib/sane/reliability/snapshots"
+check "fresh leaf init reports the canonical path" sh -c \
+	"sh '$TOOL' -v --root '$T/ancestor-link/newroot' init | grep -q 'reliability state initialised in $T/real-ancestor/newroot/var/lib/sane/reliability'"
+expect_fail "relative --root still rejected" sh -c \
+	"sh '$TOOL' --root relative-dir init"
+
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
