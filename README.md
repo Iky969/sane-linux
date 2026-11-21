@@ -61,7 +61,7 @@ If the cgroup v2 hierarchy is unavailable (e.g. kernel without `CONFIG_CGROUPS`,
 Requires `build-essential` and (for testing) `busybox-static`:
 
 ```bash
-sudo apt-get install build-essential busybox-static python3
+sudo apt-get install build-essential busybox-static python3 shellcheck
 
 make          # Build static binary ./ninit
 make lint     # Pattern/format linters + ShellCheck gate on 11 production scripts

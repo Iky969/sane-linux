@@ -132,4 +132,3 @@ Urutan prioritas perbaikan yang kusarankan:
 * P2: perbaiki pemindaian `nopass` agar tidak salah mengidentifikasi argumen command.
 
 * Tambahkan regresi untuk ketiganya, lalu jalankan ulang CI.
-

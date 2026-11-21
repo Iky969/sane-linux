@@ -7,7 +7,7 @@
 Prerequisites: `build-essential` and `busybox-static`:
 
 ```bash
-sudo apt-get update && sudo apt-get install build-essential busybox-static python3
+sudo apt-get update && sudo apt-get install build-essential busybox-static python3 shellcheck
 make            # -> ./ninit (gcc -static -O2 -Wall)
 ```
 
@@ -65,7 +65,7 @@ BusyBox inputs (never run it in the shared checkout).
 |---|---|---|
 | Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 237 passed, 0 failed |
 | Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 239 passed, 0 failed |
-| Reliability | `sh scripts/test-reliability.sh` | 418 passed, 0 failed |
+| Reliability | `sh scripts/test-reliability.sh` | 439 passed, 0 failed |
 | SPM | `bash scripts/test-spm.sh` | 36 passed, 0 failed |
 | Build package | `bash scripts/test-build-package.sh` (scratch) | 13 passed, 0 failed |
 | Build rootfs | `sh scripts/test-build-rootfs.sh` (scratch) | 25 passed, 0 failed |

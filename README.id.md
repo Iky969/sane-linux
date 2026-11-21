@@ -72,7 +72,7 @@ container/chroot tanpa delegasi controller), ninit mencatat fallback
 Butuh `build-essential` dan (untuk uji) `busybox-static`:
 
 ```bash
-sudo apt-get install build-essential busybox-static
+sudo apt-get install build-essential busybox-static python3 shellcheck
 
 make          # hasilkan biner statis ./ninit
 make lint     # lint pola/format + gate ShellCheck pada 11 skrip produksi
