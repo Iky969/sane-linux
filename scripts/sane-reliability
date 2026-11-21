@@ -110,6 +110,19 @@ LOGDIR="$ROOT/var/log/sane"
 LOGFILE="$LOGDIR/reliability.log"
 MAX_LOG_BYTES=65536
 
+# Internal state/log path components whose symlink resolution must stay inside
+# the canonical ROOT. Validated at the top-level dispatcher entry BEFORE any
+# write, mkdir or lock acquisition (see validate_internal_state). Kept as
+# relative paths so the same bounded-hop walk as symlink_safe_rel resolves
+# them. Order matters: the shallowest component of a chain is listed first,
+# so the failure reason names the exact component that escaped.
+INTERNAL_STATE_RELS="var var/lib var/lib/sane var/lib/sane/reliability \
+var/lib/sane/reliability/snapshots var/lib/sane/reliability/staging \
+var/lib/sane/reliability/journal var/lib/sane/reliability/lock \
+var/lib/sane/reliability/lock/pid \
+var/log var/log/sane var/log/sane/reliability.log \
+var/log/sane/reliability.log.1"
+
 valid_tag() {
 	# '.' and '..' are whole-dot components, and '.tmp.*' / '.old.*' are
 	# the internal crash-window staging/aside namespaces: none can be a
@@ -199,6 +212,83 @@ symlink_safe_rel() {
 		done
 	done
 	return 0
+}
+
+symlink_resolve_contained() {
+	# symlink_resolve_contained REL -- bounded-hop resolver for the internal
+	# state preflight. REL is relative (no '..'/absolute) and ROOT is already
+	# canonical. Walk component by component; whenever a component is a
+	# symlink, expand it and RESTART the walk from the new base with the link
+	# target's components prepended to the remaining ones. Restarting is
+	# essential: resolving a link to "a/b" must still walk "a", which may be
+	# an ancestor symlink pointing outside ROOT even when "b" is ordinary —
+	# a one-shot normalize would wrongly accept that chain. Absolute targets
+	# reset the base to '/'; relative targets resolve against the link's
+	# directory. Every intermediate path is checked to stay under ROOT, hops
+	# are bounded at 40, and '.'/'..' are collapsed with normalize_path (pure
+	# POSIX, identical on the BusyBox runtime). Nothing is created here.
+	src_rel=$1
+	src_root=$ROOT
+	while [ "${src_root%/}" != "$src_root" ]; do src_root=${src_root%/}; done
+	[ -n "$src_root" ] || src_root=/
+	# canonicalize_root can emit a doubled leading slash for symlinked roots
+	# (abs-target expansion sets base=/ then appends a leading-'/'-stripped
+	# target). Collapse it so the lexical containment check compares the
+	# same spelling as normalize_path's output.
+	src_root=$(normalize_path "$src_root") || return 1
+	src_base=$src_root
+	src_rest=$src_rel
+	src_hops=0
+	while [ -n "$src_rest" ]; do
+		case "$src_rest" in
+			*/*) src_comp=${src_rest%%/*}; src_rest=${src_rest#*/} ;;
+			*) src_comp=$src_rest; src_rest= ;;
+		esac
+		case "$src_comp" in
+			''|.) continue ;;
+		esac
+		src_cand=$(normalize_path "$src_base/$src_comp") || return 1
+		if [ "$src_root" != "/" ]; then
+			case "$src_cand/" in
+				"$src_root/"*) ;;
+				*) return 1 ;;
+			esac
+		fi
+		if [ -L "$src_cand" ]; then
+			src_hops=$((src_hops + 1))
+			[ "$src_hops" -le 40 ] || return 1
+			src_target=$(readlink "$src_cand" 2>/dev/null) || return 1
+			[ -n "$src_target" ] || return 1
+			case "$src_target" in
+				/*) src_base=/; src_rest="${src_target#/}/$src_rest" ;;
+				*)  src_base=$(dirname "$src_cand")
+				    src_rest="$src_target/$src_rest" ;;
+			esac
+			continue
+		fi
+		src_base=$src_cand
+	done
+	return 0
+}
+
+validate_internal_state() {
+	# validate_internal_state -- containment gate for the tool's OWN state
+	# and log paths. Called at the top-level dispatcher entry BEFORE
+	# acquire_lock's mkdir and before any command's first write, so every
+	# command (and every nested/internal recovery path, which runs later in
+	# the same process) is covered without a second acquisition.
+	#
+	# Every listed path (state directories, the journal/lock/pid leaves and
+	# the log leaves that cmd_init/log_event create or append directly) is
+	# resolved with symlink_resolve_contained. An existing symlink whose full
+	# resolution stays under the canonical ROOT is accepted (internal
+	# symlinks remain legal); a chain that escapes ROOT fails closed with a
+	# specific reason and NO lock, directory or file is created. Paths that
+	# do not exist yet (fresh roots) pass trivially.
+	for vis_rel in $INTERNAL_STATE_RELS; do
+		symlink_resolve_contained "$vis_rel" || \
+			die "internal state path escapes root: $vis_rel"
+	done
 }
 
 record_symlink() {
@@ -985,6 +1075,12 @@ acquire_lock() {
 
 case "$CMD" in
 	init|list|verify|log|snapshot|rollback|upgrade|recover|net-recover|backup|restore)
+		# Internal state containment (P1-2): validate every self-owned
+		# state/log path for escaping symlinks BEFORE acquire_lock's mkdir
+		# and before any command's first write. Covers all commands and,
+		# because nested recovery runs in this same process, every internal
+		# recovery path too. Rejection creates no lock, dir or file.
+		validate_internal_state
 		# ALL commands serialize on the state lock: init/list/verify/log
 		# auto-init and write state too, so every write happens under the
 		# lock. Read commands (list/verify) may block up to the lock timeout

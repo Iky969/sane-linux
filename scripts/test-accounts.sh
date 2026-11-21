@@ -617,6 +617,9 @@ set_pw root 'LifecyclePass1!'
 set_pw sane 'LifecyclePass2!'
 expect_ok "merge setup: add alice into wheel" \
 	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "merge setup: give alice an active password" set_pw alice 'AliceMerge1!'
+alice_shadow_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+alice_hash_before=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
 printf 'permit persist :wheel cmd /usr/bin/echo hello\n' > "$T/etc/doas.conf"
 chmod 0644 "$T/etc/doas.conf"
 expect_fail "validate flags the permissive doas.conf mode before merge" \
@@ -627,6 +630,14 @@ check "recover preserves the extra account in passwd" sh -c \
 	"grep -q '^alice:x:1005:10:' '$T/etc/passwd'"
 check "recover preserves wheel membership for the extra account" sh -c \
 	"grep -q '^wheel:x:10:root,sane,alice$' '$T/etc/group'"
+check "recover keeps alice's shadow entry" sh -c \
+	"grep -q '^alice:' '$T/etc/shadow'"
+alice_shadow_after=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+alice_hash_after=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
+check "recover preserves alice's shadow hash byte-for-byte" \
+	test "$alice_hash_after" = "$alice_hash_before"
+check "recover preserves alice's whole shadow entry byte-for-byte" \
+	test "$alice_shadow_after" = "$alice_shadow_before"
 check "recover preserves the custom doas rule" sh -c \
 	"grep -q '^permit persist :wheel cmd /usr/bin/echo hello$' '$T/etc/doas.conf'"
 check "recover repairs doas.conf mode to 600" \
@@ -721,8 +732,8 @@ check "recover reports passwd merge action per file" sh -c \
 	"grep -q 'passwd merged' '$T/recover-out'"
 check "recover reports group merge action per file" sh -c \
 	"grep -q 'group merged' '$T/recover-out'"
-check "recover reports shadow rebuild action per file" sh -c \
-	"grep -q 'shadow rebuilt' '$T/recover-out'"
+check "recover reports shadow merge action per file" sh -c \
+	"grep -q 'shadow merged' '$T/recover-out'"
 
 # H: sane's baseline uid occupied by an extra account -> conflict rebuild
 # (a blind merge would append sane and create a duplicate uid, leaving a
@@ -742,6 +753,112 @@ check "recover drops the conflicting uid-1000 extra entry" sh -c \
 	"! grep -q '^alice:' '$T/etc/passwd'"
 expect_ok "validate passes after the conflict rebuild" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+printf '\n--- shadow preservation (P1-1) ---\n'
+# A structurally sound shadow must keep every extra entry byte-for-byte;
+# only a genuinely corrupt one is rebuilt, then valid non-conflicting extra
+# entries are appended again. root/sane hashes are repaired only when the old
+# hash is usable; the firstboot marker contract stays exactly as before.
+
+# B: a corrupt shadow (garbage line) is rebuilt, but usable root/sane hashes
+# and the valid extra entry are carried back into the baseline.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "shadow setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "shadow setup: give alice an active password" set_pw alice 'AliceCorrupt1!'
+root_hash_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_hash_before=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+alice_hash_corrupt_before=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
+printf 'garbage\n' >> "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects a shadow with a corrupt extra line" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds a corrupt shadow with valid extras" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the corrupt shadow rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "corrupt shadow recover keeps the firstboot marker" \
+	test -f "$T/etc/.sane-firstboot-done"
+check "corrupt shadow recover preserves the usable root hash" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_hash_before"
+check "corrupt shadow recover preserves the usable sane hash" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_hash_before"
+check "corrupt shadow recover restores the valid alice hash" \
+	test "$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")" = "$alice_hash_corrupt_before"
+check "corrupt shadow recover keeps alice in passwd" sh -c \
+	"grep -q '^alice:x:1005:10:' '$T/etc/passwd'"
+check "corrupt shadow recover drops the malformed shadow line" sh -c \
+	"! grep -q '^garbage$' '$T/etc/shadow'"
+
+# C: neither hash is usable -> baseline locked, marker removed, and a fresh
+# firstboot can set both passwords and validate cleanly.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+awk -F: -v OFS=: '$1=="root" || $1=="sane" {$2="!"} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+expect_fail "validate rejects missing root/sane hashes with firstboot done" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover repairs missing hashes" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "P1-1 removes the firstboot marker when hashes are missing" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+check "P1-1 restores the locked root baseline" sh -c \
+	"grep -q '^root:!:19700:0:99999:7:::$' '$T/etc/shadow'"
+check "P1-1 restores the locked sane baseline" sh -c \
+	"grep -q '^sane:!:19700:0:99999:7:::$' '$T/etc/shadow'"
+expect_ok "validate passes with the marker removed" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "firstboot helper is present to set passwords again" \
+	test -x "$REPO_ROOT/scripts/sane-firstboot"
+expect_ok "firstboot can set a new root password" set_pw root 'FirstPass1!'
+expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass2!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "validate passes after a successful firstboot rerun" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# D: a corrupt shadow with both an active and a locked extra hash. The rebuild
+# must restore both byte-for-byte, drop a duplicate name and an invalid hash,
+# and discard the line that made the file structurally corrupt.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "shadow rebuild setup: add alice and bob to wheel" sh -c \
+	"sh '$ACCOUNTS' --root '$T' add-user alice 1005 wheel --skip-chown >/dev/null && \
+	 sh '$ACCOUNTS' --root '$T' add-user bob 1006 wheel --skip-chown >/dev/null && \
+	 sh '$ACCOUNTS' --root '$T' add-user mallory 1007 --skip-chown >/dev/null"
+expect_ok "shadow rebuild setup: alice gets an active hash" set_pw alice 'AliceActive1!'
+expect_ok "shadow rebuild setup: bob gets a locked hash" set_pw bob 'BobLocked1!'
+expect_ok "shadow rebuild setup: lock bob" sh "$ACCOUNTS" --root "$T" lock bob
+alice_active_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+bob_locked_before=$(awk -F: '$1=="bob"{print}' "$T/etc/shadow")
+awk -F: -v OFS=: '$1=="mallory"{$2="plaintext"} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf '%s\ngarbage\n%s\n' "$alice_active_before" "$alice_active_before" >> "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects the corrupt shadow with mixed extra entries" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds a shadow with active and locked extras" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the mixed shadow rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "rebuild keeps the active extra entry byte-for-byte" \
+	test "$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")" = "$alice_active_before"
+check "rebuild keeps the locked extra entry byte-for-byte" \
+	test "$(awk -F: '$1=="bob"{print}' "$T/etc/shadow")" = "$bob_locked_before"
+check "rebuild keeps the lock marker on bob" sh -c \
+	"grep -q '^bob:!' '$T/etc/shadow'"
+check "rebuild drops a duplicate valid extra name" \
+	test "$(grep -c '^alice:' "$T/etc/shadow")" -eq 1
+check "rebuild drops an extra with an invalid active hash" sh -c \
+	"! grep -q '^mallory:' '$T/etc/shadow'"
+check "rebuild drops the corrupt garbage line" sh -c \
+	"! grep -q '^garbage$' '$T/etc/shadow'"
 
 check "provision installs account recovery helper" \
 	test -f "$REPO_ROOT/scripts/sane-account-recovery"

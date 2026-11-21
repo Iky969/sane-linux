@@ -246,6 +246,37 @@ fail-closed and nothing is written. Symlinks that resolve **inside** the target
 root remain allowed. The same containment check guards `new-files` deletion so
 a rollback never removes a file through an escaping symlink.
 
+### Internal state containment
+
+Beyond manifest destinations, the tool's **own** state and log paths are
+contained before anything is written. At the top-level command entry — before
+`acquire_lock`'s `mkdir`, before `cmd_init`, and before any dispatcher command
+or internal recovery path writes — every internal path component is resolved
+for symlink escape: `var`, `var/lib`, `var/lib/sane`,
+`var/lib/sane/reliability` with its `snapshots`, `staging`, `journal`, `lock`
+and `lock/pid` leaves, plus `var/log`, `var/log/sane`, `reliability.log` and
+`reliability.log.1`. These are exactly the paths that `cmd_init`,
+`write_journal`, `acquire_lock` and `log_event` create, append, rotate or chmod
+directly, so checking only manifest destinations would still allow an external
+file write through a symlinked parent **or leaf**.
+
+Each listed path is walked component by component with a bounded-hop resolver
+(40 hops): every symlink is expanded with `readlink` and the walk **restarts
+from the resolved base** so an ancestor symlink inside a target chain is
+followed too (a one-shot lexical normalization would miss, for example,
+`var/lib/sane -> anc/escape` where `anc -> /outside`). Absolute targets restart
+from `/`, relative targets from the link's directory; `.`/`..` are collapsed
+with pure POSIX expansion, and every intermediate path must stay under the
+canonical ROOT. An existing symlink whose full resolution remains under ROOT
+is accepted (internal multi-hop symlinks stay legal); a chain that escapes
+ROOT, or a symlink loop that exhausts the hop bound, is rejected fail-closed
+with `internal state path escapes root: <rel>` — naming the shallowest escaping
+component — and **no lock, directory or file is created**. Paths that do not
+exist yet on a fresh root pass trivially. Because the check runs at the single
+top-level dispatcher entry, all eleven commands and nested recovery paths are
+covered; a canonicalized (symlinked) `--root` resolves to a physical path
+first and is unaffected.
+
 ### Network recovery
 
 `net-recover [--iface IFACE]` recovers DNS and connectivity independently of an

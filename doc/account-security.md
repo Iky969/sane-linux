@@ -142,11 +142,7 @@ repairs the identity files **per file, merging instead of rewriting**:
   non-baseline lines that are themselves valid and conflict-free (numeric
   ids `>= 1000`, unique id and name). Conflicting or malformed lines are
   dropped.
-- `shadow`: always rebuilt from the locked baseline; still-usable `root` and
-  `sane` SHA-512 hashes are restored. Extra accounts' shadow entries are not
-  preserved (by design). If either hash is unusable, the first-boot marker
-  `/etc/.sane-firstboot-done` is removed so the console setup runs again on
-  this boot; otherwise it is (re)written.
+- `shadow`: structurally valid files are preserved entry-by-entry, with only root/sane hashes repaired; structurally corrupt files are rebuilt from the locked baseline and re-appended with valid, conflict-free non-baseline entries. Usable root/sane hashes and the first-boot marker logic are unchanged.
 
 `recover` prints one line per file stating whether it was preserved/merged
 or rebuilt, followed by the hash/marker summary. Accounts whose passwd lines

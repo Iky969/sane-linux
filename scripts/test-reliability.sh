@@ -1785,5 +1785,133 @@ check "live destination survived the failed ln" sh -c \
 check "no staged symlink temp left after ln failure" sh -c \
 	"! ls '$T/etc/.sane-rel-ln.'* >/dev/null 2>&1"
 
+# --- Round 6 P1-2: internal state / log path containment -------------------
+# Before ANY write, mkdir or lock, the tool resolves every self-owned state
+# and log path. An existing symlink whose resolution escapes the canonical
+# ROOT is rejected with 'internal state path escapes root: <rel>' and writes
+# nothing outside; internal symlinks (including multi-hop chains) stay legal.
+INTERNAL_CMDS="init list verify log snapshot rollback upgrade recover net-recover backup restore"
+
+# Shared, otherwise-valid fixtures so a containment rejection is meaningful.
+IS_WORK=$(mktemp -d)
+mkdir -p "$IS_WORK/payload/etc"
+printf 'containment-payload\n' > "$IS_WORK/payload/etc/init.conf"
+(cd "$IS_WORK/payload" && sha256sum etc/init.conf > manifest.sha256)
+IS_GOLD=$(mktemp -d "$IS_WORK/gold.XXXXXX")
+mkdir -p "$IS_GOLD/etc"
+printf 'network:once:/bin/true\n' > "$IS_GOLD/etc/init.conf"
+sh "$TOOL" --root "$IS_GOLD" init >/dev/null 2>&1
+sh "$TOOL" --root "$IS_GOLD" snapshot seed >/dev/null 2>&1
+sh "$TOOL" --root "$IS_GOLD" backup "$IS_WORK/arch.tar.gz" >/dev/null 2>&1
+
+invoke_internal_cmd() {
+	case "$1" in
+		init)        sh "$TOOL" --root "$T" init ;;
+		list)        sh "$TOOL" --root "$T" list ;;
+		verify)      sh "$TOOL" --root "$T" verify seed ;;
+		log)         sh "$TOOL" --root "$T" log INFO containment-probe ;;
+		snapshot)    sh "$TOOL" --root "$T" snapshot cont-tag ;;
+		rollback)    sh "$TOOL" --root "$T" rollback seed ;;
+		upgrade)     sh "$TOOL" --root "$T" upgrade "$IS_WORK/payload" ;;
+		recover)     sh "$TOOL" --root "$T" recover ;;
+		net-recover) sh "$TOOL" --root "$T" net-recover ;;
+		backup)      sh "$TOOL" --root "$T" backup "$T/probe.tar.gz" ;;
+		restore)     sh "$TOOL" --root "$T" restore "$IS_WORK/arch.tar.gz" ;;
+		*) return 99 ;;
+	esac
+}
+
+internal_symlink_case() {
+	isc_rel=$1; isc_cmd=$2
+	base
+	IS_EXT="$IS_WORK/ext.$(printf '%s' "$isc_rel" | tr '/' '_').$isc_cmd"
+	mkdir -p "$IS_EXT"
+	case "$isc_rel" in
+		var) rm -rf "$T/var"; ln -s "$IS_EXT" "$T/var" ;;
+		var/lib) rm -rf "$T/var/lib"; mkdir -p "$T/var"; ln -s "$IS_EXT" "$T/var/lib" ;;
+		var/lib/sane) mkdir -p "$T/var/lib"; ln -s "$IS_EXT" "$T/var/lib/sane" ;;
+		var/log) rm -rf "$T/var/log"; ln -s "$IS_EXT" "$T/var/log" ;;
+		var/log/sane/reliability.log)
+			mkdir -p "$T/var/log/sane"; ln -s "$IS_EXT/escaped.log" "$T/var/log/sane/reliability.log" ;;
+		var/lib/sane/reliability/lock/pid)
+			mkdir -p "$T/var/lib/sane/reliability/lock"
+			ln -s "$IS_EXT/escaped.pid" "$T/var/lib/sane/reliability/lock/pid" ;;
+	esac
+	find "$T" -mindepth 1 ! -name ic.err | LC_ALL=C sort > "$IS_WORK/before.$isc_cmd"
+	if invoke_internal_cmd "$isc_cmd" >/dev/null 2>"$T/ic.err"; then isc_rc=0; else isc_rc=$?; fi
+	find "$T" -mindepth 1 ! -name ic.err | LC_ALL=C sort > "$IS_WORK/after.$isc_cmd"
+	check "P1-2 [$isc_rel/$isc_cmd] rejected with exit 1" \
+		test "$isc_rc" -eq 1
+	check "P1-2 [$isc_rel/$isc_cmd] names the escaping component" \
+		grep -q "internal state path escapes root: $isc_rel" "$T/ic.err"
+	check "P1-2 [$isc_rel/$isc_cmd] left the external dir empty (zero-write)" \
+		test -z "$(ls -A "$IS_EXT")"
+	check "P1-2 [$isc_rel/$isc_cmd] created no lock/state/log in root (pre-write)" \
+		cmp -s "$IS_WORK/before.$isc_cmd" "$IS_WORK/after.$isc_cmd"
+}
+
+for isc_loc in var var/lib var/lib/sane var/log \
+		var/log/sane/reliability.log var/lib/sane/reliability/lock/pid; do
+	for isc_cmd in $INTERNAL_CMDS; do
+		internal_symlink_case "$isc_loc" "$isc_cmd"
+	done
+done
+
+# Internal multi-hop symlinks resolving under ROOT are accepted, not over-rejected.
+base
+rm -rf "$T/var"
+mkdir -p "$T/realvar/lib/sanereal" "$T/realvar/log"
+ln -s realvar "$T/var"
+ln -s sanereal "$T/realvar/lib/sane"
+expect_ok "P1-2 accepts internal multi-hop symlinks (init)" run init
+check "P1-2 internal multi-hop state landed under canonical root" \
+	test -d "$T/realvar/lib/sanereal/reliability/snapshots"
+check "P1-2 internal multi-hop log landed under canonical root" \
+	test -d "$T/realvar/log/sane"
+expect_ok "P1-2 accepts internal multi-hop symlinks (snapshot)" run snapshot mhop
+check "P1-2 internal multi-hop snapshot created" \
+	test -d "$T/realvar/lib/sanereal/reliability/snapshots/mhop"
+
+# A target whose ANCESTOR is a symlink to outside ROOT must still escape.
+base
+IS_ANC="$IS_WORK/ancestor"
+mkdir -p "$IS_ANC/escape" "$T/var/lib"
+ln -s "$IS_ANC" "$T/var/lib/anc"
+ln -s anc/escape "$T/var/lib/sane"
+if sh "$TOOL" --root "$T" init 2>"$T/anc.err"; then
+	fail "P1-2 rejects an ancestor symlink escaping root"
+else
+	pass "P1-2 rejects an ancestor symlink escaping root"
+fi
+check "P1-2 ancestor escape names the state component" \
+	grep -q 'internal state path escapes root: var/lib/sane' "$T/anc.err"
+check "P1-2 ancestor escape left external dir empty" \
+	test -z "$(ls -A "$IS_ANC/escape")"
+
+# Symlink loops are rejected at the bounded hop limit (fail closed).
+base
+mkdir -p "$T/var/lib"
+ln -s loopb "$T/var/lib/loopa"
+ln -s loopa "$T/var/lib/loopb"
+ln -s loopa "$T/var/lib/sane"
+if sh "$TOOL" --root "$T" init 2>"$T/loop.err"; then
+	fail "P1-2 rejects a symlink loop at the bounded hop limit"
+else
+	pass "P1-2 rejects a symlink loop at the bounded hop limit"
+fi
+check "P1-2 loop rejection names the state component" \
+	grep -q 'internal state path escapes root: var/lib/sane' "$T/loop.err"
+
+# A canonicalized (symlinked) --root must not regress under the new gate.
+base
+IS_CANON=$(mktemp -d "$IS_WORK/canon.XXXXXX")
+ln -s "$IS_CANON" "$T/rootlink"
+expect_ok "P1-2 canonicalized root symlink still accepted" sh -c \
+	"sh '$TOOL' --root '$T/rootlink' init"
+check "P1-2 canonicalized root state created in the physical target" \
+	test -d "$IS_CANON/var/lib/sane/reliability/snapshots"
+
+rm -rf -- "$IS_WORK"
+
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

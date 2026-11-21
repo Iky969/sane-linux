@@ -624,6 +624,42 @@ group_structurally_ok() {
 	' "$1"
 }
 
+# Structural audit for recover's shadow check. Mirrors passwd/group structural
+# checks and the cmd_validate hash rules: every line must have the complete
+# 9-field shape, a unique name that also exists in passwd (with the baseline
+# uid for root/sane), numeric age fields, and a complete active SHA-512 hash
+# or a lock/disable marker. Passwd has already been merged when this runs, so
+# a name that only a corrupt passwd could supply is no longer in the way.
+shadow_structurally_ok() {
+	awk -F: -v passwd_file="$PASSWD" '
+		function shadow_hash_ok(h, a) {
+			if (h == "") return 0
+			if (h ~ /^!/) sub(/^!/, "", h)
+			if (h == "*" || h == "") return 1
+			if (h !~ /^\$6\$/) return 0
+			sub(/^\$6\$/, "", h)
+			if (split(h, a, "\\$") != 2) return 0
+			if (a[1] == "" || length(a[1]) > 16 || a[1] ~ /[^.\/A-Za-z0-9]/) return 0
+			if (length(a[2]) != 86 || a[2] ~ /[^.\/A-Za-z0-9]/) return 0
+			return 1
+		}
+		FILENAME == passwd_file { puid[$1] = $3; next }
+		{
+			if (NF != 9) { bad = 1; next }
+			if ($1 !~ /^[a-z_][a-z0-9_-]*$/) { bad = 1; next }
+			if (seen[$1]++) bad = 1
+			if (!shadow_hash_ok($2)) bad = 1
+			if ($3 !~ /^[0-9]+$/) bad = 1
+			for (i = 4; i <= 8; i++)
+				if ($i != "" && $i !~ /^[0-9]+$/) bad = 1
+			if (!($1 in puid)) bad = 1
+			if ($1 == "root" && puid[$1] != "0") bad = 1
+			if ($1 == "sane" && puid[$1] != "1000") bad = 1
+		}
+		END { exit bad }
+	' "$PASSWD" "$1"
+}
+
 merge_passwd() {
 	# Ensure root/sane match the baseline exactly (replace the line when
 	# present, append when missing); every other line survives byte-for-byte.
@@ -726,16 +762,90 @@ rebuild_group() {
 	mv "$tmp" "$GROUP"
 }
 
+merge_shadow() {
+	# root/sane get the baseline fields, with the old hash only when it was
+	# usable (otherwise the locked marker). Every other line is printed
+	# verbatim, so additional accounts keep their hashes byte-for-byte.
+	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	if ! awk -F: -v rh="$ROOT_HASH_OLD" -v sh="$SANE_HASH_OLD" '
+		$1 == "root" {
+			print "root:" (rh == "" ? "!" : rh) ":19700:0:99999:7:::"; r = 1; next
+		}
+		$1 == "sane" {
+			print "sane:" (sh == "" ? "!" : sh) ":19700:0:99999:7:::"; s = 1; next
+		}
+		{ print }
+		END {
+			if (!r) print "root:" (rh == "" ? "!" : rh) ":19700:0:99999:7:::"
+			if (!s) print "sane:" (sh == "" ? "!" : sh) ":19700:0:99999:7:::"
+		}
+	' "$SHADOW" > "$tmp"; then
+		rm -f "$tmp"
+		die "failed to merge $SHADOW"
+	fi
+	mv "$tmp" "$SHADOW"
+}
+
+rebuild_shadow() {
+	# Baseline locked template + every extra entry that is itself valid and
+	# conflict-free: unique name still present in passwd, complete 9 fields,
+	# numeric age fields, and a valid active SHA-512 or lock/disable marker.
+	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$tmp"
+	if [ -f "$SHADOW" ]; then
+		if ! awk -F: -v passwd_file="$PASSWD" '
+			function shadow_hash_ok(h, a) {
+				if (h == "") return 0
+				if (h ~ /^!/) sub(/^!/, "", h)
+				if (h == "*" || h == "") return 1
+				if (h !~ /^\$6\$/) return 0
+				sub(/^\$6\$/, "", h)
+				if (split(h, a, "\\$") != 2) return 0
+				if (a[1] == "" || length(a[1]) > 16 || a[1] ~ /[^.\/A-Za-z0-9]/) return 0
+				if (length(a[2]) != 86 || a[2] ~ /[^.\/A-Za-z0-9]/) return 0
+				return 1
+			}
+			FILENAME == passwd_file { pname[$1] = 1; next }
+			$1 == "root" || $1 == "sane" { next }
+			NF != 9 { next }
+			$1 !~ /^[a-z_][a-z0-9_-]*$/ { next }
+			!shadow_hash_ok($2) { next }
+			$3 !~ /^[0-9]+$/ { next }
+			{
+				ok = 1
+				for (i = 4; i <= 8; i++)
+					if ($i != "" && $i !~ /^[0-9]+$/) ok = 0
+				if (!ok) next
+			}
+			!($1 in pname) { next }
+			seen[$1]++ { next }
+			{ print }
+		' "$PASSWD" "$SHADOW" >> "$tmp"; then
+			rm -f "$tmp"
+			die "failed to rebuild $SHADOW"
+		fi
+	fi
+	mv "$tmp" "$SHADOW"
+	if [ -n "$ROOT_HASH_OLD" ]; then
+		set_field "$SHADOW" root 2 "$ROOT_HASH_OLD"
+	fi
+	if [ -n "$SANE_HASH_OLD" ]; then
+		set_field "$SHADOW" sane 2 "$SANE_HASH_OLD"
+	fi
+}
+
 cmd_recover() {
 	# Merge, not rewrite (X6): repair each identity file individually and
 	# preserve everything still valid. A structurally sound passwd/group is
 	# merged (baseline ensured, extra lines and memberships kept); only a
 	# structurally corrupt one is rebuilt from the template with valid,
 	# conflict-free extra lines restored. A policy-compliant doas.conf is
-	# preserved and only its mode/owner is repaired. shadow is always
-	# rebuilt from the locked baseline with usable root/sane hashes
-	# restored. If no valid root/sane hash survives, remove the firstboot
-	# marker so the console setup runs again on this boot.
+	# preserved and only its mode/owner is repaired. A structurally sound shadow
+	# is merged (root/sane repaired only when their old hash is usable; every
+	# extra entry kept byte-for-byte); a corrupt one is rebuilt from the locked
+	# baseline with valid, conflict-free extra entries appended again. If no
+	# valid root/sane hash survives, remove the firstboot marker so the console
+	# setup runs again on this boot.
 	ensure_etc
 	ROOT_HASH_OLD=
 	SANE_HASH_OLD=
@@ -776,14 +886,16 @@ cmd_recover() {
 		printf 'recover: group rebuilt from baseline (structural corruption; valid extra entries restored)\n'
 	fi
 
-	# shadow: locked baseline + usable root/sane hashes (unchanged policy).
-	printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$SHADOW"
-	[ -n "$ROOT_HASH_OLD" ] && set_field "$SHADOW" root 2 "$ROOT_HASH_OLD"
-	[ -n "$SANE_HASH_OLD" ] && set_field "$SHADOW" sane 2 "$SANE_HASH_OLD"
-	if [ -n "$ROOT_HASH_OLD" ] || [ -n "$SANE_HASH_OLD" ]; then
-		printf 'recover: shadow rebuilt from baseline (usable root/sane hashes preserved)\n'
+	# shadow: merge when structurally sound (extra hashes preserved
+	# byte-for-byte); otherwise rebuild the locked baseline and append back
+	# only valid, conflict-free extra entries. Usable root/sane hashes are
+	# restored in both paths, and the marker logic below is unchanged.
+	if [ -f "$SHADOW" ] && shadow_structurally_ok "$SHADOW"; then
+		merge_shadow
+		printf 'recover: shadow merged (root/sane repaired when usable; extra entries preserved)\n'
 	else
-		printf 'recover: shadow rebuilt from baseline (no usable root/sane hash)\n'
+		rebuild_shadow
+		printf 'recover: shadow rebuilt from baseline (structural corruption; valid extra entries restored)\n'
 	fi
 
 	chmod 0644 "$PASSWD" "$GROUP"
