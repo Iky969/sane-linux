@@ -439,6 +439,84 @@ kill "$HOLDER" 2>/dev/null || true
 HOLDER=""
 stop_init
 
+# --------------------------------------------------------------- scenario 2b
+# B1 boot-failure contract: the reliability:once wrapper must propagate a
+# failed `recover` as a NONZERO exit (with the message still logged), so ninit
+# marks the root service FAILED and cancels every dependent — boot must not
+# reach getty with an unrepaired filesystem. The wrapper line is read from the
+# builder itself, so a builder drifting back to the fail-open `|| echo` form
+# makes this regression fail.
+printf '\n== 2b. failed reliability recover -> FAILED, chain cancelled ==\n'
+start_root reliability-fail
+LOG2B="$LOG"
+mkdir -p "$ROOT/usr/bin"
+cat > "$ROOT/usr/bin/sane-reliability" <<'EOSVC'
+#!/bin/sh
+printf 'stub recover: forced failure\n' >&2
+exit 1
+EOSVC
+chmod 0755 "$ROOT/usr/bin/sane-reliability"
+REL_LINE=$(grep -h '^reliability:once:' "$REPO_ROOT/scripts/build-rootfs.sh" | head -n 1)
+[ -n "$REL_LINE" ] || fail "2b: cannot read the reliability:once line from build-rootfs.sh"
+{
+	printf '%s\n' "$REL_LINE"
+	printf 'network:once:echo NETWORK_STARTED:requires=reliability\n'
+	printf 'getty:once:echo GETTY_STARTED:requires=network\n'
+} > "$ROOT/etc/init.conf"
+
+run_init
+if ! wait_for 'state RUNNING -> FAILED'; then
+	sed 's/^/  | /' "$LOG"
+	bad "2b: failed reliability recover did not mark the root service FAILED"
+fi
+check "2b: wrapper logs the boot-enters-rescue message" \
+	'reliability: recover failed; boot enters rescue'
+check "2b: root once service is FAILED" 'reliability: state RUNNING -> FAILED'
+check "2b: root exited nonzero" 'exit status=0x100'
+check_absent "2b: dependent network never started" 'NETWORK_STARTED'
+check_absent "2b: transitive getty never started" 'GETTY_STARTED'
+# PID 1 survives a failed once service (it keeps supervising the main loop).
+INIT_PID_2B=$(find_init_pid || true)
+if [ -n "$INIT_PID_2B" ] && kill -0 "$INIT_PID_2B" 2>/dev/null; then
+	ok "2b: PID 1 alive after the root service FAILED"
+else
+	bad "2b: PID 1 gone after the root service FAILED"
+fi
+INIT_PID="${INIT_PID_2B:-}"
+stop_init
+
+# ninit emits the generic FATAL: Dependency / Entering rescue-mode pair only
+# for CONFIG-level dependency errors (checked before any service is spawned),
+# not for a once service that exits nonzero. Model the post-recovery service
+# that the boot chain cannot reach as an absent dependency so the supervised
+# rescue contract of the boot chain is asserted alongside 2b above.
+printf '\n== 2b-rescue. unreachable chain dependency -> supervised rescue ==\n'
+start_root reliability-rescue
+LOG2BR="$LOG"
+cat > "$ROOT/etc/init.conf" <<'EOCFG'
+reliability:once:/bin/sh -c 'echo stub-recover-failed >&2; exit 1':timeout=0
+network:once:echo NETWORK_STARTED:requires=reliability
+getty:once:echo GETTY_STARTED:requires=account-recovery
+EOCFG
+mkfifo "$ROOT/rescue.stdin"
+sleep 15 > "$ROOT/rescue.stdin" &
+HOLDER=$!
+INIT_STDIN="$ROOT/rescue.stdin"
+run_init
+if ! wait_for 'rescue mode'; then
+	sed 's/^/  | /' "$LOG"
+	bad "2b-rescue: ninit did not report rescue mode"
+fi
+check "2b-rescue: generic FATAL Dependency reported" \
+	"FATAL: Dependency 'account-recovery' for 'getty' not found"
+check "2b-rescue: init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+check_absent "2b-rescue: boot not continued (no 'main loop ready')" 'main loop ready'
+assert_supervised_rescue "2b-rescue"
+INIT_STDIN=/dev/null
+kill "$HOLDER" 2>/dev/null || true
+HOLDER=""
+stop_init
+
 # --------------------------------------------------------------- scenario 3
 # $1 = test tag, $2 = printf payload the service sends to /run/initctl
 #      (e.g. 'poweroff\nreboot\n')
@@ -1447,6 +1525,10 @@ grep -vE "ninit: (started s[0-9]+ \(pid|cgroup: 's[0-9]+'|s[0-9]+ \(pid [0-9]+\)
 	"$LOG2" | sed 's/^/  | /'
 printf '\n== log 2 (missing dependency) ==\n'
 sed 's/^/  | /' "$LOG3"
+printf '\n== log 2b (failed reliability recover) ==\n'
+sed 's/^/  | /' "$LOG2B"
+printf '\n== log 2b-rescue (unreachable chain dependency) ==\n'
+sed 's/^/  | /' "$LOG2BR"
 printf '\n== log 3a (/run/initctl: poweroff + reboot) ==\n'
 sed 's/^/  | /' "$LOG4"
 printf '\n== log 3b (/run/initctl: status + poweroff) ==\n'

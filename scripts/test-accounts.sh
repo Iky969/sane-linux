@@ -910,18 +910,18 @@ run_wrapper >/dev/null 2>&1
 check "wrapper drops to shell when rebuild fails" \
 	test "$(grep -c 'fallback shell reached' "$T/cli-calls")" -eq 1
 
-printf '\n--- reliability:once fail-open wrapper (extracted wiring) ---\n'
+printf '\n--- reliability:once fail-closed wrapper (extracted wiring) ---\n'
 # Extract the LIVE reliability:once command from build-rootfs.sh instead of
 # hardcoding a copy, so wiring drift is caught here. Only the absolute tool
-# path is redirected to a stub; the /bin/sh -c structure, the fail-open
-# || echo branch and :timeout=0 stay verbatim. The stub performs no host
-# operations (it only exits with the requested code).
+# path is redirected to a stub; the /bin/sh -c structure, the fail-closed
+# || { echo ...; exit 1; } branch and :timeout=0 stay verbatim. The stub
+# performs no host operations (it only exits with the requested code).
 rel_line=$(grep '^reliability:once:' "$REPO_ROOT/scripts/build-rootfs.sh")
 check "reliability:once wiring present in build-rootfs.sh" test -n "$rel_line"
 check "reliability:once wiring carries timeout=0" sh -c \
 	"grep -q '^reliability:once:.*:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
 check "reliability:once wiring byte-identical across the 3 builders" sh -c \
-	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^5f794f774c3989b8282b0a493ea2584b'"
+	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^b41ae02acee4b7648b9ef05472ef9554'"
 check "network:once wiring byte-identical across the 3 builders" sh -c \
 	"grep -h 'network:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^77a839731687c05b1e0fe2e0f1d0810a'"
 rel_cmd=${rel_line#reliability:once:}
@@ -936,11 +936,11 @@ run_rel_wrapper() {
 }
 
 run_rel_wrapper 1
-check "fail-open wrapper exits 0 when recover fails" test "$REL_RC" -eq 0
+check "fail-closed wrapper exits nonzero when recover fails" test "$REL_RC" -ne 0
 case "$REL_ERR" in
-	*'reliability: recover failed; continuing boot'*)
-		pass "fail-open wrapper cites continue-boot notice on stderr" ;;
-	*) fail "fail-open wrapper missing continue-boot notice: $REL_ERR" ;;
+	*'reliability: recover failed; boot enters rescue'*)
+		pass "fail-closed wrapper cites the caller's exact stderr notice" ;;
+	*) fail "fail-closed wrapper missing the caller's exact stderr notice: $REL_ERR" ;;
 esac
 
 run_rel_wrapper 0

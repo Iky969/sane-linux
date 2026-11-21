@@ -24,7 +24,7 @@ Root build leaves the rootfs root-owned so doas stays 4755 and identity files st
 ## Automated Test Suites
 
 ```bash
-make lint                              # Python pattern/format linters + ShellCheck gate (11 production scripts)
+make lint                              # Python pattern/format linters + ShellCheck gate (13 production scripts)
 make lint-shell                        # ShellCheck gate alone (fail-closed on any warning)
 make test                              # 12 suites from TEST_SCRIPTS: 7 root-required + 5 unprivileged
 sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh        # 1) PID 1 smoke test (root)
@@ -45,14 +45,17 @@ make test-lifecycle                    # seven QEMU account-lifecycle scenarios
 ```
 
 ShellCheck gate details: `make lint-shell` runs
-`shellcheck -S warning -e SC3043,SC3013` over exactly the 11 production shell
+`shellcheck -S warning -e SC3043,SC3013` over exactly the 13 production shell
 scripts (`build-package.sh`, `build-rootfs.sh`, `make-image.sh`,
 `provision-accounts.sh`, `run-qemu.sh`, `sane-account-recovery`, `sane-accounts`,
-`sane-firstboot`, `sane-install.sh`, `sane-reliability`, `spm`). Test, smoke,
+`sane-firstboot`, `sane-install.sh`, `sane-reliability`, `spm`,
+`packages/ninit/x/usr/bin/sane-net`, `packages/ninit/x/usr/bin/sane-ctl`). Test, smoke,
 fuzz helpers and Python files are intentionally excluded. `SC3043` (`local`)
 and `SC3013` (`-ef`) are documented exclusions: undefined in strict POSIX but
 supported by all target shells (dash, ash, BusyBox sh). Info/style severities
 are not gated; any warning fails the build.
+
+Boot recovery is fail-closed: a nonzero `reliability:once` recovery stops its dependency chain, so `firstboot` and `getty` do not start on an unrepaired filesystem. It does **not** enter the supervised rescue shell; that shell is reserved for invalid dependency/config errors (the config/initctl scenarios listed below).
 
 ### Measured suite counts (final pass)
 
@@ -63,13 +66,13 @@ BusyBox inputs (never run it in the shared checkout).
 
 | Suite | Invocation | Measured result |
 |---|---|---|
-| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 237 passed, 0 failed |
-| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 239 passed, 0 failed |
-| Reliability | `sh scripts/test-reliability.sh` | 469 passed, 0 failed |
+| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 275 passed, 0 failed |
+| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 277 passed, 0 failed |
+| Reliability | `sh scripts/test-reliability.sh` | 745 passed, 0 failed |
 | SPM | `bash scripts/test-spm.sh` | 36 passed, 0 failed |
 | Build package | `bash scripts/test-build-package.sh` (scratch) | 13 passed, 0 failed |
 | Build rootfs | `sh scripts/test-build-rootfs.sh` (scratch) | 25 passed, 0 failed |
-| Config / initctl | `sudo -n -E BIN=./ninit-test sh scripts/test-config.sh` | 159 `[ OK ]`, 0 `[ FAIL ]` |
+| Config / initctl | `sudo -n -E BIN=./ninit-test sh scripts/test-config.sh` | 171 `[ OK ]`, 0 `[ FAIL ]` |
 | QEMU report harness | `sh scripts/test-qemu-report.sh` | 21 `[ OK ]`, RESULT: PASS |
 | Networking | `sh scripts/test-network.sh` | 60 passed, 0 failed |
 | Network faults | `sh scripts/test-network-fault.sh` | 137 passed, 0 failed |

@@ -99,7 +99,7 @@ lint:
 	python3 ./scripts/verify-format-strings.py
 	$(MAKE) lint-shell
 
-# Real, failing gate over the 11 production shell scripts. Test, smoke, fuzz
+# Real, failing gate over the 13 production shell scripts. Test, smoke, fuzz
 # and Python helpers are intentionally NOT included. -S warning gates warnings
 # only (info/style are not gated). SC3043 (local) and SC3013 (-ef) are excluded
 # because they are undefined in strict POSIX sh yet supported by every target
@@ -109,7 +109,8 @@ lint-shell:
 		scripts/build-package.sh scripts/build-rootfs.sh scripts/make-image.sh \
 		scripts/provision-accounts.sh scripts/run-qemu.sh scripts/sane-account-recovery \
 		scripts/sane-accounts scripts/sane-firstboot scripts/sane-install.sh \
-		scripts/sane-reliability scripts/spm
+		scripts/sane-reliability scripts/spm \
+		packages/ninit/x/usr/bin/sane-net packages/ninit/x/usr/bin/sane-ctl
 
 packages: $(BIN)
 	bash ./packages/build-all.sh

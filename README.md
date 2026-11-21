@@ -64,7 +64,7 @@ Requires `build-essential` and (for testing) `busybox-static`:
 sudo apt-get install build-essential busybox-static python3 shellcheck
 
 make          # Build static binary ./ninit
-make lint     # Pattern/format linters + ShellCheck gate on 11 production scripts
+make lint     # Pattern/format linters + ShellCheck gate on 13 production scripts
 make test     # 12 suites: 7 root-required + 5 unprivileged (root/sudo for namespaces)
 make rootfs   # Build minimal distro rootfs + initramfs (static BusyBox, ninit as PID 1)
 make qemu     # Boot rootfs in QEMU with serial console (requires qemu-system-x86)
@@ -126,6 +126,8 @@ LIFECYCLE_LOGDIR=/tmp/my-logs make test-lifecycle
 Each boot writes its serial transcript to `LIFECYCLE_LOGDIR` (default `/tmp/sane-lifecycle-logs`). The suite requires root or passwordless `sudo` for loop devices and `util-linux` (`losetup`) to inspect and repair the image between boots. It never opens a PR by itself.
 
 The recovery path is part of the image: `recovery:once:/usr/bin/sane-account-recovery` runs before `firstboot` and `getty`. A damaged `passwd`, `group`, `shadow`, or `doas.conf` is rebuilt from the baseline; if no valid password hash survives, the first-boot marker is removed so setup runs again instead of leaving the console locked.
+
+Boot-time reliability recovery is fail-closed: a failed `sane-reliability recover` exits nonzero and stops its `reliability:once` dependency chain, so `firstboot` and `getty` do not start on an unrepaired filesystem. It does **not** enter the supervised rescue shell; that shell is reserved for invalid dependency/config errors (missing dependencies, unreadable config, dependency cycles).
 
 ### Manual Testing (chroot)
 
