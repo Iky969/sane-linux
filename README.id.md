@@ -10,7 +10,7 @@ menjaganya, memindahkan proses ke cgroup v2, memasang filesystem dari
 
 Repository ini berisi distribusi lengkap S.A.N.E Linux:
 - **`ninit`**: Init system ringkas dan statis (PID 1) di [`ninit.c`](ninit.c) (±3100 baris) dengan pembatasan cgroup v2, privilege drop fail-closed (`:user=`/`:group=`), IPC `/run/initctl` per baris, eskalasi stop grace period, dan emergency shell tersupervisi.
-- **`spm`**: S.A.N.E Package Manager ([`scripts/spm`](scripts/spm)), manajer paket berbasis POSIX `/bin/sh` dengan atomic staging via `rename(2)` / anti-`ETXTBSY`, verifikasi kriptografis, power-cut journal recovery, dan pelacakan reverse dependencies.
+- **`spm`**: S.A.N.E Package Manager ([`scripts/spm`](scripts/spm)), manajer paket berbasis POSIX `/bin/sh` dengan atomic staging via `rename(2)` / anti-`ETXTBSY`, verifikasi integritas SHA-256 terhadap daftar checksum di dalam arsip yang sama (deteksi korupsi, **bukan** verifikasi tanda tangan — lihat [SECURITY.md](SECURITY.md)), power-cut journal recovery, dan pelacakan reverse dependencies.
 - **Distro & Image Builder**: Builder rootfs otomatis (`scripts/build-rootfs.sh`), pembuat raw GPT disk image (`scripts/make-image.sh`), dan guest offline live installer (`scripts/sane-install.sh`) berdukungan dual Limine BIOS dan UEFI GPT.
 
 Event loop ninit berbasis `ppoll`, jadi init tetap responsif terhadap sinyal bahkan saat layanan respawn sangat cepat.
@@ -44,8 +44,8 @@ Event loop ninit berbasis `ppoll`, jadi init tetap responsif terhadap sinyal bah
 - **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
   `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
   penulisan tidak saling menelan.
-- **Pemisahan Hak Akses (`:user=`, `:group=`)**: menurunkan hak akses ke user/group non-root dari `/etc/passwd` dan `/etc/group` sebelum payload layanan dijalankan, fail-closed jika data identitas tidak valid.
-- **Kontrol Daemon `sane-ctl`**: CLI terpadu untuk `start`, `stop`, `restart`, `status`, dan `reload` daemon lewat FIFO `/run/initctl` dengan pelacakan state di `/run/ninit-*.state` dan eskalasi SIGKILL jika stop grace timeout habis.
+- **Pemisahan Hak Akses (`:user=`, `:group=`)**: layanan berjalan sebagai `root` secara default; `:user=` menurunkan hak ke user non-root dari `/etc/passwd`. `:group=` opsional dan **harus berpasangan** dengan `:user=` (group-only ditolak fail-closed sejak round 2). Supplementary groups dibuang (`setgroups`). Kesalahan lookup menyebabkan kegagalan fail-closed.
+- **Kontrol Daemon `sane-ctl`**: CLI terpadu untuk `start`, `stop`, `restart`, dan `status` daemon lewat FIFO `/run/initctl` dengan pelacakan state di `/run/ninit-*.state` dan eskalasi SIGKILL jika stop grace timeout habis.
 - **S.A.N.E Package Manager (`spm`)**: manajer paket POSIX `/bin/sh` dengan atomic staging `rename(2)`, penggantian binary aktif tanpa `ETXTBSY`, proteksi reverse dependency, hardening keamanan arsip, dan pemulihan transaksi mati lampu (power-cut journal recovery).
 - **Installer Offline & Dual-Boot**: installer live guest (`sane-install.sh`) yang mendukung dual boot Limine BIOS (MBR/GPT) dan UEFI (ESP FAT32) dengan resolusi partisi root via GPT `PARTUUID`.
 - **Biner statis** (`gcc -static`): cukup libc, tanpa library tambahan.
@@ -72,18 +72,23 @@ container/chroot tanpa delegasi controller), ninit mencatat fallback
 Butuh `build-essential` dan (untuk uji) `busybox-static`:
 
 ```bash
-sudo apt-get install build-essential busybox-static
+sudo apt-get install build-essential busybox-static python3 shellcheck
 
 make          # hasilkan biner statis ./ninit
-make test     # smoke test + SIGTERM + config + fixture harness QEMU (tiga pertama butuh root/sudo)
+make lint     # lint pola/format + gate ShellCheck pada 11 skrip produksi
+make test     # 12 suite: 7 butuh root/sudo + 5 tanpa root (namespace PID 1)
 make rootfs   # rootfs distro minimal + initramfs (busybox statis, ninit PID 1)
 make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
 make clean
 ```
 
-`make test` menjalankan enam uji otomatis. Lima pertama menyiapkan rootfs
-sementara (busybox sebagai `/bin/sh`) lalu menjalankan ninit sebagai PID 1 di
-PID + mount namespace baru:
+`make test` menjalankan ke-**12** suite dari `TEST_SCRIPTS` dengan `./ninit-test`
+(`-DNINIT_TESTING` isolasi cgroup per run): 7 butuh root/sudo (smoke, sigterm,
+config, spawn-failure, cgroup-limits, respawn-cleanup, state-machine) karena
+menjalankan PID 1 di namespace terisolasi dan menguji cgroup; 5 jalan tanpa
+root (qemu-report, accounts, network, network-fault, reliability) terhadap
+rootfs sementara. `make integration` dan suite lifecycle/image terpisah dari
+`make test`.
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
   (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
@@ -116,6 +121,12 @@ PID + mount namespace baru:
   oktal, duplikat mountpoint) harus benar-benar ter-mount di kernel dan
   terlihat dari `/proc/mounts` milik layanan, SEMUA mount selesai sebelum
   service pertama start, dan harness standar tetap LULUS (`make integration`).
+- **[`scripts/test-respawn-cleanup.sh`](scripts/test-respawn-cleanup.sh)** *(butuh root)* — pembersihan respawn dan penahanan grandchild: pohon proses orphan dibersihkan bersama leaf cgroup-nya saat respawn; counter generation di-reset (T12).
+- **[`scripts/test-state-machine.sh`](scripts/test-state-machine.sh)** *(butuh root)* — transisi state-machine formal dan telemetri saat boot, stop, respawn, dan shutdown (T10/T11/T13).
+- **[`scripts/test-accounts.sh`](scripts/test-accounts.sh)** *(tanpa root)* — siklus dan kebijakan akun Phase A: `sane-accounts`, recovery dengan merge, vocabulary `doas`, dan alokasi UID first-free; terhadap root target sementara.
+- **[`scripts/test-network.sh`](scripts/test-network.sh)** *(tanpa root)* — jaringan Phase B: `sane-net`, DNS/DHCP, Wi-Fi, dan helper TLS keluar.
+- **[`scripts/test-network-fault.sh`](scripts/test-network-fault.sh)** *(tanpa root)* — injeksi fault jaringan dan jalur pemulihan stack reconnect/TLS.
+- **[`scripts/test-reliability.sh`](scripts/test-reliability.sh)** *(tanpa root)* — Phase C: snapshot, rollback terverifikasi, upgrade bertahap, crash-window recovery, backup dan restore.
 
 Contoh output dan penjelasan tiap pemeriksaan ada di
 [doc/build-and-test.md](doc/build-and-test.md).

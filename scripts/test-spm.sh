@@ -2376,6 +2376,312 @@ test_concurrent_installs() {
 }
 
 # -----------------------------------------------------------------------------
+# Round 2 F2: shared doas/snippet vocabulary (protective behavior only)
+# -----------------------------------------------------------------------------
+test_snippet_vocabulary() {
+    local tdir="$TEST_TMP/snippet_vocab"
+    local root="$tdir/root"
+    mkdir -p "$tdir" "$root"
+
+    local all_keys='respawn:/bin/true :requires=base :memory_max=64M :cpu_max=50 :pids_max=32 :timeout=0 :grace=5 :user=svc :group=svc'
+    if ! python_pkg_helper create_forbidden_service "$tdir/keys.spm.tar.xz" "vocab-keys" "svc" "$all_keys"; then
+        test_fail "F2 snippet vocabulary" "cannot build fixture package"
+        return
+    fi
+    if ! sh "$SPM_BIN" --root "$root" install "$tdir/keys.spm.tar.xz" >"$tdir/keys.out" 2>"$tdir/keys.err"; then
+        test_fail "F2 snippet vocabulary" "all eight valid keys rejected: $(cat "$tdir/keys.err")"
+        return
+    fi
+
+    # Ordinary arguments may be quoted or carry '='; quotes must balance.
+    local quoted='respawn:/bin/echo "hello world" status=running'
+    python_pkg_helper create_forbidden_service "$tdir/quoted.spm.tar.xz" "vocab-quoted" "svcq" "$quoted"
+    if ! sh "$SPM_BIN" --root "$root" install "$tdir/quoted.spm.tar.xz" >/dev/null 2>"$tdir/quoted.err"; then
+        test_fail "F2 snippet vocabulary" "balanced quoted argument rejected: $(cat "$tdir/quoted.err")"
+        return
+    fi
+
+    local unbalanced='respawn:/bin/echo "hello world'
+    python_pkg_helper create_forbidden_service "$tdir/unbalanced.spm.tar.xz" "vocab-unbal" "svcu" "$unbalanced"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/unbalanced.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "unbalanced quote accepted"
+        return
+    fi
+
+    # Legacy/foreign key must be rejected with the full vocabulary and the
+    # :requires= migration hint.
+    local legacy='respawn:/bin/true :deps=base'
+    python_pkg_helper create_forbidden_service "$tdir/deps.spm.tar.xz" "vocab-deps" "svcd" "$legacy"
+    if err=$(sh "$SPM_BIN" --root "$root" install "$tdir/deps.spm.tar.xz" 2>&1 >/dev/null); then
+        test_fail "F2 snippet vocabulary" "legacy :deps= key accepted"
+        return
+    fi
+    for needle in ':requires=' ':memory_max=' ':cpu_max=' ':pids_max=' ':timeout=' ':grace=' ':user=' ':group='; do
+        printf '%s\n' "$err" | grep -q -- "$needle" || {
+            test_fail "F2 snippet vocabulary" "unknown-key diagnostic missing $needle"
+            return
+        }
+    done
+
+    # Empty user/group and group without user.
+    local empty_user='respawn:/bin/true :user='
+    python_pkg_helper create_forbidden_service "$tdir/euser.spm.tar.xz" "vocab-eu" "svce" "$empty_user"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/euser.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "empty :user= accepted"
+        return
+    fi
+    local empty_group='respawn:/bin/true :user=svc :group='
+    python_pkg_helper create_forbidden_service "$tdir/egroup.spm.tar.xz" "vocab-eg" "svcf" "$empty_group"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/egroup.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "empty :group= accepted"
+        return
+    fi
+    local group_only='respawn:/bin/true :group=svc'
+    python_pkg_helper create_forbidden_service "$tdir/gonly.spm.tar.xz" "vocab-go" "svcg" "$group_only"
+    if err=$(sh "$SPM_BIN" --root "$root" install "$tdir/gonly.spm.tar.xz" 2>&1 >/dev/null); then
+        test_fail "F2 snippet vocabulary" "group-only snippet accepted"
+        return
+    fi
+    printf '%s\n' "$err" | grep -q "':group=' requires ':user='" || {
+        test_fail "F2 snippet vocabulary" "group-only diagnostic missing ':group=' requires ':user='"
+        return
+    }
+
+    # Old metacharacter rejection must still fire with the wider grammar.
+    local metachar='respawn:/bin/echo | sh'
+    python_pkg_helper create_forbidden_service "$tdir/meta.spm.tar.xz" "vocab-meta" "svcm" "$metachar"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/meta.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "shell metacharacter accepted by widened grammar"
+        return
+    fi
+
+    test_pass "F2: eight valid keys, quoted args, vocabulary/hint, empty user/group, group-only and metachar rejection"
+}
+
+# -----------------------------------------------------------------------------
+# Round 2 X2: privileged doas preservation (inert data, synthetic owner stub)
+# -----------------------------------------------------------------------------
+doas_stat_stub() {
+    local bindir="$1" state="$2"
+    mkdir -p "$bindir"
+    cat > "$bindir/stat" <<STUB
+#!/bin/sh
+case "\$3" in
+    */usr/bin/doas) printf '%s\\n' "$state" ;;
+    *) exec /usr/bin/stat "\$@" ;;
+esac
+STUB
+    chmod +x "$bindir/stat"
+}
+
+test_doas_preserve_identical() {
+    local tdir="$TEST_TMP/doas_identical"
+    local root="$tdir/root"
+    mkdir -p "$root/usr/bin" "$tdir/bin"
+    printf 'inert trusted doas bytes\n' > "$root/usr/bin/doas"
+    chmod 4755 "$root/usr/bin/doas"
+    local inode_before mode_before
+    inode_before="$(stat -c %i "$root/usr/bin/doas")"
+    mode_before="$(stat -c %a "$root/usr/bin/doas")"
+    cp "$root/usr/bin/doas" "$tdir/doas-src"
+
+    python_pkg_helper create_binary_pkg "$tdir/pkg.spm.tar.xz" "doas-identical" "1.0.0" "usr/bin/doas" "$tdir/doas-src"
+    doas_stat_stub "$tdir/bin" '0:0 4755'
+    if ! PATH="$tdir/bin:$PATH" sh "$SPM_BIN" --root "$root" install "$tdir/pkg.spm.tar.xz" >/dev/null 2>"$tdir/err"; then
+        test_fail "X2 doas identical" "install rejected: $(cat "$tdir/err")"
+        return
+    fi
+    if [ "$(stat -c %i "$root/usr/bin/doas")" != "$inode_before" ] ||
+       [ "$(stat -c %a "$root/usr/bin/doas")" != "$mode_before" ] ||
+       ! cmp -s "$tdir/doas-src" "$root/usr/bin/doas"; then
+        test_fail "X2 doas identical" "inode/mode/bytes changed despite identical staged file"
+        return
+    fi
+    if ! grep -qx '/usr/bin/doas' "$root/var/lib/spm/installed/doas-identical/files.list"; then
+        test_fail "X2 doas identical" "files.list record missing after preserved replacement"
+        return
+    fi
+    if ! grep -q '/usr/bin/doas' "$root/var/lib/spm/providers"; then
+        test_fail "X2 doas identical" "provider record missing after preserved replacement"
+        return
+    fi
+    test_pass "X2: identical staged doas skipped, inode/mode/bytes and records preserved"
+}
+
+test_doas_reject_privilege_changes() {
+    local tdir="$TEST_TMP/doas_changes"
+    local root="$tdir/root"
+    mkdir -p "$root/usr/bin" "$tdir/bin"
+    printf 'inert trusted doas bytes\n' > "$root/usr/bin/doas"
+    chmod 4755 "$root/usr/bin/doas"
+    local inode_before mode_before
+    inode_before="$(stat -c %i "$root/usr/bin/doas")"
+    mode_before="$(stat -c %a "$root/usr/bin/doas")"
+    doas_stat_stub "$tdir/bin" '0:0 4755'
+
+    # Changed bytes must be rejected with an actionable diagnostic.
+    printf 'different staged bytes\n' > "$tdir/changed-src"
+    python_pkg_helper create_binary_pkg "$tdir/changed.spm.tar.xz" "doas-changed" "1.0.0" "usr/bin/doas" "$tdir/changed-src"
+    if err=$(PATH="$tdir/bin:$PATH" sh "$SPM_BIN" --root "$root" install "$tdir/changed.spm.tar.xz" 2>&1 >/dev/null); then
+        test_fail "X2 doas changes" "changed staged doas accepted"
+        return
+    fi
+    printf '%s\n' "$err" | grep -qi 'trusted image' || {
+        test_fail "X2 doas changes" "diagnostic lacks trusted-image guidance: $err"
+        return
+    }
+
+    # Non-regular staged doas must also be rejected.
+    python_pkg_helper create_symlink_escape "$tdir/link.spm.tar.xz" "doas-link" "usr/bin/doas" "plain-target"
+    if PATH="$tdir/bin:$PATH" sh "$SPM_BIN" --root "$root" install "$tdir/link.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "X2 doas changes" "non-regular staged doas accepted"
+        return
+    fi
+
+    # An upgrade pruning the trusted doas must be rejected before commit.
+    cp "$root/usr/bin/doas" "$tdir/original-src"
+    python_pkg_helper create_binary_pkg "$tdir/v1.spm.tar.xz" "doas-prune" "1.0.0" "usr/bin/doas" "$tdir/original-src"
+    PATH="$tdir/bin:$PATH" sh "$SPM_BIN" --root "$root" install "$tdir/v1.spm.tar.xz" >/dev/null 2>&1 || {
+        test_fail "X2 doas changes" "setup install of v1 failed"
+        return
+    }
+    python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "doas-prune" "2.0.0" false "Upgrade without doas" "usr/share/doc/doas-prune/readme:ok"
+    if PATH="$tdir/bin:$PATH" sh "$SPM_BIN" --root "$root" install "$tdir/v2.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "X2 doas changes" "upgrade pruning trusted doas accepted"
+        return
+    fi
+
+    if [ "$(stat -c %i "$root/usr/bin/doas")" != "$inode_before" ] ||
+       [ "$(stat -c %a "$root/usr/bin/doas")" != "$mode_before" ] ||
+       ! printf 'inert trusted doas bytes\n' | cmp -s - "$root/usr/bin/doas"; then
+        test_fail "X2 doas changes" "rejected operation changed doas inode/mode/bytes"
+        return
+    fi
+    if [ -d "$root/var/lib/spm/installed/doas-changed" ] || [ -d "$root/var/lib/spm/installed/doas-link" ]; then
+        test_fail "X2 doas changes" "DB record created for a rejected doas package"
+        return
+    fi
+    test_pass "X2: changed/staged-nonregular/pruned doas rejected with no inode, byte or record change"
+}
+
+test_doas_fresh_stays_unprivileged() {
+    local tdir="$TEST_TMP/doas_fresh"
+    local root="$tdir/root"
+    mkdir -p "$tdir"
+    printf 'generic archive doas bytes\n' > "$tdir/doas-src"
+    python_pkg_helper create_binary_pkg "$tdir/pkg.spm.tar.xz" "doas-fresh" "1.0.0" "usr/bin/doas" "$tdir/doas-src"
+
+    if ! sh "$SPM_BIN" --root "$root" install "$tdir/pkg.spm.tar.xz" >/dev/null 2>"$tdir/err"; then
+        test_fail "X2 doas fresh" "fresh install rejected: $(cat "$tdir/err")"
+        return
+    fi
+    local mode
+    mode="$(stat -c %a "$root/usr/bin/doas")"
+    if [ "$mode" = '4755' ] || [ "$mode" = '2755' ] || [ "$mode" = '4750' ]; then
+        test_fail "X2 doas fresh" "generic archive gained setuid/setgid privileges (mode $mode)"
+        return
+    fi
+    if ! cmp -s "$tdir/doas-src" "$root/usr/bin/doas" ||
+       ! grep -q '/usr/bin/doas' "$root/var/lib/spm/providers"; then
+        test_fail "X2 doas fresh" "fresh doas payload or record incorrect"
+        return
+    fi
+    test_pass "X2: fresh generic install installs doas unprivileged with intact records"
+}
+
+# -----------------------------------------------------------------------------
+# Round 2 X8: standalone read-only validate-source
+# -----------------------------------------------------------------------------
+snapshot_source_tree() {
+    (cd "$1" && find . -mindepth 1 -printf '%P|%m|%y|%l\n' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+}
+
+test_validate_source_readonly() {
+    local tdir="$TEST_TMP/validate_source"
+    local src="$tdir/src" newroot="$tdir/no-db-root"
+    mkdir -p "$src/x/usr/bin" "$src/.META"
+    cat > "$src/.META/package" <<'EOF'
+name=vsrc
+version=1.0.0
+arch=x86_64
+description=Validate source
+base=false
+EOF
+    printf 'payload\n' > "$src/x/usr/bin/tool"
+    chmod 755 "$src/x/usr/bin/tool"
+
+    if ! sh "$SPM_BIN" --root "$newroot" validate-source "$src" >/dev/null 2>"$tdir/err"; then
+        test_fail "X8 validate-source" "valid source rejected: $(cat "$tdir/err")"
+        return
+    fi
+    if [ -e "$newroot" ] || [ -e "$tdir/no-db-root" ] || [ -d "$src/var" ]; then
+        test_fail "X8 validate-source" "validator created a target root or DB"
+        return
+    fi
+    local before after
+    before="$(snapshot_source_tree "$src")"
+    sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1 || {
+        test_fail "X8 validate-source" "second validation failed"
+        return
+    }
+    after="$(snapshot_source_tree "$src")"
+    if [ "$before" != "$after" ]; then
+        test_fail "X8 validate-source" "source bytes/modes/symlink targets changed"
+        return
+    fi
+
+    # A validated snippet keeps its original mode (no in-validator chmod).
+    mkdir -p "$src/x/usr/share/ninit/services"
+    printf 'respawn:/bin/true\n' > "$src/x/usr/share/ninit/services/v.service"
+    chmod 0600 "$src/x/usr/share/ninit/services/v.service"
+    before="$(snapshot_source_tree "$src")"
+    sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1 || {
+        test_fail "X8 validate-source" "source with valid snippet rejected"
+        return
+    }
+    after="$(snapshot_source_tree "$src")"
+    if [ "$before" != "$after" ] ||
+       [ "$(stat -c %a "$src/x/usr/share/ninit/services/v.service")" != 600 ]; then
+        test_fail "X8 validate-source" "validator normalized snippet mode"
+        return
+    fi
+
+    # Same symlink policy as the archive walker: /etc/hostname is outside the
+    # absolute allowlist; an internal relative link is valid and roundtrips.
+    ln -s /etc/hostname "$src/x/usr/bin/hostlink"
+    if sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1; then
+        test_fail "X8 validate-source" "unsupported absolute symlink accepted"
+        return
+    fi
+    rm -f "$src/x/usr/bin/hostlink"
+    ln -s tool "$src/x/usr/bin/hostlink"
+    if ! sh "$SPM_BIN" validate-source "$src" >/dev/null 2>"$tdir/err"; then
+        test_fail "X8 validate-source" "valid internal relative symlink rejected: $(cat "$tdir/err")"
+        return
+    fi
+
+    # .META symlinks are forbidden even when internal.
+    ln -s package "$src/.META/alias"
+    if sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1; then
+        test_fail "X8 validate-source" "symlink in .META accepted"
+        return
+    fi
+    rm -f "$src/.META/alias"
+
+    # Shared snippet vocabulary: legacy :deps= rejected with migration hint.
+    printf 'respawn:/bin/true :deps=base\n' > "$src/x/usr/share/ninit/services/v.service"
+    if err=$(sh "$SPM_BIN" validate-source "$src" 2>&1 >/dev/null); then
+        test_fail "X8 validate-source" "legacy :deps= snippet accepted"
+        return
+    fi
+    printf '%s\n' "$err" | grep -q ':requires=' || {
+        test_fail "X8 validate-source" "vocabulary diagnostic lacks :requires= hint"
+        return
+    }
+    test_pass "X8: validate-source is read-only, shares symlink/snippet policy, rejects unsupported absolute links"
+}
+
+# -----------------------------------------------------------------------------
 # Main Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -2416,6 +2722,11 @@ main() {
     test_sigkill_interrupted_install_recovery
     test_uninstall_with_shared_file
     test_concurrent_installs
+    test_snippet_vocabulary
+    test_doas_preserve_identical
+    test_doas_reject_privilege_changes
+    test_doas_fresh_stays_unprivileged
+    test_validate_source_readonly
 
     printf '\n==================================================\n'
     printf 'SPM Test Suite Summary: %d passed, %d failed\n' "$PASSED_COUNT" "$FAILED_COUNT"

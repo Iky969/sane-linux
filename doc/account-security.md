@@ -101,7 +101,11 @@ test roots.
 Rules enforced by `add-user`:
 
 - Names match `^[a-z_][a-z0-9_-]*$`; `root` is reserved.
-- UID is numeric, in `1000..65534`, and unique.
+- UID is numeric, in `1000..65534`, and unique. Without an explicit UID, the
+  smallest free id in `1000..65534` is allocated (first-free scan: gaps below
+  the maximum are reused, and a high-uid import such as `nobody` at 65534
+  cannot exhaust the range). A completely full range is a clean error. The
+  same allocation applies to automatically created group ids.
 - Without an explicit group, a private group with `GID == UID` is created;
   with an existing group the account is appended to its member list.
 - The home is created as `/home/NAME`, mode `0750`, and chowned to `UID:GID`.
@@ -116,17 +120,34 @@ supplementary group. `validate` checks modes, ownership of doas files,
 numeric/duplicate UIDs and GIDs, absence of a second UID 0, empty password
 fields, SHA-512 (or locked) hashes, `wheel` membership, and an effective
 `permit ... :wheel` rule with no `nopass`. Wired into `make test` and CI
-(`scripts/test-accounts.sh`, 165 assertions; 167 when run as root).
+(`scripts/test-accounts.sh`, 236 assertions; 238 when run as root).
 
-### Recovery scope and data loss (`recover`)
+### Recovery semantics (`recover`)
 
 `recover` (and the boot-time `sane-account-recovery` wrapper that calls it)
-rebuilds passwd/group/shadow/doas.conf from the baseline template, which
-contains **only `root` and `sane`**, then restores any still-usable root/sane
-hashes. Additional accounts created with `add-user` are therefore **lost by
-design** when a recovery rebuild runs — a deliberate lockout-prevention
-trade-off, not a bug. Their home directories remain on disk, but the
-accounts no longer exist; recreate them after recovery. The wrapper also
+repairs the identity files **per file, merging instead of rewriting**:
+
+- `doas.conf`: content that passes the policy scan (no `nopass` grant and an
+  effective `permit ... :wheel` rule, both bounded by the first `cmd`/`as`
+  token) is **preserved**; only the mode (`0600`) and owner (`root:root` when
+  run as root) are repaired. Missing or policy-violating content is replaced
+  with the baseline `permit persist :wheel`.
+- `passwd` / `group`: structurally sound files are **merged** — every
+  non-baseline line and membership is preserved, and the baseline entries
+  (`root`, `sane`; groups `root`, `wheel`, `sane`) are ensured: fixed in
+  place when present, appended when missing, and `wheel` always contains
+  `root` and `sane`. Structural corruption (non-numeric uid/gid, duplicate
+  ids, a second uid 0, or a non-baseline line occupying a baseline id)
+  rebuilds that file from the baseline template and re-appends the
+  non-baseline lines that are themselves valid and conflict-free (numeric
+  ids `>= 1000`, unique id and name). Conflicting or malformed lines are
+  dropped.
+- `shadow`: structurally valid files are preserved entry-by-entry, with only root/sane hashes repaired; structurally corrupt files are rebuilt from the locked baseline and re-appended with valid, conflict-free non-baseline entries. Usable root/sane hashes and the first-boot marker logic are unchanged.
+
+`recover` prints one line per file stating whether it was preserved/merged
+or rebuilt, followed by the hash/marker summary. Accounts whose passwd lines
+were destroyed by the corruption itself cannot be brought back — recreate
+them after recovery; their home directories remain on disk. The wrapper also
 ensures `awk`/`mktemp` applet links exist for the rebuild: it never clobbers
 an existing regular file, creates a link only when the path is absent,
 repairs dangling or wrong symlinks, and leaves correct symlinks untouched
@@ -138,9 +159,20 @@ repairs dangling or wrong symlinks, and leaves correct symlinks untouched
   run any command as root; the credential is cached per session.
 - The binary is setuid root (`4755`) and the config is `0600` root:root.
   `validate` rejects wrong modes, non-root ownership, missing or ineffective
-  permit rules, and any `permit` rule carrying a `nopass` token in any
-  position after the keyword (e.g. `permit persist nopass :wheel`). Comment
-  text and `setenv` values such as `X=nopass` are not grants and are accepted.
+  permit rules, and any `permit` rule carrying a `nopass` option token
+  before the first `cmd`/`as` terminator OUTSIDE a `setenv { ... }` block
+  (e.g. `permit persist nopass :wheel`). A `setenv` block is skipped as a
+  whole: names such as `as` or `cmd` inside the braces are environment
+  variables, NOT terminators. Therefore `permit setenv { as } nopass :wheel`
+  is a real passwordless grant and is rejected, while
+  `permit setenv { as } :wheel` is a valid identity rule and is accepted.
+  Tokens after a `cmd`/`as` terminator are command arguments, not options:
+  `permit :wheel cmd /usr/bin/echo nopass` and
+  `permit setenv { as } :wheel cmd /usr/bin/echo nopass` are both valid.
+  Comment text and `setenv` values such as `X=nopass` are not grants and
+  are accepted. The same scan rules apply to the effective `:wheel` check
+  and to `recover`'s decision to preserve `doas.conf`; a valid rule on one
+  line cannot mask a nopass grant hidden in a `setenv` block on another.
 - Do not add wildcard `nopass` rules: they defeat the password prompt.
 
 ## Security boundaries

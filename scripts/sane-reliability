@@ -110,9 +110,25 @@ LOGDIR="$ROOT/var/log/sane"
 LOGFILE="$LOGDIR/reliability.log"
 MAX_LOG_BYTES=65536
 
+# Internal state/log path components whose symlink resolution must stay inside
+# the canonical ROOT. Validated at the top-level dispatcher entry BEFORE any
+# write, mkdir or lock acquisition (see validate_internal_state). Kept as
+# relative paths so the same bounded-hop walk as symlink_safe_rel resolves
+# them. Order matters: the shallowest component of a chain is listed first,
+# so the failure reason names the exact component that escaped.
+INTERNAL_STATE_RELS="var var/lib var/lib/sane var/lib/sane/reliability \
+var/lib/sane/reliability/snapshots var/lib/sane/reliability/staging \
+var/lib/sane/reliability/journal var/lib/sane/reliability/lock \
+var/lib/sane/reliability/lock/pid \
+var/log var/log/sane var/log/sane/reliability.log \
+var/log/sane/reliability.log.1"
+
 valid_tag() {
+	# '.' and '..' are whole-dot components, and '.tmp.*' / '.old.*' are
+	# the internal crash-window staging/aside namespaces: none can be a
+	# user snapshot tag. Dot-prefixed names such as '.hidden' remain legal.
 	case "$1" in
-		''|*[!A-Za-z0-9._-]*) return 1 ;;
+		''|.|..|.tmp.*|.old.*|*[!A-Za-z0-9._-]*) return 1 ;;
 		-*) return 1 ;;
 	esac
 	[ "${#1}" -le 64 ]
@@ -198,6 +214,175 @@ symlink_safe_rel() {
 	return 0
 }
 
+resolve_abs_no_contain() {
+	# resolve_abs_no_contain ABS -- follow an ABSOLUTE symlink target to its
+	# final physical path with the same bounded-hop component walk, WITHOUT
+	# any containment check. An absolute target's prefixes are legitimately
+	# outside ROOT (e.g. /tmp when ROOT is /tmp/fixture/root), so checking
+	# each prefix against ROOT would over-reject an internal absolute link.
+	# The CALLER tests the final resolved path under ROOT. Relative targets
+	# keep the containment-checked walk in symlink_resolve_contained.
+	rac_base=/
+	rac_rest=${1#/}
+	rac_hops=0
+	while [ -n "$rac_rest" ]; do
+		case "$rac_rest" in
+			*/*) rac_comp=${rac_rest%%/*}; rac_rest=${rac_rest#*/} ;;
+			*) rac_comp=$rac_rest; rac_rest= ;;
+		esac
+		case "$rac_comp" in
+			''|.) continue ;;
+		esac
+		rac_cand=$(normalize_path "$rac_base/$rac_comp") || return 1
+		if [ -L "$rac_cand" ]; then
+			rac_hops=$((rac_hops + 1))
+			[ "$rac_hops" -le 40 ] || return 1
+			rac_target=$(readlink "$rac_cand" 2>/dev/null) || return 1
+			[ -n "$rac_target" ] || return 1
+			case "$rac_target" in
+				/*) rac_base=/; rac_rest="${rac_target#/}/$rac_rest" ;;
+				*)  rac_base=$(dirname "$rac_cand")
+				    rac_rest="$rac_target/$rac_rest" ;;
+			esac
+			continue
+		fi
+		rac_base=$rac_cand
+	done
+	printf '%s\n' "$rac_base"
+}
+
+symlink_resolve_contained() {
+	# symlink_resolve_contained REL -- bounded-hop resolver for the internal
+	# state preflight. REL is relative (no '..'/absolute) and ROOT is already
+	# canonical. Walk component by component; whenever a component is a
+	# symlink, expand it and RESTART the walk from the new base with the link
+	# target's components prepended to the remaining ones. Restarting is
+	# essential: resolving a link to "a/b" must still walk "a", which may be
+	# an ancestor symlink pointing outside ROOT even when "b" is ordinary —
+	# a one-shot normalize would wrongly accept that chain. Absolute targets
+	# are resolved fully by resolve_abs_no_contain WITHOUT per-prefix
+	# containment (their prefixes may lie outside ROOT) and their FINAL
+	# resolved path must be under ROOT; relative targets resolve against the
+	# link's directory with per-component containment. Hops are bounded at 40
+	# and '.'/'..' collapse via normalize_path (pure POSIX, identical on the
+	# BusyBox runtime). Nothing is created here.
+	src_rel=$1
+	src_root=$ROOT
+	while [ "${src_root%/}" != "$src_root" ]; do src_root=${src_root%/}; done
+	[ -n "$src_root" ] || src_root=/
+	# canonicalize_root can emit a doubled leading slash for symlinked roots
+	# (abs-target expansion sets base=/ then appends a leading-'/'-stripped
+	# target). Collapse it so the lexical containment check compares the
+	# same spelling as normalize_path's output.
+	src_root=$(normalize_path "$src_root") || return 1
+	src_base=$src_root
+	src_rest=$src_rel
+	src_hops=0
+	while [ -n "$src_rest" ]; do
+		case "$src_rest" in
+			*/*) src_comp=${src_rest%%/*}; src_rest=${src_rest#*/} ;;
+			*) src_comp=$src_rest; src_rest= ;;
+		esac
+		case "$src_comp" in
+			''|.) continue ;;
+		esac
+		src_cand=$(normalize_path "$src_base/$src_comp") || return 1
+		if [ "$src_root" != "/" ]; then
+			case "$src_cand/" in
+				"$src_root/"*) ;;
+				*) return 1 ;;
+			esac
+		fi
+		if [ -L "$src_cand" ]; then
+			src_hops=$((src_hops + 1))
+			[ "$src_hops" -le 40 ] || return 1
+			src_target=$(readlink "$src_cand" 2>/dev/null) || return 1
+			[ -n "$src_target" ] || return 1
+			case "$src_target" in
+				/*)
+					# Absolute target: resolve every component (including
+					# further symlink hops) WITHOUT per-prefix containment,
+					# then require the FINAL resolved path to stay under
+					# ROOT. Prefixes like /tmp are outside ROOT by design.
+					src_abs=$(resolve_abs_no_contain "$src_target") || return 1
+					if [ "$src_root" != "/" ]; then
+						case "$src_abs/" in
+							"$src_root/"*) ;;
+							*) return 1 ;;
+						esac
+					fi
+					src_base=$src_abs
+					;;
+				*)  src_base=$(dirname "$src_cand")
+				    src_rest="$src_target/$src_rest" ;;
+			esac
+			continue
+		fi
+		src_base=$src_cand
+	done
+	return 0
+}
+
+validate_internal_state() {
+	# validate_internal_state -- containment gate for the tool's OWN state
+	# and log paths. Called at the top-level dispatcher entry BEFORE
+	# acquire_lock's mkdir and before any command's first write, so every
+	# command (and every nested/internal recovery path, which runs later in
+	# the same process) is covered without a second acquisition.
+	#
+	# Every listed path (state directories, the journal/lock/pid leaves and
+	# the log leaves that cmd_init/log_event create or append directly) is
+	# resolved with symlink_resolve_contained. An existing symlink whose full
+	# resolution stays under the canonical ROOT is accepted (internal
+	# symlinks remain legal); a chain that escapes ROOT fails closed with a
+	# specific reason and NO lock, directory or file is created. Paths that
+	# do not exist yet (fresh roots) pass trivially.
+	for vis_rel in $INTERNAL_STATE_RELS; do
+		symlink_resolve_contained "$vis_rel" || \
+			die "internal state path escapes root: $vis_rel"
+	done
+}
+
+record_symlink() {
+	# record_symlink SNAPSHOT_TMP SRC_PATH REL -- append a path/target pair
+	# to the snapshot's symlinks metadata (two lines per entry). Targets
+	# share the manifest grammar: a backslash or newline cannot be
+	# represented in the line format, so refuse to record it (fail closed).
+	rs_tmp=$1; rs_src=$2; rs_rel=$3
+	rs_target=$(readlink "$rs_src") || return 1
+	case "$rs_target" in
+		*'\'*) return 1 ;;
+	esac
+	[ "$(printf '%s' "$rs_target" | wc -l | tr -d ' ')" -eq 0 ] || return 1
+	printf '%s\n%s\n' "$rs_rel" "$rs_target" >> "$rs_tmp/symlinks"
+}
+
+symlink_target_inside() {
+	# symlink_target_inside REL TARGET -- fail closed unless a recorded
+	# symlink target resolves inside ROOT. Absolute targets must normalize
+	# under ROOT; relative targets resolve against the link's directory.
+	# The resolved target's own components are walked too (bounded hops via
+	# symlink_safe_rel), so an internal-looking first hop cannot chain out
+	# of ROOT. Dangling targets inside ROOT are allowed.
+	sti_rel=$1; sti_target=$2
+	[ -n "$sti_target" ] || return 1
+	case "$sti_target" in
+		*'\'*) return 1 ;;
+	esac
+	case "$sti_target" in
+		/*) sti_cand=$(normalize_path "$sti_target") || return 1 ;;
+		*) sti_cand=$(normalize_path "$(dirname "$ROOT/$sti_rel")/$sti_target") || return 1 ;;
+	esac
+	sti_root=$ROOT
+	while [ "${sti_root%/}" != "$sti_root" ]; do sti_root=${sti_root%/}; done
+	case "$sti_cand/" in
+		"$sti_root/"*) ;;
+		*) return 1 ;;
+	esac
+	sti_crel=${sti_cand#"$sti_root"/}
+	symlink_safe_rel "$sti_crel"
+}
+
 check_dest_symlinks() {
 	# check_dest_symlinks DIR -- pre-pass over a manifest: reject before any
 	# write if a destination would traverse a symlink escaping ROOT.
@@ -206,7 +391,7 @@ check_dest_symlinks() {
 		[ -n "$cds_line" ] || continue
 		cds_path=$(printf '%s\n' "$cds_line" | sed 's/^[^ ]*  //')
 		case "$cds_path" in
-			./meta|./manifest.sha256|./new-files|'') continue ;;
+			./meta|./manifest.sha256|./new-files|./symlinks|'') continue ;;
 		esac
 		cds_rel=${cds_path#./}
 		valid_rel_path "$cds_rel" || die "unsafe manifest path: $cds_path"
@@ -222,7 +407,7 @@ validate_manifest() {
 		[ -n "$vm_line" ] || continue
 		vm_path=$(printf '%s\n' "$vm_line" | sed 's/^[^ ]*  //')
 		case "$vm_path" in
-			./meta|./manifest.sha256|./new-files|'') continue ;;
+			./meta|./manifest.sha256|./new-files|./symlinks|'') continue ;;
 		esac
 		vm_rel=${vm_path#./}
 		valid_rel_path "$vm_rel" || die "unsafe manifest path: $vm_path"
@@ -230,10 +415,25 @@ validate_manifest() {
 }
 
 write_manifest() {
-	# write_manifest DIR -- NUL-delimited so spaced names survive
+	# write_manifest DIR -- NUL-delimited so spaced names survive. One
+	# grammar with the verifier: GNU sha256sum escapes backslash/newline
+	# names with a leading backslash, which valid_rel_path rejects -- such
+	# a manifest could never verify, so refuse the snapshot here (fail
+	# closed, staging removed) instead of writing a permanently dead one.
 	dir=$1
 	(cd "$dir" && find . -type f ! -name manifest.sha256 -print0 | \
 		LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$dir/manifest.sha256"
+	while IFS= read -r wm_line; do
+		[ -n "$wm_line" ] || continue
+		case "$wm_line" in
+			'\'*)
+				rm -rf -- "$dir"
+				die "snapshot rejected: backslash/newline filename breaks the manifest grammar: $wm_line" ;;
+		esac
+		wm_path=$(printf '%s\n' "$wm_line" | sed 's/^[^ ]*  //')
+		wm_rel=${wm_path#./}
+		valid_rel_path "$wm_rel" || { rm -rf -- "$dir"; die "unsafe snapshot filename: $wm_path"; }
+	done < "$dir/manifest.sha256"
 }
 
 unique_tag() {
@@ -256,8 +456,16 @@ do_snapshot() {
 	[ -d "$ds_target" ] && [ "$ds_force" -ne 1 ] && die "snapshot already exists: $ds_tag"
 	ds_tmp=$(mktemp -d "$SNAPS/.tmp.XXXXXX") || die "cannot create snapshot staging dir"
 	[ -d "$ds_tmp" ] || die "mktemp did not create a directory"
+	# Symlink metadata: two lines per entry (relative path, readlink target).
+	# A regular file, so write_manifest hashes it and verify protects it.
+	: > "$ds_tmp/symlinks"
 	for rel in $STATE_FILES; do
 		src="$ROOT/$rel"
+		if [ -L "$src" ]; then
+			record_symlink "$ds_tmp" "$src" "$rel" || \
+				{ rm -rf -- "$ds_tmp"; die "cannot record symlink: $rel"; }
+			continue
+		fi
 		[ -f "$src" ] || continue
 		mkdir -p "$ds_tmp/$(dirname "$rel")"
 		cp -p "$src" "$ds_tmp/$rel" || { rm -rf -- "$ds_tmp"; die "cannot copy $rel"; }
@@ -265,13 +473,33 @@ do_snapshot() {
 	if [ -d "$ROOT/var/lib/spm" ]; then
 		mkdir -p "$ds_tmp/var/lib"
 		cp -a "$ROOT/var/lib/spm" "$ds_tmp/var/lib/" || { rm -rf -- "$ds_tmp"; die "cannot copy spm DB"; }
+		# cp -a preserved DB symlinks; record them (relative to ROOT) so
+		# rollback recreates them -- the manifest only covers regular files.
+		ds_llist=$(mktemp "$STAGING/.snapshot-links.XXXXXX") || \
+			{ rm -rf -- "$ds_tmp"; die "cannot stage symlink list"; }
+		find "$ds_tmp/var/lib/spm" -type l -print > "$ds_llist"
+		while IFS= read -r ds_lnk; do
+			[ -n "$ds_lnk" ] || continue
+			ds_lrel=${ds_lnk#"$ds_tmp/"}
+			record_symlink "$ds_tmp" "$ds_lnk" "$ds_lrel" || \
+				{ rm -f -- "$ds_llist"; rm -rf -- "$ds_tmp"; die "cannot record spm symlink: $ds_lrel"; }
+		done < "$ds_llist"
+		rm -f -- "$ds_llist"
 	fi
 	if [ -n "$ds_extra" ] && [ -f "$ds_extra" ]; then
 		: > "$ds_tmp/new-files"
 		while IFS= read -r ds_rel; do
 			[ -n "$ds_rel" ] || continue
 			valid_rel_path "$ds_rel" || { rm -rf -- "$ds_tmp"; die "unsafe snapshot path: $ds_rel"; }
-			if [ -f "$ROOT/$ds_rel" ]; then
+			case "$ds_rel" in
+				symlinks)
+					rm -rf -- "$ds_tmp"
+					die "payload target collides with snapshot metadata: $ds_rel" ;;
+			esac
+			if [ -L "$ROOT/$ds_rel" ]; then
+				record_symlink "$ds_tmp" "$ROOT/$ds_rel" "$ds_rel" || \
+					{ rm -rf -- "$ds_tmp"; die "cannot record symlink: $ds_rel"; }
+			elif [ -f "$ROOT/$ds_rel" ]; then
 				mkdir -p "$ds_tmp/$(dirname "$ds_rel")"
 				cp -p "$ROOT/$ds_rel" "$ds_tmp/$ds_rel" || { rm -rf -- "$ds_tmp"; die "cannot copy $ds_rel"; }
 			else
@@ -327,10 +555,15 @@ cmd_snapshot() {
 cmd_list() {
 	cmd_init
 	printf 'TAG  CREATED\n'
-	for dir in "$SNAPS"/*; do
+	# Enumerate dot-directories too: user tags such as '.hidden' are legal
+	# and must be visible. Only the internal .tmp.* staging and .old.*
+	# swap-aside directories (plus '.'/'..') are hidden.
+	for dir in "$SNAPS"/* "$SNAPS"/.*; do
 		[ -d "$dir" ] || continue
 		tag=${dir##*/}
-		case "$tag" in .*) continue ;; esac
+		case "$tag" in
+			.|..|.tmp.*|.old.*) continue ;;
+		esac
 		ts=$(sed -n 's/^timestamp=//p' "$dir/meta" 2>/dev/null || true)
 		printf '%-24s %s\n' "$tag" "${ts:-unknown}"
 	done
@@ -381,7 +614,7 @@ restore_files_from() {
 		[ -n "$rf_line" ] || continue
 		rf_path=$(printf '%s\n' "$rf_line" | sed 's/^[^ ]*  //')
 		case "$rf_path" in
-			./meta|./manifest.sha256|./new-files|'') continue ;;
+			./meta|./manifest.sha256|./new-files|./symlinks|'') continue ;;
 		esac
 		rf_rel=${rf_path#./}
 		valid_rel_path "$rf_rel" || die "unsafe manifest path: $rf_path"
@@ -403,6 +636,31 @@ restore_files_from() {
 			symlink_safe_rel "$rf_new" || die "new-file symlink escapes root: $rf_new"
 			rm -f "$ROOT/$rf_new"
 		done < "$rf_dir/new-files"
+	fi
+	# Recreate recorded symlinks (type + target preserved). The metadata is
+	# a regular manifest entry, so its integrity is already verified; each
+	# path and target is still validated fail-closed before installation.
+	if [ -f "$rf_dir/symlinks" ]; then
+		while IFS= read -r rf_lpath; do
+			IFS= read -r rf_ltarget || die "malformed symlinks metadata in $rf_dir"
+			valid_rel_path "$rf_lpath" || die "unsafe symlink path: $rf_lpath"
+			symlink_safe_rel "$rf_lpath" || die "symlink destination escapes root: $rf_lpath"
+			symlink_target_inside "$rf_lpath" "$rf_ltarget" || \
+				die "symlink target escapes root: $rf_lpath -> $rf_ltarget"
+			rf_ldst="$ROOT/$rf_lpath"
+			mkdir -p "$(dirname "$rf_ldst")" || die "cannot create parent for $rf_lpath"
+			# Stage the link NEXT TO its destination, then rename it over
+			# the live path. The destination is never removed first: a
+			# failing ln leaves it exactly as it was. '--' keeps a target
+			# starting with '-' from being parsed as an ln option; this is
+			# portable to dash/ash and their ln/mv applets.
+			rf_ltmp=$(mktemp -u "$(dirname "$rf_ldst")/.sane-rel-ln.XXXXXX") || \
+				die "cannot stage symlink: $rf_lpath"
+			ln -s -- "$rf_ltarget" "$rf_ltmp" || \
+				{ rm -f -- "$rf_ltmp"; die "cannot recreate symlink: $rf_lpath"; }
+			mv -fT -- "$rf_ltmp" "$rf_ldst" || \
+				{ rm -f -- "$rf_ltmp"; die "cannot install symlink: $rf_lpath"; }
+		done < "$rf_dir/symlinks"
 	fi
 }
 
@@ -535,10 +793,23 @@ cmd_upgrade() {
 	payload=$1
 	[ -d "$payload" ] || die "payload directory not found: $payload"
 	[ -f "$payload/manifest.sha256" ] || die "payload has no manifest.sha256"
-	(cd "$payload" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || die "payload integrity check failed"
-	validate_manifest "$payload"
-	check_dest_symlinks "$payload"
 	cmd_init
+	# Verify-at-use (F4): read the manifest ONCE into a staged copy and let
+	# every consumer (pre-check, validation, path-list builder, apply loop)
+	# use that same copy. A same-user writer swapping payload/manifest.sha256
+	# after this point cannot redirect the upgrade; payload file contents
+	# are re-hashed again immediately before each install below.
+	up_stage=$(mktemp -d "$STAGING/.upgrade.XXXXXX") || die "cannot stage upgrade manifest"
+	cp "$payload/manifest.sha256" "$up_stage/manifest.sha256" || \
+		{ rm -rf -- "$up_stage"; die "cannot stage upgrade manifest"; }
+	# Clean the staged dir on EVERY exit path (die, set -e, signals, success);
+	# release_lock stays part of the EXIT trap owned by the dispatcher.
+	trap 'rm -rf -- "$up_stage"; release_lock' EXIT
+	# Fast-fail pre-check against the staged manifest (legacy error contract).
+	(cd "$payload" && sha256sum -c "$up_stage/manifest.sha256" >/dev/null 2>&1) || \
+		die "payload integrity check failed"
+	validate_manifest "$up_stage"
+	check_dest_symlinks "$up_stage"
 	up_extra=$(mktemp "$STAGING/.upgrade-paths.XXXXXX") || die "cannot stage upgrade path list"
 	while IFS= read -r upe_line; do
 		[ -n "$upe_line" ] || continue
@@ -558,13 +829,33 @@ cmd_upgrade() {
 				die "payload targets protected reliability state: $upe_rel" ;;
 		esac
 		printf '%s\n' "$upe_rel" >> "$up_extra"
-	done < "$payload/manifest.sha256"
+	done < "$up_stage/manifest.sha256"
 	tag=$(unique_tag "auto-pre-upgrade-$(date -u '+%Y%m%dT%H%M%SZ')")
 	do_snapshot "$tag" 0 "$up_extra" || { rm -f "$up_extra"; die "cannot create pre-upgrade snapshot"; }
 	rm -f "$up_extra"
 	write_journal in-progress "$tag"
+	# Fault hook (test-only, same pattern as sane-net's SANE_NET_FAULT):
+	# exact match against ${SANE_RELIABILITY_FAULT:-}; any other value or
+	# unset is a complete no-op. Simulates a same-user writer mutating one
+	# payload file AFTER the pre-check; the apply loop's re-hash must catch
+	# it. Writes only into the payload directory, never into tool state.
+	if [ "${SANE_RELIABILITY_FAULT:-}" = payload-swap ]; then
+		printf '%s: fault injection: payload-swap\n' "$PROG" >&2
+		fs_path=
+		while IFS= read -r fs_line; do
+			[ -n "$fs_line" ] || continue
+			fs_path=$(printf '%s\n' "$fs_line" | sed 's/^[^ ]*  //')
+			case "$fs_path" in
+				./manifest.sha256|./meta|'') continue ;;
+			esac
+			break
+		done < "$up_stage/manifest.sha256"
+		[ -n "$fs_path" ] || die "payload-swap fault found no payload file"
+		printf 'fault-swap\n' >> "$payload/$fs_path"
+	fi
 	while IFS= read -r up_line; do
 		[ -n "$up_line" ] || continue
+		up_hash=${up_line%%  *}
 		up_path=$(printf '%s\n' "$up_line" | sed 's/^[^ ]*  //')
 		case "$up_path" in
 			./manifest.sha256|./meta|'') continue ;;
@@ -574,12 +865,34 @@ cmd_upgrade() {
 		up_src="$payload/$up_path"
 		up_dst="$ROOT/$up_rel"
 		[ -f "$up_src" ] || { recover_internal || true; die "payload file missing: $up_rel"; }
+		# Re-hash immediately before copy: the pre-check is a fast-fail, not
+		# a guarantee about the bytes present at install time.
+		up_actual=$(sha256sum "$up_src") || { recover_internal || true; die "cannot re-hash payload file: $up_rel"; }
+		[ "${up_actual%% *}" = "$up_hash" ] || \
+			{ recover_internal || true; die "payload changed during upgrade: $up_rel"; }
+		# Re-check containment immediately before install as well.
+		symlink_safe_rel "$up_rel" || \
+			{ recover_internal || true; die "destination symlink escapes root: $up_rel"; }
 		mkdir -p "$(dirname "$up_dst")" || { recover_internal || true; die "cannot create parent for $up_rel"; }
 		up_tmp=$(mktemp "$(dirname "$up_dst")/.sane-rel.XXXXXX") || { recover_internal || true; die "cannot stage $up_rel"; }
+		# Late-swap fault hook (exact match, no-op for any other value):
+		# mutate the payload source AFTER its hash was verified and BEFORE
+		# cp, so only hashing the private staged copy can detect the change.
+		# Writes only into the test-owned payload directory.
+		if [ "${SANE_RELIABILITY_FAULT:-}" = payload-swap-late ]; then
+			printf '%s: fault injection: payload-swap-late\n' "$PROG" >&2
+			printf 'fault-swap-late\n' >> "$up_src"
+		fi
 		cp -p "$up_src" "$up_tmp" || { rm -f "$up_tmp"; recover_internal || true; die "cannot copy $up_rel"; }
+		# Verify the bytes actually staged, not just the source we copied.
+		up_tmp_hash=$(sha256sum "$up_tmp") || \
+			{ rm -f "$up_tmp"; recover_internal || true; die "cannot re-hash staged file: $up_rel"; }
+		[ "${up_tmp_hash%% *}" = "$up_hash" ] || \
+			{ rm -f "$up_tmp"; recover_internal || true; die "payload changed during upgrade: $up_rel"; }
 		mv "$up_tmp" "$up_dst" || { rm -f "$up_tmp"; recover_internal || true; die "cannot install $up_rel"; }
-	done < "$payload/manifest.sha256"
-	write_journal done "$tag"
+	done < "$up_stage/manifest.sha256"
+	rm -rf -- "$up_stage"
+	write_journal 'done' "$tag"
 	log_event INFO "upgrade committed with pre-upgrade snapshot $tag"
 	note "upgrade committed (rollback tag: $tag)"
 }
@@ -608,8 +921,17 @@ cmd_backup() {
 	done
 	cmd_init
 	[ -e "$archive" ] && [ "$force" -ne 1 ] && die "archive already exists: $archive"
+	# The lock is process-local runtime state, never backup material: list
+	# persistent members EXPLICITLY so lock/ and lock.stale.* are excluded by
+	# construction. The shipped BusyBox tar has no --exclude/-X support, and
+	# enumerating members works with both GNU tar and BusyBox tar. Every
+	# member below exists after cmd_init. NEW persistent state MUST be added
+	# to this list AND documented in doc/reliability.md (Backup and restore).
 	tar -czf "$archive" -C "$ROOT" \
-		var/lib/sane/reliability var/log/sane 2>/dev/null || die "cannot create archive"
+		var/lib/sane/reliability/snapshots \
+		var/lib/sane/reliability/staging \
+		var/lib/sane/reliability/journal \
+		var/log/sane 2>/dev/null || die "cannot create archive"
 	[ -s "$archive" ] || die "archive is empty"
 	note "backup written to $archive"
 }
@@ -656,6 +978,15 @@ cmd_restore() {
 	done < "$rt_tmp/members"
 	tar -xzf "$archive" -C "$rt_tmp" 2>/dev/null || \
 		{ rm -rf -- "$rt_tmp"; die "cannot extract archive"; }
+	# Archives made by old tool versions still carry the backup holder's
+	# lock/ (and lock.stale.* crash residue). Never restore lock state: strip
+	# every lock* entry from staging right after extraction, before any
+	# validation or install. The LIVE restore lock lives under the target
+	# root (not staging), so it is untouched and release_lock still sees $$.
+	for rt_lock in "$rt_tmp/var/lib/sane/reliability/lock"*; do
+		[ -e "$rt_lock" ] || [ -L "$rt_lock" ] || continue
+		rm -rf -- "$rt_lock"
+	done
 	[ -d "$rt_tmp/var/lib/sane/reliability/snapshots" ] || \
 		{ rm -rf -- "$rt_tmp"; die "archive has no reliability snapshots"; }
 	# Reject absolute targets and symlink chains that leave the staging root
@@ -695,10 +1026,10 @@ cmd_restore() {
 
 heal_snapshot_swaps() {
 	# Complete or discard interrupted --force swaps. Called ONLY while the
-	# state lock is held (mutator entry, including recover's boot path), so
-	# every .old.<tag> aside and .tmp.* staging dir here is crash residue:
-	# the exclusive lock guarantees no live writer owns them. Never called
-	# from the lock-free read-only commands (init/list/verify/log).
+	# state lock is held (every command entry acquires it, including
+	# recover's boot path), so every .old.<tag> aside and .tmp.* staging dir
+	# here is crash residue: the exclusive lock guarantees no live writer
+	# owns them.
 	for hs_old in "$SNAPS"/.old.*; do
 		[ -d "$hs_old" ] || continue
 		hs_tag=${hs_old##*/}
@@ -736,11 +1067,13 @@ release_lock() {
 }
 
 acquire_lock() {
-	# Atomic mkdir lock for ALL mutators, acquired ONLY at the top-level
-	# dispatcher entry. Nested mutator calls in the same process (recover ->
-	# cmd_net_recover, rollback/upgrade -> do_snapshot) never re-acquire: the
-	# pid check below makes the lock reentrant by pid, and the EXIT-trap
-	# release belongs to the top-level acquisition alone.
+	# Atomic mkdir lock for ALL commands (every command writes or auto-inits
+	# state, so all writes happen under the lock), acquired ONLY at the
+	# top-level dispatcher entry. Nested calls in the same process (recover
+	# -> cmd_net_recover, rollback/upgrade -> do_snapshot, every command ->
+	# cmd_init) never re-acquire: the pid check below makes the lock
+	# reentrant by pid, and the EXIT-trap release belongs to the top-level
+	# acquisition alone.
 	#
 	# Stale handling: a lock whose pid is dead (kill -0 fails) or garbage is
 	# stolen via an atomic mv aside; the mv loser loops and re-evaluates.
@@ -793,17 +1126,26 @@ acquire_lock() {
 }
 
 case "$CMD" in
-	init)          cmd_init "$@" ;;
-	list)          cmd_list "$@" ;;
-	verify)        cmd_verify "$@" ;;
-	log)           cmd_log "$@" ;;
-	snapshot|rollback|upgrade|recover|net-recover|backup|restore)
-		# All mutators serialize on the state lock. Acquisition happens only
-		# here, at the top-level entry; the EXIT-trap release belongs to this
-		# acquisition alone. Nested mutator calls within the process reuse the
-		# held lock (reentrant by pid) and never re-acquire or release it.
+	init|list|verify|log|snapshot|rollback|upgrade|recover|net-recover|backup|restore)
+		# Internal state containment (P1-2): validate every self-owned
+		# state/log path for escaping symlinks BEFORE acquire_lock's mkdir
+		# and before any command's first write. Covers all commands and,
+		# because nested recovery runs in this same process, every internal
+		# recovery path too. Rejection creates no lock, dir or file.
+		validate_internal_state
+		# ALL commands serialize on the state lock: init/list/verify/log
+		# auto-init and write state too, so every write happens under the
+		# lock. Read commands (list/verify) may block up to the lock timeout
+		# while a mutator holds it. Acquisition happens only here, at the
+		# top-level entry; the EXIT-trap release belongs to this acquisition
+		# alone. Nested calls within the process reuse the held lock
+		# (reentrant by pid) and never re-acquire or release it.
 		acquire_lock
 		case "$CMD" in
+			init)        cmd_init "$@" ;;
+			list)        cmd_list "$@" ;;
+			verify)      cmd_verify "$@" ;;
+			log)         cmd_log "$@" ;;
 			snapshot)    cmd_snapshot "$@" ;;
 			rollback)    cmd_rollback "$@" ;;
 			upgrade)     cmd_upgrade "$@" ;;

@@ -26,7 +26,7 @@ State lives under the target root:
 | `/var/lib/sane/reliability/snapshots/<tag>/` | Verified state snapshots |
 | `/var/lib/sane/reliability/staging/` | Reserved for staged payloads |
 | `/var/lib/sane/reliability/journal` | Upgrade/recovery state (`0600`) |
-| `/var/lib/sane/reliability/lock/` | Mutator exclusion lock (holder `pid` file) |
+| `/var/lib/sane/reliability/lock/` | Command exclusion lock (holder `pid` file) |
 | `/var/log/sane/reliability.log` | Structured event log (rotated at 64 KiB) |
 
 ## Commands
@@ -51,8 +51,31 @@ sane-reliability [--root DIR] restore ARCHIVE
 `/etc/shadow`, `/etc/doas.conf`, `/etc/init.conf`, `/etc/fstab`,
 `/etc/hostname`) plus the whole `/var/lib/spm` package database. Every captured
 file is listed in `manifest.sha256` with a SHA-256 digest; `meta` records the
-UTC creation time. Tags accept `[A-Za-z0-9._-]`, max 64 chars, and may not
-start with `-`. Overwriting an existing tag requires `--force`.
+UTC creation time. Tags accept `[A-Za-z0-9._-]`, max 64 chars, may not
+start with `-`, and may not be `.` or `..` (whole-dot tags can never be
+installed by the snapshot swap renames). The `.tmp.*` and `.old.*` prefixes
+are the internal staging/aside namespaces and are also rejected as user tags
+(up front, including with `--force`), so no user tag can collide with
+crash-window residue. Dot-prefixed tags such as `.hidden` are legal, are
+written into the snapshot directory, verify and roll back like any other tag,
+and are shown by `list`. Overwriting an existing tag requires `--force`.
+
+Symlinks are preserved, not dereferenced: a symlink among the identity/config
+files, inside the `spm` database, or at a pre-upgrade payload target path is
+recorded in a `symlinks` metadata file at the snapshot root (two lines per
+entry: the relative path, then the verbatim `readlink` target). The metadata
+is a regular file, so it is hashed into `manifest.sha256` and protected by
+`verify`. Dangling symlinks are recorded too. `rollback`/`recover` recreate
+each recorded symlink after the regular files are installed (see *Rollback
+and safety snapshots*).
+
+The manifest writer and verifier share one grammar: GNU `sha256sum` escapes
+filenames containing backslash or newline with a leading backslash, which the
+path verifier rejects. Rather than writing a manifest that could never
+verify (a permanently dead snapshot), `snapshot` refuses such names
+fail-closed with a clear error, removes its staging directory, and leaves
+existing state untouched. Legal-but-unusual names (for example spaces) still
+roundtrip through snapshot, verify and rollback.
 
 `verify TAG` re-checks every manifest entry before a snapshot is used. A
 corrupt or incomplete snapshot is never applied — `rollback`, `upgrade` and
@@ -72,21 +95,44 @@ filenames containing spaces are handled correctly.
 `rollback TAG` first creates an `auto-pre-rollback-<UTC>` snapshot of the
 current state, then restores every manifest entry atomically (stage with
 `mktemp` in the destination directory, `cp -p`, `rename(2)`), preserving file
-modes. The journal records `state=rolled-back` and the tag used. Safety tags
-get a numeric suffix on collision, so two rollbacks in the same second never
-clash. `--force` swaps snapshots via rename-aside/install/delete rather than
-deleting first, so a failed move cannot destroy the previous snapshot.
+modes. After the regular files (and `new-files` deletions), every symlink
+recorded in the snapshot's `symlinks` metadata is recreated by staging a link
+in the destination's own directory (`mktemp -u ... .sane-rel-ln.XXXXXX`),
+creating it with `ln -s -- TARGET TEMP`, and renaming it over the live path
+with `mv -fT -- TEMP DEST`. The live destination is never removed first: a
+failing `ln` (or `mv`) removes only the staged temp and leaves the previous
+destination untouched. `--` protects dash-prefixed targets from option
+parsing, and `-T` prevents `mv` from following a destination symlink that
+points at an internal directory (which would hide the staged link inside that
+directory). The sequence is POSIX-sh/dash/ash compatible with both GNU mv and
+the shipped BusyBox mv; on failure the staged temp is cleaned up and the
+recreation is fatal. Each recreation is still validated fail-closed:
+the path must pass the relative-path grammar and destination symlink
+containment, and the target must resolve inside the target root — absolute
+targets must normalize under the root, relative targets resolve against the
+link's directory, and the resolved target's own components are walked too, so
+an internal-looking first hop cannot chain out of the root. Escaping targets
+are rejected before anything is written; internal targets (including dangling
+ones) are allowed. The journal records `state=rolled-back` and the tag used.
+Safety tags get a numeric suffix on collision, so two rollbacks in the same
+second never clash. `--force` swaps snapshots via rename-aside/install/delete
+rather than deleting first, so a failed move cannot destroy the previous
+snapshot.
 
 ### State lock and crash-window self-heal
 
-All mutating commands (`snapshot`, `rollback`, `upgrade`, `recover`,
-`net-recover`, `backup`, `restore`) serialize on an atomic `mkdir` lock at
-`var/lib/sane/reliability/lock`, acquired once at the top-level command
-entry. The holder writes its PID to `lock/pid`. Acquisition retries every
-0.1 s and fails closed after 30 s (`timed out waiting for reliability
-lock`); the `SANE_RELIABILITY_LOCK_TIMEOUT` environment variable overrides
-the timeout in seconds for tests — the production default stays 30 s.
-`init`, `list`, `verify` and `log` never take the lock.
+**All commands** (`init`, `list`, `verify`, `log`, `snapshot`, `rollback`,
+`upgrade`, `recover`, `net-recover`, `backup`, `restore`) serialize on an
+atomic `mkdir` lock at `var/lib/sane/reliability/lock`, acquired once at the
+top-level command entry. Every command writes or auto-initializes state, so
+all writes happen under the lock; the read commands `list` and `verify` may
+block up to the lock timeout while a mutator holds it. The holder writes its
+PID to `lock/pid`. Acquisition retries every 0.1 s and fails closed after 30 s
+(`timed out waiting for reliability lock`); the
+`SANE_RELIABILITY_LOCK_TIMEOUT` environment variable overrides the timeout in
+seconds for tests — the production default stays 30 s. The auto-init behavior
+of `list`, `verify` and `log` is unchanged: they still create the state
+directories on a fresh root, now under the lock.
 
 Nested mutator calls inside one process (`recover` invoking the network
 recovery internally, `rollback`/`upgrade` invoking the snapshot helper)
@@ -110,13 +156,14 @@ tool assumes single-user/root operation on the state it protects.
 Crash-window self-heal: `snapshot --force` swaps via rename-aside /
 install / delete with a **deterministic** aside name `.old.<tag>` (the tag
 is validated, so it is filename-safe). A crash between the two renames
-would otherwise lose the old snapshot, so every lock-holding mutator —
-including `recover`, the boot path — first runs `heal_snapshot_swaps`: for
-each `.old.<tag>`, if the live tag is missing the aside is renamed back; if
-the live tag exists the aside is redundant and removed. Orphaned `.tmp.*`
-staging directories are removed too — the exclusive lock guarantees they
-belong to no live writer. Healing never runs in the lock-free read-only
-commands (`init`, `list`, `verify`, `log`).
+would otherwise lose the old snapshot, so every lock acquisition — every
+command, including `recover`, the boot path — first runs
+`heal_snapshot_swaps`: for each `.old.<tag>`, if the live tag is missing the
+aside is renamed back; if the live tag exists the aside is redundant and
+removed. Orphaned `.tmp.*` staging directories are removed too — the
+exclusive lock guarantees they belong to no live writer. Because read
+commands now take the lock as well, a `list` or `verify` heals crash residue
+exactly like a mutator (and releases the lock again on exit).
 
 ### Upgrades and recovery
 
@@ -130,17 +177,43 @@ An upgrade payload is a directory containing the files to install and a
 
 `upgrade PAYLOAD_DIR`:
 
-1. verifies the payload manifest and rejects any destination that would
-   traverse a symlink escaping the target root (see *Symlink containment*),
+1. reads the payload manifest **once** into a staged copy under
+   `var/lib/sane/reliability/staging/` and verifies it (fast-fail
+   `payload integrity check failed`), rejecting any destination that would
+   traverse a symlink escaping the target root (see *Symlink containment*).
+   Every later consumer — validation, the path-list builder and the apply
+   loop — reads that same staged copy, so a same-user writer swapping
+   `payload/manifest.sha256` after the pre-check cannot redirect the upgrade
+   (the staged copy is removed on every exit path),
 2. takes an automatic `auto-pre-upgrade-<UTC>` snapshot covering **every
    payload target path** in addition to the identity/config files and the
    `spm` database: target files that already exist are copied into the
-   snapshot, and target files that do not yet exist are recorded in a
-   `new-files` list inside the snapshot,
+   snapshot (symlink targets are recorded in the `symlinks` metadata), and
+   target files that do not yet exist are recorded in a `new-files` list
+   inside the snapshot,
 3. writes `state=in-progress` plus that tag to the journal,
 4. installs each payload file atomically (installation is **not** restricted
-   to the identity/config files),
+   to the identity/config files). Immediately before each copy the payload
+   file is **re-hashed** and compared against the staged manifest, and the
+   destination symlink containment is re-checked: a file changed after the
+   pre-check aborts the upgrade (`payload changed during upgrade`) and the
+   recorded snapshot is restored. After `cp` into the private `.sane-rel.*`
+   temp file, that **staged copy is hashed again** against the manifest hash,
+   the temp file is removed on mismatch (`recover_internal` +
+   `payload changed during upgrade`), and only a verified copy is renamed
+   into place — so a writer racing the source between the hash and the copy
+   cannot install unverified bytes,
 5. writes `state=done` and logs the rollback tag.
+
+Fault injection (tests only): `SANE_RELIABILITY_FAULT=payload-swap` fires
+after the pre-check and before the apply loop, appending bytes to one payload
+file to simulate a same-user writer racing the upgrade; the verify-at-use
+re-hash must catch it and recover. `SANE_RELIABILITY_FAULT=payload-swap-late`
+fires inside the apply loop **after** the source re-hash and **before** `cp`,
+so the post-copy staged-copy hash is the gate that catches it. Both hooks
+follow the `sane-net` `SANE_NET_FAULT` pattern: exact string match against the
+environment variable, a complete no-op for any other value or when unset, and
+they write only into the payload directory — never into tool state.
 
 If any step fails, the recorded snapshot is restored immediately. `rollback`
 and `recover` restore every snapshot file **and delete the `new-files`** the
@@ -172,6 +245,44 @@ If any resolved path leaves the target root, the operation is rejected
 fail-closed and nothing is written. Symlinks that resolve **inside** the target
 root remain allowed. The same containment check guards `new-files` deletion so
 a rollback never removes a file through an escaping symlink.
+
+### Internal state containment
+
+Beyond manifest destinations, the tool's **own** state and log paths are
+contained before anything is written. At the top-level command entry — before
+`acquire_lock`'s `mkdir`, before `cmd_init`, and before any dispatcher command
+or internal recovery path writes — every internal path component is resolved
+for symlink escape: `var`, `var/lib`, `var/lib/sane`,
+`var/lib/sane/reliability` with its `snapshots`, `staging`, `journal`, `lock`
+and `lock/pid` leaves, plus `var/log`, `var/log/sane`, `reliability.log` and
+`reliability.log.1`. These are exactly the paths that `cmd_init`,
+`write_journal`, `acquire_lock` and `log_event` create, append, rotate or chmod
+directly, so checking only manifest destinations would still allow an external
+file write through a symlinked parent **or leaf**.
+
+Each listed path is walked component by component with a bounded-hop resolver
+(40 hops): every symlink is expanded with `readlink` and the walk **restarts
+from the resolved base** so an ancestor symlink inside a target chain is
+followed too (a one-shot lexical normalization would miss, for example,
+`var/lib/sane -> anc/escape` where `anc -> /outside`). Relative targets
+resolve against the link's directory and are containment-checked component by
+component; `.`/`..` are collapsed with pure POSIX expansion. An **absolute**
+target is different: its prefixes are legitimately outside ROOT (for example
+`/tmp` when the canonical ROOT is `/tmp/fixture/root`), so it is followed with
+the same bounded-hop walk but **without** a per-prefix containment check — only
+the **final resolved path** is tested under ROOT. This avoids over-rejecting a
+legal absolute-internal link while still refusing an external one, including a
+target that looks internal but passes through an ancestor symlink to the
+outside. An existing symlink whose full resolution remains under ROOT is
+accepted (internal multi-hop and absolute-internal symlinks stay legal); a
+chain that escapes ROOT, or a symlink loop that exhausts the hop bound, is
+rejected fail-closed
+with `internal state path escapes root: <rel>` — naming the shallowest escaping
+component — and **no lock, directory or file is created**. Paths that do not
+exist yet on a fresh root pass trivially. Because the check runs at the single
+top-level dispatcher entry, all eleven commands and nested recovery paths are
+covered; a canonicalized (symlinked) `--root` resolves to a physical path
+first and is unaffected.
 
 ### Network recovery
 
@@ -289,20 +400,39 @@ entry is written. Reliability commands log their own lifecycle events.
 ### Backup and restore
 
 `backup ARCHIVE.tar.gz` archives the reliability state and log directory from
-the target root; it refuses to overwrite unless `--force` is given.
+the target root; it refuses to overwrite unless `--force` is given. The
+state lock is process-local runtime state, never backup material. Backup
+therefore enumerates the persistent members **explicitly**:
+`var/lib/sane/reliability/snapshots`, `var/lib/sane/reliability/staging`,
+`var/lib/sane/reliability/journal` and `var/log/sane`. `lock/` and
+`lock.stale.*` are excluded by construction, so a restore can never
+resurrect a holder PID (possibly reused by an unrelated process) in another
+root. All four members exist because backup calls `init` first. This is also
+the reason for enumeration instead of an exclusion pattern: the shipped
+BusyBox tar (v1.37.0, Ubuntu 1:1.37.0-7ubuntu1 build) supports neither
+`--exclude` nor `-X`, so an exclusion-pattern backup fails at runtime on the
+target while passing host-side GNU tar tests. **Constraint:** every future
+persistent state path must be added to this member list in `cmd_backup` AND
+to this paragraph; omitting it silently excludes that state from backups.
 Trust boundary: `ARCHIVE` is an operator-controlled host path, intentionally
 **not** confined to `--root` — it may legitimately live outside the target
 root. Backup/restore are administrative, root-only operations in production;
 the archive path is trusted operator input, while the archive *content*
 remains fully validated.
 
-`restore` extracts to a temporary directory, rejects absolute/traversal
-member names, and walks every symlink chain with a bounded hop count (40)
-against the staging root: absolute targets and chains resolving outside the
-staging root are rejected fail-closed before anything is installed, while
-internal relative chains (including `..` that normalizes back inside the
-staging root) are allowed. It then verifies every snapshot manifest inside
-the archive and copies the state and logs into the target root.
+`restore` extracts to a temporary directory and rejects absolute/traversal
+member names. Archives made by old tool versions still carry `lock/` entries:
+restore does not reject them — it strips every `lock*` entry from the staging
+directory right after extraction, before validation and install. The live
+restore lock lives under the target root (not staging), so it is untouched
+and released normally on exit; the next mutator acquires the lock immediately
+instead of waiting on an archived PID. Restore then walks every symlink chain
+with a bounded hop count (40) against the staging root: absolute targets and
+chains resolving outside the staging root are rejected fail-closed before
+anything is installed, while internal relative chains (including `..` that
+normalizes back inside the staging root) are allowed. It then verifies every
+snapshot manifest inside the archive and copies the state and logs into the
+target root.
 
 Restore **resets the journal**: after the copy it forces `state=idle`
 (state only, no snapshot tag or interface), never trusting the archived
@@ -340,14 +470,34 @@ stages all writable paths under another temporary root and uses stubbed network
 tools to verify fail-before-side-effect injection, reconnect retry/backoff,
 default-resolver restoration after DHCP failures, and connectivity checks.
 The reliability suite also covers the state lock (live-holder contention
-fails closed within a test-shortened `SANE_RELIABILITY_LOCK_TIMEOUT`, retry
-after release, stale dead/garbage-PID steal, pidless grace steal, no lock
-left behind on any failed operation, and the nested `recover` → network
-recovery path finishing without self-deadlock), crash-window swap self-heal
-(injected rename failures between the two swap moves, manual crash state,
-redundant-aside discard, orphan staging cleanup, read-only commands never
-healing or locking), restore journal-trust and symlink-chain containment,
-upgrade self-state protection with zero-write assertions, and root
+fails closed within a test-shortened `SANE_RELIABILITY_LOCK_TIMEOUT` for
+mutators **and** for `init`/`list`/`verify`/`log`, retry after release, stale
+dead/garbage-PID steal, pidless grace steal, no lock left behind on any failed
+operation, and the nested `recover` → network recovery path finishing without
+self-deadlock), crash-window swap self-heal (injected rename failures between
+the two swap moves, manual crash state, redundant-aside discard, orphan
+staging cleanup, read commands healing under the lock like mutators), restore
+journal-trust and symlink-chain containment, backup/restore lock hygiene
+(archive excludes `lock*`, old/crafted archives carrying a live-PID `lock/`
+and `lock.stale.*` are accepted but stripped, the next mutator never waits on
+an archived PID, contended restore fails closed), symlink preservation
+(STATE_FILES, spm DB and payload-target symlinks survive snapshot → upgrade →
+rollback with type and target intact; dangling and absolute-internal targets
+preserved; crafted escaping targets rejected fail-closed; real snapshot
+round-trips cover dash-prefixed and dangling dash targets, normal symlinks,
+and a live destination symlink into an internal directory (the staged link
+must not leak inside it), with an `ln` failure shim proving the previous
+destination survives), the shared
+manifest grammar (backslash/newline filenames refuse the snapshot cleanly;
+spaced names roundtrip), whole-dot tag rejection with `.hidden` still legal,
+persistent and listed while the internal `.tmp.*`/`.old.*` namespaces are
+rejected even with `--force`, verify-at-use (the
+`SANE_RELIABILITY_FAULT=payload-swap` hook aborts and recovers to exact
+pre-upgrade bytes, `payload-swap-late` is caught by the post-`cp` staged-copy
+hash, other values are no-ops, bad-hash payloads keep the legacy pre-check
+contract with zero writes, and a sha256sum-shim manifest swap after the
+pre-check cannot redirect the
+upgrade), upgrade self-state protection with zero-write assertions, and root
 canonicalization (symlinked, dangling-symlink and fresh-leaf roots).
 Neither suite changes the host `/etc` or host network state.
 
@@ -376,7 +526,7 @@ into `make test`, `make test-reliability`, and CI.
   discarding any archived in-progress state (see *Backup and restore*); it
   does not roll back already committed payload files; use `rollback` for
   that.
-- Mutators are serialized by the state lock; a concurrent mutator fails
+- All commands are serialized by the state lock; a concurrent command fails
   closed after the lock timeout rather than interleaving writes. Stale
   detection is PID-liveness based and carries the pid-reuse and cross-user
   limits described in *State lock and crash-window self-heal*.

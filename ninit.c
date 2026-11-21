@@ -143,6 +143,9 @@ static char g_seen_mnt[MAX_SEEN_MNT][MAX_LINE];
 static int  g_seen_cnt = 0;
 
 /* ---------- logging ---------- */
+/* The format attribute must be visible at the declaration so gcc -Wformat=2
+   checks every init_log call site (verify-format-strings.py asserts it). */
+static void init_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void init_log(const char *fmt, ...)
 {
     char buf[1024];
@@ -1042,7 +1045,7 @@ static int parse_config(const char *path)
             init_log("Parse err: line exceeds MAX_LINE (%d), line rejected", MAX_LINE);
             continue;
         }
-        line[strcspn(line, "\n")] = 0;
+        line[strcspn(line, "\r\n")] = 0;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == 0) continue;
@@ -1210,11 +1213,14 @@ static int parse_config(const char *path)
             }
         }
 
-        /* Mode Validation */
+        /* Mode Validation: an unknown mode is a configuration error, not a
+           reason to silently default to once (fail-open typo -> daemon
+           permanently dead). Reject the entry like other parse errors. */
         int is_respawn = 0;
         if (strcmp(mode, "respawn") == 0) is_respawn = 1;
         else if (strcmp(mode, "once") != 0) {
-            init_log("Warning: unknown mode '%s' for '%s'. Default: once", mode, name);
+            init_log("Parse err: unknown mode '%s' for '%s', entry rejected", mode, name);
+            continue;
         }
 
         /* Resolve user / group for privilege dropping (FEAT-62) */
@@ -1236,6 +1242,13 @@ static int parse_config(const char *path)
         }
 
         if (group_opt) {
+            /* A group without a user would keep uid 0 (setresuid(0,0,0))
+               while looking like a privilege-dropped service: fail closed
+               at parse time, consistent with the other entry rejections. */
+            if (!user_opt) {
+                init_log("Parse err: group option on service '%s' requires user option, entry rejected", name);
+                continue;
+            }
             if (*group_opt == '\0') {
                 init_log("Parse err: empty group option on service '%s', entry rejected", name);
                 continue;
@@ -2706,7 +2719,7 @@ static void mount_fstab(void)
             init_log("fstab: line exceeds MAX_LINE (%d), skipped", MAX_LINE);
             continue;
         }
-        line[strcspn(line, "\n")] = 0;
+        line[strcspn(line, "\r\n")] = 0;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == 0) continue;

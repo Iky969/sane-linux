@@ -15,6 +15,8 @@ set -eu
 
 TARGET=${1:-}
 SUDO=${2:-}
+# CDPATH= is an intentional env-prefix: it stops CDPATH from redirecting cd.
+# shellcheck disable=SC1007
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 [ -n "$TARGET" ] || { printf 'FAIL: target root required\n' >&2; exit 1; }

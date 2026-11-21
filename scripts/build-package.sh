@@ -76,6 +76,7 @@ while [ $# -gt 0 ]; do
 done
 
 # Validate required arguments
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 [ -n "$SOURCE_DIR" ] || die "Missing required option: --source <staging_dir>"
 [ -n "$OUTPUT_DIR" ] || die "Missing required option: --output <output_dir>"
 
@@ -87,6 +88,13 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 
 # 1. Validate payload structure
 [ -d "$SOURCE_DIR/x" ] || die "Missing payload directory: $SOURCE_DIR/x"
+
+# Shared read-only policy check BEFORE any source mutation (mkdir/touch/chmod
+# below must never follow a symlinked .META or service path). The validator
+# lives in spm, invoked from this script's own directory: one symlink policy,
+# one snippet grammar for builder and installer.
+sh "$SCRIPT_DIR/spm" validate-source "$SOURCE_DIR" || die "Source rejected by spm validate-source"
+
 mkdir -p "$SOURCE_DIR/.META"
 
 # 2. Validate .META/package manifest
@@ -150,26 +158,10 @@ fi
 printf 'base=%s\n' "$PKG_BASE" >> "$MANIFEST.tmp"
 mv -f "$MANIFEST.tmp" "$MANIFEST"
 
-# 3. Path safety audit on staging directory (anti-traversal guard)
-log "Auditing staging tree for path safety in $SOURCE_DIR..."
-
-# Audit .META directory: strictly regular files only, zero symlinks, zero traversal
-while IFS= read -r -d '' entry; do
-    rel="${entry#$SOURCE_DIR/.META/}"
-    [ -n "$rel" ] || continue
-
-    if echo "$rel" | grep -qE '(^|/)\.\.(/|$)'; then
-        die "Path traversal detected in .META entry: $rel"
-    fi
-
-    if [ -L "$entry" ]; then
-        die "Symlinks are strictly forbidden in .META directory: $rel"
-    fi
-
-    if [ ! -f "$entry" ] && [ ! -d "$entry" ]; then
-        die "Special file detected in .META directory: $rel"
-    fi
-done < <(find "$SOURCE_DIR/.META" -mindepth 1 -print0)
+# 3. Path safety audit -- delegated to spm validate-source above (single
+# policy). The private symlink helper below remains for the post-pack archive
+# structural audit only; that invariant is unchanged.
+log "Staging tree path safety validated by spm: $SOURCE_DIR"
 
 # Helper to verify a symlink does not escape target root
 verify_symlink_safety() {
@@ -214,53 +206,18 @@ verify_symlink_safety() {
     return 0
 }
 
-# Audit regular files, directories, and symlinks in staging tree
-while IFS= read -r -d '' entry; do
-    rel="${entry#$SOURCE_DIR/x/}"
-    [ -n "$rel" ] || continue
+# Source-side x/ path and symlink audit is delegated to spm validate-source
+# (called before any source mutation). Post-pack archive audit below still
+# uses the private helper, unchanged.
 
-    # Reject traversal components in file/directory path
-    if echo "$rel" | grep -qE '(^|/)\.\.(/|$)'; then
-        die "Path traversal detected in staging entry: $rel"
-    fi
-
-    # If it is a symlink, audit target
-    if [ -L "$entry" ]; then
-        target="$(readlink "$entry")"
-        verify_symlink_safety "$rel" "$target"
-    fi
-done < <(find "$SOURCE_DIR/x" -mindepth 1 -print0)
-
-# 4. Service snippet audit
+# 4. Service snippet mode normalization -- only AFTER validate-source passed.
+# Content auditing and vocabulary are exclusively spm's shared validator.
 SERVICE_DIR="$SOURCE_DIR/x/usr/share/ninit/services"
 if [ -d "$SERVICE_DIR" ]; then
-    log "Auditing ninit service snippets in $SERVICE_DIR..."
+    log "Normalizing validated ninit service snippet modes in $SERVICE_DIR..."
     while IFS= read -r -d '' sfile; do
-        sname="$(basename "$sfile")"
-        if [ -L "$sfile" ]; then
-            die "Service file must not be a symlink: $sname"
-        fi
-        [ -f "$sfile" ] || die "Service file is not a regular file: $sname"
-        [[ "$sname" == *.service ]] || die "Service file must end in .service: $sname"
-
-        # Enforce 0644 non-executable permissions
+        [ -f "$sfile" ] && [ ! -L "$sfile" ] || continue
         chmod 0644 "$sfile"
-
-        # Audit content
-        content="$(tr -d '\r\n' < "$sfile")"
-        [ -n "$content" ] || die "Service file is empty: $sname"
-
-        # Check for forbidden dangerous patterns
-        for forbidden in "/run/initctl" "reboot" "poweroff" "halt" "kill" "signal"; do
-            if echo "$content" | grep -qw "$forbidden"; then
-                die "Forbidden keyword '$forbidden' detected in service snippet: $sname"
-            fi
-        done
-
-        # Check for forbidden shell metacharacters
-        if echo "$content" | grep -qE '[|><;&`$]'; then
-            die "Forbidden shell metacharacters detected in service snippet: $sname"
-        fi
     done < <(find "$SERVICE_DIR" -mindepth 1 -maxdepth 1 -print0)
 fi
 

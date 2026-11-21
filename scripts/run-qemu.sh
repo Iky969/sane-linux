@@ -35,7 +35,11 @@
 
 set -eu
 
+# CDPATH= is an intentional env-prefix: it stops CDPATH from redirecting cd.
+# shellcheck disable=SC1007
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# CDPATH= is an intentional env-prefix: it stops CDPATH from redirecting cd.
+# shellcheck disable=SC1007
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 DISTRO_DIR=${DISTRO_DIR:-$REPO_ROOT/distro}

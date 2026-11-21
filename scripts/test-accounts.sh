@@ -214,6 +214,80 @@ printf 'permit persist :wheel # nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate ignores nopass in an inline comment" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
+# P2-nopass boundary: the nopass scan must stop BEFORE the first 'cmd'/'as'
+# token, exactly like the effective-rule scan. A command ARGUMENT named
+# nopass is not a doas option; a false positive here fails validation and
+# triggers a recovery rebuild of a perfectly valid policy.
+base
+printf 'permit :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts nopass as a cmd argument (whole file)" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit nopass :wheel cmd /usr/bin/echo x\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass option before the cmd terminator" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit :wheel as root cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts nopass as a cmd argument after as (whole file)" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit nopass :wheel as root\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass option before the as terminator" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit :wheel cmd /usr/bin/echo x # nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate ignores nopass in an inline comment after cmd arguments" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Round 1.5 setenv-aware scan: "as" and "cmd" inside a setenv { } block are
+# environment variable names, NOT the cmd/as option terminators. The scans
+# must skip the whole block, then resume for nopass / :wheel.
+base
+printf 'permit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after a setenv { as } block" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { cmd } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects nopass after a setenv { cmd } block" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { as } :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts :wheel identity after a setenv { as } block" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit setenv { as } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts a cmd argument after a setenv { as } block" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Multi-rule bypass: a valid wheel rule on one line must not mask a nopass
+# grant hidden after a setenv block on another line.
+base
+printf 'permit persist :wheel\npermit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a multi-rule nopass grant after setenv { as }" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { cmd } nopass :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a multi-rule nopass grant after setenv { cmd }" \
+	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { as } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts a multi-rule cmd argument after setenv { as }" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit persist :wheel\npermit setenv { cmd } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts a multi-rule cmd argument after setenv { cmd }" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
 # Effective-rule scan (r1B-498): whole-file cases, no extra base rule.
 # A valid doas rule may carry options the old fixed regex cannot parse
 # (setenv braces); :wheel must be the identity, i.e. appear BEFORE the
@@ -383,6 +457,42 @@ done
 check "firstboot clears stale passwd temp files" sh -c \
 	"grep -q 'rm -f /etc/passwd+ /etc/shadow+' '$REPO_ROOT/scripts/sane-firstboot'"
 
+printf '\n--- first-free id allocation (X11) ---\n'
+# next_id must scan upward from 1000 for the first FREE id, not return
+# max+1: a high-uid import (nobody 65534) must not push new accounts into
+# the 65535 ceiling, and gaps below the maximum must be reused.
+base
+expect_ok "add-user nobody at the top of the range" \
+	sh "$ACCOUNTS" --root "$T" add-user nobody 65534 --skip-chown
+expect_ok "add-user bob succeeds with nobody at 65534" \
+	sh "$ACCOUNTS" --root "$T" add-user bob --skip-chown
+check "bob gets the lowest free uid (1001), not 65535" sh -c \
+	"grep -q '^bob:x:1001:1001:' '$T/etc/passwd'"
+
+base
+expect_ok "add-user alice above a gap" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1002 --skip-chown
+expect_ok "add-user bob succeeds with a gap at 1001" \
+	sh "$ACCOUNTS" --root "$T" add-user bob --skip-chown
+check "bob fills the gap (uid 1001)" sh -c \
+	"grep -q '^bob:x:1001:1001:' '$T/etc/passwd'"
+
+# A completely full 1000..65534 range must fail with a clean error, not
+# with the generic 'uid out of range' from the max+1 implementation.
+base
+awk 'BEGIN{for(i=1001;i<=65534;i++) printf "u%d:x:%d:%d:u%d:/home/u%d:/bin/sh\n", i, i, i, i, i}' >> "$T/etc/passwd"
+expect_fail_msg "add-user reports a full uid range cleanly" "no free uid" \
+	sh "$ACCOUNTS" --root "$T" add-user bob --skip-chown
+check "full-range failure leaves no bob entry" sh -c \
+	"! grep -q '^bob:' '$T/etc/passwd'"
+
+base
+awk 'BEGIN{for(i=1001;i<=65534;i++) printf "g%d:x:%d:\n", i, i}' >> "$T/etc/group"
+expect_fail_msg "add-user reports a full gid range cleanly" "no free gid" \
+	sh "$ACCOUNTS" --root "$T" add-user bob 1001 newgrp --skip-chown
+check "full-gid failure leaves no bob entry" sh -c \
+	"! grep -q '^bob:' '$T/etc/passwd'"
+
 printf '\n--- account recovery (boot lockout prevention) ---\n'
 stub_doas() {
 	mkdir -p "$T/usr/bin"
@@ -466,6 +576,373 @@ check "recover clears done marker when sane hash is lost" \
 check "recover restores sane to locked baseline" sh -c \
 	"grep -q '^sane:!:19700:' '$T/etc/shadow'"
 
+# Round 1.5 recover: doas_policy_ok must detect nopass grants hidden after
+# setenv blocks, including the multi-rule file the base tool preserves.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'permit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_ok "recover succeeds on a single-rule setenv nopass violation" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover replaces a single-rule setenv nopass policy" sh -c \
+	"grep -q '^permit persist :wheel$' '$T/etc/doas.conf' && ! grep -q 'nopass' '$T/etc/doas.conf'"
+check "recover repairs doas.conf mode after a setenv policy rebuild" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+expect_ok "validate passes after the single-rule setenv rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'permit persist :wheel\npermit setenv { as } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_ok "recover succeeds on a multi-rule setenv nopass bypass" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover rebuilds a preserved multi-rule nopass bypass" sh -c \
+	"grep -q '^permit persist :wheel$' '$T/etc/doas.conf' && ! grep -q 'nopass' '$T/etc/doas.conf'"
+check "recover repairs mode for a multi-rule bypass rebuild" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+expect_ok "validate passes after the multi-rule bypass rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+printf '\n--- recover merge semantics (X6) ---\n'
+# recover must MERGE, not rewrite: a validation failure caused by a mode
+# bit or one corrupt file must not destroy other accounts, memberships or
+# a policy-compliant doas.conf.
+
+# A: doas.conf mode 644 + extra account + custom rule -> content survives.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "merge setup: add alice into wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "merge setup: give alice an active password" set_pw alice 'AliceMerge1!'
+alice_shadow_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+alice_hash_before=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
+printf 'permit persist :wheel cmd /usr/bin/echo hello\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_fail "validate flags the permissive doas.conf mode before merge" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds on a mode-only doas.conf failure" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover preserves the extra account in passwd" sh -c \
+	"grep -q '^alice:x:1005:10:' '$T/etc/passwd'"
+check "recover preserves wheel membership for the extra account" sh -c \
+	"grep -q '^wheel:x:10:root,sane,alice$' '$T/etc/group'"
+check "recover keeps alice's shadow entry" sh -c \
+	"grep -q '^alice:' '$T/etc/shadow'"
+alice_shadow_after=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+alice_hash_after=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
+check "recover preserves alice's shadow hash byte-for-byte" \
+	test "$alice_hash_after" = "$alice_hash_before"
+check "recover preserves alice's whole shadow entry byte-for-byte" \
+	test "$alice_shadow_after" = "$alice_shadow_before"
+check "recover preserves the custom doas rule" sh -c \
+	"grep -q '^permit persist :wheel cmd /usr/bin/echo hello$' '$T/etc/doas.conf'"
+check "recover repairs doas.conf mode to 600" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+expect_ok "validate passes after the merge recover" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# B: a policy-violating doas.conf must still be replaced by the baseline.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'permit persist nopass :wheel\n' > "$T/etc/doas.conf"
+expect_ok "recover succeeds on a nopass policy violation" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover drops the nopass rule for the baseline" sh -c \
+	"grep -q '^permit persist :wheel$' '$T/etc/doas.conf' && ! grep -q 'nopass' '$T/etc/doas.conf'"
+check "recover keeps doas.conf mode 600 after policy rebuild" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+expect_ok "validate passes after the policy rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# C: duplicate uid -> passwd rebuilt, valid extra entries restored.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+sh "$ACCOUNTS" --root "$T" add-user alice 1005 --skip-chown >/dev/null
+sh "$ACCOUNTS" --root "$T" add-user bob 1006 --skip-chown >/dev/null
+printf 'clone:x:1005:1005:clone:/home/clone:/bin/sh\n' >> "$T/etc/passwd"
+expect_fail "validate flags the duplicate uid before rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds on a duplicate-uid passwd" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the passwd rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "rebuild preserves the valid alice entry" sh -c \
+	"grep -q '^alice:x:1005:1005:' '$T/etc/passwd'"
+check "rebuild preserves the valid bob entry" sh -c \
+	"grep -q '^bob:x:1006:1006:' '$T/etc/passwd'"
+check "rebuild drops the conflicting clone entry" sh -c \
+	"! grep -q '^clone:' '$T/etc/passwd'"
+check "rebuild preserves the alice private group" sh -c \
+	"grep -q '^alice:x:1005:' '$T/etc/group'"
+check "rebuild keeps root and sane baseline entries" sh -c \
+	"grep -q '^root:x:0:0:' '$T/etc/passwd' && grep -q '^sane:x:1000:1000:' '$T/etc/passwd'"
+
+# D: a missing sane entry is restored without touching extra accounts.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+sh "$ACCOUNTS" --root "$T" add-user alice 1005 --skip-chown >/dev/null
+awk -F: '$1!="sane"' "$T/etc/passwd" > "$T/etc/passwd.new"
+mv "$T/etc/passwd.new" "$T/etc/passwd"
+expect_ok "recover succeeds when the sane entry is missing" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover restores the sane baseline entry" sh -c \
+	"grep -q '^sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh$' '$T/etc/passwd'"
+check "recover preserves alice while restoring sane" sh -c \
+	"grep -q '^alice:x:1005:1005:' '$T/etc/passwd'"
+check "recover keeps the firstboot marker when hashes survive" \
+	test -f "$T/etc/.sane-firstboot-done"
+expect_ok "validate passes after restoring sane" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# F: duplicate gid -> group rebuilt, valid extra groups restored.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+sh "$ACCOUNTS" --root "$T" add-user alice 1005 --skip-chown >/dev/null
+printf 'clone:x:1005:\n' >> "$T/etc/group"
+expect_fail "validate flags the duplicate gid before rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds on a duplicate-gid group" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the group rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "group rebuild preserves the valid alice group" sh -c \
+	"grep -q '^alice:x:1005:$' '$T/etc/group'"
+check "group rebuild drops the conflicting clone group" sh -c \
+	"! grep -q '^clone:' '$T/etc/group'"
+check "group rebuild restores wheel with root and sane" sh -c \
+	"grep -q '^wheel:x:10:root,sane$' '$T/etc/group'"
+
+# G: recover reports the action taken for each file, not just the hashes.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+chmod 0644 "$T/etc/doas.conf"
+sh "$ACCOUNTS" --root "$T" $VFLAGS recover > "$T/recover-out" 2>&1
+check "recover reports doas.conf preserved per file" sh -c \
+	"grep -q 'doas.conf preserved' '$T/recover-out'"
+check "recover reports passwd merge action per file" sh -c \
+	"grep -q 'passwd merged' '$T/recover-out'"
+check "recover reports group merge action per file" sh -c \
+	"grep -q 'group merged' '$T/recover-out'"
+check "recover reports shadow merge action per file" sh -c \
+	"grep -q 'shadow merged' '$T/recover-out'"
+
+# H: sane's baseline uid occupied by an extra account -> conflict rebuild
+# (a blind merge would append sane and create a duplicate uid, leaving a
+# state that still fails validation).
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+awk -F: '$1!="sane"' "$T/etc/passwd" > "$T/etc/passwd.new"
+mv "$T/etc/passwd.new" "$T/etc/passwd"
+expect_ok "conflict setup: alice takes the freed uid 1000" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1000 wheel --skip-chown
+expect_ok "recover succeeds when sane's uid is occupied" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover restores sane at uid 1000 despite the conflict" sh -c \
+	"grep -q '^sane:x:1000:1000:' '$T/etc/passwd'"
+check "recover drops the conflicting uid-1000 extra entry" sh -c \
+	"! grep -q '^alice:' '$T/etc/passwd'"
+expect_ok "validate passes after the conflict rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+printf '\n--- shadow preservation (P1-1) ---\n'
+# A structurally sound shadow must keep every extra entry byte-for-byte;
+# only a genuinely corrupt one is rebuilt, then valid non-conflicting extra
+# entries are appended again. root/sane hashes are repaired only when the old
+# hash is usable; the firstboot marker contract stays exactly as before.
+
+# B: a corrupt shadow (garbage line) is rebuilt, but usable root/sane hashes
+# and the valid extra entry are carried back into the baseline.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "shadow setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "shadow setup: give alice an active password" set_pw alice 'AliceCorrupt1!'
+root_hash_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_hash_before=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+alice_hash_corrupt_before=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
+printf 'garbage\n' >> "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects a shadow with a corrupt extra line" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds a corrupt shadow with valid extras" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the corrupt shadow rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "corrupt shadow recover keeps the firstboot marker" \
+	test -f "$T/etc/.sane-firstboot-done"
+check "corrupt shadow recover preserves the usable root hash" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_hash_before"
+check "corrupt shadow recover preserves the usable sane hash" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_hash_before"
+check "corrupt shadow recover restores the valid alice hash" \
+	test "$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")" = "$alice_hash_corrupt_before"
+check "corrupt shadow recover keeps alice in passwd" sh -c \
+	"grep -q '^alice:x:1005:10:' '$T/etc/passwd'"
+check "corrupt shadow recover drops the malformed shadow line" sh -c \
+	"! grep -q '^garbage$' '$T/etc/shadow'"
+
+# C: neither hash is usable -> baseline locked, marker removed, and a fresh
+# firstboot can set both passwords and validate cleanly.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+awk -F: -v OFS=: '$1=="root" || $1=="sane" {$2="!"} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+expect_fail "validate rejects missing root/sane hashes with firstboot done" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover repairs missing hashes" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "P1-1 removes the firstboot marker when hashes are missing" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+check "P1-1 restores the locked root baseline" sh -c \
+	"grep -q '^root:!:19700:0:99999:7:::$' '$T/etc/shadow'"
+check "P1-1 restores the locked sane baseline" sh -c \
+	"grep -q '^sane:!:19700:0:99999:7:::$' '$T/etc/shadow'"
+expect_ok "validate passes with the marker removed" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "firstboot helper is present to set passwords again" \
+	test -x "$REPO_ROOT/scripts/sane-firstboot"
+expect_ok "firstboot can set a new root password" set_pw root 'FirstPass1!'
+expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass2!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "validate passes after a successful firstboot rerun" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# D: a corrupt shadow with both an active and a locked extra hash. The rebuild
+# must restore both byte-for-byte, drop a duplicate name and an invalid hash,
+# and discard the line that made the file structurally corrupt.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "shadow rebuild setup: add alice and bob to wheel" sh -c \
+	"sh '$ACCOUNTS' --root '$T' add-user alice 1005 wheel --skip-chown >/dev/null && \
+	 sh '$ACCOUNTS' --root '$T' add-user bob 1006 wheel --skip-chown >/dev/null && \
+	 sh '$ACCOUNTS' --root '$T' add-user mallory 1007 --skip-chown >/dev/null"
+expect_ok "shadow rebuild setup: alice gets an active hash" set_pw alice 'AliceActive1!'
+expect_ok "shadow rebuild setup: bob gets a locked hash" set_pw bob 'BobLocked1!'
+expect_ok "shadow rebuild setup: lock bob" sh "$ACCOUNTS" --root "$T" lock bob
+alice_active_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+bob_locked_before=$(awk -F: '$1=="bob"{print}' "$T/etc/shadow")
+awk -F: -v OFS=: '$1=="mallory"{$2="plaintext"} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf '%s\ngarbage\n%s\n' "$alice_active_before" "$alice_active_before" >> "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects the corrupt shadow with mixed extra entries" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds a shadow with active and locked extras" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the mixed shadow rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "rebuild keeps the active extra entry byte-for-byte" \
+	test "$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")" = "$alice_active_before"
+check "rebuild keeps the locked extra entry byte-for-byte" \
+	test "$(awk -F: '$1=="bob"{print}' "$T/etc/shadow")" = "$bob_locked_before"
+check "rebuild keeps the lock marker on bob" sh -c \
+	"grep -q '^bob:!' '$T/etc/shadow'"
+check "rebuild drops a duplicate valid extra name" \
+	test "$(grep -c '^alice:' "$T/etc/shadow")" -eq 1
+check "rebuild drops an extra with an invalid active hash" sh -c \
+	"! grep -q '^mallory:' '$T/etc/shadow'"
+check "rebuild drops the corrupt garbage line" sh -c \
+	"! grep -q '^garbage$' '$T/etc/shadow'"
+
+printf '\n--- shadow field3 empty means aging disabled (C2) ---\n'
+# shadow(5): an empty third field disables password aging. It is valid and
+# must survive both merge and rebuild byte-for-byte; a non-digit field3 is
+# still invalid and must be dropped.
+
+# A: mode-only doas.conf failure must preserve an extra whose field3 is empty.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "field3 setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "field3 setup: give alice an active password" set_pw alice 'AliceAging1!'
+awk -F: -v OFS=: '$1=="alice"{$3=""} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+alice_field3_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+check "field3 setup: alice's third field is empty" sh -c \
+	"awk -F: '\$1==\"alice\"{exit (\$3==\"\" ? 0 : 1)}' '$T/etc/shadow'"
+printf 'permit persist :wheel cmd /usr/bin/echo hello\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_fail "validate flags the permissive doas.conf mode with an empty field3" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds with an empty-field3 extra entry" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover keeps the empty-field3 alice line byte-identical" \
+	test "$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")" = "$alice_field3_before"
+check "recover leaves alice in passwd" sh -c \
+	"grep -q '^alice:x:1005:10:' '$T/etc/passwd'"
+expect_ok "validate passes after the empty-field3 merge" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# B: a corrupt shadow is rebuilt, and a valid empty-field3 extra is restored.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "field3 rebuild setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "field3 rebuild setup: give alice an active password" set_pw alice 'AliceAging2!'
+awk -F: -v OFS=: '$1=="alice"{$3=""} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+alice_field3_corrupt_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+root_hash_field3_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_hash_field3_before=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+printf 'garbage\n' >> "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects a corrupt shadow with an empty-field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds a shadow with an empty-field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the empty-field3 rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "empty-field3 rebuild keeps the firstboot marker" \
+	test -f "$T/etc/.sane-firstboot-done"
+check "empty-field3 rebuild preserves the root hash" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_hash_field3_before"
+check "empty-field3 rebuild preserves the sane hash" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_hash_field3_before"
+check "empty-field3 rebuild restores alice byte-identically" \
+	test "$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")" = "$alice_field3_corrupt_before"
+check "empty-field3 rebuild drops the malformed line" sh -c \
+	"! grep -q '^garbage$' '$T/etc/shadow'"
+
+# C: a non-digit field3 is still invalid, so the extra entry is dropped.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "non-digit setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "non-digit setup: give alice an active password" set_pw alice 'AliceBadAge1!'
+awk -F: -v OFS=: '$1=="alice"{$3="bogus"} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "recover rejects a non-digit field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover drops the non-digit field3 extra" sh -c \
+	"! grep -q '^alice:' '$T/etc/shadow'"
+expect_ok "validate passes after dropping the non-digit field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "non-digit field3 rebuild keeps the firstboot marker" \
+	test -f "$T/etc/.sane-firstboot-done"
+
 check "provision installs account recovery helper" \
 	test -f "$REPO_ROOT/scripts/sane-account-recovery"
 
@@ -516,18 +993,20 @@ run_wrapper >/dev/null 2>&1
 check "wrapper drops to shell when rebuild fails" \
 	test "$(grep -c 'fallback shell reached' "$T/cli-calls")" -eq 1
 
-printf '\n--- reliability:once fail-open wrapper (extracted wiring) ---\n'
+printf '\n--- reliability:once fail-closed wrapper (extracted wiring) ---\n'
 # Extract the LIVE reliability:once command from build-rootfs.sh instead of
 # hardcoding a copy, so wiring drift is caught here. Only the absolute tool
-# path is redirected to a stub; the /bin/sh -c structure, the fail-open
-# || echo branch and :timeout=0 stay verbatim. The stub performs no host
-# operations (it only exits with the requested code).
+# path is redirected to a stub; the /bin/sh -c structure, the fail-closed
+# || { echo ...; exit 1; } branch and :timeout=0 stay verbatim. The stub
+# performs no host operations (it only exits with the requested code).
 rel_line=$(grep '^reliability:once:' "$REPO_ROOT/scripts/build-rootfs.sh")
 check "reliability:once wiring present in build-rootfs.sh" test -n "$rel_line"
 check "reliability:once wiring carries timeout=0" sh -c \
 	"grep -q '^reliability:once:.*:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
 check "reliability:once wiring byte-identical across the 3 builders" sh -c \
-	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^5f794f774c3989b8282b0a493ea2584b'"
+	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^b41ae02acee4b7648b9ef05472ef9554'"
+check "network:once wiring byte-identical across the 3 builders" sh -c \
+	"grep -h 'network:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^77a839731687c05b1e0fe2e0f1d0810a'"
 rel_cmd=${rel_line#reliability:once:}
 rel_cmd=${rel_cmd%:timeout=0}
 rel_stub_cmd=$(printf '%s\n' "$rel_cmd" | sed "s|/usr/bin/sane-reliability|$T/stub-reliability|")
@@ -540,18 +1019,23 @@ run_rel_wrapper() {
 }
 
 run_rel_wrapper 1
-check "fail-open wrapper exits 0 when recover fails" test "$REL_RC" -eq 0
+check "fail-closed wrapper exits nonzero when recover fails" test "$REL_RC" -ne 0
 case "$REL_ERR" in
-	*'reliability: recover failed; continuing boot'*)
-		pass "fail-open wrapper cites continue-boot notice on stderr" ;;
-	*) fail "fail-open wrapper missing continue-boot notice: $REL_ERR" ;;
+	*'reliability: recover failed; boot enters rescue'*)
+		pass "fail-closed wrapper cites the caller's exact stderr notice" ;;
+	*) fail "fail-closed wrapper missing the caller's exact stderr notice: $REL_ERR" ;;
 esac
 
 run_rel_wrapper 0
 check "wrapper exits 0 when recover succeeds" test "$REL_RC" -eq 0
 check "wrapper stays silent when recover succeeds" test -z "$REL_ERR"
 
-printf '\n--- recover data-loss boundary (root+sane only, by design) ---\n'
+printf '\n--- recover corruption-loss boundary (merge semantics) ---\n'
+# The corruption itself destroyed the extra passwd line (the file was
+# overwritten with garbage), so recover cannot bring it back: the rebuild
+# restores only lines still present and valid. The healthy group file is
+# MERGED, so the extra group survives; shadow is always rebuilt from the
+# locked baseline, so the extra shadow entry is still dropped by design.
 base_firstboot
 set_pw root 'LifecyclePass1!'
 set_pw sane 'LifecyclePass2!'
@@ -559,15 +1043,15 @@ sh "$ACCOUNTS" --root "$T" add-user extra 1010 --skip-chown >/dev/null
 printf 'garbage\n' > "$T/etc/passwd"
 expect_ok "recover rebuilds corrupted passwd with an extra account present" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
-expect_ok "validate passes after the data-loss rebuild" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "validate passes after the corruption rebuild" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 check "recover restores root and sane" sh -c \
 	"grep -q '^root:' '$T/etc/passwd' && grep -q '^sane:' '$T/etc/passwd'"
 check "recover preserves the usable root and sane hashes" sh -c \
 	"grep -q '^root:[\$]6[\$]' '$T/etc/shadow' && grep -q '^sane:[\$]6[\$]' '$T/etc/shadow'"
-check "extra account passwd entry is lost by design" sh -c \
+check "extra passwd entry destroyed by the corruption stays lost" sh -c \
 	"! grep -q '^extra:' '$T/etc/passwd'"
-check "extra account group is lost by design" sh -c \
-	"! grep -q '^extra:' '$T/etc/group'"
+check "extra account group survives the healthy-group merge" sh -c \
+	"grep -q '^extra:x:1010:$' '$T/etc/group'"
 check "extra account shadow entry is lost by design" sh -c \
 	"! grep -q '^extra:' '$T/etc/shadow'"
 check "extra home directory survives as an orphan" test -d "$T/home/extra"
