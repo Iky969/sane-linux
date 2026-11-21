@@ -96,8 +96,17 @@ filenames containing spaces are handled correctly.
 current state, then restores every manifest entry atomically (stage with
 `mktemp` in the destination directory, `cp -p`, `rename(2)`), preserving file
 modes. After the regular files (and `new-files` deletions), every symlink
-recorded in the snapshot's `symlinks` metadata is recreated with `ln -s`,
-preserving type and target verbatim. Each recreation is validated fail-closed:
+recorded in the snapshot's `symlinks` metadata is recreated by staging a link
+in the destination's own directory (`mktemp -u ... .sane-rel-ln.XXXXXX`),
+creating it with `ln -s -- TARGET TEMP`, and renaming it over the live path
+with `mv -fT -- TEMP DEST`. The live destination is never removed first: a
+failing `ln` (or `mv`) removes only the staged temp and leaves the previous
+destination untouched. `--` protects dash-prefixed targets from option
+parsing, and `-T` prevents `mv` from following a destination symlink that
+points at an internal directory (which would hide the staged link inside that
+directory). The sequence is POSIX-sh/dash/ash compatible with both GNU mv and
+the shipped BusyBox mv; on failure the staged temp is cleaned up and the
+recreation is fatal. Each recreation is still validated fail-closed:
 the path must pass the relative-path grammar and destination symlink
 containment, and the target must resolve inside the target root — absolute
 targets must normalize under the root, relative targets resolve against the
@@ -436,7 +445,11 @@ and `lock.stale.*` are accepted but stripped, the next mutator never waits on
 an archived PID, contended restore fails closed), symlink preservation
 (STATE_FILES, spm DB and payload-target symlinks survive snapshot → upgrade →
 rollback with type and target intact; dangling and absolute-internal targets
-preserved; crafted escaping targets rejected fail-closed), the shared
+preserved; crafted escaping targets rejected fail-closed; real snapshot
+round-trips cover dash-prefixed and dangling dash targets, normal symlinks,
+and a live destination symlink into an internal directory (the staged link
+must not leak inside it), with an `ln` failure shim proving the previous
+destination survives), the shared
 manifest grammar (backslash/newline filenames refuse the snapshot cleanly;
 spaced names roundtrip), whole-dot tag rejection with `.hidden` still legal,
 persistent and listed while the internal `.tmp.*`/`.old.*` namespaces are

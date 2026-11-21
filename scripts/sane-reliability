@@ -507,8 +507,17 @@ restore_files_from() {
 				die "symlink target escapes root: $rf_lpath -> $rf_ltarget"
 			rf_ldst="$ROOT/$rf_lpath"
 			mkdir -p "$(dirname "$rf_ldst")" || die "cannot create parent for $rf_lpath"
-			rm -f -- "$rf_ldst"
-			ln -s "$rf_ltarget" "$rf_ldst" || die "cannot recreate symlink: $rf_lpath"
+			# Stage the link NEXT TO its destination, then rename it over
+			# the live path. The destination is never removed first: a
+			# failing ln leaves it exactly as it was. '--' keeps a target
+			# starting with '-' from being parsed as an ln option; this is
+			# portable to dash/ash and their ln/mv applets.
+			rf_ltmp=$(mktemp -u "$(dirname "$rf_ldst")/.sane-rel-ln.XXXXXX") || \
+				die "cannot stage symlink: $rf_lpath"
+			ln -s -- "$rf_ltarget" "$rf_ltmp" || \
+				{ rm -f -- "$rf_ltmp"; die "cannot recreate symlink: $rf_lpath"; }
+			mv -fT -- "$rf_ltmp" "$rf_ldst" || \
+				{ rm -f -- "$rf_ltmp"; die "cannot install symlink: $rf_lpath"; }
 		done < "$rf_dir/symlinks"
 	fi
 }

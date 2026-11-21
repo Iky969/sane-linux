@@ -1680,7 +1680,110 @@ check "late swap installed no payload file" test ! -e "$T/usr/bin/prog"
 check "late swap journal records recovered" \
 	grep -q '^state=recovered$' "$T/var/lib/sane/reliability/journal"
 check "late swap left no lock or staging residue" sh -c \
-	"test ! -e '$T/var/lib/sane/reliability/lock' && ! ls '$T/var/lib/sane/reliability/staging'/.upgrade* >/dev/null 2>&1 && ! ls '$T/etc/.sane-rel.'* '$T/usr/bin/.sane-rel.'* >/dev/null 2>&1"
+	"test ! -e '$T/var/lib/sane/reliability/lock' && ! ls '$T/var/lib/sane/reliability/staging'/.upgrade* >/dev/null 2>&1 && ! ls '$T/etc/.sane-rel.'* >/dev/null 2>&1 && ! ls '$T/usr/bin/.sane-rel.'* >/dev/null 2>&1"
+
+# --- Round 5: symlink recreation stages a same-parent temp link -------------
+# The live destination must survive until the staged symlink is ready to be
+# renamed over it; targets beginning with '-' must not be parsed as ln options.
+# (a) REAL snapshot round-trip: a dash-prefixed target with a live marker.
+base
+run init
+printf 'DASH_MARKER\n' > "$T/etc/-hostname"
+ln -s -- -hostname "$T/etc/hostname"
+expect_ok "snapshot with a real dash-prefixed symlink" run snapshot dashreal
+expect_ok "verify snapshot with a real dash-prefixed symlink" run verify dashreal
+rm -f "$T/etc/hostname"
+printf 'regular-placeholder\n' > "$T/etc/hostname"
+expect_ok "rollback recreates a real dash-prefixed symlink" run rollback dashreal
+check "real dash target symlink created" test -L "$T/etc/hostname"
+check "real dash target preserved verbatim" \
+	test "$(readlink "$T/etc/hostname")" = -hostname
+check "real dash target marker readable through symlink" \
+	grep -q '^DASH_MARKER$' "$T/etc/hostname"
+check "real dash rollback journal recorded" \
+	grep -q '^state=rolled-back$' "$T/var/lib/sane/reliability/journal"
+
+# (b) REAL dangling state symlink with a dash-prefixed absent target.
+base
+run init
+ln -s -- -absent-target "$T/etc/fstab"
+expect_ok "snapshot records a real dangling dash symlink" run snapshot danglereal
+expect_ok "verify snapshot with a real dangling dash symlink" run verify danglereal
+rm -f "$T/etc/fstab"
+expect_ok "rollback recreates a real dangling dash symlink" run rollback danglereal
+check "real dangling dash symlink created" test -L "$T/etc/fstab"
+check "real dangling dash target preserved verbatim" \
+	test "$(readlink "$T/etc/fstab")" = -absent-target
+check "real dangling rollback journal recorded" \
+	grep -q '^state=rolled-back$' "$T/var/lib/sane/reliability/journal"
+
+# (c) REAL normal symlink fixture (STATE_FILES, internal relative target).
+base
+run init
+printf 'NORMAL_MARKER\n' > "$T/etc/normal-target"
+ln -s normal-target "$T/etc/hostname"
+expect_ok "snapshot with a real normal symlink" run snapshot normalreal
+expect_ok "verify snapshot with a real normal symlink" run verify normalreal
+rm -f "$T/etc/hostname"
+printf 'regular-placeholder\n' > "$T/etc/hostname"
+expect_ok "rollback recreates a real normal symlink" run rollback normalreal
+check "real normal symlink created" test -L "$T/etc/hostname"
+check "real normal symlink target preserved" \
+	test "$(readlink "$T/etc/hostname")" = normal-target
+check "real normal symlink marker readable" \
+	grep -q '^NORMAL_MARKER$' "$T/etc/hostname"
+
+# (c2) REAL snapshot round-trip with the live destination already a symlink
+# to an internal directory: plain 'mv -f tmp dst' follows it and hides the
+# staged link inside the directory instead of replacing the destination.
+base
+run init
+printf 'DIR_MARKER\n' > "$T/etc/plain-target"
+ln -s plain-target "$T/etc/hostname"
+expect_ok "snapshot with dirlink destination fixture" run snapshot dirlink
+expect_ok "verify dirlink snapshot" run verify dirlink
+rm -f "$T/etc/hostname"
+mkdir -p "$T/etc/hostdir"
+ln -s hostdir "$T/etc/hostname"
+expect_ok "rollback replaces a dst symlink pointing to an internal dir" \
+	run rollback dirlink
+check "dirlink destination restored to the snapshot target" \
+	test "$(readlink "$T/etc/hostname")" = plain-target
+check "no staged link leaked inside the internal dir" sh -c \
+	"! ls '$T/etc/hostdir/.sane-rel-ln.'* >/dev/null 2>&1"
+check "dirlink rollback journal recorded" \
+	grep -q '^state=rolled-back$' "$T/var/lib/sane/reliability/journal"
+
+# (d) Crafted metadata + failing ln shim: the only case where a synthetic
+# symlinks file is appropriate, because we must force ln to fail.
+base
+run init
+run snapshot lnsnap
+printf 'SENTINEL-DST\n' > "$T/etc/hostname"
+printf 'etc/hostname\nsome-target\n' \
+	> "$T/var/lib/sane/reliability/snapshots/lnsnap/symlinks"
+(cd "$T/var/lib/sane/reliability/snapshots/lnsnap" && \
+	find . -type f ! -name manifest.sha256 -print0 | \
+	LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
+mkdir -p "$T/bin"
+cat > "$T/bin/ln" <<EOF
+#!/bin/sh
+: > "$T/ln-shim-fired"
+exit 1
+EOF
+chmod 0755 "$T/bin/ln"
+if env PATH="$T/bin:$PATH" sh "$TOOL" --root "$T" rollback lnsnap 2>"$T/ln.err"; then
+	fail "rollback fails closed when symlink staging fails"
+else
+	pass "rollback fails closed when symlink staging fails"
+fi
+check "ln shim really fired (not vacuous)" test -f "$T/ln-shim-fired"
+check "ln failure names the recreate error" \
+	grep -q 'cannot recreate symlink' "$T/ln.err"
+check "live destination survived the failed ln" sh -c \
+	"test -f '$T/etc/hostname' && test ! -L '$T/etc/hostname' && grep -q '^SENTINEL-DST$' '$T/etc/hostname'"
+check "no staged symlink temp left after ln failure" sh -c \
+	"! ls '$T/etc/.sane-rel-ln.'* >/dev/null 2>&1"
 
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
