@@ -53,10 +53,12 @@ sane-reliability [--root DIR] restore ARCHIVE
 file is listed in `manifest.sha256` with a SHA-256 digest; `meta` records the
 UTC creation time. Tags accept `[A-Za-z0-9._-]`, max 64 chars, may not
 start with `-`, and may not be `.` or `..` (whole-dot tags can never be
-installed by the snapshot swap renames). Dot-prefixed tags such as `.hidden`
-are legal and are shown by `list`; only the internal `.tmp.*` staging and
-`.old.*` swap-aside directories are hidden from the listing. Overwriting an
-existing tag requires `--force`.
+installed by the snapshot swap renames). The `.tmp.*` and `.old.*` prefixes
+are the internal staging/aside namespaces and are also rejected as user tags
+(up front, including with `--force`), so no user tag can collide with
+crash-window residue. Dot-prefixed tags such as `.hidden` are legal, are
+written into the snapshot directory, verify and roll back like any other tag,
+and are shown by `list`. Overwriting an existing tag requires `--force`.
 
 Symlinks are preserved, not dereferenced: a symlink among the identity/config
 files, inside the `spm` database, or at a pre-upgrade payload target path is
@@ -186,16 +188,23 @@ An upgrade payload is a directory containing the files to install and a
    file is **re-hashed** and compared against the staged manifest, and the
    destination symlink containment is re-checked: a file changed after the
    pre-check aborts the upgrade (`payload changed during upgrade`) and the
-   recorded snapshot is restored,
+   recorded snapshot is restored. After `cp` into the private `.sane-rel.*`
+   temp file, that **staged copy is hashed again** against the manifest hash,
+   the temp file is removed on mismatch (`recover_internal` +
+   `payload changed during upgrade`), and only a verified copy is renamed
+   into place — so a writer racing the source between the hash and the copy
+   cannot install unverified bytes,
 5. writes `state=done` and logs the rollback tag.
 
 Fault injection (tests only): `SANE_RELIABILITY_FAULT=payload-swap` fires
 after the pre-check and before the apply loop, appending bytes to one payload
 file to simulate a same-user writer racing the upgrade; the verify-at-use
-re-hash must catch it and recover. The hook follows the `sane-net`
-`SANE_NET_FAULT` pattern: exact string match against the environment
-variable, a complete no-op for any other value or when unset, and it writes
-only into the payload directory — never into tool state.
+re-hash must catch it and recover. `SANE_RELIABILITY_FAULT=payload-swap-late`
+fires inside the apply loop **after** the source re-hash and **before** `cp`,
+so the post-copy staged-copy hash is the gate that catches it. Both hooks
+follow the `sane-net` `SANE_NET_FAULT` pattern: exact string match against the
+environment variable, a complete no-op for any other value or when unset, and
+they write only into the payload directory — never into tool state.
 
 If any step fails, the recorded snapshot is restored immediately. `rollback`
 and `recover` restore every snapshot file **and delete the `new-files`** the
@@ -429,11 +438,14 @@ an archived PID, contended restore fails closed), symlink preservation
 rollback with type and target intact; dangling and absolute-internal targets
 preserved; crafted escaping targets rejected fail-closed), the shared
 manifest grammar (backslash/newline filenames refuse the snapshot cleanly;
-spaced names roundtrip), whole-dot tag rejection with `.hidden` still legal
-and visible in `list`, verify-at-use (the `SANE_RELIABILITY_FAULT=payload-swap`
-hook aborts and recovers to exact pre-upgrade bytes, other values are no-ops,
-bad-hash payloads keep the legacy pre-check contract with zero writes, and a
-sha256sum-shim manifest swap after the pre-check cannot redirect the
+spaced names roundtrip), whole-dot tag rejection with `.hidden` still legal,
+persistent and listed while the internal `.tmp.*`/`.old.*` namespaces are
+rejected even with `--force`, verify-at-use (the
+`SANE_RELIABILITY_FAULT=payload-swap` hook aborts and recovers to exact
+pre-upgrade bytes, `payload-swap-late` is caught by the post-`cp` staged-copy
+hash, other values are no-ops, bad-hash payloads keep the legacy pre-check
+contract with zero writes, and a sha256sum-shim manifest swap after the
+pre-check cannot redirect the
 upgrade), upgrade self-state protection with zero-write assertions, and root
 canonicalization (symlinked, dangling-symlink and fresh-leaf roots).
 Neither suite changes the host `/etc` or host network state.

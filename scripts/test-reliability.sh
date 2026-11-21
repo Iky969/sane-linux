@@ -1619,5 +1619,68 @@ kill "$RC_HOLDER" 2>/dev/null
 wait "$RC_HOLDER" 2>/dev/null
 rm -rf -- "$T/var/lib/sane/reliability/lock"
 
+# --- Round 4 P2-1: internal dot-namespaces are not user snapshot tags --------
+# .tmp.* and .old.* are reserved for crash-window staging/asides and must be
+# rejected up front, including with --force; '.hidden' stays a legal user tag.
+base
+run init
+for rt_tag in .tmp.foo .old.foo; do
+	if sh "$TOOL" --root "$T" snapshot "$rt_tag" 2>"$T/tag.err"; then
+		fail "snapshot rejects internal namespace tag: $rt_tag"
+	else
+		pass "snapshot rejects internal namespace tag: $rt_tag"
+	fi
+	check "internal namespace tag reason: $rt_tag" \
+		grep -q 'invalid snapshot tag' "$T/tag.err"
+	if sh "$TOOL" --root "$T" snapshot "$rt_tag" --force 2>"$T/tagforce.err"; then
+		fail "forced snapshot rejects internal namespace tag: $rt_tag"
+	else
+		pass "forced snapshot rejects internal namespace tag: $rt_tag"
+	fi
+	check "forced internal namespace tag reason: $rt_tag" \
+		grep -q 'invalid snapshot tag' "$T/tagforce.err"
+done
+check "internal namespace rejection left no residue" sh -c \
+	"! ls -d '$T/var/lib/sane/reliability/snapshots'/.tmp.* >/dev/null 2>&1 && ! ls -d '$T/var/lib/sane/reliability/snapshots'/.old.* >/dev/null 2>&1 && test ! -e '$T/var/lib/sane/reliability/lock'"
+
+base
+run init
+expect_ok "hidden tag snapshot remains legal" run snapshot .hidden
+expect_ok "hidden tag snapshot verifies" run verify .hidden
+printf 'mutated-after-hidden\n' > "$T/etc/init.conf"
+expect_ok "hidden tag rollback restores state" run rollback .hidden
+check "hidden tag rollback restored content" \
+	grep -q '^network:once:/bin/true$' "$T/etc/init.conf"
+run list > "$T/hidden-list.out"
+check "hidden tag remains listed after rollback" grep -q '^\.hidden' "$T/hidden-list.out"
+
+# --- Round 4 P2-2: late payload swap is caught at the staged-copy hash -------
+# The payload-swap-late hook fires after the SOURCE re-hash and before cp, so
+# only hashing the private staged copy can detect it.
+base
+run init
+printf 'pre-upgrade-bytes\n' > "$T/etc/init.conf"
+cp "$T/etc/init.conf" "$T/pre-upgrade.copy"
+mkdir -p "$T/payload/etc" "$T/payload/usr/bin"
+printf 'new-init\n' > "$T/payload/etc/init.conf"
+printf 'new-prog\n' > "$T/payload/usr/bin/prog"
+(cd "$T/payload" && sha256sum etc/init.conf usr/bin/prog > manifest.sha256)
+if env SANE_RELIABILITY_FAULT=payload-swap-late sh "$TOOL" --root "$T" upgrade "$T/payload" 2>"$T/late.err"; then
+	fail "late payload swap aborts at the staged-copy hash"
+else
+	pass "late payload swap aborts at the staged-copy hash"
+fi
+check "late swap names the changed payload file" \
+	grep -q 'payload changed during upgrade: etc/init.conf' "$T/late.err"
+check "late swap hook really fired (not vacuous)" \
+	grep -q 'fault injection: payload-swap-late' "$T/late.err"
+check "late swap recovered exact pre-upgrade bytes" \
+	cmp -s "$T/etc/init.conf" "$T/pre-upgrade.copy"
+check "late swap installed no payload file" test ! -e "$T/usr/bin/prog"
+check "late swap journal records recovered" \
+	grep -q '^state=recovered$' "$T/var/lib/sane/reliability/journal"
+check "late swap left no lock or staging residue" sh -c \
+	"test ! -e '$T/var/lib/sane/reliability/lock' && ! ls '$T/var/lib/sane/reliability/staging'/.upgrade* >/dev/null 2>&1 && ! ls '$T/etc/.sane-rel.'* '$T/usr/bin/.sane-rel.'* >/dev/null 2>&1"
+
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

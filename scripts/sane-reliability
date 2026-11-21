@@ -111,11 +111,11 @@ LOGFILE="$LOGDIR/reliability.log"
 MAX_LOG_BYTES=65536
 
 valid_tag() {
-	# '.' and '..' are whole-dot components: the snapshot swap renames can
-	# never move them (EBUSY/EINVAL), so reject them up front. Dot-prefixed
-	# names such as '.hidden' remain legal.
+	# '.' and '..' are whole-dot components, and '.tmp.*' / '.old.*' are
+	# the internal crash-window staging/aside namespaces: none can be a
+	# user snapshot tag. Dot-prefixed names such as '.hidden' remain legal.
 	case "$1" in
-		''|.|..|*[!A-Za-z0-9._-]*) return 1 ;;
+		''|.|..|.tmp.*|.old.*|*[!A-Za-z0-9._-]*) return 1 ;;
 		-*) return 1 ;;
 	esac
 	[ "${#1}" -le 64 ]
@@ -724,7 +724,20 @@ cmd_upgrade() {
 			{ recover_internal || true; die "destination symlink escapes root: $up_rel"; }
 		mkdir -p "$(dirname "$up_dst")" || { recover_internal || true; die "cannot create parent for $up_rel"; }
 		up_tmp=$(mktemp "$(dirname "$up_dst")/.sane-rel.XXXXXX") || { recover_internal || true; die "cannot stage $up_rel"; }
+		# Late-swap fault hook (exact match, no-op for any other value):
+		# mutate the payload source AFTER its hash was verified and BEFORE
+		# cp, so only hashing the private staged copy can detect the change.
+		# Writes only into the test-owned payload directory.
+		if [ "${SANE_RELIABILITY_FAULT:-}" = payload-swap-late ]; then
+			printf '%s: fault injection: payload-swap-late\n' "$PROG" >&2
+			printf 'fault-swap-late\n' >> "$up_src"
+		fi
 		cp -p "$up_src" "$up_tmp" || { rm -f "$up_tmp"; recover_internal || true; die "cannot copy $up_rel"; }
+		# Verify the bytes actually staged, not just the source we copied.
+		up_tmp_hash=$(sha256sum "$up_tmp") || \
+			{ rm -f "$up_tmp"; recover_internal || true; die "cannot re-hash staged file: $up_rel"; }
+		[ "${up_tmp_hash%% *}" = "$up_hash" ] || \
+			{ rm -f "$up_tmp"; recover_internal || true; die "payload changed during upgrade: $up_rel"; }
 		mv "$up_tmp" "$up_dst" || { rm -f "$up_tmp"; recover_internal || true; die "cannot install $up_rel"; }
 	done < "$up_stage/manifest.sha256"
 	rm -rf -- "$up_stage"
