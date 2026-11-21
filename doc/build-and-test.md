@@ -66,9 +66,9 @@ BusyBox inputs (never run it in the shared checkout).
 
 | Suite | Invocation | Measured result |
 |---|---|---|
-| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 275 passed, 0 failed |
-| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 277 passed, 0 failed |
-| Reliability | `sh scripts/test-reliability.sh` | 745 passed, 0 failed |
+| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 299 passed, 0 failed |
+| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 301 passed, 0 failed |
+| Reliability | `sh scripts/test-reliability.sh` | 772 passed, 0 failed |
 | SPM | `bash scripts/test-spm.sh` | 36 passed, 0 failed |
 | Build package | `bash scripts/test-build-package.sh` (scratch) | 13 passed, 0 failed |
 | Build rootfs | `sh scripts/test-build-rootfs.sh` (scratch) | 25 passed, 0 failed |

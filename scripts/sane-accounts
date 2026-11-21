@@ -649,7 +649,8 @@ shadow_structurally_ok() {
 			if ($1 !~ /^[a-z_][a-z0-9_-]*$/) { bad = 1; next }
 			if (seen[$1]++) bad = 1
 			if (!shadow_hash_ok($2)) bad = 1
-			if ($3 !~ /^[0-9]+$/) bad = 1
+			# An empty field3 disables password aging (shadow(5)).
+			if ($3 != "" && $3 !~ /^[0-9]+$/) bad = 1
 			for (i = 4; i <= 8; i++)
 				if ($i != "" && $i !~ /^[0-9]+$/) bad = 1
 			if (!($1 in puid)) bad = 1
@@ -810,7 +811,8 @@ rebuild_shadow() {
 			NF != 9 { next }
 			$1 !~ /^[a-z_][a-z0-9_-]*$/ { next }
 			!shadow_hash_ok($2) { next }
-			$3 !~ /^[0-9]+$/ { next }
+			# Empty field3 is valid: password aging is disabled.
+			$3 != "" && $3 !~ /^[0-9]+$/ { next }
 			{
 				ok = 1
 				for (i = 4; i <= 8; i++)

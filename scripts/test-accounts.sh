@@ -860,6 +860,89 @@ check "rebuild drops an extra with an invalid active hash" sh -c \
 check "rebuild drops the corrupt garbage line" sh -c \
 	"! grep -q '^garbage$' '$T/etc/shadow'"
 
+printf '\n--- shadow field3 empty means aging disabled (C2) ---\n'
+# shadow(5): an empty third field disables password aging. It is valid and
+# must survive both merge and rebuild byte-for-byte; a non-digit field3 is
+# still invalid and must be dropped.
+
+# A: mode-only doas.conf failure must preserve an extra whose field3 is empty.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "field3 setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "field3 setup: give alice an active password" set_pw alice 'AliceAging1!'
+awk -F: -v OFS=: '$1=="alice"{$3=""} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+alice_field3_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+check "field3 setup: alice's third field is empty" sh -c \
+	"awk -F: '\$1==\"alice\"{exit (\$3==\"\" ? 0 : 1)}' '$T/etc/shadow'"
+printf 'permit persist :wheel cmd /usr/bin/echo hello\n' > "$T/etc/doas.conf"
+chmod 0644 "$T/etc/doas.conf"
+expect_fail "validate flags the permissive doas.conf mode with an empty field3" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds with an empty-field3 extra entry" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover keeps the empty-field3 alice line byte-identical" \
+	test "$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")" = "$alice_field3_before"
+check "recover leaves alice in passwd" sh -c \
+	"grep -q '^alice:x:1005:10:' '$T/etc/passwd'"
+expect_ok "validate passes after the empty-field3 merge" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# B: a corrupt shadow is rebuilt, and a valid empty-field3 extra is restored.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "field3 rebuild setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "field3 rebuild setup: give alice an active password" set_pw alice 'AliceAging2!'
+awk -F: -v OFS=: '$1=="alice"{$3=""} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+alice_field3_corrupt_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
+root_hash_field3_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_hash_field3_before=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+printf 'garbage\n' >> "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects a corrupt shadow with an empty-field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover rebuilds a shadow with an empty-field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after the empty-field3 rebuild" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "empty-field3 rebuild keeps the firstboot marker" \
+	test -f "$T/etc/.sane-firstboot-done"
+check "empty-field3 rebuild preserves the root hash" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_hash_field3_before"
+check "empty-field3 rebuild preserves the sane hash" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_hash_field3_before"
+check "empty-field3 rebuild restores alice byte-identically" \
+	test "$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")" = "$alice_field3_corrupt_before"
+check "empty-field3 rebuild drops the malformed line" sh -c \
+	"! grep -q '^garbage$' '$T/etc/shadow'"
+
+# C: a non-digit field3 is still invalid, so the extra entry is dropped.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+expect_ok "non-digit setup: add alice to wheel" \
+	sh "$ACCOUNTS" --root "$T" add-user alice 1005 wheel --skip-chown
+expect_ok "non-digit setup: give alice an active password" set_pw alice 'AliceBadAge1!'
+awk -F: -v OFS=: '$1=="alice"{$3="bogus"} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "recover rejects a non-digit field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover drops the non-digit field3 extra" sh -c \
+	"! grep -q '^alice:' '$T/etc/shadow'"
+expect_ok "validate passes after dropping the non-digit field3 extra" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "non-digit field3 rebuild keeps the firstboot marker" \
+	test -f "$T/etc/.sane-firstboot-done"
+
 check "provision installs account recovery helper" \
 	test -f "$REPO_ROOT/scripts/sane-account-recovery"
 

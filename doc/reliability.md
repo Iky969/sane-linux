@@ -264,12 +264,19 @@ Each listed path is walked component by component with a bounded-hop resolver
 (40 hops): every symlink is expanded with `readlink` and the walk **restarts
 from the resolved base** so an ancestor symlink inside a target chain is
 followed too (a one-shot lexical normalization would miss, for example,
-`var/lib/sane -> anc/escape` where `anc -> /outside`). Absolute targets restart
-from `/`, relative targets from the link's directory; `.`/`..` are collapsed
-with pure POSIX expansion, and every intermediate path must stay under the
-canonical ROOT. An existing symlink whose full resolution remains under ROOT
-is accepted (internal multi-hop symlinks stay legal); a chain that escapes
-ROOT, or a symlink loop that exhausts the hop bound, is rejected fail-closed
+`var/lib/sane -> anc/escape` where `anc -> /outside`). Relative targets
+resolve against the link's directory and are containment-checked component by
+component; `.`/`..` are collapsed with pure POSIX expansion. An **absolute**
+target is different: its prefixes are legitimately outside ROOT (for example
+`/tmp` when the canonical ROOT is `/tmp/fixture/root`), so it is followed with
+the same bounded-hop walk but **without** a per-prefix containment check — only
+the **final resolved path** is tested under ROOT. This avoids over-rejecting a
+legal absolute-internal link while still refusing an external one, including a
+target that looks internal but passes through an ancestor symlink to the
+outside. An existing symlink whose full resolution remains under ROOT is
+accepted (internal multi-hop and absolute-internal symlinks stay legal); a
+chain that escapes ROOT, or a symlink loop that exhausts the hop bound, is
+rejected fail-closed
 with `internal state path escapes root: <rel>` — naming the shallowest escaping
 component — and **no lock, directory or file is created**. Paths that do not
 exist yet on a fresh root pass trivially. Because the check runs at the single

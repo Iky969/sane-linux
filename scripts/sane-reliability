@@ -214,6 +214,43 @@ symlink_safe_rel() {
 	return 0
 }
 
+resolve_abs_no_contain() {
+	# resolve_abs_no_contain ABS -- follow an ABSOLUTE symlink target to its
+	# final physical path with the same bounded-hop component walk, WITHOUT
+	# any containment check. An absolute target's prefixes are legitimately
+	# outside ROOT (e.g. /tmp when ROOT is /tmp/fixture/root), so checking
+	# each prefix against ROOT would over-reject an internal absolute link.
+	# The CALLER tests the final resolved path under ROOT. Relative targets
+	# keep the containment-checked walk in symlink_resolve_contained.
+	rac_base=/
+	rac_rest=${1#/}
+	rac_hops=0
+	while [ -n "$rac_rest" ]; do
+		case "$rac_rest" in
+			*/*) rac_comp=${rac_rest%%/*}; rac_rest=${rac_rest#*/} ;;
+			*) rac_comp=$rac_rest; rac_rest= ;;
+		esac
+		case "$rac_comp" in
+			''|.) continue ;;
+		esac
+		rac_cand=$(normalize_path "$rac_base/$rac_comp") || return 1
+		if [ -L "$rac_cand" ]; then
+			rac_hops=$((rac_hops + 1))
+			[ "$rac_hops" -le 40 ] || return 1
+			rac_target=$(readlink "$rac_cand" 2>/dev/null) || return 1
+			[ -n "$rac_target" ] || return 1
+			case "$rac_target" in
+				/*) rac_base=/; rac_rest="${rac_target#/}/$rac_rest" ;;
+				*)  rac_base=$(dirname "$rac_cand")
+				    rac_rest="$rac_target/$rac_rest" ;;
+			esac
+			continue
+		fi
+		rac_base=$rac_cand
+	done
+	printf '%s\n' "$rac_base"
+}
+
 symlink_resolve_contained() {
 	# symlink_resolve_contained REL -- bounded-hop resolver for the internal
 	# state preflight. REL is relative (no '..'/absolute) and ROOT is already
@@ -223,10 +260,12 @@ symlink_resolve_contained() {
 	# essential: resolving a link to "a/b" must still walk "a", which may be
 	# an ancestor symlink pointing outside ROOT even when "b" is ordinary —
 	# a one-shot normalize would wrongly accept that chain. Absolute targets
-	# reset the base to '/'; relative targets resolve against the link's
-	# directory. Every intermediate path is checked to stay under ROOT, hops
-	# are bounded at 40, and '.'/'..' are collapsed with normalize_path (pure
-	# POSIX, identical on the BusyBox runtime). Nothing is created here.
+	# are resolved fully by resolve_abs_no_contain WITHOUT per-prefix
+	# containment (their prefixes may lie outside ROOT) and their FINAL
+	# resolved path must be under ROOT; relative targets resolve against the
+	# link's directory with per-component containment. Hops are bounded at 40
+	# and '.'/'..' collapse via normalize_path (pure POSIX, identical on the
+	# BusyBox runtime). Nothing is created here.
 	src_rel=$1
 	src_root=$ROOT
 	while [ "${src_root%/}" != "$src_root" ]; do src_root=${src_root%/}; done
@@ -260,7 +299,20 @@ symlink_resolve_contained() {
 			src_target=$(readlink "$src_cand" 2>/dev/null) || return 1
 			[ -n "$src_target" ] || return 1
 			case "$src_target" in
-				/*) src_base=/; src_rest="${src_target#/}/$src_rest" ;;
+				/*)
+					# Absolute target: resolve every component (including
+					# further symlink hops) WITHOUT per-prefix containment,
+					# then require the FINAL resolved path to stay under
+					# ROOT. Prefixes like /tmp are outside ROOT by design.
+					src_abs=$(resolve_abs_no_contain "$src_target") || return 1
+					if [ "$src_root" != "/" ]; then
+						case "$src_abs/" in
+							"$src_root/"*) ;;
+							*) return 1 ;;
+						esac
+					fi
+					src_base=$src_abs
+					;;
 				*)  src_base=$(dirname "$src_cand")
 				    src_rest="$src_target/$src_rest" ;;
 			esac

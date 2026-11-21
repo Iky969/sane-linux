@@ -1913,5 +1913,116 @@ check "P1-2 canonicalized root state created in the physical target" \
 
 rm -rf -- "$IS_WORK"
 
+# --- Batch C1: absolute-internal symlink containment ------------------------
+# An ABSOLUTE symlink whose target resolves under the canonical ROOT must be
+# accepted. Prefixes of an absolute target (e.g. /tmp when ROOT is
+# /tmp/fixture/root) are legitimately outside ROOT and are NOT containment-
+# checked one by one; only the FINAL resolved path is. Escapes still fail.
+CW=$(mktemp -d)
+
+# Absolute internal target at the top-level var component: init/snapshot/list.
+base
+mkdir -p "$T/realvar"
+rm -rf "$T/var"
+ln -s "$T/realvar" "$T/var"
+expect_ok "C1 absolute internal var symlink accepted (init)" run init
+check "C1 absolute internal var state stayed under root" \
+	test -d "$T/realvar/lib/sane/reliability/snapshots"
+expect_ok "C1 absolute internal var symlink accepted (snapshot)" run snapshot absinternal
+check "C1 absolute internal var snapshot created" \
+	test -d "$T/realvar/lib/sane/reliability/snapshots/absinternal"
+expect_ok "C1 absolute internal var symlink accepted (list)" sh -c \
+	"run() { sh '$TOOL' --root '$T' \"\$@\"; }; run list | grep -q absinternal"
+
+# Absolute internal target at var/lib/sane and at the log leaf.
+base
+mkdir -p "$T/realvar/lib/realsane"
+ln -s "$T/realvar/lib/realsane" "$T/var/lib/sane"
+expect_ok "C1 absolute internal var/lib/sane accepted" run init
+check "C1 state landed at the absolute internal target" \
+	test -d "$T/realvar/lib/realsane/reliability/snapshots"
+
+base
+mkdir -p "$T/var/log/sane"
+ln -s "$T/log-real.log" "$T/var/log/sane/reliability.log"
+expect_ok "C1 absolute internal log leaf accepted" run log INFO absinternal
+check "C1 log written through the absolute internal symlink" \
+	grep -q absinternal "$T/log-real.log"
+
+# Absolute EXTERNAL targets are rejected with the exact reason and zero writes.
+for abs_loc in var var/lib/sane var/log/sane/reliability.log; do
+	abs_ext="$CW/ext.$(printf '%s' "$abs_loc" | tr '/' '_')"
+	mkdir -p "$abs_ext"
+	base
+	case "$abs_loc" in
+		var) rm -rf "$T/var"; ln -s "$abs_ext" "$T/var" ;;
+		var/lib/sane) mkdir -p "$T/var/lib"; ln -s "$abs_ext" "$T/var/lib/sane" ;;
+		var/log/sane/reliability.log)
+			mkdir -p "$T/var/log/sane"
+			ln -s "$abs_ext/escaped.log" "$T/var/log/sane/reliability.log" ;;
+	esac
+	if run init 2>"$T/abs.err"; then
+		fail "C1 absolute external $abs_loc rejected"
+	else
+		pass "C1 absolute external $abs_loc rejected"
+	fi
+	check "C1 absolute external $abs_loc names the component" \
+		grep -q "internal state path escapes root: $abs_loc" "$T/abs.err"
+	check "C1 absolute external $abs_loc left external dir empty" \
+		test -z "$(ls -A "$abs_ext")"
+done
+
+# An absolute target INSIDE ROOT whose ancestor is an escaping symlink is
+# still rejected: the no-containment helper resolves the ancestor too.
+base
+abs_anc="$CW/ancestor"
+mkdir -p "$abs_anc/escape" "$T/var/lib"
+ln -s "$abs_anc" "$T/var/lib/anc"
+ln -s "$T/var/lib/anc/escape" "$T/var/lib/sane"
+if run init 2>"$T/anc2.err"; then
+	fail "C1 absolute internal target with escaping ancestor rejected"
+else
+	pass "C1 absolute internal target with escaping ancestor rejected"
+fi
+check "C1 escaping ancestor names the state component" \
+	grep -q 'internal state path escapes root: var/lib/sane' "$T/anc2.err"
+check "C1 escaping ancestor left external dir empty" \
+	test -z "$(ls -A "$abs_anc/escape")"
+
+# Multi-hop absolute internal chain stays accepted; an absolute symlink loop
+# is still rejected at the bounded hop limit.
+base
+mkdir -p "$T/real1/lib/real2"
+rm -rf "$T/var"
+ln -s "$T/real1" "$T/var"
+ln -s "$T/real1/lib/real2" "$T/real1/lib/sane"
+expect_ok "C1 multi-hop absolute internal accepted" run init
+check "C1 multi-hop absolute internal state landed" \
+	test -d "$T/real1/lib/real2/reliability/snapshots"
+
+base
+mkdir -p "$T/var/lib"
+ln -s "$T/var/lib/loopb" "$T/var/lib/loopa"
+ln -s "$T/var/lib/loopa" "$T/var/lib/loopb"
+ln -s "$T/var/lib/loopa" "$T/var/lib/sane"
+if run init 2>"$T/loop2.err"; then
+	fail "C1 absolute symlink loop rejected at bounded hop limit"
+else
+	pass "C1 absolute symlink loop rejected at bounded hop limit"
+fi
+check "C1 absolute loop rejection names the state component" \
+	grep -q 'internal state path escapes root: var/lib/sane' "$T/loop2.err"
+
+# Relative internal symlinks (the original accepted path) remain accepted.
+base
+mkdir -p "$T/realvar"
+rm -rf "$T/var"
+ln -s realvar "$T/var"
+expect_ok "C1 relative internal still accepted" run init
+check "C1 relative internal state landed" \
+	test -d "$T/realvar/lib/sane/reliability/snapshots"
+
+rm -rf -- "$CW"
+
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
