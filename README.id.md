@@ -44,7 +44,7 @@ Event loop ninit berbasis `ppoll`, jadi init tetap responsif terhadap sinyal bah
 - **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
   `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
   penulisan tidak saling menelan.
-- **Pemisahan Hak Akses (`:user=`, `:group=`)**: layanan berjalan sebagai `root` secara default; `:user=` menurunkan hak ke user non-root dari `/etc/passwd`. `:group=` opsional dan **harus berpasangan** dengan `:user=` (group-only ditolak fail-closed sejak round 2). Supplementary groups dibuang (`setgroups`). Kesalahan lookup menyebabkan kegagalan fail-closed.
+- **Pemisahan Hak Akses (`:user=`, `:group=`)**: layanan berjalan sebagai `root` secara default; `:user=` menurunkan hak ke user non-root dari `/etc/passwd`. `:group=` opsional dan **harus berpasangan** dengan `:user=` (group-only ditolak fail-closed sejak round 2). Supplementary groups dibuang (`setgroups`). Kesalahan lookup menyebabkan kegagalan fail-closed. Nilai numerik `:user=`/`:group=` harus ada di `/etc/passwd`/`/etc/group`, dan numerik `0` ditolak -- tulis `:user=root` / `:group=root`.
 - **Kontrol Daemon `sane-ctl`**: CLI terpadu untuk `start`, `stop`, `restart`, dan `status` daemon lewat FIFO `/run/initctl` dengan pelacakan state di `/run/ninit-*.state` dan eskalasi SIGKILL jika stop grace timeout habis.
 - **S.A.N.E Package Manager (`spm`)**: manajer paket POSIX `/bin/sh` dengan atomic staging `rename(2)`, penggantian binary aktif tanpa `ETXTBSY`, proteksi reverse dependency, hardening keamanan arsip, dan pemulihan transaksi mati lampu (power-cut journal recovery).
 - **Installer Offline & Dual-Boot**: installer live guest (`sane-install.sh`) yang mendukung dual boot Limine BIOS (MBR/GPT) dan UEFI (ESP FAT32) dengan resolusi partisi root via GPT `PARTUUID`.
@@ -75,7 +75,7 @@ Butuh `build-essential` dan (untuk uji) `busybox-static`:
 sudo apt-get install build-essential busybox-static python3 shellcheck
 
 make          # hasilkan biner statis ./ninit
-make lint     # lint pola/format + gate ShellCheck pada 11 skrip produksi
+make lint     # lint pola/format + gate ShellCheck pada 13 skrip produksi
 make test     # 12 suite: 7 butuh root/sudo + 5 tanpa root (namespace PID 1)
 make rootfs   # rootfs distro minimal + initramfs (busybox statis, ninit PID 1)
 make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
