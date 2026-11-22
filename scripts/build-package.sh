@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/build-package.sh -- S.A.N.E Package Builder CLI
 #
-# Builds deterministic, cryptographically verified .spm.tar.xz (or .spm.tar.gz)
+# Builds deterministic, SHA-256 integrity-checked .spm.tar.xz (or .spm.tar.gz)
 # packages from a staging directory following the S.A.N.E Package Specification.
 #
 # CLI Contract:
@@ -220,6 +220,14 @@ if [ -d "$SERVICE_DIR" ]; then
         chmod 0644 "$sfile"
     done < <(find "$SERVICE_DIR" -mindepth 1 -maxdepth 1 -print0)
 fi
+
+# T1: a device node, FIFO or socket in the source payload must never reach
+# the archive. Reject them here, before .META/files is generated (the old
+# `find ! -type d` below would have listed them as payload entries).
+special_files=$(find "$SOURCE_DIR/x" ! -type f ! -type d ! -type l 2>/dev/null || true)
+[ -z "$special_files" ] || die "Special file (device/FIFO/socket) in package payload: $special_files"
+special_files=$(find "$SOURCE_DIR/.META" ! -type f ! -type d 2>/dev/null || true)
+[ -z "$special_files" ] || die "Special file in package metadata: $special_files"
 
 # 5. Auto-generate .META/files
 log "Generating .META/files manifest..."
