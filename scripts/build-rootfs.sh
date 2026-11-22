@@ -12,7 +12,8 @@
 #   DISTRO_DIR=distro        working directory (cache/, build/, rootfs/, initramfs)
 #   ROOTFS=$DISTRO_DIR/rootfs
 #   BB_VERSION=1.36.1        busybox source version
-#   BB_SHA256=<hash>         official tarball checksum; empty to skip
+#   BB_SHA256=<hash>         official tarball checksum (required; an empty
+#                            value fails the build)
 #   BUSYBOX_MODE=auto        auto | source | prebuilt
 #   BUSYBOX_PREBUILT=/bin/busybox   fallback static busybox (busybox-static)
 #   NINIT=./ninit            binary installed as /sbin/init
@@ -56,6 +57,15 @@ PKG_INSTALL=$BUILD_DIR/busybox-install
 BB_VERSION=${BB_VERSION:-1.36.1}
 BB_URL=${BB_URL:-https://busybox.net/downloads/busybox-$BB_VERSION.tar.bz2}
 BB_SHA256=${BB_SHA256:-b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314}
+# R1: BusyBox must come over https and its checksum is mandatory; an empty
+# BB_SHA256 used to silently skip verification.
+case "$BB_URL" in
+	https://*) ;;
+	*) die "BB_URL must use https: $BB_URL" ;;
+esac
+if ! printf '%s' "$BB_SHA256" | grep -qE '^[0-9a-fA-F]{64}$'; then
+	die "BB_SHA256 must be a 64-digit hex checksum (empty value is not allowed)"
+fi
 BUSYBOX_MODE=${BUSYBOX_MODE:-auto}
 BUSYBOX_PREBUILT=${BUSYBOX_PREBUILT:-/bin/busybox}
 BUSYBOX_FORCE=${BUSYBOX_FORCE:-0}
@@ -117,7 +127,7 @@ build_busybox_source() {
   got      $actual"
 		info "tarball checksum matches (sha256)"
 	else
-		info "checksum verification skipped (BB_SHA256 empty)"
+		die "BB_SHA256 is empty; refusing to build BusyBox without checksum verification"
 	fi
 
 	if [ ! -d "$src" ] || [ "$BUSYBOX_FORCE" = 1 ]; then
@@ -596,6 +606,17 @@ resolve_busybox
 # The rootfs is always rebuilt from scratch so its contents are deterministic,
 # except for the busybox build in build/ and the download cache.
 log "clearing the old rootfs"
+# R1: guard the destructive rm -rf: refuse system paths, the repo root
+# itself, and the builder's home. (A rootfs *under* the repo, e.g.
+# $REPO_ROOT/distro/rootfs, is the normal case and is allowed.)
+case "$ROOTFS" in
+	""|"/"|"/etc"|"/usr"|"/boot"|"/var"|"/home"|"$HOME"|"$REPO_ROOT")
+		die "refusing to clear unsafe ROOTFS path: ${ROOTFS:-<empty>}" ;;
+esac
+case "$ROOTFS" in
+	/*) ;;
+	*) die "ROOTFS must be an absolute path: $ROOTFS" ;;
+esac
 rm -rf "$ROOTFS"
 make_dirs
 install_busybox
