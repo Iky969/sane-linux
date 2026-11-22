@@ -1114,6 +1114,7 @@ cat > "$ROOT/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
 daemon:x:1:1:daemon:/usr/sbin:/bin/sh
 nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+numericuser:x:1234:5678:Numeric UID test:/nonexistent:/bin/false
 emptyuser::1000:1000::/home/emptyuser:/bin/sh
 bad_empty_uid:x::1001::/home:/bin/sh
 bad_nonnum_uid:x:abc:1001::/home:/bin/sh
@@ -1123,6 +1124,7 @@ cat > "$ROOT/etc/group" <<'EOF'
 root:x:0:
 daemon:x:1:
 nogroup:x:65534:
+numericgrp:x:5678:
 customgrp:x:5000:
 emptygrp::2000:
 bad_empty_gid:x::
