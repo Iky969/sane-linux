@@ -59,7 +59,7 @@ base() {
 	mkdir -p "$T/etc" "$T/home" "$T/usr/bin"
 	printf 'stub' > "$T/usr/bin/doas"
 	chmod 4755 "$T/usr/bin/doas"
-	sh "$ACCOUNTS" --root "$T" init >/dev/null
+	sh "$ACCOUNTS" --root "$T" --firstboot init >/dev/null
 }
 
 cleanup() { [ -n "$T" ] && rm -rf -- "$T"; }
@@ -118,8 +118,13 @@ check "del-user removes passwd entry" sh -c \
 
 # --- password management ---------------------------------------------------
 expect_fail "empty password rejected" set_pw alice ''
-expect_fail "unknown user password rejected" set_pw nobody secret
-expect_ok "set-password updates shadow" set_pw alice secret
+expect_fail "unknown user password rejected" set_pw nobody 'UnknownPass123!'
+expect_fail "short password rejected (minimum 12)" set_pw alice 'short1'
+expect_ok "12-character password accepted" set_pw alice '123456789012'
+expect_ok "add-user for same-name password test" sh "$ACCOUNTS" --root "$T" add-user testuser1234 1007 --skip-chown
+expect_fail "password equal to username rejected" set_pw testuser1234 'testuser1234'
+expect_ok "set-password updates shadow" set_pw alice 'SecretPass123!'
+
 stored=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
 case "$stored" in
 	\$6\$*) pass "set-password produces SHA-512 crypt hash" ;;
@@ -127,7 +132,7 @@ case "$stored" in
 esac
 rest=${stored#\$6\$}
 salt=${rest%%\$*}
-expected=$(printf '%s' 'secret' | openssl passwd -6 -salt "$salt" -stdin)
+expected=$(printf '%s' 'SecretPass123!' | openssl passwd -6 -salt "$salt" -stdin)
 check "stored hash verifies against password" test "$stored" = "$expected"
 check "shadow stays 0600 after password change" test "$(stat -c %a "$T/etc/shadow")" = 600
 expect_ok "validate accepts active SHA-512 password" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
@@ -148,7 +153,7 @@ chmod 0644 "$T/etc/shadow"
 expect_fail "validate rejects world-readable shadow" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
-sed -i 's/^sane:\$6\$/sane:plaintext/' "$T/etc/shadow"
+sed -i 's/^sane:!:/sane:plaintext:/' "$T/etc/shadow"
 expect_fail "validate rejects non-SHA512 password" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
@@ -379,7 +384,16 @@ expect_fail "init refuses to overwrite existing identity files" \
 check "failed init preserved the extra account" sh -c \
 	"grep -q '^extra:' '$T/etc/passwd'"
 expect_ok "init --force overwrites when explicitly asked" \
-	sh "$ACCOUNTS" --root "$T" init --force
+	sh "$ACCOUNTS" --root "$T" init --force --firstboot
+# K1: plain init without --firstboot (or --allow-weak-defaults with runtime
+# passwords) must refuse to write password accounts -- there is no
+# deterministic hash left to fall back to.
+T2=$(mktemp -d)
+mkdir -p "$T2/etc"
+expect_fail_msg "plain init without --firstboot is rejected" \
+	"refusing to write password accounts" \
+	sh "$ACCOUNTS" --root "$T2" init --force
+rm -rf -- "$T2"
 check "init --force replaced the account table" sh -c \
 	"! grep -q '^extra:' '$T/etc/passwd'"
 
@@ -440,10 +454,37 @@ base
 mkdir -p "$T/usr/bin"
 printf stub > "$T/usr/bin/doas"
 chmod 4755 "$T/usr/bin/doas"
-SANE_WEAK_DEFAULT_CREDS=1 sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T" >/dev/null 2>&1
+SANE_TEST_CREDS_FILE="$T/sane-test-creds" SANE_WEAK_DEFAULT_CREDS=1 sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T" >/dev/null 2>&1
 check "weak-creds mode writes an active root hash" sh -c \
 	"! grep -q '^root:!' '$T/etc/shadow'"
 check "weak-creds mode marks first boot complete" test -f "$T/etc/.sane-firstboot-done"
+# K1: the weak-creds passwords are random per run, recorded only in a 0600
+# file outside the image -- never the deterministic root/root + sane/sane.
+check "weak-creds mode writes a credentials file outside the image" test -f "$T/sane-test-creds"
+check "credentials file is mode 0600" test "$(stat -c %a "$T/sane-test-creds")" = 600
+check "weak-creds passwords are not the old defaults" sh -c \
+	"! grep -q '^root:root$' '$T/sane-test-creds' && ! grep -q '^sane:sane$' '$T/sane-test-creds'"
+rm -f "$T/sane-test-creds"
+
+# Some POSIX mktemp implementations require an explicit template. Use a
+# wrapper that enforces that interface while delegating to the real utility.
+T2=$(mktemp -d)
+mkdir -p "$T2/bin" "$T2/tmp"
+REAL_MKTEMP=$(command -v mktemp)
+cat > "$T2/bin/mktemp" <<EOF
+#!/bin/sh
+[ "\$#" -eq 1 ] || { printf 'mktemp: template required\n' >&2; exit 1; }
+case "\$1" in *XXXXXX) ;; *) printf 'mktemp: six X template required\n' >&2; exit 1 ;; esac
+exec "$REAL_MKTEMP" "\$@"
+EOF
+chmod 0755 "$T2/bin/mktemp"
+base
+expect_ok "provision works with template-only mktemp" \
+	env PATH="$T2/bin:$PATH" TMPDIR="$T2/tmp" SANE_WEAK_DEFAULT_CREDS=1 \
+	sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T"
+check "template-form mktemp creates credentials in TMPDIR" sh -c \
+	"find '$T2/tmp' -type f -name 'sane-test-creds.*' | grep -q ."
+rm -rf -- "$T2"
 
 # First boot must not be killed by ninit's 30s once-service timeout.
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
@@ -815,10 +856,30 @@ expect_ok "validate passes with the marker removed" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 check "firstboot helper is present to set passwords again" \
 	test -x "$REPO_ROOT/scripts/sane-firstboot"
-expect_ok "firstboot can set a new root password" set_pw root 'FirstPass1!'
-expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass2!'
+expect_ok "firstboot can set a new root password" set_pw root 'FirstPass123!'
+expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass234!'
 printf 'done\n' > "$T/etc/.sane-firstboot-done"
 expect_ok "validate passes after a successful firstboot rerun" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Empty fields are corrupt rather than locked markers. Recovery must rebuild
+# them as locked accounts and re-arm firstboot instead of crashing or unlocking.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+awk -F: -v OFS=: '$1=="root" || $1=="sane" {$2=""} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects empty root/sane fields before recovery" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover handles empty root/sane fields" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "empty-field recovery locks root and sane" sh -c \
+	"grep -q '^root:!:19700:' '$T/etc/shadow' && grep -q '^sane:!:19700:' '$T/etc/shadow'"
+check "empty-field recovery removes the firstboot marker" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+expect_ok "validate passes after empty-field recovery" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 # D: a corrupt shadow with both an active and a locked extra hash. The rebuild
@@ -832,7 +893,7 @@ expect_ok "shadow rebuild setup: add alice and bob to wheel" sh -c \
 	 sh '$ACCOUNTS' --root '$T' add-user bob 1006 wheel --skip-chown >/dev/null && \
 	 sh '$ACCOUNTS' --root '$T' add-user mallory 1007 --skip-chown >/dev/null"
 expect_ok "shadow rebuild setup: alice gets an active hash" set_pw alice 'AliceActive1!'
-expect_ok "shadow rebuild setup: bob gets a locked hash" set_pw bob 'BobLocked1!'
+expect_ok "shadow rebuild setup: bob gets a locked hash" set_pw bob 'BobLocked123!'
 expect_ok "shadow rebuild setup: lock bob" sh "$ACCOUNTS" --root "$T" lock bob
 alice_active_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
 bob_locked_before=$(awk -F: '$1=="bob"{print}' "$T/etc/shadow")

@@ -15,6 +15,9 @@
  *           non-blocking fork() EAGAIN retry, cgroup base override gated behind
  *           -DNINIT_TESTING.
  * v1.2.0  : interactive cttyhack console, fail-closed privilege drop parser (:user=/:group=), sane-ctl IPC /run/initctl lifecycle control
+ * v1.3.0  : numeric :user=/:group= must exist in /etc/passwd//etc/group;
+ *           numeric 0 is rejected -- write :user=root / :group=root instead,
+ *           so a typo can never silently keep a service running as root.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -938,33 +941,39 @@ static int lookup_user(const char *name_or_uid, uid_t *out_uid, gid_t *out_gid)
 
     unsigned long u = 0;
     if (parse_numeric_id(name_or_uid, &u) == 0) {
+        /* T4: a numeric UID is no longer accepted blindly. It must name an
+           account that actually exists in /etc/passwd, and numeric 0 is
+           rejected outright -- write :user=root instead, so a typo such as
+           :user=0 can never silently keep a service running as root. */
+        if (u == 0) return -1;
         *out_uid = (uid_t)u;
         *out_gid = (gid_t)u;
 
+        int found = 0;
         FILE *f = fopen("/etc/passwd", "r");
-        if (f) {
-            char buf[MAX_LINE];
-            while (fgets(buf, sizeof(buf), f)) {
-                buf[strcspn(buf, "\n")] = 0;
-                char *ptr = buf;
-                char *u_name = next_colon_field(&ptr);
-                char *u_pwd  = next_colon_field(&ptr);
-                char *u_uid  = next_colon_field(&ptr);
-                char *u_gid  = next_colon_field(&ptr);
+        if (!f) return -1;
+        char buf[MAX_LINE];
+        while (fgets(buf, sizeof(buf), f)) {
+            buf[strcspn(buf, "\n")] = 0;
+            char *ptr = buf;
+            char *u_name = next_colon_field(&ptr);
+            char *u_pwd  = next_colon_field(&ptr);
+            char *u_uid  = next_colon_field(&ptr);
+            char *u_gid  = next_colon_field(&ptr);
 
-                if (u_name && u_pwd && u_uid && u_gid) {
-                    unsigned long rec_uid = 0, rec_gid = 0;
-                    if (parse_numeric_id(u_uid, &rec_uid) == 0 && rec_uid == u) {
-                        if (parse_numeric_id(u_gid, &rec_gid) == 0) {
-                            *out_gid = (gid_t)rec_gid;
-                            break;
-                        }
+            if (u_name && u_pwd && u_uid && u_gid) {
+                unsigned long rec_uid = 0, rec_gid = 0;
+                if (parse_numeric_id(u_uid, &rec_uid) == 0 && rec_uid == u) {
+                    if (parse_numeric_id(u_gid, &rec_gid) == 0) {
+                        *out_gid = (gid_t)rec_gid;
+                        found = 1;
+                        break;
                     }
                 }
             }
-            fclose(f);
         }
-        return 0;
+        fclose(f);
+        return found ? 0 : -1;
     }
 
     FILE *f = fopen("/etc/passwd", "r");
@@ -1003,6 +1012,29 @@ static int lookup_group(const char *name_or_gid, gid_t *out_gid)
 
     unsigned long g = 0;
     if (parse_numeric_id(name_or_gid, &g) == 0) {
+        /* T4: same rule as lookup_user -- numeric 0 is rejected (use
+           :group=root), and any other numeric GID must exist in /etc/group. */
+        if (g == 0) return -1;
+        FILE *gf = fopen("/etc/group", "r");
+        if (!gf) return -1;
+        int gfound = 0;
+        char gbuf[MAX_LINE];
+        while (fgets(gbuf, sizeof(gbuf), gf)) {
+            gbuf[strcspn(gbuf, "\n")] = 0;
+            char *gptr = gbuf;
+            char *g_name = next_colon_field(&gptr);
+            char *g_pwd  = next_colon_field(&gptr);
+            char *g_gid  = next_colon_field(&gptr);
+            if (g_name && g_pwd && g_gid) {
+                unsigned long rec_gid = 0;
+                if (parse_numeric_id(g_gid, &rec_gid) == 0 && rec_gid == g) {
+                    gfound = 1;
+                    break;
+                }
+            }
+        }
+        fclose(gf);
+        if (!gfound) return -1;
         *out_gid = (gid_t)g;
         return 0;
     }

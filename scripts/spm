@@ -384,9 +384,68 @@ verify_symlink_safety() {
     return 0
 }
 
-# Helper to inspect all symlinks inside archive
+# Helper to inspect all symlinks inside archive.
+# T2: the old implementation parsed `tar -tvf` by splitting on spaces, so a
+# symlink named `foo bar` was validated as `bar` and a name/target containing
+# ` -> ` broke the parse entirely. When python3 is available, use its
+# tarfile module instead: it reports each member's name, type and link
+# target structurally, with no text parsing at all. The python check mirrors
+# verify_symlink_safety() exactly (same forbidden/allowed target lists);
+# when python3 is absent, fall back to the old tar -tvf scan as a
+# best-effort pre-check -- the authoritative check is the post-extraction
+# verify_staged_symlinks() below, which inspects the extracted tree
+# directly and runs before anything is committed.
 verify_archive_symlinks() {
     local pkg="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$pkg" <<'PYEOF' || die "Failed to inspect archive symlinks: $pkg"
+import sys, tarfile, fnmatch
+pkg = sys.argv[1]
+TAR_SOCKET_TYPE = b"s"  # tarfile has no socket constant; use the tar typeflag.
+FORBIDDEN = ("/etc/shadow*", "/etc/passwd*", "/etc/sudoers*", "/etc/gshadow*",
+             "/proc/*", "/sys/*", "/dev/*", "/root/*", "/home/*")
+ALLOWED = ("/bin/*", "/sbin/*", "/usr/bin/*", "/usr/sbin/*", "/usr/share/*",
+           "/lib/*", "/usr/lib/*", "/boot/*", "/opt/*")
+def die(msg):
+    print("ERROR: " + msg, file=sys.stderr)
+    sys.exit(1)
+def check(link_path, link_target):
+    if link_path.startswith("./.META"):
+        die("Symlinks are strictly forbidden in .META directory: " + link_path)
+    rel = link_path[4:] if link_path.startswith("./x/") else link_path
+    if link_target.startswith("/"):
+        parts = [p for p in link_target.split("/") if p]
+        if any(p == ".." for p in parts):
+            die("Path traversal detected in absolute symlink target: %s -> %s" % (link_path, link_target))
+        if any(fnmatch.fnmatch(link_target, pat) for pat in FORBIDDEN):
+            die("Symlink escape attack: forbidden system target " + link_target)
+        if not any(fnmatch.fnmatch(link_target, pat) for pat in ALLOWED):
+            die("Symlink escape attack: absolute target outside allowed system directories: " + link_target)
+        return
+    d = rel.rsplit("/", 1)[0] if "/" in rel else "."
+    depth = 0 if d == "." else len([p for p in d.split("/") if p])
+    cur = depth
+    for p in link_target.split("/"):
+        if p == "..":
+            cur -= 1
+            if cur < 0:
+                die("Relative symlink escapes target payload root: %s -> %s" % (link_path, link_target))
+        elif p not in ("", "."):
+            cur += 1
+try:
+    with tarfile.open(pkg) as tf:
+        for m in tf.getmembers():
+            if m.issym():
+                check(m.name, m.linkname)
+            elif m.islnk():
+                die("Archive contains forbidden hard link: " + m.name)
+            elif m.isdev() or m.isfifo() or m.type == TAR_SOCKET_TYPE:
+                die("Archive contains forbidden special file (device/FIFO/socket): " + m.name)
+except tarfile.TarError as e:
+    die("Failed to inspect archive symlinks: %s (%s)" % (pkg, e))
+PYEOF
+        return 0
+    fi
     local line
     local tmp_tar
     tmp_tar="$(mktemp "${TMPDIR:-/tmp}/spm-symlinks.XXXXXX")"
@@ -404,6 +463,33 @@ verify_archive_symlinks() {
         esac
     done < "$tmp_tar"
     rm -f "$tmp_tar"
+}
+
+# Post-extraction, pre-commit audit of the staged tree (T1/T2).
+# These inspect the extracted files directly -- no tar parsing -- so they
+# are authoritative even if a crafted archive name bypassed the
+# pre-extraction scan. They run immediately after extraction, before
+# parity/checksum/service validation and before any file is committed.
+verify_staged_payload_types() {
+    local staging_root="$1"
+    local bad
+    bad="$(find "$staging_root/x" ! -type f ! -type d ! -type l 2>/dev/null || true)"
+    [ -z "$bad" ] || die "Archive contains forbidden special file in payload: $bad"
+    bad="$(find "$staging_root/.META" ! -type f ! -type d 2>/dev/null || true)"
+    [ -z "$bad" ] || die "Archive contains forbidden special file in .META: $bad"
+}
+
+verify_staged_symlinks() {
+    local staging_root="$1"
+    local tmp_list entry rel
+    tmp_list="$(mktemp "${TMPDIR:-/tmp}/spm-staged-links.XXXXXX")"
+    find "$staging_root/x" -type l -print > "$tmp_list" 2>/dev/null || true
+    while IFS= read -r entry || [ -n "$entry" ]; do
+        [ -n "$entry" ] || continue
+        rel="${entry#"$staging_root/x/"}"
+        verify_symlink_safety "./x/$rel" "$(readlink "$entry")"
+    done < "$tmp_list"
+    rm -f "$tmp_list"
 }
 
 # Helper to validate an individual entry in .META/files
@@ -905,6 +991,12 @@ cmd_install() {
                 rm -f "$tmp_tv"
                 die "Archive contains forbidden hard link: $tv_line"
                 ;;
+            # T1: first character of the mode field is the entry type:
+            # b/c = block/char device, p = FIFO, s = socket.
+            b*|c*|p*|s*)
+                rm -f "$tmp_tv"
+                die "Archive contains forbidden special file (device/FIFO/socket): $tv_line"
+                ;;
         esac
         local tv_mode="${tv_line%% *}"
         if echo "$tv_mode" | grep -qE '^.[rwx-]{2}[sS]|^.[rwx-]{5}[sS]'; then
@@ -1055,6 +1147,11 @@ cmd_install() {
 
     [ -d "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; die "Archive missing payload root ./x/"; }
     [ -d "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; die "Archive missing metadata directory ./.META/"; }
+
+    # Authoritative post-extraction audit (T1/T2): special files and
+    # symlinks in the extracted tree, before any other validation or commit.
+    verify_staged_payload_types "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; die "Staged payload type audit failed"; }
+    verify_staged_symlinks "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; die "Staged symlink audit failed"; }
 
     # Post-extraction audit for setuid/setgid files
     local suid_sgid_files
@@ -1484,6 +1581,8 @@ cmd_validate_source() {
 
     # x/ payload: the same path invariants and symlink policy as the archive
     # walker. Never dereference a symlink while auditing path components.
+    # T1: reject device/FIFO/socket entries here as well, not just in .META/.
+    verify_staged_payload_types "$source_dir"
     find "$source_dir/x" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue

@@ -8,7 +8,7 @@ S.A.N.E Linux v1.2.0 is a major milestone release delivering production-grade in
 ## 2. Core Init System (`ninit` v1.2.0)
 - **Interactive cttyhack Console**: Automatic terminal allocation via `cttyhack` on `/dev/console` for reliable interactive root shells across serial, virtual, and physical consoles.
 - **Fail-Closed Privilege Drop Parser**:
-  - Secure `:user=` and `:group=` directives in service declarations (`/etc/ninit.services`).
+  - Secure `:user=` and `:group=` directives in service declarations (`/etc/init.conf`).
   - Resolves user and group identities via `/etc/passwd` and `/etc/group` with support for both symbolic names and numeric IDs.
   - Enforces strict privilege drop to unprivileged credentials prior to executing service payloads, failing closed on unknown users/groups or permission errors.
 - **`sane-ctl` IPC Lifecycle Control via `/run/initctl`**:

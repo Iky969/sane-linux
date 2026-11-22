@@ -146,6 +146,12 @@ KERNEL_PINNED_SHA256="be523954ad673a78c9cdfd3d473a8d39609f5901adfcc68402c67dc037
 MODLOOP_PINNED_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/netboot-3.20.10/modloop-virt"
 MODLOOP_PINNED_SHA256="a6ed1699b1c8c863fe57543263480ee3835c083b8202251d3919d1817a3c5358"
 PARTUUID="${PARTUUID:-44444444-4444-4444-8888-888888888888}"
+# Validate PARTUUID (S5): it is written into the GPT entry, fstab and the
+# kernel command line, so anything but a lowercase UUID must be rejected.
+PARTUUID=$(printf '%s' "$PARTUUID" | tr 'A-Z' 'a-z')
+if ! printf '%s' "$PARTUUID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    die "invalid PARTUUID format: $PARTUUID"
+fi
 
 verify_file_sha256() {
     local file="$1"

@@ -8,9 +8,12 @@
 #
 # By default accounts are locked and /etc/.sane-firstboot-done is absent, so
 # sane-firstboot will demand new passwords on first boot. For CI/test images,
-# set SANE_WEAK_DEFAULT_CREDS=1 to keep the deterministic root/root + sane/sane
-# credentials and mark first boot as already complete. NEVER use that flag for
-# images intended for distribution.
+# set SANE_WEAK_DEFAULT_CREDS=1 to generate RANDOM per-run passwords instead
+# (K1: no deterministic root/root + sane/sane credentials exist any more).
+# The passwords are written to SANE_TEST_CREDS_FILE, or to a mktemp-generated
+# sane-test-creds.XXXXXX file under ${TMPDIR:-/tmp} (mode 0600, outside the
+# image), so a test that needs to log in can read them; they are never
+# committed. NEVER use that flag for images intended for distribution.
 set -eu
 
 TARGET=${1:-}
@@ -33,8 +36,30 @@ RECOVERY="$SCRIPT_DIR/sane-account-recovery"
 $SUDO sh "$ACCOUNTS" --root "$TARGET" --force --firstboot init
 
 if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
-	printf 'WARNING: provisioning CI/test credentials (root/root, sane/sane)\n' >&2
-	$SUDO sh "$ACCOUNTS" --root "$TARGET" --force init
+	# CI/test only (K1): random per-run passwords, set via set-password on
+	# top of the locked --firstboot baseline. Verified: set-password
+	# replaces the '!' lock marker with a usable hash, so no unlock step
+	# is needed after init --firstboot.
+	printf 'WARNING: provisioning random per-run CI/test credentials (see SANE_TEST_CREDS_FILE)\n' >&2
+	if [ -n "${SANE_TEST_CREDS_FILE:-}" ]; then
+		CREDS_FILE="$SANE_TEST_CREDS_FILE"
+		CLEANUP_CREDS=0
+	else
+		CREDS_FILE=$(mktemp "${TMPDIR:-/tmp}/sane-test-creds.XXXXXX") || { printf "FAIL: failed to create credentials file\n" >&2; exit 1; }
+		CLEANUP_CREDS=1
+	fi
+	# Remove a mktemp-generated creds file on exit/error; never delete an
+	# explicitly provided SANE_TEST_CREDS_FILE.
+	if [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then
+		trap 'if [ "$?" -ne 0 ] && [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then rm -f "$CREDS_FILE"; fi' EXIT HUP INT TERM
+	fi
+	ROOT_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
+	SANE_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
+	# Write atomically with mode 0600; umask guards the creation.
+	( umask 077; printf 'root:%s\nsane:%s\n' "$ROOT_PASS" "$SANE_PASS" > "$CREDS_FILE" )
+	chmod 0600 "$CREDS_FILE"
+	printf '%s' "$ROOT_PASS" | $SUDO sh "$ACCOUNTS" --root "$TARGET" set-password root
+	printf '%s' "$SANE_PASS" | $SUDO sh "$ACCOUNTS" --root "$TARGET" set-password sane
 	printf 'done\n' | $SUDO tee "$TARGET/etc/.sane-firstboot-done" >/dev/null
 	$SUDO chmod 0600 "$TARGET/etc/.sane-firstboot-done"
 fi

@@ -48,13 +48,30 @@ Nobody can log in before this completes. If reading the console fails, the
 service command falls back to a root shell on the console for recovery;
 physical/serial console access is already a trusted boundary in this project.
 
-### CI / test exception
+### CI / test credentials (no deterministic defaults any more)
 
-`SANE_WEAK_DEFAULT_CREDS=1` makes provisioning write the deterministic
-`root`/`root` and `sane`/`sane` hashes and pre-create the first-boot marker.
-All GitHub Actions workflows set this flag because the serial-console and
-installer tests log in with those credentials. **Never use this flag for an
-image intended for distribution.**
+There are **no deterministic default credentials** in this repo since
+v1.3.0: the old `root`/`root` and `sane`/`sane` hashes were removed from
+`scripts/sane-accounts` (K1). `sane-accounts init` without `--firstboot`
+now refuses to write password accounts, unless `--allow-weak-defaults`
+is given together with runtime-only passwords in
+`SANE_TEST_ROOT_PASSWORD` / `SANE_TEST_SANE_PASSWORD` (never committed).
+
+`SANE_WEAK_DEFAULT_CREDS=1` still exists as a CI/test convenience in
+`scripts/provision-accounts.sh`, but it now generates **random per-run
+passwords** (via `openssl rand`), writes them to
+`${SANE_TEST_CREDS_FILE:-/tmp/sane-test-creds}` (mode `0600`, outside the
+image), and sets them with `set-password` on top of the locked
+`--firstboot` baseline. No GitHub Actions workflow sets this flag
+globally any more, and no test in this repo logs in with a default
+credential: the boot/integration/installer suites only check boot
+markers, and the lifecycle suite (`scripts/qemu_lifecycle.py`) sets its
+own passwords (`LifecycleRoot2026` / `LifecycleUser2026`) through
+firstboot. **Never use this flag for an image intended for distribution.**
+Images built before this change (v1.2.0 and earlier) must be treated as
+using publicly known credentials and must not be distributed; `validate`
+now rejects any live shadow hash with the old deterministic salts
+(`$6$root$` / `$6$sane$`).
 
 ## Password management
 
@@ -74,7 +91,11 @@ image intended for distribution.**
   current user's password.
 - Build-time: the password is read from **stdin**, not from argv, so it never
   appears in a process listing or shell history:
-  `printf '%s' 'secret' | sane-accounts --root DIR set-password USER`.
+  `printf '%s' 'SecretPass123!' | sane-accounts --root DIR set-password USER`.
+  Passwords must be at least 12 characters and must not equal the account
+  name (case-insensitive); `set-password` and `sane-firstboot` both enforce
+  this, and `sane-accounts init --allow-weak-defaults` enforces it for the
+  runtime passwords it reads from the environment.
 
 ## User lifecycle (`scripts/sane-accounts`)
 
@@ -84,7 +105,8 @@ unless `--root /` is passed explicitly. Fail-closed on invalid input.
 ```
 sane-accounts [--root DIR] [options] <command> [args]
 
-  init [--force] [--firstboot]   write baseline files (refuse to overwrite)
+  init [--force] [--firstboot|--allow-weak-defaults]
+                               write baseline files (refuse to overwrite)
   add-user NAME [UID] [GROUP]    create a locked account + home
   del-user NAME [--remove-home]  remove an account
   set-password NAME              read password from stdin (one line)
@@ -93,7 +115,9 @@ sane-accounts [--root DIR] [options] <command> [args]
 ```
 
 Options: `--force` allows `init` to overwrite an existing account table;
-`--firstboot` writes locked accounts with no known hash; `--skip-chown`
+`--firstboot` writes locked accounts with no known hash;
+`--allow-weak-defaults` writes accounts only with runtime passwords from
+`SANE_TEST_ROOT_PASSWORD` / `SANE_TEST_SANE_PASSWORD`; `--skip-chown`
 suppresses home ownership setting (only for non-privileged test builds);
 `--skip-owner-check` relaxes ownership checks in `validate` for unprivileged
 test roots.
@@ -120,7 +144,7 @@ supplementary group. `validate` checks modes, ownership of doas files,
 numeric/duplicate UIDs and GIDs, absence of a second UID 0, empty password
 fields, SHA-512 (or locked) hashes, `wheel` membership, and an effective
 `permit ... :wheel` rule with no `nopass`. Wired into `make test` and CI
-(`scripts/test-accounts.sh`, 236 assertions; 238 when run as root).
+(`scripts/test-accounts.sh`).
 
 ### Recovery semantics (`recover`)
 

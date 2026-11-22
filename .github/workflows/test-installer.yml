@@ -9,9 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  SANE_WEAK_DEFAULT_CREDS: "1"
-
 jobs:
   test-installer:
     name: Guest offline installer verification (INST-50 / INST-51)

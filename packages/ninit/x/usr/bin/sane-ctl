@@ -4,6 +4,20 @@ set -eu
 
 INITCTL="/run/initctl"
 
+# S6: service names go into state-file paths and initctl commands, so a
+# name containing '/' or a newline could escape them. Accept only the
+# characters ninit itself allows in service names.
+valid_service_name() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    return 0
+}
+
+require_service_name() {
+    valid_service_name "$1" || { printf 'sane-ctl: invalid service name %s\n' "'$1'" >&2; exit 1; }
+}
+
 usage() {
     printf 'Usage: sane-ctl <status|stop|start|restart|poweroff|reboot> [service]\n' >&2
     exit 1
@@ -24,6 +38,7 @@ cmd="${1:-}"
 case "$cmd" in
     status)
         target="${2:-}"
+        [ -z "$target" ] || require_service_name "$target"
         if [ -n "$target" ]; then
             state_file="/run/ninit-${target}.state"
             if [ -f "$state_file" ]; then
@@ -51,6 +66,7 @@ case "$cmd" in
     stop)
         target="${2:-}"
         [ -n "$target" ] || { printf 'Usage: sane-ctl stop <name>\n' >&2; exit 1; }
+        require_service_name "$target"
         state_file="/run/ninit-${target}.state"
         if [ ! -f "$state_file" ]; then
             printf 'sane-ctl: service '\''%s'\'' not found\n' "$target" >&2
@@ -78,11 +94,13 @@ case "$cmd" in
     start)
         target="${2:-}"
         [ -n "$target" ] || { printf 'Usage: sane-ctl start <name>\n' >&2; exit 1; }
+        require_service_name "$target"
         send_cmd "start $target"
         ;;
     restart)
         target="${2:-}"
         [ -n "$target" ] || { printf 'Usage: sane-ctl restart <name>\n' >&2; exit 1; }
+        require_service_name "$target"
         send_cmd "restart $target"
         ;;
     poweroff)

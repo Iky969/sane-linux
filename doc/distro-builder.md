@@ -135,7 +135,7 @@ Commands executed on the serial console after shell readiness:
 | Variable | Default | Description |
 |---|---|---|
 | `DISTRO_DIR` | `distro` | Build working directory |
-| `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / official hash | BusyBox source details (clear `BB_SHA256` to skip hash verification) |
+| `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / official hash | BusyBox source details (BB_SHA256 is required; an empty value fails the build) |
 | `BUSYBOX_MODE` | `auto` | `auto` \| `source` (enforce source build) \| `prebuilt` (use static `/bin/busybox`). In `auto`, source build failure falls back to prebuilt binary. |
 | `BUSYBOX_PREBUILT` | `/bin/busybox` | Fallback binary if source build fails |
 | `BUSYBOX_FORCE` | `0` | `1` = force clean re-download and re-compilation |
@@ -160,7 +160,7 @@ Commands executed on the serial console after shell readiness:
 ## Known Limitations
 
 - **Early serial input (t=0) timing**: Piped input sent before the guest shell finishes initialization can be dropped. Use a ~6 second delay or interact via live terminal.
-- **First-boot setup on real consoles**: a fresh image has no known password; `sane-firstboot` must set the `root` and `sane` passwords before getty starts. CI builds set `SANE_WEAK_DEFAULT_CREDS=1` to keep deterministic test credentials. See [account-security.md](account-security.md).
+- **First-boot setup on real consoles**: a fresh image has no known password; `sane-firstboot` must set the `root` and `sane` passwords before getty starts. CI builds no longer set any deterministic test credentials: the SANE_WEAK_DEFAULT_CREDS flag now generates random per-run passwords instead. See [account-security.md](account-security.md).
 - **Transient RAM disk**: Executes from initramfs; changes do not persist across reboot cycles.
 - **Kernel source**: Defaults to host kernel or precompiled Alpine `vmlinuz-virt` (v3.20) rather than a custom-built minimal kernel.
 - BusyBox is built with `defconfig` minus the `tc` applet (401 applets), avoiding legacy CBQ header compatibility issues on modern kernels.

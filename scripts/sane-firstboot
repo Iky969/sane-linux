@@ -48,6 +48,14 @@ ask_password() {
 			printf 'ERROR: passwords do not match. Try again.\n'
 			continue
 		fi
+		if [ "$(printf '%s' "$p1" | wc -m)" -lt 12 ]; then
+			printf 'ERROR: password must be at least 12 characters.\n'
+			continue
+		fi
+		if [ "$(printf '%s' "$p1" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$user" | tr 'A-Z' 'a-z')" ]; then
+			printf 'ERROR: password must not be the account name.\n'
+			continue
+		fi
 		if printf '%s\n%s\n' "$p1" "$p2" | passwd -a sha512 "$user" >/dev/null 2>&1; then
 			printf 'Password set for %s.\n' "$user"
 			return 0
