@@ -6,7 +6,8 @@
 # POSIX sh, fail-closed: invalid input exits non-zero without partial edits.
 #
 # Subcommands:
-#   init [--force]               write baseline passwd/group/shadow/doas.conf
+#   init [--force] [--firstboot|--allow-weak-defaults]
+#                                write baseline passwd/group/shadow/doas.conf
 #   add-user NAME [UID] [GROUP]  create account, group and home (locked by default)
 #   del-user NAME [--remove-home] remove account, group membership and home
 #   set-password NAME            read password from stdin, write SHA-512 hash
@@ -24,16 +25,19 @@ FORCE=0
 SKIP_CHOWN=0
 FIRSTBOOT=0
 SKIP_OWNER=0
-
-ROOT_HASH='$6$root$N8eFzhP5TW/1Wl1YXkIGagZroL.BmOIKvdCEdFDgndVp1uiOE6pZOZ8e.I/.50xHwXH03TeV0/gBC1ylGDzyJ0'
-SANE_HASH='$6$sane$3ICce1sXtopEktaXixOFe9fW.55Pk0aeOTPjmsyD4/WdI5jscOJmRClUUlRdSxC5xJ7Q20WIzAl5bURheXxvS.'
+ALLOW_WEAK_DEFAULTS=0
+# NOTE (K1): no default password hash is shipped in this repo any more.
+# The pre-v1.3.0 deterministic root/root and sane/sane hashes were removed;
+# they remain in git history, so treat any v1.2.0 image as using publicly
+# known credentials and do not distribute it.
 
 usage() {
 	cat <<EOF
-Usage: $PROG [--root DIR] [--force] [--skip-chown] [--firstboot] <command> [args]
+Usage: $PROG [--root DIR] [--force] [--skip-chown] [--firstboot|--allow-weak-defaults] <command> [args]
 
 Commands:
-  init [--force] [--firstboot]  write baseline identity files (refuse overwrite)
+  init [--force] [--firstboot|--allow-weak-defaults]
+                              write baseline identity files (refuse overwrite)
   add-user NAME [UID] [GROUP]   create a locked account + home
   del-user NAME [--remove-home] remove an account
   set-password NAME             read password from stdin (one line)
@@ -57,6 +61,7 @@ while [ "$#" -gt 0 ]; do
 		--force) FORCE=1; shift ;;
 		--skip-chown) SKIP_CHOWN=1; shift ;;
 		--firstboot) FIRSTBOOT=1; shift ;;
+		--allow-weak-defaults) ALLOW_WEAK_DEFAULTS=1; shift ;;
 		--skip-owner-check) SKIP_OWNER=1; shift ;;
 		-h|--help) usage; exit 0 ;;
 		--) shift; break ;;
@@ -120,6 +125,17 @@ ensure_base() {
 	chmod 0600 "$SHADOW"
 }
 
+# Password policy (S3): at least 12 characters, and never the account name
+# itself (case-insensitive). Enforced by set-password, by the
+# --allow-weak-defaults init path, and (mirrored) by sane-firstboot.
+check_password_policy() {
+	name=$1; password=$2
+	[ "${#password}" -ge 12 ] || die "password for '$name' is too short (minimum 12 characters)"
+	lower_name=$(printf '%s' "$name" | tr 'A-Z' 'a-z')
+	lower_pw=$(printf '%s' "$password" | tr 'A-Z' 'a-z')
+	[ "$lower_pw" != "$lower_name" ] || die "password for '$name' must not be the account name"
+}
+
 valid_name() {
 	case "$1" in
 		''|*[!a-z0-9_-]*) return 1 ;;
@@ -173,6 +189,23 @@ cmd_init() {
 	if [ "${2:-}" = "--firstboot" ]; then
 		FIRSTBOOT=1
 	fi
+	if [ "${1:-}" = "--allow-weak-defaults" ] || [ "${2:-}" = "--allow-weak-defaults" ]; then
+		ALLOW_WEAK_DEFAULTS=1
+	fi
+	# Fail closed BEFORE writing anything (K1): without --firstboot there is
+	# no password to write any more, and without --allow-weak-defaults plus
+	# runtime passwords there is nothing safe to fall back to. Validate the
+	# runtime passwords here too, so a missing/weak one also fails before
+	# any passwd/group file is touched.
+	if [ "$FIRSTBOOT" -ne 1 ] && [ "$ALLOW_WEAK_DEFAULTS" -ne 1 ]; then
+		die "refusing to write password accounts without --firstboot; use --firstboot (locked accounts), or set passwords explicitly with set-password"
+	fi
+	if [ "$ALLOW_WEAK_DEFAULTS" -eq 1 ] && [ "$FIRSTBOOT" -ne 1 ]; then
+		[ -n "${SANE_TEST_ROOT_PASSWORD:-}" ] || die "--allow-weak-defaults requires SANE_TEST_ROOT_PASSWORD in the environment"
+		[ -n "${SANE_TEST_SANE_PASSWORD:-}" ] || die "--allow-weak-defaults requires SANE_TEST_SANE_PASSWORD in the environment"
+		check_password_policy root "$SANE_TEST_ROOT_PASSWORD"
+		check_password_policy sane "$SANE_TEST_SANE_PASSWORD"
+	fi
 	if [ "$FORCE" -ne 1 ]; then
 		for f in "$PASSWD" "$GROUP" "$SHADOW" "$DOAS_CONF"; do
 			[ -e "$f" ] && die "refusing to overwrite existing ${f#$ROOT}; use --force"
@@ -185,9 +218,23 @@ cmd_init() {
 	if [ "$FIRSTBOOT" -eq 1 ]; then
 		# No public password: accounts stay locked until sane-firstboot sets them.
 		printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$SHADOW"
-	else
+	elif [ "$ALLOW_WEAK_DEFAULTS" -eq 1 ]; then
+		# Test-only path (K1): there is no deterministic hash any more.
+		# Passwords must be supplied at runtime via the environment
+		# (never committed); without them init refuses to write accounts.
+		root_pw=${SANE_TEST_ROOT_PASSWORD:-}
+		sane_pw=${SANE_TEST_SANE_PASSWORD:-}
+		[ -n "$root_pw" ] || die "--allow-weak-defaults requires SANE_TEST_ROOT_PASSWORD in the environment"
+		[ -n "$sane_pw" ] || die "--allow-weak-defaults requires SANE_TEST_SANE_PASSWORD in the environment"
+		check_password_policy root "$root_pw"
+		check_password_policy sane "$sane_pw"
+		command -v openssl >/dev/null 2>&1 || die "openssl is required to hash passwords"
+		root_hash=$(printf '%s' "$root_pw" | openssl passwd -6 -salt "$(openssl rand -hex 8)" -stdin) || die "failed to hash root password"
+		sane_hash=$(printf '%s' "$sane_pw" | openssl passwd -6 -salt "$(openssl rand -hex 8)" -stdin) || die "failed to hash sane password"
 		printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' \
-			"$ROOT_HASH" "$SANE_HASH" > "$SHADOW"
+			"$root_hash" "$sane_hash" > "$SHADOW"
+	else
+		die "refusing to write password accounts without --firstboot; use --firstboot (locked accounts), or set passwords explicitly with set-password"
 	fi
 	printf 'permit persist :wheel\n' > "$DOAS_CONF"
 	chmod 0644 "$PASSWD" "$GROUP"
@@ -400,6 +447,7 @@ cmd_set_password() {
 	ensure_base
 	user_exists "$name" || die "no such account: $name"
 	[ -n "$password" ] || die "refusing to set an empty password"
+	check_password_policy "$name" "$password"
 	command -v openssl >/dev/null 2>&1 || die "openssl is required to hash passwords"
 	salt=$(openssl rand -hex 8)
 	[ -n "$salt" ] || die "failed to generate salt"
@@ -531,9 +579,16 @@ cmd_validate() {
 	# prefix. A truncated hash passes a prefix-only check and leaves the
 	# console locked out while validation still reports success.
 	bad=0
+	weak_default=0
 	while IFS=: read -r _u _p _uid _gid _gecos _home _shell _rest; do
 		h=$_p; [ -z "$h" ] && { bad=1; continue; }
 		case "$h" in '!'*) h=${h#!} ;; esac
+		# K1: the pre-v1.3.0 deterministic hashes used the salts 'root' and
+		# 'sane'. Any live hash with those salts is a known weak default
+		# credential from an old image; rotate both passwords.
+		case "$h" in
+			'$6$root$'*|'$6$sane$'*) weak_default=1 ;;
+		esac
 		case "$h" in
 			'*'|'') continue ;;  # deliberately disabled account
 			'$6$'*) valid_sha512_hash "$h" || bad=1 ;;
@@ -542,6 +597,8 @@ cmd_validate() {
 	done < "$SHADOW"
 	[ "$bad" -eq 0 ] || \
 		audit_fail "shadow has an empty field, truncated hash, or unsupported active hash"
+	[ "$weak_default" -eq 0 ] || \
+		audit_fail "shadow contains a known weak default credential hash (deterministic salt 'root'/'sane' from a pre-v1.3.0 image); rotate both passwords"
 
 	if ! awk -F: -v n=wheel '$1==n {found=1} END{exit !found}' "$GROUP"; then
 		audit_fail "wheel group is missing"
