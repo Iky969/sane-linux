@@ -59,7 +59,7 @@ base() {
 	mkdir -p "$T/etc" "$T/home" "$T/usr/bin"
 	printf 'stub' > "$T/usr/bin/doas"
 	chmod 4755 "$T/usr/bin/doas"
-	sh "$ACCOUNTS" --root "$T" init >/dev/null
+	sh "$ACCOUNTS" --root "$T" --firstboot init >/dev/null
 }
 
 cleanup() { [ -n "$T" ] && rm -rf -- "$T"; }
@@ -118,8 +118,12 @@ check "del-user removes passwd entry" sh -c \
 
 # --- password management ---------------------------------------------------
 expect_fail "empty password rejected" set_pw alice ''
-expect_fail "unknown user password rejected" set_pw nobody secret
-expect_ok "set-password updates shadow" set_pw alice secret
+expect_fail "unknown user password rejected" set_pw nobody 'UnknownPass123!'
+expect_fail "short password rejected (minimum 12)" set_pw alice 'short1'
+expect_ok "add-user for same-name password test" sh "$ACCOUNTS" --root "$T" add-user testuser1234 1007 --skip-chown
+expect_fail "password equal to username rejected" set_pw testuser1234 'testuser1234'
+expect_ok "set-password updates shadow" set_pw alice 'SecretPass123!'
+
 stored=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
 case "$stored" in
 	\$6\$*) pass "set-password produces SHA-512 crypt hash" ;;
@@ -127,7 +131,7 @@ case "$stored" in
 esac
 rest=${stored#\$6\$}
 salt=${rest%%\$*}
-expected=$(printf '%s' 'secret' | openssl passwd -6 -salt "$salt" -stdin)
+expected=$(printf '%s' 'SecretPass123!' | openssl passwd -6 -salt "$salt" -stdin)
 check "stored hash verifies against password" test "$stored" = "$expected"
 check "shadow stays 0600 after password change" test "$(stat -c %a "$T/etc/shadow")" = 600
 expect_ok "validate accepts active SHA-512 password" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
@@ -379,7 +383,16 @@ expect_fail "init refuses to overwrite existing identity files" \
 check "failed init preserved the extra account" sh -c \
 	"grep -q '^extra:' '$T/etc/passwd'"
 expect_ok "init --force overwrites when explicitly asked" \
-	sh "$ACCOUNTS" --root "$T" init --force
+	sh "$ACCOUNTS" --root "$T" init --force --firstboot
+# K1: plain init without --firstboot (or --allow-weak-defaults with runtime
+# passwords) must refuse to write password accounts -- there is no
+# deterministic hash left to fall back to.
+T2=$(mktemp -d)
+mkdir -p "$T2/etc"
+expect_fail_msg "plain init without --firstboot is rejected" \
+	"refusing to write password accounts" \
+	sh "$ACCOUNTS" --root "$T2" init --force
+rm -rf -- "$T2"
 check "init --force replaced the account table" sh -c \
 	"! grep -q '^extra:' '$T/etc/passwd'"
 
@@ -444,6 +457,13 @@ SANE_WEAK_DEFAULT_CREDS=1 sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T" >/d
 check "weak-creds mode writes an active root hash" sh -c \
 	"! grep -q '^root:!' '$T/etc/shadow'"
 check "weak-creds mode marks first boot complete" test -f "$T/etc/.sane-firstboot-done"
+# K1: the weak-creds passwords are random per run, recorded only in a 0600
+# file outside the image -- never the deterministic root/root + sane/sane.
+check "weak-creds mode writes a credentials file outside the image" test -f /tmp/sane-test-creds
+check "credentials file is mode 0600" test "$(stat -c %a /tmp/sane-test-creds)" = 600
+check "weak-creds passwords are not the old defaults" sh -c \
+	"! grep -q '^root:root$' /tmp/sane-test-creds && ! grep -q '^sane:sane$' /tmp/sane-test-creds"
+rm -f /tmp/sane-test-creds
 
 # First boot must not be killed by ninit's 30s once-service timeout.
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
@@ -815,8 +835,8 @@ expect_ok "validate passes with the marker removed" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 check "firstboot helper is present to set passwords again" \
 	test -x "$REPO_ROOT/scripts/sane-firstboot"
-expect_ok "firstboot can set a new root password" set_pw root 'FirstPass1!'
-expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass2!'
+expect_ok "firstboot can set a new root password" set_pw root 'FirstPass123!'
+expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass234!'
 printf 'done\n' > "$T/etc/.sane-firstboot-done"
 expect_ok "validate passes after a successful firstboot rerun" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
@@ -832,7 +852,7 @@ expect_ok "shadow rebuild setup: add alice and bob to wheel" sh -c \
 	 sh '$ACCOUNTS' --root '$T' add-user bob 1006 wheel --skip-chown >/dev/null && \
 	 sh '$ACCOUNTS' --root '$T' add-user mallory 1007 --skip-chown >/dev/null"
 expect_ok "shadow rebuild setup: alice gets an active hash" set_pw alice 'AliceActive1!'
-expect_ok "shadow rebuild setup: bob gets a locked hash" set_pw bob 'BobLocked1!'
+expect_ok "shadow rebuild setup: bob gets a locked hash" set_pw bob 'BobLocked123!'
 expect_ok "shadow rebuild setup: lock bob" sh "$ACCOUNTS" --root "$T" lock bob
 alice_active_before=$(awk -F: '$1=="alice"{print}' "$T/etc/shadow")
 bob_locked_before=$(awk -F: '$1=="bob"{print}' "$T/etc/shadow")
