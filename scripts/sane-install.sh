@@ -118,6 +118,13 @@ else
     fi
 fi
 
+# Validate PARTUUID (S5): it is written unquoted into fstab and the kernel
+# command line, so anything but a lowercase UUID must be rejected here.
+PARTUUID=$(printf '%s' "$PARTUUID" | tr 'A-Z' 'a-z')
+if ! printf '%s' "$PARTUUID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    die "invalid PARTUUID format: $PARTUUID"
+fi
+
 # Root check
 if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
     die "sane-install must be run as root (UID 0)"
@@ -460,6 +467,9 @@ PROVISION_BIN=$(find_tool provision-accounts.sh "$SCRIPT_DIR/provision-accounts.
 [ -n "$PROVISION_BIN" ] || die "provision-accounts.sh not found"
 if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
     export SANE_WEAK_DEFAULT_CREDS=1
+fi
+if [ -n "${SANE_TEST_CREDS_FILE:-}" ]; then
+    export SANE_TEST_CREDS_FILE
 fi
 sh "$PROVISION_BIN" "$TARGET_ROOT"
 
