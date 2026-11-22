@@ -362,6 +362,14 @@ elif cmd == "create_hardlink":
     raw = [(link_path, None, tarfile.LNKTYPE, target_path, 0o644)]
     make_package(out, name, payload_files=payload, raw_entries=raw)
 
+elif cmd == "create_socket":
+    out = sys.argv[2]
+    name = sys.argv[3]
+    sock_path = sys.argv[4]
+    payload = {"usr/bin/tool": "echo tool"}
+    raw = [(sock_path, None, b"s", "", 0o755)]
+    make_package(out, name, payload_files=payload, raw_entries=raw)
+
 elif cmd == "create_suid":
     out = sys.argv[2]
     name = sys.argv[3]
@@ -1787,6 +1795,50 @@ test_hardlink_rejection() {
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 32: Socket rejection in the structural Python archive checker
+# -----------------------------------------------------------------------------
+test_socket_rejection() {
+    local tdir="$TEST_TMP/scenario32_socket"
+    local root="$tdir/root"
+    local pkg="$tdir/socket-pkg-1.0.0.spm.tar.xz"
+    mkdir -p "$root" "$tdir/bin"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1
+    python_pkg_helper create_socket "$pkg" "socket-pkg" "./x/usr/bin/tool.sock"
+
+    # Bypass the earlier tar-listing screen so this exercises tarfile directly.
+    local real_tar
+    real_tar="$(command -v tar)"
+    cat > "$tdir/bin/tar" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "-tvf" ]; then
+    exit 0
+fi
+exec "$real_tar" "\$@"
+EOF
+    chmod 0755 "$tdir/bin/tar"
+
+    local exit_code=0
+    local err_out=""
+    err_out="$(PATH="$tdir/bin:$PATH" "$SPM_BIN" install "$pkg" --root "$root" 2>&1)" || exit_code=$?
+
+    if [ "$exit_code" -ne 1 ]; then
+        test_fail "Scenario 32" "Expected exit code 1 for archive containing socket, got $exit_code"
+        return
+    fi
+    if ! echo "$err_out" | grep -qi "forbidden special file"; then
+        test_fail "Scenario 32" "Socket was not rejected by the structural checker: '$err_out'"
+        return
+    fi
+    if [ -d "$root/var/lib/spm/installed/socket-pkg" ] || [ -e "$root/usr/bin/tool.sock" ]; then
+        test_fail "Scenario 32" "Socket package left installed files or records"
+        return
+    fi
+
+    test_pass "Scenario 32: Socket rejection (structural tarfile check rejects socket type)"
+}
+
+# -----------------------------------------------------------------------------
 # Scenario 23: Setuid/setgid rejection
 # -----------------------------------------------------------------------------
 test_setuid_setgid_rejection() {
@@ -2713,6 +2765,7 @@ main() {
     test_package_upgrade_rdeps_pruning
     test_base_package_protection_and_atomic_replacement
     test_hardlink_rejection
+    test_socket_rejection
     test_setuid_setgid_rejection
     test_duplicate_member_rejection
     test_invalid_dependency_name_rejection

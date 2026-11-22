@@ -401,6 +401,7 @@ verify_archive_symlinks() {
         python3 - "$pkg" <<'PYEOF' || die "Failed to inspect archive symlinks: $pkg"
 import sys, tarfile, fnmatch
 pkg = sys.argv[1]
+TAR_SOCKET_TYPE = b"s"  # tarfile has no socket constant; use the tar typeflag.
 FORBIDDEN = ("/etc/shadow*", "/etc/passwd*", "/etc/sudoers*", "/etc/gshadow*",
              "/proc/*", "/sys/*", "/dev/*", "/root/*", "/home/*")
 ALLOWED = ("/bin/*", "/sbin/*", "/usr/bin/*", "/usr/sbin/*", "/usr/share/*",
@@ -438,7 +439,7 @@ try:
                 check(m.name, m.linkname)
             elif m.islnk():
                 die("Archive contains forbidden hard link: " + m.name)
-            elif m.isdev() or m.isfifo() or m.type == b"s":  # socket: tarfile has no SOCKTYPE constant
+            elif m.isdev() or m.isfifo() or m.type == TAR_SOCKET_TYPE:
                 die("Archive contains forbidden special file (device/FIFO/socket): " + m.name)
 except tarfile.TarError as e:
     die("Failed to inspect archive symlinks: %s (%s)" % (pkg, e))

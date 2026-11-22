@@ -28,6 +28,35 @@ expect_fail() { d=$1; shift; if ( "$@" ) >/dev/null 2>&1; then fail "$d"; else p
 check "build-rootfs.sh is present" test -f "$BUILD"
 check "build-rootfs.sh passes shell syntax" sh -n "$BUILD"
 
+# R1: malformed and explicitly empty checksums must fail before curl runs.
+# The fake curl leaves a marker if validation is accidentally too late.
+check_sha_rejected_before_download() {
+	d=$1; value=$2; name=$3
+	dir="$T/sha-$name"
+	mkdir -p "$dir/bin"
+	cat > "$dir/bin/curl" <<'EOF'
+#!/bin/sh
+: > "$SANE_TEST_CURL_MARKER"
+exit 1
+EOF
+	chmod 0755 "$dir/bin/curl"
+	if err=$(SANE_TEST_CURL_MARKER="$dir/curl-called" \
+		PATH="$dir/bin:$PATH" BB_SHA256="$value" \
+		BB_URL="https://example.invalid/busybox.tar.bz2" \
+		BUSYBOX_MODE=source DISTRO_DIR="$dir/distro" \
+		sh "$BUILD" 2>&1 >/dev/null); then
+		fail "$d"
+	elif ! printf '%s\n' "$err" | grep -q 'BB_SHA256 must be a 64-digit hex checksum'; then
+		fail "$d (diagnostic: $err)"
+	elif [ -e "$dir/curl-called" ]; then
+		fail "$d (download was attempted)"
+	else
+		pass "$d"
+	fi
+}
+check_sha_rejected_before_download "empty BB_SHA256 is rejected before download" "" empty
+check_sha_rejected_before_download "malformed BB_SHA256 is rejected before download" "abc" malformed
+
 # Source only the function definitions. The sourced script sets -eu; drop -e so
 # a failing probe below is reported by the harness instead of aborting it.
 # shellcheck disable=SC1090

@@ -130,7 +130,7 @@ ensure_base() {
 # --allow-weak-defaults init path, and (mirrored) by sane-firstboot.
 check_password_policy() {
 	name=$1; password=$2
-	[ "${#password}" -ge 12 ] || die "password for '$name' is too short (minimum 12 characters)"
+	[ "$(printf '%s' "$password" | wc -m)" -ge 12 ] || die "password for '$name' is too short (minimum 12 characters)"
 	lower_name=$(printf '%s' "$name" | tr 'A-Z' 'a-z')
 	lower_pw=$(printf '%s' "$password" | tr 'A-Z' 'a-z')
 	[ "$lower_pw" != "$lower_name" ] || die "password for '$name' must not be the account name"
@@ -824,8 +824,9 @@ merge_shadow() {
 	# root/sane get the baseline fields, with the old hash only when it was
 	# usable (otherwise the locked marker). Every other line is printed
 	# verbatim, so additional accounts keep their hashes byte-for-byte.
+	root_hash=$1; sane_hash=$2
 	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	if ! awk -F: -v rh="$ROOT_HASH_OLD" -v sh="$SANE_HASH_OLD" '
+	if ! awk -F: -v rh="$root_hash" -v sh="$sane_hash" '
 		$1 == "root" {
 			print "root:" (rh == "" ? "!" : rh) ":19700:0:99999:7:::"; r = 1; next
 		}
@@ -848,6 +849,7 @@ rebuild_shadow() {
 	# Baseline locked template + every extra entry that is itself valid and
 	# conflict-free: unique name still present in passwd, complete 9 fields,
 	# numeric age fields, and a valid active SHA-512 or lock/disable marker.
+	root_hash=$1; sane_hash=$2
 	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
 	printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$tmp"
 	if [ -f "$SHADOW" ]; then
@@ -885,11 +887,11 @@ rebuild_shadow() {
 		fi
 	fi
 	mv "$tmp" "$SHADOW"
-	if [ -n "$ROOT_HASH_OLD" ]; then
-		set_field "$SHADOW" root 2 "$ROOT_HASH_OLD"
+	if [ -n "$root_hash" ]; then
+		set_field "$SHADOW" root 2 "$root_hash"
 	fi
-	if [ -n "$SANE_HASH_OLD" ]; then
-		set_field "$SHADOW" sane 2 "$SANE_HASH_OLD"
+	if [ -n "$sane_hash" ]; then
+		set_field "$SHADOW" sane 2 "$sane_hash"
 	fi
 }
 
@@ -906,15 +908,15 @@ cmd_recover() {
 	# valid root/sane hash survives, remove the firstboot marker so the console
 	# setup runs again on this boot.
 	ensure_etc
-	ROOT_HASH_OLD=
-	SANE_HASH_OLD=
+	recover_root_hash=
+	recover_sane_hash=
 	if [ -f "$SHADOW" ]; then
 		h=$(field_of "$SHADOW" root 2 || true)
 		case "$h" in '!'*) h=${h#!} ;; esac
-		valid_sha512_hash "$h" && ROOT_HASH_OLD=$h
+		valid_sha512_hash "$h" && recover_root_hash=$h
 		h=$(field_of "$SHADOW" sane 2 || true)
 		case "$h" in '!'*) h=${h#!} ;; esac
-		valid_sha512_hash "$h" && SANE_HASH_OLD=$h
+		valid_sha512_hash "$h" && recover_sane_hash=$h
 	fi
 
 	# doas.conf: keep policy-compliant content, repair mode/owner only.
@@ -950,10 +952,10 @@ cmd_recover() {
 	# only valid, conflict-free extra entries. Usable root/sane hashes are
 	# restored in both paths, and the marker logic below is unchanged.
 	if [ -f "$SHADOW" ] && shadow_structurally_ok "$SHADOW"; then
-		merge_shadow
+		merge_shadow "$recover_root_hash" "$recover_sane_hash"
 		printf 'recover: shadow merged (root/sane repaired when usable; extra entries preserved)\n'
 	else
-		rebuild_shadow
+		rebuild_shadow "$recover_root_hash" "$recover_sane_hash"
 		printf 'recover: shadow rebuilt from baseline (structural corruption; valid extra entries restored)\n'
 	fi
 
@@ -963,7 +965,7 @@ cmd_recover() {
 	chmod 0750 "$HOME_BASE/sane"
 
 	MARK="$ETC/.sane-firstboot-done"
-	if [ -z "$ROOT_HASH_OLD" ] || [ -z "$SANE_HASH_OLD" ]; then
+	if [ -z "$recover_root_hash" ] || [ -z "$recover_sane_hash" ]; then
 		rm -f "$MARK"
 		printf 'recover: no usable root/sane hash; first boot will ask for passwords again\n'
 	else

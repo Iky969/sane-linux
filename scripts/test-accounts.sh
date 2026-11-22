@@ -120,6 +120,7 @@ check "del-user removes passwd entry" sh -c \
 expect_fail "empty password rejected" set_pw alice ''
 expect_fail "unknown user password rejected" set_pw nobody 'UnknownPass123!'
 expect_fail "short password rejected (minimum 12)" set_pw alice 'short1'
+expect_ok "12-character password accepted" set_pw alice '123456789012'
 expect_ok "add-user for same-name password test" sh "$ACCOUNTS" --root "$T" add-user testuser1234 1007 --skip-chown
 expect_fail "password equal to username rejected" set_pw testuser1234 'testuser1234'
 expect_ok "set-password updates shadow" set_pw alice 'SecretPass123!'
@@ -464,6 +465,26 @@ check "credentials file is mode 0600" test "$(stat -c %a "$T/sane-test-creds")" 
 check "weak-creds passwords are not the old defaults" sh -c \
 	"! grep -q '^root:root$' '$T/sane-test-creds' && ! grep -q '^sane:sane$' '$T/sane-test-creds'"
 rm -f "$T/sane-test-creds"
+
+# Some POSIX mktemp implementations require an explicit template. Use a
+# wrapper that enforces that interface while delegating to the real utility.
+T2=$(mktemp -d)
+mkdir -p "$T2/bin" "$T2/tmp"
+REAL_MKTEMP=$(command -v mktemp)
+cat > "$T2/bin/mktemp" <<EOF
+#!/bin/sh
+[ "\$#" -eq 1 ] || { printf 'mktemp: template required\n' >&2; exit 1; }
+case "\$1" in *XXXXXX) ;; *) printf 'mktemp: six X template required\n' >&2; exit 1 ;; esac
+exec "$REAL_MKTEMP" "\$@"
+EOF
+chmod 0755 "$T2/bin/mktemp"
+base
+expect_ok "provision works with template-only mktemp" \
+	env PATH="$T2/bin:$PATH" TMPDIR="$T2/tmp" SANE_WEAK_DEFAULT_CREDS=1 \
+	sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T"
+check "template-form mktemp creates credentials in TMPDIR" sh -c \
+	"find '$T2/tmp' -type f -name 'sane-test-creds.*' | grep -q ."
+rm -rf -- "$T2"
 
 # First boot must not be killed by ninit's 30s once-service timeout.
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
@@ -839,6 +860,26 @@ expect_ok "firstboot can set a new root password" set_pw root 'FirstPass123!'
 expect_ok "firstboot can set a new sane password" set_pw sane 'FirstPass234!'
 printf 'done\n' > "$T/etc/.sane-firstboot-done"
 expect_ok "validate passes after a successful firstboot rerun" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Empty fields are corrupt rather than locked markers. Recovery must rebuild
+# them as locked accounts and re-arm firstboot instead of crashing or unlocking.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+awk -F: -v OFS=: '$1=="root" || $1=="sane" {$2=""} 1' \
+	"$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail "validate rejects empty root/sane fields before recovery" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover handles empty root/sane fields" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "empty-field recovery locks root and sane" sh -c \
+	"grep -q '^root:!:19700:' '$T/etc/shadow' && grep -q '^sane:!:19700:' '$T/etc/shadow'"
+check "empty-field recovery removes the firstboot marker" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+expect_ok "validate passes after empty-field recovery" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 # D: a corrupt shadow with both an active and a locked extra hash. The rebuild

@@ -10,10 +10,10 @@
 # sane-firstboot will demand new passwords on first boot. For CI/test images,
 # set SANE_WEAK_DEFAULT_CREDS=1 to generate RANDOM per-run passwords instead
 # (K1: no deterministic root/root + sane/sane credentials exist any more).
-# The passwords are written to ${SANE_TEST_CREDS_FILE:-/tmp/sane-test-creds}
-# (mode 0600, outside the image) so a test that needs to log in can read
-# them; they are never committed. NEVER use that flag for images intended
-# for distribution.
+# The passwords are written to SANE_TEST_CREDS_FILE, or to a mktemp-generated
+# sane-test-creds.XXXXXX file under ${TMPDIR:-/tmp} (mode 0600, outside the
+# image), so a test that needs to log in can read them; they are never
+# committed. NEVER use that flag for images intended for distribution.
 set -eu
 
 TARGET=${1:-}
@@ -45,7 +45,7 @@ if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
 		CREDS_FILE="$SANE_TEST_CREDS_FILE"
 		CLEANUP_CREDS=0
 	else
-		CREDS_FILE=$(mktemp) || { printf "FAIL: failed to create credentials file\n" >&2; exit 1; }
+		CREDS_FILE=$(mktemp "${TMPDIR:-/tmp}/sane-test-creds.XXXXXX") || { printf "FAIL: failed to create credentials file\n" >&2; exit 1; }
 		CLEANUP_CREDS=1
 	fi
 	# Remove a mktemp-generated creds file on exit/error; never delete an

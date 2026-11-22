@@ -48,7 +48,7 @@ ask_password() {
 			printf 'ERROR: passwords do not match. Try again.\n'
 			continue
 		fi
-		if [ "${#p1}" -lt 12 ]; then
+		if [ "$(printf '%s' "$p1" | wc -m)" -lt 12 ]; then
 			printf 'ERROR: password must be at least 12 characters.\n'
 			continue
 		fi

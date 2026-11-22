@@ -56,7 +56,10 @@ PKG_INSTALL=$BUILD_DIR/busybox-install
 
 BB_VERSION=${BB_VERSION:-1.36.1}
 BB_URL=${BB_URL:-https://busybox.net/downloads/busybox-$BB_VERSION.tar.bz2}
-BB_SHA256=${BB_SHA256:-b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314}
+# An unset checksum selects the pinned default; an explicitly empty one is
+# invalid and must not fall back to that default.
+BB_SHA256=${BB_SHA256-b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314}
+die()  { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 # R1: BusyBox must come over https and its checksum is mandatory; an empty
 # BB_SHA256 used to silently skip verification.
 case "$BB_URL" in
@@ -75,7 +78,6 @@ HOSTNAME_NAME=${HOSTNAME_NAME:-S.A.N.E}
 
 log()  { printf '== %s\n' "$1"; }
 info() { printf '   %s\n' "$1"; }
-die()  { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 # A failure inside build_busybox_source(): reported as-is and then returns 1,
 # so BUSYBOX_MODE=auto can still fall back to the fallback busybox.
 # BUSYBOX_MODE=source demands it hard (see resolve_busybox).
