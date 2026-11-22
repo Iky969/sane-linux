@@ -55,7 +55,7 @@ TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-confi
                 scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
                 scripts/test-state-machine.sh scripts/test-accounts.sh \
                 scripts/test-network.sh scripts/test-network-fault.sh \
-                scripts/test-reliability.sh
+                scripts/test-reliability.sh scripts/test-zombie-reap-500.sh
 
 test: $(TESTBIN)
 	@PRE_CGROUPS=$$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null || true); \
