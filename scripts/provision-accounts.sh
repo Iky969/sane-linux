@@ -51,7 +51,7 @@ if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
 	# Remove a mktemp-generated creds file on exit/error; never delete an
 	# explicitly provided SANE_TEST_CREDS_FILE.
 	if [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then
-		trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then rm -f "$CREDS_FILE"; fi' EXIT HUP INT TERM
+		trap 'if [ "$?" -ne 0 ] && [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then rm -f "$CREDS_FILE"; fi' EXIT HUP INT TERM
 	fi
 	ROOT_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
 	SANE_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
