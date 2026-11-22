@@ -9,9 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  SANE_WEAK_DEFAULT_CREDS: "1"
-
 jobs:
   test-dual-boot:
     name: Dual-boot headless QEMU verification (BIOS and UEFI)

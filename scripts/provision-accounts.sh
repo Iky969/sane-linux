@@ -41,10 +41,22 @@ if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
 	# replaces the '!' lock marker with a usable hash, so no unlock step
 	# is needed after init --firstboot.
 	printf 'WARNING: provisioning random per-run CI/test credentials (see SANE_TEST_CREDS_FILE)\n' >&2
-	CREDS_FILE="${SANE_TEST_CREDS_FILE:-/tmp/sane-test-creds}"
+	if [ -n "${SANE_TEST_CREDS_FILE:-}" ]; then
+		CREDS_FILE="$SANE_TEST_CREDS_FILE"
+		CLEANUP_CREDS=0
+	else
+		CREDS_FILE=$(mktemp) || { printf "FAIL: failed to create credentials file\n" >&2; exit 1; }
+		CLEANUP_CREDS=1
+	fi
+	# Remove a mktemp-generated creds file on exit/error; never delete an
+	# explicitly provided SANE_TEST_CREDS_FILE.
+	if [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then
+		trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "${CLEANUP_CREDS:-0}" -eq 1 ]; then rm -f "$CREDS_FILE"; fi' EXIT HUP INT TERM
+	fi
 	ROOT_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
 	SANE_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
-	printf 'root:%s\nsane:%s\n' "$ROOT_PASS" "$SANE_PASS" > "$CREDS_FILE"
+	# Write atomically with mode 0600; umask guards the creation.
+	( umask 077; printf 'root:%s\nsane:%s\n' "$ROOT_PASS" "$SANE_PASS" > "$CREDS_FILE" )
 	chmod 0600 "$CREDS_FILE"
 	printf '%s' "$ROOT_PASS" | $SUDO sh "$ACCOUNTS" --root "$TARGET" set-password root
 	printf '%s' "$SANE_PASS" | $SUDO sh "$ACCOUNTS" --root "$TARGET" set-password sane

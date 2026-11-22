@@ -152,7 +152,7 @@ chmod 0644 "$T/etc/shadow"
 expect_fail "validate rejects world-readable shadow" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
-sed -i 's/^sane:\$6\$/sane:plaintext/' "$T/etc/shadow"
+sed -i 's/^sane:!:/sane:plaintext:/' "$T/etc/shadow"
 expect_fail "validate rejects non-SHA512 password" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
@@ -453,17 +453,17 @@ base
 mkdir -p "$T/usr/bin"
 printf stub > "$T/usr/bin/doas"
 chmod 4755 "$T/usr/bin/doas"
-SANE_WEAK_DEFAULT_CREDS=1 sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T" >/dev/null 2>&1
+SANE_TEST_CREDS_FILE="$T/sane-test-creds" SANE_WEAK_DEFAULT_CREDS=1 sh "$REPO_ROOT/scripts/provision-accounts.sh" "$T" >/dev/null 2>&1
 check "weak-creds mode writes an active root hash" sh -c \
 	"! grep -q '^root:!' '$T/etc/shadow'"
 check "weak-creds mode marks first boot complete" test -f "$T/etc/.sane-firstboot-done"
 # K1: the weak-creds passwords are random per run, recorded only in a 0600
 # file outside the image -- never the deterministic root/root + sane/sane.
-check "weak-creds mode writes a credentials file outside the image" test -f /tmp/sane-test-creds
-check "credentials file is mode 0600" test "$(stat -c %a /tmp/sane-test-creds)" = 600
+check "weak-creds mode writes a credentials file outside the image" test -f "$T/sane-test-creds"
+check "credentials file is mode 0600" test "$(stat -c %a "$T/sane-test-creds")" = 600
 check "weak-creds passwords are not the old defaults" sh -c \
-	"! grep -q '^root:root$' /tmp/sane-test-creds && ! grep -q '^sane:sane$' /tmp/sane-test-creds"
-rm -f /tmp/sane-test-creds
+	"! grep -q '^root:root$' '$T/sane-test-creds' && ! grep -q '^sane:sane$' '$T/sane-test-creds'"
+rm -f "$T/sane-test-creds"
 
 # First boot must not be killed by ninit's 30s once-service timeout.
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
