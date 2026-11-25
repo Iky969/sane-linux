@@ -1024,16 +1024,8 @@ esac
 exit "\$rc"
 STUB
 chmod +x "$T/stub-cli"
-cat > "$T/stub-shell" <<STUB
-#!/bin/sh
-printf 'fallback shell reached\n' >> "$T/cli-calls"
-exit 42
-STUB
-chmod +x "$T/stub-shell"
-
 run_wrapper() {
 	SANE_ACCOUNTS_CLI="$T/stub-cli" \
-	SANE_RECOVERY_SHELL="$T/stub-shell" \
 	SANE_RECOVERY_BIN_DIR="$T" \
 		sh "$WRAPPER"
 }
@@ -1042,6 +1034,13 @@ run_wrapper() {
 expect_ok "wrapper exits 0 when validation passes" run_wrapper
 check "wrapper validates and does not recover when healthy" sh -c \
 	"[ \$(wc -l < '$T/cli-calls') -eq 1 ] && grep -q 'validate' '$T/cli-calls'"
+if [ "$(id -u)" -eq 0 ]; then
+	check "wrapper omits --skip-owner-check when running as root" sh -c \
+		"! grep -q -- '--skip-owner-check' '$T/cli-calls'"
+else
+	check "wrapper passes --skip-owner-check when non-root" sh -c \
+		"grep -q -- '--skip-owner-check' '$T/cli-calls'"
+fi
 
 : > "$T/cli-calls"; touch "$T/validate-fail"
 expect_ok "wrapper recovers when validation fails" run_wrapper
@@ -1050,9 +1049,23 @@ check "wrapper validates, recovers, then revalidates" sh -c \
 	 grep -q 'recover' '$T/cli-calls'"
 
 : > "$T/cli-calls"; touch "$T/validate-fail" "$T/recover-fail"
-run_wrapper >/dev/null 2>&1
-check "wrapper drops to shell when rebuild fails" \
-	test "$(grep -c 'fallback shell reached' "$T/cli-calls")" -eq 1
+expect_fail "wrapper fails closed (exits nonzero) when rebuild fails" run_wrapper
+
+: > "$T/cli-calls"; rm -f "$T/recover-fail"; touch "$T/validate-fail"
+cat > "$T/stub-cli-still-bad" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$T/cli-calls"
+exit 1
+STUB
+chmod +x "$T/stub-cli-still-bad"
+expect_fail "wrapper fails closed when post-recover validation still fails" \
+	env SANE_ACCOUNTS_CLI="$T/stub-cli-still-bad" SANE_RECOVERY_BIN_DIR="$T" sh "$WRAPPER"
+expect_fail "wrapper fails closed when CLI is missing" \
+	env SANE_ACCOUNTS_CLI="$T/missing-cli" SANE_RECOVERY_BIN_DIR="$T" sh "$WRAPPER"
+printf '#!/bin/sh\nexit 0\n' > "$T/nonexec-cli"
+chmod 0644 "$T/nonexec-cli"
+expect_fail "wrapper fails closed when CLI is not executable" \
+	env SANE_ACCOUNTS_CLI="$T/nonexec-cli" SANE_RECOVERY_BIN_DIR="$T" sh "$WRAPPER"
 
 printf '\n--- reliability:once fail-closed wrapper (extracted wiring) ---\n'
 # Extract the LIVE reliability:once command from build-rootfs.sh instead of
@@ -1066,8 +1079,11 @@ check "reliability:once wiring carries on_fail=rescue and timeout=0" sh -c \
 	"grep -q '^reliability:once:.*:on_fail=rescue:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
 check "reliability:once wiring byte-identical across the 3 builders" sh -c \
 	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^e2945f26938e65bae7a08ce841763f08'"
-check "network:once wiring byte-identical across the 3 builders" sh -c \
-	"grep -h 'network:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^77a839731687c05b1e0fe2e0f1d0810a'"
+check "network wiring present and byte-identical across the 3 builders" sh -c \
+	"grep -Eq '^network:(once|respawn):' '$REPO_ROOT/scripts/build-rootfs.sh' && \
+	 grep -Eq '^network:(once|respawn):' '$REPO_ROOT/scripts/make-image.sh' && \
+	 grep -Eq '^network:(once|respawn):' '$REPO_ROOT/scripts/sane-install.sh' && \
+	 test \"\$(grep -Eh '^network:(once|respawn):' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | wc -l)\" -eq 1"
 rel_cmd=${rel_line#reliability:once:}
 rel_cmd=${rel_cmd%:on_fail=rescue:timeout=0}
 rel_cmd=${rel_cmd%:timeout=0}
@@ -1307,6 +1323,252 @@ expect_fail_msg "--allow-weak-defaults without env vars fails closed before writ
 	sh -c "unset SANE_TEST_ROOT_PASSWORD SANE_TEST_SANE_PASSWORD; exec sh '$ACCOUNTS' --root '$WFAIL' init --allow-weak-defaults"
 check "failed --allow-weak-defaults leaves no partial passwd or shadow" \
 	sh -c "[ ! -e '$WFAIL/etc/passwd' ] && [ ! -e '$WFAIL/etc/shadow' ]"
+
+printf '\n--- weak-salt shadow rejection & double-lock normalization (P1-6, P3#10) ---\n'
+weak_root_hash=$(printf 'root' | openssl passwd -6 -salt root -stdin)
+weak_sane_hash=$(printf 'sane' | openssl passwd -6 -salt sane -stdin)
+
+base_firstboot
+awk -F: -v OFS=: -v rh="$weak_root_hash" -v sh="$weak_sane_hash" \
+	'$1=="root"{$2=rh} $1=="sane"{$2=sh} 1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_fail_msg "validate rejects deterministic weak-salt hashes" "weak default" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds on weak-salt shadow" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover replaces weak root hash with '!'" sh -c \
+	"grep -q '^root:!:19700:' '$T/etc/shadow'"
+check "recover replaces weak sane hash with '!'" sh -c \
+	"grep -q '^sane:!:19700:' '$T/etc/shadow'"
+check "recover clears firstboot marker when weak hashes are removed" \
+	test ! -f "$T/etc/.sane-firstboot-done"
+expect_ok "post-recover validate passes after weak-salt cleanup" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+set_pw root 'StrongRoot123!'
+set_pw sane 'StrongSane123!'
+sh "$ACCOUNTS" --root "$T" add-user alice 1005 --skip-chown >/dev/null
+awk -F: -v OFS=: -v rh="!!$weak_root_hash" -v ah="$weak_sane_hash" \
+	'$1=="root"{$2=rh} $1=="alice"{$2=ah} 1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "recover heals locked weak root and weak extra shadow" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover locks weak root and clears firstboot marker" sh -c \
+	"grep -q '^root:!:19700:' '$T/etc/shadow' && [ ! -f '$T/etc/.sane-firstboot-done' ]"
+check "recover drops extra account with weak-salt hash" sh -c \
+	"! grep -q '^alice:' '$T/etc/shadow'"
+expect_ok "validate passes after locked weak-salt recovery" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# Double-locked !!$6$... accounts must validate, unlock, and survive recover.
+base_firstboot
+set_pw root 'DoubleLockRoot1!'
+set_pw sane 'DoubleLockSane1!'
+sh "$ACCOUNTS" --root "$T" add-user alice 1005 --skip-chown >/dev/null
+set_pw alice 'DoubleLockAlice1!'
+root_raw_hash=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+alice_raw_hash=$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")
+awk -F: -v OFS=: '$1=="root" || $1=="alice" {$2="!!" $2} 1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+chmod 0600 "$T/etc/shadow"
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "validate accepts double-locked !! hashes" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover preserves double-locked valid root and extra hashes" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover normalizes baseline root double-lock to single '!'" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "!$root_raw_hash"
+check "recover keeps double-locked extra alice hash" \
+	test "$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")" = "!!$alice_raw_hash"
+check "recover keeps firstboot marker for double-locked valid root/sane" \
+	test -f "$T/etc/.sane-firstboot-done"
+expect_ok "unlock handles double-locked !! hash" sh "$ACCOUNTS" --root "$T" unlock alice
+check "unlock removes all leading '!' markers" \
+	test "$(awk -F: '$1=="alice"{print $2}' "$T/etc/shadow")" = "$alice_raw_hash"
+
+base_firstboot
+awk -F: -v OFS=: '$1=="root"{$2="!!"} 1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+chmod 0600 "$T/etc/shadow"
+expect_ok "validate accepts '!!' disabled marker" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_fail "unlock rejects bare '!!' without hash" sh "$ACCOUNTS" --root "$T" unlock root
+
+printf '\n--- doas.conf quote/brace/comment/deny parser (P1-7) ---\n'
+DOAS_BIN="$REPO_ROOT/packages/doas/x/usr/bin/doas"
+DOAS_RUNNABLE=0
+if [ -x "$DOAS_BIN" ]; then
+	_dt=$(mktemp)
+	printf 'permit persist :wheel\n' > "$_dt"
+	if "$DOAS_BIN" -C "$_dt" >/dev/null 2>&1; then
+		DOAS_RUNNABLE=1
+	fi
+	rm -f -- "$_dt"
+fi
+
+base_firstboot
+set_pw root 'DoasParserRoot1!'
+set_pw sane 'DoasParserSane1!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+printf 'permit persist :wheel\npermit setenv { FOO }nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+if [ "$DOAS_RUNNABLE" -eq 1 ]; then
+	expect_ok "real doas -C confirms '}nopass' syntax is accepted by OpenDoas" "$DOAS_BIN" -C "$T/etc/doas.conf"
+fi
+expect_fail_msg "validate rejects '}nopass' without space after brace" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover replaces '}nopass' bypass policy" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover removed '}nopass' policy" sh -c "! grep -q 'nopass' '$T/etc/doas.conf'"
+
+base_firstboot
+set_pw root 'DoasParserRoot2!'
+set_pw sane 'DoasParserSane2!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+printf 'permit persist :wheel\npermit setenv { VAR="a#b" } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+if [ "$DOAS_RUNNABLE" -eq 1 ]; then
+	expect_ok "real doas -C confirms '#' inside quotes is literal" "$DOAS_BIN" -C "$T/etc/doas.conf"
+fi
+expect_fail_msg "validate rejects nopass after quoted '#' in setenv" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover replaces policy with nopass after quoted '#'" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover cleared nopass after quoted '#'" sh -c "! grep -q 'nopass' '$T/etc/doas.conf'"
+
+base_firstboot
+printf 'permit persist :wheel\npermit setenv { VAR="a } b" } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_fail_msg "validate ignores '}' inside quotes and catches trailing nopass" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit persist :wheel\npermit setenv { VAR="a\\" } b" } nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_fail_msg "validate handles escaped quote inside setenv and catches nopass" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit persist :wheel\npermit setenv { VAR="}nopass" } :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_ok "validate accepts '}nopass' literal inside double quotes" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit setenv{ FOO } :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+if [ "$DOAS_RUNNABLE" -eq 1 ]; then
+	expect_ok "real doas -C confirms 'setenv{' without space is valid" "$DOAS_BIN" -C "$T/etc/doas.conf"
+fi
+expect_ok "validate accepts 'setenv{' without space before brace" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit setenv{ as } :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_ok "validate accepts 'permit setenv{ as } :wheel' without early break" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit setenv{ FOO }nopass :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_fail_msg "validate rejects 'setenv{ FOO }nopass :wheel'" "grants 'nopass'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit persist :wheel\ndeny :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+if [ "$DOAS_RUNNABLE" -eq 1 ]; then
+	expect_ok "real doas -C confirms trailing 'deny :wheel' is valid syntax" "$DOAS_BIN" -C "$T/etc/doas.conf"
+fi
+expect_fail_msg "validate rejects trailing 'deny :wheel' overriding permit" "no effective permit rule" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover replaces policy invalidated by trailing 'deny :wheel'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "recover restored permit persist :wheel after trailing deny" \
+	grep -qx 'permit persist :wheel' "$T/etc/doas.conf"
+
+base_firstboot
+printf 'deny :wheel\npermit persist :wheel\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_ok "validate accepts 'permit persist :wheel' after earlier 'deny :wheel'" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit persist :wheel\ndeny :wheel cmd /bin/sh\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_ok "validate accepts command-specific deny after general :wheel permit" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base_firstboot
+printf 'permit persist :wheel\npermit setenv { VAR="unclosed\n' > "$T/etc/doas.conf"
+chmod 0600 "$T/etc/doas.conf"
+expect_fail "validate rejects unterminated quotes in doas.conf" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+printf '\n--- atomic modes, init args, and --root symlink containment (P2#5/#6) ---\n'
+base_firstboot
+OUTSIDE=$(mktemp -d)
+chmod 0777 "$OUTSIDE"
+ln -s "$OUTSIDE" "$T/home/bob"
+expect_fail "add-user rejects symlinked home directory" \
+	sh "$ACCOUNTS" --root "$T" add-user bob 1005 --skip-chown
+check "symlinked home target mode stayed untouched" \
+	test "$(stat -c %a "$OUTSIDE")" = 777
+check "symlinked home rejection added no passwd entry" sh -c \
+	"! grep -q '^bob:' '$T/etc/passwd'"
+rm -rf -- "$OUTSIDE"
+
+base_firstboot
+OUTSIDE=$(mktemp -d)
+rm -rf "$T/etc"
+ln -s "$OUTSIDE" "$T/etc"
+expect_fail "init rejects escaping etc symlink" sh "$ACCOUNTS" --root "$T" init --firstboot --force
+expect_fail "add-user rejects escaping etc symlink" sh "$ACCOUNTS" --root "$T" add-user bob 1005 --skip-chown
+expect_fail "recover rejects escaping etc symlink" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "escaping etc symlink left external dir empty" test -z "$(ls -A "$OUTSIDE")"
+rm -rf -- "$OUTSIDE"
+
+base_firstboot
+OUTSIDE=$(mktemp -d)
+rm -rf "$T/home"
+ln -s "$OUTSIDE" "$T/home"
+expect_fail "add-user rejects escaping home base symlink" sh "$ACCOUNTS" --root "$T" add-user bob 1005 --skip-chown
+expect_fail "recover rejects escaping home base symlink" sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "escaping home base left external dir empty" test -z "$(ls -A "$OUTSIDE")"
+rm -rf -- "$OUTSIDE"
+
+base_firstboot
+OUTSIDE=$(mktemp -d)
+printf 'keep\n' > "$OUTSIDE/keep"
+sh "$ACCOUNTS" --root "$T" add-user bob 1005 --skip-chown
+rm -rf "$T/home/bob"
+ln -s "$OUTSIDE" "$T/home/bob"
+expect_fail "del-user --remove-home rejects symlinked home" \
+	sh "$ACCOUNTS" --root "$T" del-user bob --remove-home
+check "del-user symlink rejection left external dir intact" test -f "$OUTSIDE/keep"
+rm -rf -- "$OUTSIDE"
+
+# init --firstboot --force (with --force in $2) and unknown flag rejection
+base_firstboot
+expect_ok "init accepts --force after --firstboot" \
+	sh "$ACCOUNTS" --root "$T" init --firstboot --force
+expect_fail "init rejects unknown option" \
+	sh "$ACCOUNTS" --root "$T" init --firstboot --bogus
+
+# Under permissive umask 0000, secret files are still created at mode 0600.
+T_UMASK=$(mktemp -d)
+mkdir -p "$T_UMASK/etc" "$T_UMASK/home" "$T_UMASK/usr/bin"
+printf 'stub' > "$T_UMASK/usr/bin/doas"
+chmod 4755 "$T_UMASK/usr/bin/doas"
+expect_ok "provision succeeds under umask 0000" \
+	sh -c "umask 0000 && SANE_TEST_CREDS_FILE='$T_UMASK/creds' SANE_WEAK_DEFAULT_CREDS=1 sh '$REPO_ROOT/scripts/provision-accounts.sh' '$T_UMASK'"
+check "shadow is mode 0600 under umask 0000" test "$(stat -c %a "$T_UMASK/etc/shadow")" = 600
+check "doas.conf is mode 0600 under umask 0000" test "$(stat -c %a "$T_UMASK/etc/doas.conf")" = 600
+check "firstboot marker is mode 0600 under umask 0000" test "$(stat -c %a "$T_UMASK/etc/.sane-firstboot-done")" = 600
+check "test creds file is mode 0600 under umask 0000" test "$(stat -c %a "$T_UMASK/creds")" = 600
+check "passwd is mode 0644 under umask 0000" test "$(stat -c %a "$T_UMASK/etc/passwd")" = 644
+check "group is mode 0644 under umask 0000" test "$(stat -c %a "$T_UMASK/etc/group")" = 644
+rm -rf -- "$T_UMASK"
 
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

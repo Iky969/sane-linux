@@ -23,9 +23,21 @@ chmod 0755 "$PKG_DIR/x/sbin/poweroff" "$PKG_DIR/x/sbin/reboot" "$PKG_DIR/x/sbin/
 [ -f "$PKG_DIR/x/usr/bin/sane-net" ] && chmod 0755 "$PKG_DIR/x/usr/bin/sane-net"
 chmod 0644 "$PKG_DIR/x/usr/share/ninit/services/getty.service"
 
-# Verify static ELF without INTERP
+# Verify static ELF without INTERP or DYNAMIC
+command -v readelf >/dev/null 2>&1 || {
+    printf 'ERROR: readelf is required for static ELF verification\n' >&2
+    exit 1
+}
+readelf -h "$PKG_DIR/x/sbin/init" >/dev/null 2>&1 || {
+    printf 'ERROR: %s is not a valid ELF binary\n' "$PKG_DIR/x/sbin/init" >&2
+    exit 1
+}
 if readelf -lW "$PKG_DIR/x/sbin/init" 2>/dev/null | grep -E -q '(^|[[:space:]])INTERP([[:space:]]|$)|PT_INTERP'; then
     printf 'ERROR: %s contains dynamic INTERP segment (must be statically linked)\n' "$PKG_DIR/x/sbin/init" >&2
+    exit 1
+fi
+if readelf -lW "$PKG_DIR/x/sbin/init" 2>/dev/null | grep -E -q '[[:space:]]DYNAMIC[[:space:]]'; then
+    printf 'ERROR: %s contains DYNAMIC segment (must be statically linked)\n' "$PKG_DIR/x/sbin/init" >&2
     exit 1
 fi
 

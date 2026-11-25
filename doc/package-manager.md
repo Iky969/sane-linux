@@ -261,7 +261,7 @@ spm remove sane-hello [--root <path>]
   evaluated or executed. No new shell syntax is recognized.
 - The tail carries only these colon-separated keys: `:requires=`,
   `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`, `:grace=`, `:user=`,
-  `:group=`. Unknown or legacy keys (notably `:deps=`) are rejected with the
+  `:group=`, `:on_fail=`. Unknown or legacy keys (notably `:deps=`) are rejected with the
   full vocabulary and a `:requires=` migration hint. Empty `:user=`/`:group=`
   and a `:group=` without `:user=` are rejected.
 - Snippet content is validated at packaging time by the **shared validator**

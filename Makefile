@@ -1,12 +1,9 @@
 # ninit -- minimal init system (PID 1)
 #
-#   make            build static binary ./ninit  (gcc -static -O2 -Wall)
+#   make            build static binary ./ninit  (gcc -static -O2 -Wall -Werror -fstack-protector-strong)
 #   make ninit-test build the test binary (production flags + -DNINIT_TESTING)
-#   make test       test PID 1 in temporary chroot with ./ninit-test: smoke test
-#                   + SIGTERM test + config test + spawn failure paths + cgroup v2
-#                   limits + respawn cleanup / generation counter reset + state
-#                   machine (requires root/sudo), then run-qemu.sh harness
-#                   verification via log fixtures (without root/QEMU)
+#   make test       test PID 1 in temporary chroot with ./ninit-test: all 13
+#                   TEST_SCRIPTS suites (8 root-required + 5 unprivileged)
 #   make rootfs     build minimal distro rootfs + initramfs (static busybox,
 #                   ninit as /sbin/init; see doc/distro-builder.md)
 #   make qemu       boot rootfs in QEMU (requires qemu-system-x86)
@@ -26,11 +23,10 @@
 #
 # Requires: build-essential + busybox-static (busybox used as /bin/sh in test rootfs).
 # On distros without static glibc (e.g. Alpine):  make CC=musl-gcc
-# Note: -Werror is omitted from default CFLAGS for compatibility across compiler toolchains;
-# CI overrides CFLAGS with -Werror to enforce the zero-warning gate.
+# Zero-warning gate: -Werror is enabled by default alongside -Wall and -fstack-protector-strong.
 
 CC     = gcc
-CFLAGS ?= -static -O2 -Wall -fstack-protector-strong
+CFLAGS ?= -static -O2 -Wall -Werror -fstack-protector-strong
 BIN    ?= ninit
 TESTBIN ?= ninit-test
 SRC    ?= ninit.c
@@ -77,14 +73,24 @@ qemu: rootfs
 integration: $(BIN)
 	sh ./scripts/test-integration.sh
 
-test-panic: $(BIN)
-	@rc=0; sh ./scripts/test-kernel-panic-specific.sh || rc=$$?; \
-	if [ $$rc -eq 77 ]; then echo "SKIP: test-panic (no QEMU/kernel/initramfs)"; exit 0; fi; \
+test-panic: $(BIN) $(TESTBIN)
+	@rc=0; BIN=./$(TESTBIN) sh ./scripts/test-kernel-panic-specific.sh || rc=$$?; \
+	if [ $$rc -eq 77 ]; then \
+		if [ "$${CI:-}" = "true" ] || [ "$${CI:-}" = "1" ]; then \
+			echo "FAIL: test-panic skipped in CI (exit 77 forbidden)" >&2; exit 1; \
+		fi; \
+		echo "SKIP: test-panic (no QEMU/kernel/initramfs)"; exit 0; \
+	fi; \
 	exit $$rc
 
 fuzz test-fuzz:
 	@rc=0; sh ./scripts/fuzz-parsers.sh || rc=$$?; \
-	if [ $$rc -eq 77 ]; then echo "SKIP: fuzz-parsers (sanitizer unsupported)"; exit 0; fi; \
+	if [ $$rc -eq 77 ]; then \
+		if [ "$${CI:-}" = "true" ] || [ "$${CI:-}" = "1" ]; then \
+			echo "FAIL: fuzz skipped in CI (exit 77 forbidden)" >&2; exit 1; \
+		fi; \
+		echo "SKIP: fuzz-parsers (sanitizer unsupported)"; exit 0; \
+	fi; \
 	exit $$rc
 
 clean:
@@ -153,7 +159,12 @@ test-image-uefi:
 
 test-lifecycle:
 	@rc=0; sh ./scripts/test-boot-lifecycle.sh || rc=$$?; \
-	if [ $$rc -eq 77 ]; then echo "SKIP: test-lifecycle (needs root, QEMU, losetup and 'make image')"; exit 0; fi; \
+	if [ $$rc -eq 77 ]; then \
+		if [ "$${CI:-}" = "true" ] || [ "$${CI:-}" = "1" ]; then \
+			echo "FAIL: test-lifecycle skipped in CI (exit 77 forbidden)" >&2; exit 1; \
+		fi; \
+		echo "SKIP: test-lifecycle (needs root, QEMU, losetup and 'make image')"; exit 0; \
+	fi; \
 	exit $$rc
 
 test-installer installer-test: packages

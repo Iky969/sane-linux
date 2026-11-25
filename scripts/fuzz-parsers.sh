@@ -107,6 +107,11 @@ printf 'a:once:/bin/true:memory_max=1M:memory_max=2M:cpu_max=1 1:pids_max=1:pids
 head -c 4096 /dev/zero | tr '\0' 'a' > "$WORK/c_longline"; printf '\n' >> "$WORK/c_longline"
 printf 'a:b:c:d:e:f:g:h\n' > "$WORK/c_colons"
 printf 'a:once:/bin/true\r\nb:once:/bin/true\r\n' > "$WORK/c_crlf"
+printf 'a:once:echo "unclosed :user=nobody\nb:once:echo ok # don'\''t:user=nobody\n' > "$WORK/c_unbalanced"
+printf 'a:once:echo "\""; id && echo :user=nobody\nb:once:echo \\'\''; id && echo :user=nobody\nc:once:echo '\''\\\\'\''; echo :on_fail=rescue\n' > "$WORK/c_escapes"
+printf 'a:once:/bin/true:usr=nobody\nb:once:/bin/true:deps=a\nc:once:/bin/true:timeout=10:timeout=bad:grace=2:grace=bad:on_fail=rescue:on_fail=bad\n' > "$WORK/c_unknown_repeat"
+printf 'a:once:/bin/true:user=4294967295\nb:once:/bin/true:user=root:group=4294967295\n' > "$WORK/c_uidmax"
+{ printf 'a:once:true\0'; head -c 1200 /dev/zero | tr '\0' 'z'; printf '\nb:once:true\n'; } > "$WORK/c_nul_long"
 
 run_case config "config: empty file" "$WORK/c_empty"
 run_case config "config: single valid line" "$WORK/c_one"
@@ -121,6 +126,11 @@ run_case config "config: stacked tags" "$WORK/c_stacked"
 run_case config "config: over-long line (> MAX_LINE)" "$WORK/c_longline"
 run_case config "config: many colon fields" "$WORK/c_colons"
 run_case config "config: CRLF line endings" "$WORK/c_crlf"
+run_case config "config: unbalanced quotes" "$WORK/c_unbalanced"
+run_case config "config: backslash escapes & single-quote rules" "$WORK/c_escapes"
+run_case config "config: unknown :key= & repeated option consistency" "$WORK/c_unknown_repeat"
+run_case config "config: (uid_t)-1 / 4294967295 rejection" "$WORK/c_uidmax"
+run_case config "config: embedded NUL in overlong line" "$WORK/c_nul_long"
 
 # ---- /etc/fstab options (parse_mount_flags) ----
 printf '' > "$WORK/f_empty"
@@ -130,6 +140,7 @@ printf '!!!,@@@,###,with space,tab\there,=,,,\n' > "$WORK/f_garbage"
 head -c 4096 /dev/zero | tr '\0' 'x' > "$WORK/f_long"; printf '\n' >> "$WORK/f_long"
 printf 'remount,bind,rbind,user,exec,suid,dev,nouser,auto,_netdev,nofail\n' > "$WORK/f_flags"
 printf '\x00\x01\xff\n' > "$WORK/f_hex"
+printf '/mnt//spa\\040ce///\n' > "$WORK/f_slashes"
 
 run_case fstab "fstab: empty options" "$WORK/f_empty"
 run_case fstab "fstab: mixed flags + userspace + data" "$WORK/f_mixed"
@@ -138,6 +149,7 @@ run_case fstab "fstab: garbage tokens" "$WORK/f_garbage"
 run_case fstab "fstab: over-long option string" "$WORK/f_long"
 run_case fstab "fstab: bind/rbind/remount/user implications" "$WORK/f_flags"
 run_case fstab "fstab: raw hex bytes" "$WORK/f_hex"
+run_case fstab "fstab: double slashes & octal escape" "$WORK/f_slashes"
 
 # ---- /run/initctl (initctl_parse_stream) ----
 : > "$WORK/i_empty"
@@ -147,6 +159,14 @@ printf 'poweroff' > "$WORK/i_nonewline"
 head -c 4096 /dev/zero | tr '\0' 'p' > "$WORK/i_long"; printf '\n' >> "$WORK/i_long"
 printf '\x00\x01\xffpoweroff\n' > "$WORK/i_hex"
 printf '  poweroff  \n\treboot\t\n' > "$WORK/i_spaces"
+{ head -c 1023 /dev/zero | tr '\0' 'a'; printf '\n'; } > "$WORK/i_exact1024"
+{ printf 'start '; head -c 1025 /dev/zero | tr '\0' 'x'; printf '\npoweroff\n'; } > "$WORK/i_prefix_overflow"
+: > "$WORK/i_25cmds"
+_i=0
+while [ "$_i" -lt 25 ]; do
+    printf 'status s%s\n' "$_i" >> "$WORK/i_25cmds"
+    _i=$((_i + 1))
+done
 
 run_case initctl "initctl: empty buffer" "$WORK/i_empty"
 run_case initctl "initctl: multi-line commands" "$WORK/i_multi"
@@ -155,6 +175,11 @@ run_case initctl "initctl: no trailing newline" "$WORK/i_nonewline"
 run_case initctl "initctl: over-long line" "$WORK/i_long"
 run_case initctl "initctl: raw hex bytes" "$WORK/i_hex"
 run_case initctl "initctl: leading/trailing whitespace" "$WORK/i_spaces"
+run_case initctl "initctl: exact 1024-byte command line" "$WORK/i_exact1024"
+run_case initctl "initctl: buffered prefix + overflow line" "$WORK/i_prefix_overflow"
+run_case initctl "initctl: >16 commands in single read" "$WORK/i_25cmds"
+
+run_case verify "verify: deterministic parser contracts (P1-1/P1-2/P2)" "dummy"
 
 # ---- deterministic mutation loop (all three parsers) ----
 _mut_rc=0

@@ -1,5 +1,6 @@
 bin/
 bin/ash
+bin/awk
 bin/busybox
 bin/cat
 bin/chmod
@@ -19,6 +20,7 @@ bin/expr
 bin/false
 bin/find
 bin/grep
+bin/gzip
 bin/head
 bin/hostname
 bin/id
@@ -28,8 +30,10 @@ bin/login
 bin/ls
 bin/mkdir
 bin/mknod
+bin/mktemp
 bin/more
 bin/mount
+bin/mountpoint
 bin/mv
 bin/od
 bin/passwd
@@ -43,9 +47,11 @@ bin/rmdir
 bin/sed
 bin/seq
 bin/sh
+bin/sha256sum
 bin/sleep
 bin/sort
 bin/stat
+bin/stty
 bin/sync
 bin/tail
 bin/tar

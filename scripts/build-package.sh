@@ -86,8 +86,12 @@ SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd -P)"
 mkdir -p "$OUTPUT_DIR" || die "Failed to create output directory: $OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 
-# 1. Validate payload structure
+# 1. Validate payload and metadata root structure (reject symlinks before mutation)
+[ ! -L "$SOURCE_DIR/x" ] || die "Payload directory must not be a symlink: $SOURCE_DIR/x"
 [ -d "$SOURCE_DIR/x" ] || die "Missing payload directory: $SOURCE_DIR/x"
+[ ! -L "$SOURCE_DIR/.META" ] || die "Metadata directory must not be a symlink: $SOURCE_DIR/.META"
+[ -d "$SOURCE_DIR/.META" ] || die "Missing metadata directory: $SOURCE_DIR/.META"
+[ ! -L "$SOURCE_DIR/.META/package" ] || die "Package manifest must not be a symlink: $SOURCE_DIR/.META/package"
 
 # Shared read-only policy check BEFORE any source mutation (mkdir/touch/chmod
 # below must never follow a symlinked .META or service path). The validator
@@ -141,8 +145,48 @@ if [ "$PKG_BASE" != "true" ] && [ "$PKG_BASE" != "false" ]; then
     die "Invalid base field value '$PKG_BASE': must be 'true' or 'false'"
 fi
 
-# Ensure .META/depends exists
-[ -f "$SOURCE_DIR/.META/depends" ] || touch "$SOURCE_DIR/.META/depends"
+# Validate and sync dependencies= and .META/depends
+[ ! -L "$SOURCE_DIR/.META/depends" ] || die "Dependency file must not be a symlink: $SOURCE_DIR/.META/depends"
+[ ! -L "$SOURCE_DIR/.META/files" ] || die "Files manifest must not be a symlink: $SOURCE_DIR/.META/files"
+[ ! -L "$SOURCE_DIR/.META/sha256" ] || die "Checksum manifest must not be a symlink: $SOURCE_DIR/.META/sha256"
+
+norm_deps_list() {
+    tr ', \t\r' '\n' | awk 'NF { print }' | LC_ALL=C sort -u
+}
+
+validate_dep_names() {
+    local d
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        [[ "$d" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Invalid dependency name '$d'"
+    done
+}
+
+deps_from_manifest=""
+if [ -n "$PKG_DEPS" ]; then
+    deps_from_manifest="$(printf '%s\n' "$PKG_DEPS" | norm_deps_list)"
+    validate_dep_names <<< "$deps_from_manifest"
+fi
+
+deps_from_file=""
+if [ -f "$SOURCE_DIR/.META/depends" ]; then
+    deps_from_file="$(norm_deps_list < "$SOURCE_DIR/.META/depends")"
+    if [ -n "$deps_from_file" ]; then
+        validate_dep_names <<< "$deps_from_file"
+    fi
+fi
+
+if [ -n "$deps_from_manifest" ] && [ -n "$deps_from_file" ]; then
+    if [ "$deps_from_manifest" != "$deps_from_file" ]; then
+        die "Dependency mismatch between .META/package dependencies= and .META/depends"
+    fi
+elif [ -n "$deps_from_manifest" ] && [ -z "$deps_from_file" ]; then
+    printf '%s\n' "$PKG_DEPS" | tr ', \t\r' '\n' | awk 'NF && !seen[$0]++ { print }' > "$SOURCE_DIR/.META/depends"
+elif [ -z "$deps_from_manifest" ] && [ -n "$deps_from_file" ]; then
+    PKG_DEPS="$(awk 'NF && !seen[$0]++ { out = (out ? out "," $0 : $0) } END { print out }' "$SOURCE_DIR/.META/depends")"
+else
+    [ -f "$SOURCE_DIR/.META/depends" ] || touch "$SOURCE_DIR/.META/depends"
+fi
 
 # Update/sync .META/package
 cat > "$MANIFEST.tmp" <<EOF
@@ -156,7 +200,7 @@ if [ -n "$PKG_DEPS" ]; then
     printf 'dependencies=%s\n' "$PKG_DEPS" >> "$MANIFEST.tmp"
 fi
 printf 'base=%s\n' "$PKG_BASE" >> "$MANIFEST.tmp"
-mv -f "$MANIFEST.tmp" "$MANIFEST"
+mv -fT "$MANIFEST.tmp" "$MANIFEST"
 
 # 3. Path safety audit -- delegated to spm validate-source above (single
 # policy). The private symlink helper below remains for the post-pack archive
@@ -177,7 +221,17 @@ verify_symlink_safety() {
         if [[ "$target" =~ (^|/)\.\.(/|$) ]]; then
             die "Path traversal detected in absolute symlink: $link_rel -> $target"
         fi
-        return 0
+        case "$target" in
+            /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/home|/home/*)
+                die "Symlink escape attack: forbidden system target $target"
+                ;;
+            /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*|/usr/share/*|/lib/*|/usr/lib/*|/boot/*|/opt/*)
+                return 0
+                ;;
+            *)
+                die "Symlink escape attack: absolute target outside allowed system directories: $link_rel -> $target"
+                ;;
+        esac
     fi
 
     # For relative symlinks, calculate directory depth under payload root
@@ -213,7 +267,7 @@ verify_symlink_safety() {
 # 4. Service snippet mode normalization -- only AFTER validate-source passed.
 # Content auditing and vocabulary are exclusively spm's shared validator.
 SERVICE_DIR="$SOURCE_DIR/x/usr/share/ninit/services"
-if [ -d "$SERVICE_DIR" ]; then
+if [ -d "$SERVICE_DIR" ] && [ ! -L "$SERVICE_DIR" ]; then
     log "Normalizing validated ninit service snippet modes in $SERVICE_DIR..."
     while IFS= read -r -d '' sfile; do
         [ -f "$sfile" ] && [ ! -L "$sfile" ] || continue
@@ -224,10 +278,30 @@ fi
 # T1: a device node, FIFO or socket in the source payload must never reach
 # the archive. Reject them here, before .META/files is generated (the old
 # `find ! -type d` below would have listed them as payload entries).
-special_files=$(find "$SOURCE_DIR/x" ! -type f ! -type d ! -type l 2>/dev/null || true)
+special_files=$(find -H "$SOURCE_DIR/x" ! -type f ! -type d ! -type l 2>/dev/null || true)
 [ -z "$special_files" ] || die "Special file (device/FIFO/socket) in package payload: $special_files"
-special_files=$(find "$SOURCE_DIR/.META" ! -type f ! -type d 2>/dev/null || true)
+special_files=$(find -H "$SOURCE_DIR/.META" ! -type f ! -type d 2>/dev/null || true)
 [ -z "$special_files" ] || die "Special file in package metadata: $special_files"
+
+# Static ELF verification across ELF payloads (fail-closed)
+while IFS= read -r -d '' pfile; do
+    magic="$(od -N 4 -An -tx1 "$pfile" 2>/dev/null | tr -d ' \n' || true)"
+    if [ "$magic" = "7f454c46" ]; then
+        command -v readelf >/dev/null 2>&1 || die "readelf is required to verify ELF payloads: $pfile"
+        readelf -h "$pfile" >/dev/null 2>&1 || die "Invalid ELF binary in package payload: $pfile"
+        if readelf -lW "$pfile" 2>/dev/null | grep -E -q '(^|[[:space:]])INTERP([[:space:]]|$)|PT_INTERP'; then
+            die "Dynamically linked ELF (PT_INTERP) is forbidden in package payload: $pfile"
+        fi
+        rel_pfile="${pfile#"$SOURCE_DIR/x/"}"
+        case "$rel_pfile" in
+            bin/*|sbin/*|usr/bin/*|usr/sbin/*)
+                if readelf -lW "$pfile" 2>/dev/null | grep -E -q '[[:space:]]DYNAMIC[[:space:]]'; then
+                    die "Dynamically linked ELF (DYNAMIC) is forbidden in executable payload: $pfile"
+                fi
+                ;;
+        esac
+    fi
+done < <(find -H "$SOURCE_DIR/x" -type f -print0)
 
 # 5. Auto-generate .META/files
 log "Generating .META/files manifest..."
@@ -242,11 +316,11 @@ log "Generating .META/files manifest..."
 # Verify .META/files is clean
 while IFS= read -r fline; do
     [ -n "$fline" ] || continue
-    if [[ "$fline" =~ ^/ ]] || [[ "$fline" =~ // ]] || echo "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
+    if [[ "$fline" =~ ^/ ]] || [[ "$fline" =~ // ]] || printf '%s\n' "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
         die "Invalid entry in generated .META/files: $fline"
     fi
     if [[ "$fline" == */ ]]; then
-        [ -d "$SOURCE_DIR/x/$fline" ] || die "Directory entry in .META/files does not exist: $fline"
+        [ ! -L "$SOURCE_DIR/x/${fline%/}" ] && [ -d "$SOURCE_DIR/x/$fline" ] || die "Directory entry in .META/files does not exist: $fline"
     else
         [ -f "$SOURCE_DIR/x/$fline" ] || [ -L "$SOURCE_DIR/x/$fline" ] || die "File entry in .META/files does not exist: $fline"
     fi
@@ -285,7 +359,8 @@ trap cleanup EXIT
 #   --sort=name : sorted directory entries
 #   --owner=0 --group=0 --numeric-owner : root:root UID/GID 0
 #   --mtime=@0 : Unix epoch timestamp
-#   --mode="go=rX,u+rw,a-s" : standardized permissions (executables 755, files 644)
+#   --mode="u+rw,go-w,a-s" : preserve 0600/0700 secrets, normalize 0664->0644 / 0775->0755, strip setuid/setgid
+#   --hard-dereference : avoid packing tar hardlinks from scratch tree copies
 TAR_BASE_CMD=(
     tar
     --sort=name
@@ -293,7 +368,8 @@ TAR_BASE_CMD=(
     --group=0
     --numeric-owner
     --mtime="@${SOURCE_DATE_EPOCH:-0}"
-    --mode="go=rX,u+rw,a-s"
+    --mode="u+rw,go-w,a-s"
+    --hard-dereference
     -cf -
     -C "$SOURCE_DIR"
     ./.META ./x
@@ -302,8 +378,9 @@ TAR_BASE_CMD=(
 if [ "$USE_GZ" = true ]; then
     "${TAR_BASE_CMD[@]}" | gzip -n -9 > "$TMP_PKG"
 else
-    # Moderate dictionary size (4 MiB) bounding decompression RAM to < 8 MB
-    "${TAR_BASE_CMD[@]}" | xz -T0 --lzma2=dict=4MiB > "$TMP_PKG"
+    # Single-threaded xz (-T1) for bit-for-bit determinism regardless of stream size or host CPU count;
+    # moderate dictionary size (4 MiB) bounds decompression RAM to < 8 MB
+    "${TAR_BASE_CMD[@]}" | xz -T1 --lzma2=dict=4MiB > "$TMP_PKG"
 fi
 
 # 9. Post-pack archive audit (tar-slip & invariant verification)
@@ -318,7 +395,7 @@ while IFS= read -r member; do
         die "Archive audit failed: member has leading slash: $member"
     fi
     # Reject path traversal components
-    if echo "$member" | grep -qE '(^|/)\.\.(/|$)'; then
+    if printf '%s\n' "$member" | grep -qE '(^|/)\.\.(/|$)'; then
         rm -f "$TMP_PKG"
         die "Archive audit failed: member contains traversal component: $member"
     fi
@@ -329,13 +406,23 @@ while IFS= read -r member; do
     fi
 done < <(tar -tf "$TMP_PKG")
 
-# Verify symlink targets inside archive
+# Verify symlink targets, hardlinks, and special files inside archive
 while IFS= read -r line; do
     [ -n "$line" ] || continue
-    # Reject any symlink in ./.META/
-    if [[ "$line" =~ ^l.*[[:space:]](\./\.META/[^[:space:]]+) ]]; then
+    case "$line" in
+        h*|-*" -> "*)
+            rm -f "$TMP_PKG"
+            die "Archive audit failed: hard links are forbidden: $line"
+            ;;
+        b*|c*|p*|s*|\?*)
+            rm -f "$TMP_PKG"
+            die "Archive audit failed: special files are forbidden: $line"
+            ;;
+    esac
+    # Reject any symlink in ./.META/ or for ./.META or ./x itself
+    if [[ "$line" =~ ^l.*[[:space:]](\./\.META(/[^[:space:]]+)?|\./x/?)[[:space:]]-\> ]]; then
         rm -f "$TMP_PKG"
-        die "Archive audit failed: symlinks are forbidden in ./.META/: ${BASH_REMATCH[1]}"
+        die "Archive audit failed: symlinks are forbidden for ${BASH_REMATCH[1]}"
     fi
     # Symlink line format in tar -tvf: lrwxrwxrwx ... ./x/path -> target
     if [[ "$line" =~ ^l.*[[:space:]](\./x/[^[:space:]]+)[[:space:]]-\>[[:space:]](.+)$ ]]; then
@@ -347,7 +434,7 @@ while IFS= read -r line; do
 done < <(tar -tvf "$TMP_PKG")
 
 # 10. Atomic commit
-mv -f "$TMP_PKG" "$PKG_FILE_CANONICAL"
+mv -fT "$TMP_PKG" "$PKG_FILE_CANONICAL"
 trap - EXIT
 
 # Provide short alias if different

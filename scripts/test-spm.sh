@@ -769,7 +769,7 @@ test_forbidden_ninit_snippet() {
     mkdir -p "$root"
 
     # Craft package with forbidden ninit command snippet
-    python_pkg_helper create_forbidden_service "$pkg" "bad-service-pkg" "evil" "respawn:kill -9 1"
+    python_pkg_helper create_forbidden_service "$pkg" "bad-service-pkg" "evil" "evil:respawn:kill -9 1"
 
     "$SPM_BIN" init --root "$root" >/dev/null 2>&1
 
@@ -2203,6 +2203,7 @@ test_failed_upgrade_rollback() {
 last=""
 for arg in "$@"; do last="$arg"; done
 case "$last" in
+    "$SPM_ROOT"/var/lib/spm/staging/*) target=0 ;;
     "$SPM_ROOT"/*) target=1 ;;
     *) target=0 ;;
 esac
@@ -2269,6 +2270,7 @@ test_sigkill_interrupted_install_recovery() {
 last=""
 for arg in "$@"; do last="$arg"; done
 case "$last" in
+    "$SPM_ROOT"/var/lib/spm/staging/*) target=0 ;;
     "$SPM_ROOT"/*) target=1 ;;
     *) target=0 ;;
 esac
@@ -2435,7 +2437,7 @@ test_snippet_vocabulary() {
     local root="$tdir/root"
     mkdir -p "$tdir" "$root"
 
-    local all_keys='respawn:/bin/true :requires=base :memory_max=64M :cpu_max=50000 100000 :pids_max=32 :timeout=0 :grace=5 :user=svc :group=svc :on_fail=rescue'
+    local all_keys='svc:respawn:/bin/true :requires=base :memory_max=64M :cpu_max=50000 100000 :pids_max=32 :timeout=0 :grace=5 :user=svc :group=svc :on_fail=rescue'
     if ! python_pkg_helper create_forbidden_service "$tdir/keys.spm.tar.xz" "vocab-keys" "svc" "$all_keys"; then
         test_fail "F2 snippet vocabulary" "cannot build fixture package"
         return
@@ -2445,37 +2447,74 @@ test_snippet_vocabulary() {
         return
     fi
 
+    # 3-field parity: 2-field snippet without <name>: must be rejected; service named 'once'/'respawn' must be accepted.
+    local two_field='respawn:/bin/true :timeout=5'
+    python_pkg_helper create_forbidden_service "$tdir/twofield.spm.tar.xz" "vocab-two" "svctwo" "$two_field"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/twofield.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "2-field snippet without service name accepted"
+        return
+    fi
+    local name_once='once:once:/bin/true:timeout=5'
+    python_pkg_helper create_forbidden_service "$tdir/nameonce.spm.tar.xz" "vocab-nameonce" "svcon" "$name_once"
+    if ! sh "$SPM_BIN" --root "$root" install "$tdir/nameonce.spm.tar.xz" >/dev/null 2>"$tdir/no.err"; then
+        test_fail "F2 snippet vocabulary" "service named 'once' rejected: $(cat "$tdir/no.err")"
+        return
+    fi
+
+    # :on_fail= rescue with leading space matches ninit.c trim(); :user=0/:group=0 and invalid limits rejected.
+    local space_onfail='svco:once:/bin/true :on_fail= rescue'
+    python_pkg_helper create_forbidden_service "$tdir/space_of.spm.tar.xz" "vocab-spaceof" "svcsof" "$space_onfail"
+    if ! sh "$SPM_BIN" --root "$root" install "$tdir/space_of.spm.tar.xz" >/dev/null 2>"$tdir/sof.err"; then
+        test_fail "F2 snippet vocabulary" "':on_fail= rescue' rejected: $(cat "$tdir/sof.err")"
+        return
+    fi
+    for bad_opt in \
+        'svcu0:respawn:/bin/true :user=0' \
+        'svcg0:respawn:/bin/true :user=svc :group=0' \
+        'svcto:once:/bin/true :timeout=abc' \
+        'svcgr:once:/bin/true :grace=9999' \
+        'svcmem:once:/bin/true :memory_max=64MB' \
+        'svcpids:once:/bin/true :pids_max=0' \
+        'svccpu:once:/bin/true :cpu_max=50000'
+    do
+        python_pkg_helper create_forbidden_service "$tdir/badopt.spm.tar.xz" "vocab-badopt" "svcbopt" "$bad_opt"
+        if sh "$SPM_BIN" --root "$root" install "$tdir/badopt.spm.tar.xz" >/dev/null 2>&1; then
+            test_fail "F2 snippet vocabulary" "invalid option accepted: $bad_opt"
+            return
+        fi
+    done
+
     # Ordinary arguments may be quoted or carry '='; quotes must balance and
     # must not hide ':' delimiters that would confuse ninit.c option parsing (F4).
-    local quoted='respawn:/bin/echo "hello world" status=running :on_fail=fail'
+    local quoted='svcq:respawn:/bin/echo "hello world" status=running :on_fail=fail'
     python_pkg_helper create_forbidden_service "$tdir/quoted.spm.tar.xz" "vocab-quoted" "svcq" "$quoted"
     if ! sh "$SPM_BIN" --root "$root" install "$tdir/quoted.spm.tar.xz" >/dev/null 2>"$tdir/quoted.err"; then
         test_fail "F2 snippet vocabulary" "balanced quoted argument rejected: $(cat "$tdir/quoted.err")"
         return
     fi
 
-    local quoted_colon='once:/bin/echo "hello :user=root"'
+    local quoted_colon='svcqc:once:/bin/echo "hello :user=root"'
     python_pkg_helper create_forbidden_service "$tdir/qcolon.spm.tar.xz" "vocab-qcolon" "svcqc" "$quoted_colon"
     if sh "$SPM_BIN" --root "$root" install "$tdir/qcolon.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "colon inside quoted argument accepted"
         return
     fi
 
-    local bad_onfail='respawn:/bin/true :on_fail=panic'
+    local bad_onfail='svcof:respawn:/bin/true :on_fail=panic'
     python_pkg_helper create_forbidden_service "$tdir/bad_onfail.spm.tar.xz" "vocab-onfail" "svcof" "$bad_onfail"
     if sh "$SPM_BIN" --root "$root" install "$tdir/bad_onfail.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "invalid :on_fail value accepted"
         return
     fi
 
-    local bare_opt='respawn:/bin/true :bogus'
+    local bare_opt='svcbare:respawn:/bin/true :bogus'
     python_pkg_helper create_forbidden_service "$tdir/bare_opt.spm.tar.xz" "vocab-bare" "svcbare" "$bare_opt"
     if sh "$SPM_BIN" --root "$root" install "$tdir/bare_opt.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "malformed bare :bogus option accepted"
         return
     fi
 
-    local unbalanced='respawn:/bin/echo "hello world'
+    local unbalanced='svcu:respawn:/bin/echo "hello world'
     python_pkg_helper create_forbidden_service "$tdir/unbalanced.spm.tar.xz" "vocab-unbal" "svcu" "$unbalanced"
     if sh "$SPM_BIN" --root "$root" install "$tdir/unbalanced.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "unbalanced quote accepted"
@@ -2484,7 +2523,7 @@ test_snippet_vocabulary() {
 
     # Legacy/foreign key must be rejected with the full vocabulary and the
     # :requires= migration hint.
-    local legacy='respawn:/bin/true :deps=base'
+    local legacy='svcd:respawn:/bin/true :deps=base'
     python_pkg_helper create_forbidden_service "$tdir/deps.spm.tar.xz" "vocab-deps" "svcd" "$legacy"
     if err=$(sh "$SPM_BIN" --root "$root" install "$tdir/deps.spm.tar.xz" 2>&1 >/dev/null); then
         test_fail "F2 snippet vocabulary" "legacy :deps= key accepted"
@@ -2498,19 +2537,19 @@ test_snippet_vocabulary() {
     done
 
     # Empty user/group and group without user.
-    local empty_user='respawn:/bin/true :user='
+    local empty_user='svce:respawn:/bin/true :user='
     python_pkg_helper create_forbidden_service "$tdir/euser.spm.tar.xz" "vocab-eu" "svce" "$empty_user"
     if sh "$SPM_BIN" --root "$root" install "$tdir/euser.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "empty :user= accepted"
         return
     fi
-    local empty_group='respawn:/bin/true :user=svc :group='
+    local empty_group='svcf:respawn:/bin/true :user=svc :group='
     python_pkg_helper create_forbidden_service "$tdir/egroup.spm.tar.xz" "vocab-eg" "svcf" "$empty_group"
     if sh "$SPM_BIN" --root "$root" install "$tdir/egroup.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "empty :group= accepted"
         return
     fi
-    local group_only='respawn:/bin/true :group=svc'
+    local group_only='svcg:respawn:/bin/true :group=svc'
     python_pkg_helper create_forbidden_service "$tdir/gonly.spm.tar.xz" "vocab-go" "svcg" "$group_only"
     if err=$(sh "$SPM_BIN" --root "$root" install "$tdir/gonly.spm.tar.xz" 2>&1 >/dev/null); then
         test_fail "F2 snippet vocabulary" "group-only snippet accepted"
@@ -2522,14 +2561,14 @@ test_snippet_vocabulary() {
     }
 
     # Old metacharacter rejection must still fire with the wider grammar.
-    local metachar='respawn:/bin/echo | sh'
+    local metachar='svcm:respawn:/bin/echo | sh'
     python_pkg_helper create_forbidden_service "$tdir/meta.spm.tar.xz" "vocab-meta" "svcm" "$metachar"
     if sh "$SPM_BIN" --root "$root" install "$tdir/meta.spm.tar.xz" >/dev/null 2>&1; then
         test_fail "F2 snippet vocabulary" "shell metacharacter accepted by widened grammar"
         return
     fi
 
-    test_pass "F2: eight valid keys, quoted args, vocabulary/hint, empty user/group, group-only and metachar rejection"
+    test_pass "F2: 3-field parity, nine valid keys, quoted args, vocabulary/hint, empty/zero user/group, and limit validation"
 }
 
 # -----------------------------------------------------------------------------
@@ -2706,7 +2745,7 @@ EOF
 
     # A validated snippet keeps its original mode (no in-validator chmod).
     mkdir -p "$src/x/usr/share/ninit/services"
-    printf 'respawn:/bin/true\n' > "$src/x/usr/share/ninit/services/v.service"
+    printf 'v:respawn:/bin/true\n' > "$src/x/usr/share/ninit/services/v.service"
     chmod 0600 "$src/x/usr/share/ninit/services/v.service"
     before="$(snapshot_source_tree "$src")"
     sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1 || {
@@ -2744,7 +2783,7 @@ EOF
 
     # Shared snippet vocabulary: legacy :deps= rejected with migration hint, and
     # colon inside quoted args rejected so snippets match ninit.c (F4 audit).
-    printf 'respawn:/bin/true :deps=base\n' > "$src/x/usr/share/ninit/services/v.service"
+    printf 'v:respawn:/bin/true :deps=base\n' > "$src/x/usr/share/ninit/services/v.service"
     if err=$(sh "$SPM_BIN" validate-source "$src" 2>&1 >/dev/null); then
         test_fail "X8 validate-source" "legacy :deps= snippet accepted"
         return
@@ -2753,12 +2792,518 @@ EOF
         test_fail "X8 validate-source" "vocabulary diagnostic lacks :requires= hint"
         return
     }
-    printf 'once:/bin/echo "hello :user=root"\n' > "$src/x/usr/share/ninit/services/v.service"
+    printf 'v:once:/bin/echo "hello :user=root"\n' > "$src/x/usr/share/ninit/services/v.service"
     if sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1; then
         test_fail "X8 validate-source" "colon inside quoted argument accepted"
         return
     fi
+    if ! sh "$SPM_BIN" validate-source "$REPO_ROOT/packages/ninit" >/dev/null 2>"$tdir/ninit.err"; then
+        test_fail "X8 validate-source" "packages/ninit failed validate-source: $(cat "$tdir/ninit.err")"
+        return
+    fi
     test_pass "X8: validate-source is read-only, shares symlink/snippet policy, rejects unsupported absolute links"
+}
+
+# -----------------------------------------------------------------------------
+# Regression P0-1: Symlinked ./x and ./.META rejection across install & validate-source
+# -----------------------------------------------------------------------------
+test_p0_symlink_root_rejection() {
+    local tdir="$TEST_TMP/p0_symlink_roots"
+    local root="$tdir/root"
+    local outside="$tdir/outside"
+    mkdir -p "$root" "$outside"
+    printf 'outside secret\n' > "$outside/secret.txt"
+    printf 'name=p0\nversion=1.0.0\narch=x86_64\ndescription=p0\n' > "$outside/package"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P0-1" "init failed"; return; }
+
+    # 1. Crafted archive with ./x -> $outside (and allowlisted /opt/ test)
+    python3 - "$tdir/symx.spm.tar.xz" "$outside" <<'PY'
+import sys, io, tarfile, lzma, hashlib
+out_path, outside = sys.argv[1:3]
+data = b"outside secret\n"
+sha = hashlib.sha256(data).hexdigest()
+pkg_txt = "name=p0-symx\nversion=1.0.0\nrelease=1\narch=x86_64\ndescription=p0\nbase=false\n"
+files_txt = "secret.txt\n"
+sha_txt = f"{sha}  secret.txt\n"
+buf = io.BytesIO()
+with lzma.open(buf, "wb") as xz:
+    with tarfile.open(fileobj=xz, mode="w") as tf:
+        for n, c in [("./.META/package", pkg_txt), ("./.META/files", files_txt), ("./.META/sha256", sha_txt), ("./.META/depends", "")]:
+            b = c.encode()
+            ti = tarfile.TarInfo(n)
+            ti.size = len(b)
+            ti.mode = 0o644
+            tf.addfile(ti, io.BytesIO(b))
+        ti = tarfile.TarInfo("./x")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = outside
+        tf.addfile(ti)
+with open(out_path, "wb") as f:
+    f.write(buf.getvalue())
+PY
+    if "$SPM_BIN" install "$tdir/symx.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P0-1" "Archive with symlinked ./x was accepted"
+        return
+    fi
+    if [ ! -f "$outside/secret.txt" ] || [ -e "$root/secret.txt" ]; then
+        test_fail "P0-1" "Symlinked ./x moved or leaked outside file!"
+        return
+    fi
+
+    # 2. Crafted archive with ./x -> /opt/ (matches ALLOWED prefix) + python3 hidden from PATH
+    python3 - "$tdir/symx_opt.spm.tar.xz" <<'PY'
+import sys, io, tarfile, lzma
+out_path = sys.argv[1]
+pkg_txt = "name=p0-symx-opt\nversion=1.0.0\nrelease=1\narch=x86_64\ndescription=p0\nbase=false\n"
+buf = io.BytesIO()
+with lzma.open(buf, "wb") as xz:
+    with tarfile.open(fileobj=xz, mode="w") as tf:
+        for n, c in [("./.META/package", pkg_txt), ("./.META/files", "foo\n"), ("./.META/sha256", ""), ("./.META/depends", "")]:
+            b = c.encode()
+            ti = tarfile.TarInfo(n)
+            ti.size = len(b)
+            ti.mode = 0o644
+            tf.addfile(ti, io.BytesIO(b))
+        ti = tarfile.TarInfo("./x")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = "/opt/"
+        tf.addfile(ti)
+with open(out_path, "wb") as f:
+    f.write(buf.getvalue())
+PY
+    mkdir -p "$tdir/nopy"
+    for tool in sh awk sed grep sort uniq comm cat rm mv cp mkdir rmdir mktemp tar xz sha256sum find stat readlink realpath flock tr cut head dirname basename printf cmp touch; do
+        tpath="$(command -v "$tool" || true)"
+        [ -n "$tpath" ] && ln -sf "$tpath" "$tdir/nopy/$tool"
+    done
+    if PATH="$tdir/nopy" "$SPM_BIN" install "$tdir/symx_opt.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P0-1" "Archive with ./x -> /opt/ accepted in non-python fallback"
+        return
+    fi
+
+    # 3. Crafted archive with ./.META -> $outside symlink
+    python3 - "$tdir/symmeta.spm.tar.xz" "$outside" <<'PY'
+import sys, io, tarfile, lzma
+out_path, outside = sys.argv[1:3]
+buf = io.BytesIO()
+with lzma.open(buf, "wb") as xz:
+    with tarfile.open(fileobj=xz, mode="w") as tf:
+        ti = tarfile.TarInfo("./.META")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = outside
+        tf.addfile(ti)
+        d = tarfile.TarInfo("./x")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tf.addfile(d)
+with open(out_path, "wb") as f:
+    f.write(buf.getvalue())
+PY
+    if "$SPM_BIN" install "$tdir/symmeta.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P0-1" "Archive with symlinked ./.META was accepted"
+        return
+    fi
+
+    # 4. Symlinked subdir ./x/sub -> /opt/ AND member ./x/sub/evil inside same archive
+    python3 - "$tdir/symdir_member.spm.tar.xz" <<'PY'
+import sys, io, tarfile, lzma, hashlib
+out_path = sys.argv[1]
+data = b"evil\n"
+sha = hashlib.sha256(data).hexdigest()
+pkg_txt = "name=p0-subdir\nversion=1.0.0\nrelease=1\narch=x86_64\ndescription=p0\nbase=false\n"
+buf = io.BytesIO()
+with lzma.open(buf, "wb") as xz:
+    with tarfile.open(fileobj=xz, mode="w") as tf:
+        for n, c in [("./.META/package", pkg_txt), ("./.META/files", "sub\nsub/evil\n"), ("./.META/sha256", f"{sha}  sub/evil\n"), ("./.META/depends", "")]:
+            b = c.encode()
+            ti = tarfile.TarInfo(n)
+            ti.size = len(b)
+            ti.mode = 0o644
+            tf.addfile(ti, io.BytesIO(b))
+        ti = tarfile.TarInfo("./x/sub")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = "/opt/nonexistent-p0"
+        tf.addfile(ti)
+        ti2 = tarfile.TarInfo("./x/sub/evil")
+        ti2.size = len(data)
+        ti2.mode = 0o644
+        tf.addfile(ti2, io.BytesIO(data))
+with open(out_path, "wb") as f:
+    f.write(buf.getvalue())
+PY
+    if "$SPM_BIN" install "$tdir/symdir_member.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P0-1" "Archive with member beneath symlink path accepted"
+        return
+    fi
+
+    # 5. validate-source must reject symlinked x and symlinked .META
+    local vsrc1="$tdir/vsrc1" vsrc2="$tdir/vsrc2"
+    mkdir -p "$vsrc1/.META" "$vsrc2/x/usr/bin"
+    printf 'name=v1\nversion=1.0.0\narch=x86_64\ndescription=v1\n' > "$vsrc1/.META/package"
+    ln -s "$outside" "$vsrc1/x"
+    if "$SPM_BIN" validate-source "$vsrc1" >/dev/null 2>&1; then
+        test_fail "P0-1" "validate-source accepted symlinked x/"
+        return
+    fi
+    printf 't\n' > "$vsrc2/x/usr/bin/t"
+    ln -s "$outside" "$vsrc2/.META"
+    if "$SPM_BIN" validate-source "$vsrc2" >/dev/null 2>&1; then
+        test_fail "P0-1" "validate-source accepted symlinked .META/"
+        return
+    fi
+
+    test_pass "P0-1: symlinked ./x, ./.META, and nested symlink-parent archives rejected in install & validate-source"
+}
+
+# -----------------------------------------------------------------------------
+# Regression P1-10: BusyBox tar -tvf hardlink bypass & st_nlink > 1 rejection
+# -----------------------------------------------------------------------------
+test_busybox_hardlink_and_nlink_rejection() {
+    local tdir="$TEST_TMP/p1_10_hardlink"
+    local root="$tdir/root"
+    mkdir -p "$root" "$tdir/bin_nopy" "$tdir/bin_bb" "$tdir/bin_bypass"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P1-10" "init failed"; return; }
+
+    local pkg="$tdir/hl.spm.tar.xz"
+    python_pkg_helper create_hardlink "$pkg" "hl-pkg" "./x/usr/bin/tool-link" "./x/usr/bin/tool"
+
+    local tool tpath
+    for tool in sh awk sed grep sort uniq comm cat rm mv cp mkdir rmdir mktemp xz sha256sum find stat readlink realpath flock tr cut head dirname basename printf cmp touch; do
+        tpath="$(command -v "$tool" || true)"
+        [ -n "$tpath" ] && ln -sf "$tpath" "$tdir/bin_nopy/$tool"
+    done
+    cp -a "$tdir/bin_nopy/." "$tdir/bin_bb/"
+    cp -a "$tdir/bin_nopy/." "$tdir/bin_bypass/"
+
+    # A. Simulated BusyBox tar -tvf output ('-rw-r--r-- ... -> target') with python3 absent
+    local real_tar
+    real_tar="$(command -v tar)"
+    cat > "$tdir/bin_nopy/tar" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "-tvf" ]; then
+    printf '%s\n' '-rw-r--r-- 0/0        10 1970-01-01 00:00:00 ./x/usr/bin/tool'
+    printf '%s\n' '-rw-r--r-- 0/0         0 1970-01-01 00:00:00 ./x/usr/bin/tool-link -> /etc/passwd'
+    exit 0
+fi
+exec "$real_tar" "\$@"
+EOF
+    chmod 0755 "$tdir/bin_nopy/tar"
+    local rc_a=0 err_a=""
+    err_a="$(PATH="$tdir/bin_nopy" "$SPM_BIN" install "$pkg" --root "$root" 2>&1)" || rc_a=$?
+    if [ "$rc_a" -ne 1 ] || ! printf '%s\n' "$err_a" | grep -qi "hard link"; then
+        test_fail "P1-10" "BusyBox tar -tvf '-... -> target' hardlink not rejected (rc=$rc_a, err=$err_a)"
+        return
+    fi
+
+    # B. Real BusyBox tar with python3 absent (if repo/host busybox available)
+    local bb="$REPO_ROOT/packages/busybox/x/bin/busybox"
+    [ -x "$bb" ] || bb="$(command -v busybox || true)"
+    if [ -x "$bb" ]; then
+        cat > "$tdir/bin_bb/tar" <<EOF
+#!/bin/sh
+exec "$bb" tar "\$@"
+EOF
+        chmod 0755 "$tdir/bin_bb/tar"
+        local rc_b=0
+        PATH="$tdir/bin_bb" "$SPM_BIN" install "$pkg" --root "$root" >/dev/null 2>&1 || rc_b=$?
+        if [ "$rc_b" -ne 1 ]; then
+            test_fail "P1-10" "Real BusyBox tar allowed hardlink archive when python3 absent"
+            return
+        fi
+    fi
+
+    # C. Post-extraction st_nlink > 1 check when pre-extraction tar -tvf and python3 are bypassed
+    cat > "$tdir/bin_bypass/tar" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "-tvf" ]; then
+    printf '%s\n' '-rw-r--r-- 0/0        10 1970-01-01 00:00:00 ./x/usr/bin/tool'
+    exit 0
+fi
+exec "$real_tar" "\$@"
+EOF
+    chmod 0755 "$tdir/bin_bypass/tar"
+    local rc_c=0 err_c=""
+    err_c="$(PATH="$tdir/bin_bypass" "$SPM_BIN" install "$pkg" --root "$root" 2>&1)" || rc_c=$?
+    if [ "$rc_c" -ne 1 ] || ! printf '%s\n' "$err_c" | grep -qi "hard link"; then
+        test_fail "P1-10" "Post-extraction st_nlink > 1 check did not reject hardlink (rc=$rc_c, err=$err_c)"
+        return
+    fi
+
+    test_pass "P1-10: BusyBox tar -tvf hardlink bypass & post-extract st_nlink > 1 verification closed"
+}
+
+# -----------------------------------------------------------------------------
+# Regression P1-11 + P2#11/#12: Journal SIGKILL safety, post-commit sentinel, SIGTERM rollback shield
+# -----------------------------------------------------------------------------
+test_journal_sigkill_and_signal_safety() {
+    local tdir="$TEST_TMP/p1_11_journal"
+    local root="$tdir/root"
+    mkdir -p "$root" "$tdir/bin"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P1-11" "init failed"; return; }
+
+    local pkg_keep="$tdir/keep.spm.tar.xz"
+    local pkg_v1="$tdir/upg-v1.spm.tar.xz"
+    local pkg_v2="$tdir/upg-v2.spm.tar.xz"
+    python_pkg_helper create_valid "$pkg_keep" "keep-pkg" "1.0.0" "false" "Keep DB intact" "usr/bin/keep:keep-bytes"
+    python_pkg_helper create_valid "$pkg_v1" "sig-pkg" "1.0.0" "false" "v1" "usr/bin/sig:v1-bytes"
+    python_pkg_helper create_valid "$pkg_v2" "sig-pkg" "2.0.0" "false" "v2" "usr/bin/sig:v2-bytes"
+
+    "$SPM_BIN" install "$pkg_keep" --root "$root" >/dev/null 2>&1 || { test_fail "P1-11" "keep install failed"; return; }
+    "$SPM_BIN" install "$pkg_v1" --root "$root" >/dev/null 2>&1 || { test_fail "P1-11" "sig v1 install failed"; return; }
+
+    # 1. Interrupted snapshot prep (.journal.prep without .journal) must NOT wipe existing DB!
+    local prep_tx="$root/var/lib/spm/staging/tx-interrupted-1111"
+    mkdir -p "$prep_tx/.journal.prep/backup"
+    "$SPM_BIN" list --root "$root" >/dev/null 2>&1 || true
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P1-11" "init recovery failed"; return; }
+    if [ -d "$prep_tx" ]; then
+        test_fail "P1-11" "Leftover .journal.prep tx dir was not cleaned"
+        return
+    fi
+    if ! grep -q "keep-pkg" "$root/var/lib/spm/providers" || ! grep -qx "keep-pkg" "$root/var/lib/spm/world"; then
+        test_fail "P1-11" "Pre-journal interruption wiped existing SPM DB!"
+        return
+    fi
+
+    # 2. Interrupted post-commit cleanup (.committed present, .journal gone) must NOT roll back committed package!
+    local done_tx="$root/var/lib/spm/staging/tx-keep-pkg-2222"
+    mkdir -p "$done_tx/.committed/backup" "$done_tx/.META"
+    printf '%s/usr/bin/keep\n' "$root" > "$done_tx/.committed/created"
+    printf 'name=keep-pkg\nversion=1.0.0\nrelease=1\narch=x86_64\ndescription=Keep\nbase=false\n' > "$done_tx/.META/package"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P1-11" "post-commit init failed"; return; }
+    if [ ! -f "$root/usr/bin/keep" ] || [ -d "$done_tx" ]; then
+        test_fail "P1-11" "Post-commit .committed tx incorrectly rolled back or left residue!"
+        return
+    fi
+
+    # 3. Incomplete legacy .journal lacking providers/no_providers must NOT wipe other packages' DB
+    local inc_tx="$root/var/lib/spm/staging/tx-incomplete-3333"
+    mkdir -p "$inc_tx/.journal/backup" "$inc_tx/.META"
+    printf 'name=incomplete-pkg\n' > "$inc_tx/.META/package"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P1-11" "incomplete journal init failed"; return; }
+    if ! grep -q "keep-pkg" "$root/var/lib/spm/providers" || ! grep -qx "keep-pkg" "$root/var/lib/spm/world"; then
+        test_fail "P1-11" "Incomplete journal without negative sentinel wiped existing DB!"
+        return
+    fi
+
+    # 4. SIGTERM arriving during do_rollback must NOT abort rollback or delete journal mid-flight
+    local real_mv
+    real_mv="$(command -v mv)"
+    cat > "$tdir/bin/mv" <<'SHIM'
+#!/bin/sh
+last=""
+for arg in "$@"; do last="$arg"; done
+if [ -n "${SPM_FAIL_ONCE:-}" ] && [ ! -f "${SPM_FAIL_ONCE}.done" ]; then
+    case "$last" in
+        "$SPM_ROOT"/usr/bin/sig)
+            touch "${SPM_FAIL_ONCE}.done"
+            exit 1
+            ;;
+    esac
+fi
+if [ -n "${SPM_TERM_ON_RB:-}" ] && [ -f "${SPM_FAIL_ONCE}.done" ] && [ ! -f "${SPM_TERM_ON_RB}.done" ]; then
+    case "$last" in
+        "$SPM_ROOT"/usr/bin/sig)
+            touch "${SPM_TERM_ON_RB}.done"
+            kill -TERM "$PPID" 2>/dev/null || true
+            ;;
+    esac
+fi
+exec "$SPM_REAL_MV" "$@"
+SHIM
+    chmod 0755 "$tdir/bin/mv"
+
+    if PATH="$tdir/bin:$PATH" SPM_ROOT="$root" SPM_REAL_MV="$real_mv" \
+       SPM_FAIL_ONCE="$tdir/fail_once" SPM_TERM_ON_RB="$tdir/term_rb" \
+       "$SPM_BIN" install "$pkg_v2" --root "$root" >/dev/null 2>&1; then
+        test_fail "P1-11" "Injected commit failure unexpectedly succeeded"
+        return
+    fi
+    if [ ! -f "$tdir/term_rb.done" ]; then
+        test_fail "P1-11" "SIGTERM during rollback shim did not trigger"
+        return
+    fi
+    if [ "$(cat "$root/usr/bin/sig" 2>/dev/null || true)" != "v1-bytes" ] ||
+       [ "$(cat "$root/var/lib/spm/installed/sig-pkg/version" 2>/dev/null || true)" != "1.0.0-1" ]; then
+        test_fail "P1-11" "SIGTERM during do_rollback corrupted restored file or DB version"
+        return
+    fi
+
+    test_pass "P1-11: atomic journal prep, post-commit sentinel, negative DB sentinels, and SIGTERM-shielded rollback"
+}
+
+# -----------------------------------------------------------------------------
+# Regression P1-12: mv -fT & non-dir destination leaf symlink-to-dir / dir checks
+# -----------------------------------------------------------------------------
+test_mv_ft_and_leaf_conflict() {
+    local tdir="$TEST_TMP/p1_12_mv_ft"
+    local root="$tdir/root"
+    local outside="$tdir/outside"
+    mkdir -p "$root/usr/bin" "$outside/target_dir"
+    printf 'original-outside-file\n' > "$outside/target_file"
+
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "P1-12" "init failed"; return; }
+
+    # 1. Pre-existing symlink-to-directory at non-dir leaf with base=true -> must reject & not write inside outside/target_dir
+    ln -s "$outside/target_dir" "$root/usr/bin/leaf"
+    python_pkg_helper create_valid "$tdir/base-leaf.spm.tar.xz" "base-leaf" "1.0.0" "true" "Base leaf test" \
+        "usr/bin/leaf:escaped-payload"
+    if "$SPM_BIN" install "$tdir/base-leaf.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P1-12" "base=true package accepted destination symlink-to-directory"
+        return
+    fi
+    if [ -e "$outside/target_dir/leaf" ]; then
+        test_fail "P1-12" "mv wrote payload INSIDE outside symlinked directory!"
+        return
+    fi
+    rm -f "$root/usr/bin/leaf"
+
+    # 2. Pre-existing real directory at non-dir leaf -> must reject cleanly
+    mkdir -p "$root/usr/bin/leaf"
+    if "$SPM_BIN" install "$tdir/base-leaf.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P1-12" "base=true package accepted destination real directory"
+        return
+    fi
+    rmdir "$root/usr/bin/leaf"
+
+    # 3. Pre-existing symlink-to-regular-file at non-dir leaf with base=true -> mv -fT replaces symlink without writing outside file
+    ln -s "$outside/target_file" "$root/usr/bin/leaf"
+    if ! "$SPM_BIN" install "$tdir/base-leaf.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "P1-12" "base=true package failed on valid symlink-to-file replacement"
+        return
+    fi
+    if [ -L "$root/usr/bin/leaf" ] || [ "$(cat "$outside/target_file")" != "original-outside-file" ]; then
+        test_fail "P1-12" "mv -fT failed to atomically replace symlink-to-file or touched target"
+        return
+    fi
+
+    test_pass "P1-12: mv -fT and non-dir destination leaf symlink-to-dir / dir conflict enforcement"
+}
+
+# -----------------------------------------------------------------------------
+# Regression Cross-Seam: BusyBox realpath compat, pkg-name traversal, dep sync, 0600 install
+# -----------------------------------------------------------------------------
+test_cross_seam_compat_and_deps() {
+    local tdir="$TEST_TMP/cross_seam"
+    local root="$tdir/root"
+    mkdir -p "$root" "$tdir/cwd" "$tdir/bin_bb"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 || { test_fail "Cross-seam" "init failed"; return; }
+
+    # 1. BusyBox realpath without -q (even when a file named '-q' exists in CWD)
+    local bb="$REPO_ROOT/packages/busybox/x/bin/busybox"
+    [ -x "$bb" ] || bb="$(command -v busybox || true)"
+    if [ -x "$bb" ]; then
+        printf 'trap\n' > "$tdir/cwd/-q"
+        mkdir -p "$root/opt/real"
+        ln -s "$root/opt/real" "$root/opt/link"
+        cat > "$tdir/bin_bb/realpath" <<EOF
+#!/bin/sh
+exec "$bb" realpath "\$@"
+EOF
+        chmod 0755 "$tdir/bin_bb/realpath"
+        # First verify internal symlink passes destination-root realpath check even with '-q' in CWD
+        # (reaches directory-vs-symlink conflict check rather than failing symlink escape!)
+        python_pkg_helper create_valid "$tdir/symparent.spm.tar.xz" "symparent" "1.0.0" "false" "Internal sym parent" \
+            "opt/link/data.txt:ok"
+        local rp_err=""
+        rp_err="$(cd "$tdir/cwd" && PATH="$tdir/bin_bb:$PATH" "$SPM_BIN" install "$tdir/symparent.spm.tar.xz" --root "$root" 2>&1 || true)"
+        if printf '%s\n' "$rp_err" | grep -qi "Symlink escape attack\|cannot be resolved"; then
+            test_fail "Cross-seam" "BusyBox realpath compat failed with '-q' in CWD: $rp_err"
+            return
+        fi
+        # And escaping symlink still gets caught by realpath without -q
+        local out_escape="$tdir/outside_rp"
+        mkdir -p "$out_escape"
+        ln -s "$out_escape" "$root/opt/esclink"
+        python_pkg_helper create_valid "$tdir/symesc.spm.tar.xz" "symesc" "1.0.0" "false" "Escaping sym parent" \
+            "opt/esclink/data.txt:bad"
+        local rp_esc_err=""
+        rp_esc_err="$(cd "$tdir/cwd" && PATH="$tdir/bin_bb:$PATH" "$SPM_BIN" install "$tdir/symesc.spm.tar.xz" --root "$root" 2>&1 || true)"
+        if ! printf '%s\n' "$rp_esc_err" | grep -qi "Symlink escape attack"; then
+            test_fail "Cross-seam" "BusyBox realpath failed to catch outside symlink: $rp_esc_err"
+            return
+        fi
+    fi
+
+    # 2. cmd_remove / cmd_info path-traversal pkg-name rejection
+    mkdir -p "$root/var/lib/spm/rdeps/keepme"
+    if "$SPM_BIN" remove "../rdeps" --root "$root" >/dev/null 2>&1; then
+        test_fail "Cross-seam" "spm remove accepted '../rdeps' traversal!"
+        return
+    fi
+    if [ ! -d "$root/var/lib/spm/rdeps/keepme" ]; then
+        test_fail "Cross-seam" "spm remove deleted '../rdeps'!"
+        return
+    fi
+    if "$SPM_BIN" info "../installed" --root "$root" >/dev/null 2>&1; then
+        test_fail "Cross-seam" "spm info accepted '../installed' traversal!"
+        return
+    fi
+
+    # 3. Manifest dependencies= enforcement when .META/depends is empty, plus mismatch rejection
+    python3 - "$tdir/mdep.spm.tar.xz" "$tdir/mismatch.spm.tar.xz" <<'PY'
+import sys, io, tarfile, lzma, hashlib
+for out_path, deps_txt in [(sys.argv[1], ""), (sys.argv[2], "other-pkg\n")]:
+    data = b"tool\n"
+    sha = hashlib.sha256(data).hexdigest()
+    pkg_txt = "name=mdep-app\nversion=1.0.0\nrelease=1\narch=x86_64\ndescription=mdep\ndependencies=req-base\nbase=false\n"
+    buf = io.BytesIO()
+    with lzma.open(buf, "wb") as xz:
+        with tarfile.open(fileobj=xz, mode="w") as tf:
+            for n, c in [("./.META/package", pkg_txt), ("./.META/files", "usr/\nusr/bin/\nusr/bin/mtool\n"),
+                         ("./.META/sha256", f"{sha}  usr/bin/mtool\n"), ("./.META/depends", deps_txt)]:
+                b = c.encode()
+                ti = tarfile.TarInfo(n)
+                ti.size = len(b)
+                ti.mode = 0o644
+                tf.addfile(ti, io.BytesIO(b))
+            for d in ["./x/usr", "./x/usr/bin"]:
+                ti = tarfile.TarInfo(d)
+                ti.type = tarfile.DIRTYPE
+                ti.mode = 0o755
+                tf.addfile(ti)
+            ti = tarfile.TarInfo("./x/usr/bin/mtool")
+            ti.size = len(data)
+            ti.mode = 0o755
+            tf.addfile(ti, io.BytesIO(data))
+    with open(out_path, "wb") as f:
+        f.write(buf.getvalue())
+PY
+    if "$SPM_BIN" install "$tdir/mdep.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "Cross-seam" "spm installed package with missing manifest dependencies=req-base"
+        return
+    fi
+    python_pkg_helper create_valid "$tdir/reqbase.spm.tar.xz" "req-base" "1.0.0" "false" "req" "usr/lib/libreq.a:req"
+    "$SPM_BIN" install "$tdir/reqbase.spm.tar.xz" --root "$root" >/dev/null 2>&1 || { test_fail "Cross-seam" "req-base failed"; return; }
+    if "$SPM_BIN" install "$tdir/mismatch.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "Cross-seam" "spm accepted mismatched dependencies= vs .META/depends"
+        return
+    fi
+    if ! "$SPM_BIN" install "$tdir/mdep.spm.tar.xz" --root "$root" >/dev/null 2>&1; then
+        test_fail "Cross-seam" "spm failed to install mdep-app once req-base was installed"
+        return
+    fi
+    if "$SPM_BIN" remove "req-base" --root "$root" >/dev/null 2>&1; then
+        test_fail "Cross-seam" "rdeps from manifest dependencies= did not block removal of req-base"
+        return
+    fi
+
+    # 4. End-to-end 0600 permission preservation from build-package.sh through spm install
+    local src06="$tdir/src06" out06="$tdir/out06"
+    mkdir -p "$src06/x/etc" "$src06/.META" "$out06"
+    printf 'name=conf0600\nversion=1.0.0\narch=x86_64\ndescription=0600\n' > "$src06/.META/package"
+    printf 'permit persist :wheel\n' > "$src06/x/etc/doas.conf"
+    chmod 0600 "$src06/x/etc/doas.conf"
+    "$REPO_ROOT/scripts/build-package.sh" --source "$src06" --output "$out06" >/dev/null 2>&1 || { test_fail "Cross-seam" "build 0600 pkg failed"; return; }
+    "$SPM_BIN" install "$out06/conf0600-1.0.0-1-x86_64.spm.tar.xz" --root "$root" >/dev/null 2>&1 || { test_fail "Cross-seam" "install 0600 pkg failed"; return; }
+    if [ "$(stat -c %a "$root/etc/doas.conf")" != "600" ]; then
+        test_fail "Cross-seam" "Installed doas.conf lost 0600 permissions (got $(stat -c %a "$root/etc/doas.conf"))"
+        return
+    fi
+
+    test_pass "Cross-seam: BusyBox realpath compat, pkg-name traversal guard, dep sync, and 0600 E2E install"
 }
 
 # -----------------------------------------------------------------------------
@@ -2808,6 +3353,11 @@ main() {
     test_doas_reject_privilege_changes
     test_doas_fresh_stays_unprivileged
     test_validate_source_readonly
+    test_p0_symlink_root_rejection
+    test_busybox_hardlink_and_nlink_rejection
+    test_journal_sigkill_and_signal_safety
+    test_mv_ft_and_leaf_conflict
+    test_cross_seam_compat_and_deps
 
     printf '\n==================================================\n'
     printf 'SPM Test Suite Summary: %d passed, %d failed\n' "$PASSED_COUNT" "$FAILED_COUNT"

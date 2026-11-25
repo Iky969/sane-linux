@@ -24,12 +24,12 @@ cek getpid()==1  ->  umask(022)  ->  blokir sinyal + sigemptyset(&orig)
    ->  mount_fstab()                pasang filesystem dari /etc/fstab
    ->  buka /var/log/ninit.log, cetak banner
    ->  set_hostname()               dari /etc/hostname
-   ->  parse_config(argv[1] atau /etc/init.conf)   gagal => rescue shell /bin/sh
-   ->  validate_dependencies()      dependensi hilang => rescue shell /bin/sh
-   ->  sort_services()              urut topologis; siklus => rescue shell /bin/sh
-   ->  setup_initctl() / run/initctl, setup_log_fifo() /run/log.fifo
+   ->  parse_config(argv[1] atau /etc/init.conf)   gagal atau 0 layanan => supervised rescue loop
+   ->  validate_dependencies()      dependensi hilang => supervised rescue loop
+   ->  sort_services()              urut topologis; siklus => supervised rescue loop
+   ->  setup_initctl() /run/initctl, setup_log_fifo() /run/log.fifo
    ->  spawn_service() untuk semua layanan
-   ->  log "main loop siap"  ->  for (;;) event loop
+   ->  log "main loop siap"  ->  for (;;) event loop   (gagal + :on_fail=rescue => supervised rescue loop)
 ```
 
 Catatan urutan: `mount_fstab()` sengaja dipanggil **sebelum** file log dibuka,
@@ -37,22 +37,27 @@ jadi pesan fstab hanya terlihat di console dan `/dev/kmsg`.
 
 ### Rescue mode (`enter_rescue_mode`)
 
-Tiga jalur menyerahkan sistem ke shell darurat: config tidak terbaca
-(`parse_config()` gagal), ada `:requires=` yang menunjuk layanan tak dikenal, dan
-siklus dependensi. Semuanya lewat satu helper `enter_rescue_mode(reason)` yang:
+Lima jalur menyerahkan sistem ke supervised rescue mode: config tidak terbaca
+(`parse_config()` gagal), nol layanan valid terdaftar, ada `:requires=` yang
+menunjuk layanan tak dikenal, siklus dependensi, dan kegagalan terminal
+(`SVC_STATE_FAILED`) pada layanan beropsi `:on_fail=rescue`. Semuanya lewat satu
+helper `enter_rescue_mode(reason)` yang:
 
-1. menulis alasan + `Masuk rescue mode (shell).` ke log;
-2. mengosongkan signal mask PID 1 (`sigprocmask(SIG_SETMASK, &empty, NULL)`) —
-   `main()` memblokir `SIGINT`/`SIGTERM`/`SIGCHLD`/`SIGUSR1`/`SIGUSR2` untuk
-   `ppoll`, dan tanpa reset ini rescue shell tidak akan pernah menerima Ctrl+C;
-3. mereset disposisi `SIGPIPE` ke `SIG_DFL` — `main()` memasang `signal(SIGPIPE, SIG_IGN)`
-   untuk PID 1, dan tanpa reset ini rescue shell mewarisi `SIG_IGN` sehingga utilitas
-   pipeline shell (`yes | head -n 1`) gagal rusak;
-4. `execl("/bin/sh", "sh", NULL)` menggantikan PID 1; bila gagal, `_exit(1)`.
+1. menulis alasan + `Entering rescue mode (shell).` ke log;
+2. memanggil `ensure_rescue_fds()` untuk menyiapkan/mempertahankan deskriptor
+   `/run/initctl` dan `/run/log.fifo` (`O_CLOEXEC`), sehingga kendali
+   `/run/initctl` tetap hidup tanpa membocorkan FD ke proses shell;
+3. masuk ke `rescue_loop()` sebagai PID 1 (tanpa pernah memanggil `_exit()`),
+   men-fork `/bin/sh` terawasi yang mengosongkan signal mask anak
+   (`sigprocmask(SIG_SETMASK, &empty, NULL)`) dan mereset `SIGPIPE` serta
+   `SIGCHLD` ke `SIG_DFL` sebelum `execl("/bin/sh", "sh", NULL)`;
+4. memanen semua zombie sambil membatasi respawn shell (`MAX_RESCUE_RESPAWN = 3`,
+   `RESCUE_RESPAWN_COOLDOWN_MS = 2000`, `RESCUE_STABLE_MS = 10000` atau `2000` di
+   `NINIT_TESTING`) dan tetap memproses perintah shutdown/reboot di `/run/initctl`.
 
-Helper ini tidak pernah kembali, jadi tidak ada jalur boot yang berlanjut dengan
-state setengah jadi (dulu `parse_config()` gagal hanya di-log dan boot lanjut
-dengan nol layanan). Diuji oleh bagian 4 `scripts/test-config.sh`.
+Dengan demikian PID 1 tidak pernah keluar menjadi kernel panic dan tidak ada
+jalur boot yang berlanjut setengah jadi. Diuji oleh `scripts/test-config.sh`
+(skenario `2d`/`2e` dan bagian `4`) serta `scripts/qemu_lifecycle.py` Skenario 9.
 
 ## Event loop
 
@@ -101,12 +106,13 @@ Poin penting:
   berjalan paling banyak 1× per detik (untuk timeout `once`).
 - `errno` disimpan tepat setelah `ppoll` (`perr`) supaya cabang error tidak salah
   terpicu oleh `errno` yang berubah karena panggilan log.
-- Perintah `/run/initctl` dibaca sekali lalu dipecah **per baris**
-  (`strtok(cmd, "\n")`, spasi/`\r` di ujung dipangkas, baris kosong dilewati).
-  Perintah penutup langsung memanggil `shutdown_all()` dan tidak pernah kembali ke
-  loop, jadi pembacaan berhenti di situ; tetapi baris sebelum perintah penutup
-  tidak lagi hilang seperti pada parser lama yang memotong buffer di newline
-  pertama.
+- Perintah `/run/initctl` diproses **per baris** lewat parser streaming
+  `initctl_parse_stream()` (`MAX_LINE = 1024`, baris melebihi 1023 byte dibuang;
+  spasi/`\r` di ujung dipangkas, baris kosong dilewati). Mendukung `poweroff`,
+  `reboot`, `force-poweroff`, `force-reboot`, `stop <svc>`, `start <svc>`,
+  `restart <svc>`, dan `status [svc]`. Perintah penutup langsung memanggil
+  `shutdown_all()` sehingga baris sesudahnya tidak dieksekusi, sementara baris
+  di depannya tetap diproses satu per satu.
 
 ## Manajemen layanan
 
@@ -118,8 +124,8 @@ Poin penting:
    `ppoll` di loop utama yang akan memanggilnya lagi.
 3. Siapkan pipe sinkronisasi searah (`int sync_pipe[2]`) sebelum `fork()` menggunakan
    `pipe2(sync_pipe, O_CLOEXEC)` (dengan fallback ke `pipe()` + `fcntl(FD_CLOEXEC)`).
-   Bila pembuatan pipe gagal, ninit mencatat peringatan dan melanjutkan spawn
-   langsung tanpa handshake sinkronisasi.
+   Bila pembuatan pipe gagal, spawn dibatalkan dan dicoba ulang hingga batas
+   `MAX_SPAWN_RETRY = 3` sebelum layanan ditandai `SVC_STATE_FAILED`.
 4. `fork()`; di proses anak:
    - Tutup ujung tulis pipe sinkronisasi (`sync_pipe[1]`).
    - `setsid()` untuk membentuk session baru.
@@ -131,8 +137,9 @@ Poin penting:
    - **Handshake Sinkronisasi Pre-Exec**: Anak memblokir pembacaan pada `sync_pipe[0]`
      (`read(sync_pipe[0], &sync_byte, 1)`) menunggu konfirmasi bahwa parent telah
      selesai menyiapkan hierarki cgroup dan memasukkan PID anak ke `cgroup.procs`.
-     Setelah menerima byte sinkronisasi atau mendeteksi EOF (pipe ditutup), anak menutup
-     `sync_pipe[0]` dan mengeksekusi `execl("/bin/sh", "sh", "-c", cmd)`. Bila exec gagal, `_exit(127)`.
+     Anak wajib menerima byte `'1'` dari induk (bila gagal atau EOF sebelum `'1'`,
+     anak langsung `_exit(127)` tanpa menjalankan `execl`), menutup `sync_pipe[0]`,
+     dan mengeksekusi `execl("/bin/sh", "sh", "-c", cmd)`. Bila exec gagal, `_exit(127)`.
 5. Di proses induk:
    - Tutup ujung baca pipe sinkronisasi (`sync_pipe[0]`).
    - Simpan `svc->pid = pid`, `svc->pgid = pid`, `svc->state = SVC_STATE_RUNNING`, reset `svc->spawn_tries = 0`.
@@ -265,9 +272,9 @@ Detail yang penting untuk yang menyentuh fungsi ini:
 |---|---|---|
 | Set `shutting_down = 1` | ✅ | ✅ |
 | Kirim `SIGTERM` ke semua layanan | ✅ | — |
-| Tunggu sampai 50 × 100 ms (maks 5 detik): `reap_zombies()` + `drain_log_fifo()` tiap iterasi | ✅ | — |
+| Tunggu sesuai `:grace=N` per layanan (default 5 detik, rentang `0`–`3600` detik): `reap_zombies()` + `drain_log_fifo()` | ✅ | — |
 | `SIGKILL` ke sisa layanan | ✅ | langsung |
-| Remount `/` read-only + `umount2(MNT_DETACH)` entri fstab yang dicatat | ✅ | ✅ |
+| `umount2(..., MNT_DETACH)` entri fstab (urutan terbalik) lalu remount `/` read-only | ✅ | ✅ |
 | `sync()` → `reboot(cmd)` → `while(1) pause()` | ✅ | ✅ |
 
 `cmd` adalah `RB_POWER_OFF` (SIGTERM/USR1) atau `RB_AUTOBOOT` (SIGINT/USR2).

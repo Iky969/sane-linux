@@ -53,6 +53,15 @@ KERNEL=${KERNEL:-}
 KERNEL_MODE=${KERNEL_MODE:-auto}
 ALPINE_BRANCH=${ALPINE_BRANCH:-v3.20}
 ALPINE_FLAVOR=${ALPINE_FLAVOR:-virt}
+ALPINE_RELEASE=${ALPINE_RELEASE:-3.20.10}
+KERNEL_PINNED_SHA256="be523954ad673a78c9cdfd3d473a8d39609f5901adfcc68402c67dc037a64c7e"
+if [ "${KERNEL_SHA256+set}" != "set" ]; then
+	if [ "$ALPINE_BRANCH" = "v3.20" ] && [ "$ALPINE_FLAVOR" = "virt" ] && [ "$ALPINE_RELEASE" = "3.20.10" ]; then
+		KERNEL_SHA256="$KERNEL_PINNED_SHA256"
+	else
+		KERNEL_SHA256=""
+	fi
+fi
 SECS=${SECS:-}
 MEM=${MEM:-256}
 NO_REBOOT=${NO_REBOOT:-1}
@@ -63,6 +72,12 @@ log()  { printf '== %s\n' "$1"; }
 info() { printf '   %s\n' "$1"; }
 die()  { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "tool '$1' not found${2:+ ($2)}"; }
+
+if [ -n "$SECS" ]; then
+	case "$SECS" in
+		*[!0-9]*|0) die "SECS must be a positive integer (got '$SECS')" ;;
+	esac
+fi
 
 if [ "${REPORT_ONLY:-0}" = 1 ]; then
 	# Report-only mode does not need QEMU/timeout/gzip — grep, sed, date suffice.
@@ -108,19 +123,32 @@ resolve_kernel() {
 
 	case $KERNEL in
 	"$CACHE_DIR"/*)
-		url="https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/releases/x86_64/netboot/vmlinuz-$ALPINE_FLAVOR"
+		if ! printf '%s' "$KERNEL_SHA256" | grep -qE '^[0-9a-fA-F]{64}$'; then
+			die "KERNEL_SHA256 must be a 64-digit hex checksum for Alpine download (ALPINE_BRANCH=$ALPINE_BRANCH ALPINE_FLAVOR=$ALPINE_FLAVOR)"
+		fi
+		[ -n "$ALPINE_RELEASE" ] || die "ALPINE_RELEASE must not be empty"
+		expected_sha=$(printf '%s' "$KERNEL_SHA256" | tr 'A-F' 'a-f')
+		url="https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/releases/x86_64/netboot-$ALPINE_RELEASE/vmlinuz-$ALPINE_FLAVOR"
 		if [ ! -s "$KERNEL" ]; then
-			log "downloading Alpine kernel ($ALPINE_BRANCH, $ALPINE_FLAVOR)"
+			log "downloading Alpine kernel ($ALPINE_BRANCH/$ALPINE_RELEASE, $ALPINE_FLAVOR)"
 			mkdir -p "$CACHE_DIR"
 			curl -fL --retry 3 --connect-timeout 15 -o "$KERNEL.part" "$url" \
-				|| die "kernel download failed: $url"
+				|| { rm -f "$KERNEL.part"; die "kernel download failed: $url"; }
+			actual_sha=$(sha256sum "$KERNEL.part" | cut -d' ' -f1 | tr 'A-F' 'a-f')
+			if [ "$actual_sha" != "$expected_sha" ]; then
+				rm -f "$KERNEL.part"
+				die "downloaded kernel SHA-256 mismatch (expected $expected_sha, got $actual_sha)"
+			fi
 			mv "$KERNEL.part" "$KERNEL"
 		fi
 		size=$(wc -c < "$KERNEL")
 		[ "$size" -gt 500000 ] || die "downloaded kernel is too small ($size bytes)"
-		sha=$(sha256sum "$KERNEL" | cut -d' ' -f1)
+		sha=$(sha256sum "$KERNEL" | cut -d' ' -f1 | tr 'A-F' 'a-f')
+		if [ "$sha" != "$expected_sha" ]; then
+			die "cached kernel '$KERNEL' SHA-256 mismatch (expected $expected_sha, got $sha)"
+		fi
 		printf '%s  %s\n' "$sha" "$(basename "$KERNEL")" > "$KERNEL.sha256"
-		info "downloaded kernel: $KERNEL ($(du -h "$KERNEL" | cut -f1), sha256 $(printf '%s' "$sha" | cut -c1-16)…)"
+		info "verified kernel: $KERNEL ($(du -h "$KERNEL" | cut -f1), sha256 $(printf '%s' "$sha" | cut -c1-16)…)"
 		;;
 	esac
 }
@@ -171,9 +199,17 @@ run_qemu() { # $1 = auto | interactive
 }
 
 # --------------------------------------------------------------- report
+now_ns() {
+	ns=$(date +%s%N 2>/dev/null || true)
+	case "$ns" in
+		*[!0-9]*|'') printf '%s' "$(($(date +%s) * 1000000000))" ;;
+		*) printf '%s' "$ns" ;;
+	esac
+}
+
 mark_ms() { # $1 = marker; print ms since $T0 when found
 	if grep -q "$1" "$CONSOLE_LOG" 2>/dev/null; then
-		printf '%s' "$(( ($(date +%s%N) - T0) / 1000000 ))"
+		printf '%s' "$(( ($(now_ns) - T0) / 1000000 ))"
 	else
 		printf ''
 	fi
@@ -231,7 +267,7 @@ report() {
 if [ "${REPORT_ONLY:-0}" = 1 ]; then
 	[ -r "$CONSOLE_LOG" ] || die "REPORT_ONLY=1 requires a readable CONSOLE_LOG '$CONSOLE_LOG'"
 	log "REPORT_ONLY=1: checking $CONSOLE_LOG without booting QEMU"
-	T0=$(date +%s%N)
+	T0=$(now_ns)
 	ready_ms=$(mark_ms 'main loop ready')
 	report
 	[ "${fail_count:-1}" -eq 0 ] || exit 1
@@ -258,10 +294,26 @@ mkdir -p "$DISTRO_DIR"
 : > "$CONSOLE_LOG"
 : > "$QEMU_LOG"
 
-T0=$(date +%s%N)
+qemu_pid=""
+cleanup_qemu() {
+	if [ -n "${qemu_pid:-}" ] && kill -0 "$qemu_pid" 2>/dev/null; then
+		kill -TERM "$qemu_pid" 2>/dev/null || true
+		ci=0
+		while [ "$ci" -lt 20 ] && kill -0 "$qemu_pid" 2>/dev/null; do
+			sleep 0.1
+			ci=$((ci + 1))
+		done
+		if kill -0 "$qemu_pid" 2>/dev/null; then
+			kill -KILL "$qemu_pid" 2>/dev/null || true
+		fi
+		wait "$qemu_pid" 2>/dev/null || true
+	fi
+}
+trap cleanup_qemu EXIT INT TERM
+
+T0=$(now_ns)
 run_qemu auto >>"$QEMU_LOG" 2>&1 &
 qemu_pid=$!
-trap 'kill -TERM "$qemu_pid" 2>/dev/null || true' EXIT INT TERM
 
 ready_ms=''
 banner_ms=''
@@ -277,7 +329,7 @@ while [ "$i" -lt $((SECS * 20)) ]; do
 done
 
 wait "$qemu_pid" 2>/dev/null || true   # timeout stops QEMU after $SECS seconds
-kill -TERM "$qemu_pid" 2>/dev/null || true
+cleanup_qemu
 
 [ -n "$banner_ms" ] && printf '   banner ninit detected after %s ms\n' "$banner_ms"
 [ -n "$ready_ms" ]  && printf '   "main loop ready" after %s ms\n' "$ready_ms"

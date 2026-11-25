@@ -55,13 +55,21 @@ if [ "${SANE_WEAK_DEFAULT_CREDS:-0}" = "1" ]; then
 	fi
 	ROOT_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
 	SANE_PASS=$(openssl rand -base64 18 2>/dev/null || head -c 18 /dev/urandom | base64)
-	# Write atomically with mode 0600; umask guards the creation.
-	( umask 077; printf 'root:%s\nsane:%s\n' "$ROOT_PASS" "$SANE_PASS" > "$CREDS_FILE" )
-	chmod 0600 "$CREDS_FILE"
+	# Write atomically with mode 0600; mktemp+chmod before mv avoids umask/mode windows.
+	creds_tmp=$(mktemp "$(dirname "$CREDS_FILE")/.sane-test-creds.XXXXXX") || { printf "FAIL: failed to stage credentials file\n" >&2; exit 1; }
+	if ! chmod 0600 "$creds_tmp" || ! printf 'root:%s\nsane:%s\n' "$ROOT_PASS" "$SANE_PASS" > "$creds_tmp" || ! mv -fT -- "$creds_tmp" "$CREDS_FILE"; then
+		rm -f -- "$creds_tmp"
+		printf "FAIL: failed to write credentials file\n" >&2
+		exit 1
+	fi
 	printf '%s' "$ROOT_PASS" | $SUDO sh "$ACCOUNTS" --root "$TARGET" set-password root
 	printf '%s' "$SANE_PASS" | $SUDO sh "$ACCOUNTS" --root "$TARGET" set-password sane
-	printf 'done\n' | $SUDO tee "$TARGET/etc/.sane-firstboot-done" >/dev/null
-	$SUDO chmod 0600 "$TARGET/etc/.sane-firstboot-done"
+	mark_tmp=$($SUDO mktemp "$TARGET/etc/.sane-firstboot-done.XXXXXX") || { printf "FAIL: failed to stage firstboot marker\n" >&2; exit 1; }
+	if ! $SUDO chmod 0600 "$mark_tmp" || ! printf 'done\n' | $SUDO tee "$mark_tmp" >/dev/null || ! $SUDO mv -fT -- "$mark_tmp" "$TARGET/etc/.sane-firstboot-done"; then
+		$SUDO rm -f -- "$mark_tmp"
+		printf "FAIL: failed to write firstboot marker\n" >&2
+		exit 1
+	fi
 fi
 
 # Make the lifecycle CLI and first-boot helper available on the installed system.

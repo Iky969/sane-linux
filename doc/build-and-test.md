@@ -4,16 +4,15 @@
 
 ## Building ninit
 
-Prerequisites: `build-essential` and `busybox-static`:
+Prerequisites: `build-essential`, `busybox-static`, `python3`, `shellcheck`, and `openssl`:
 
 ```bash
-sudo apt-get update && sudo apt-get install build-essential busybox-static python3 shellcheck
-make            # -> ./ninit (gcc -static -O2 -Wall)
+sudo apt-get update && sudo apt-get install build-essential busybox-static python3 shellcheck openssl
+make            # -> ./ninit (gcc -static -O2 -Wall -Werror -fstack-protector-strong)
 ```
 
 - The binary must be **static** so it executes without an external dynamic loader in minimal root filesystems.
-- The `main` branch builds with zero compiler warnings; verify using `-Werror`:
-  `make clean && make CFLAGS="-static -O2 -Wall -Werror"`.
+- `Makefile` enables `-Werror -fstack-protector-strong` by default so warnings fail the build (`make clean && make`).
 - On distributions without static glibc (e.g. Alpine): `make CC=musl-gcc`.
 - `make clean` removes `./ninit`. Build artifacts are ignored by `.gitignore`.
 
@@ -26,22 +25,23 @@ Root build leaves the rootfs root-owned so doas stays 4755 and identity files st
 ```bash
 make lint                              # Python pattern/format linters + ShellCheck gate (13 production scripts)
 make lint-shell                        # ShellCheck gate alone (fail-closed on any warning)
-make test                              # 12 suites from TEST_SCRIPTS: 7 root-required + 5 unprivileged
-sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh        # 1) PID 1 smoke test (root)
-sudo -E BIN=./ninit-test sh ./scripts/test-sigterm.sh      # 2) SIGTERM propagation to services (root)
-sudo -E BIN=./ninit-test sh ./scripts/test-config.sh       # 3) Dependency sort + rescue mode + initctl (root)
-sh ./scripts/test-qemu-report.sh                            # 4) run-qemu.sh harness fixture validation (no root)
-sudo -E BIN=./ninit-test sh ./scripts/test-spawn-failure.sh # 5) Spawn failure paths (root)
-sudo -E BIN=./ninit-test sh ./scripts/test-cgroup-limits.sh # 6) Cgroup v2 limits & orphan lifecycle (root)
-sudo -E BIN=./ninit-test sh ./scripts/test-respawn-cleanup.sh # 7) Respawn cleanup & grandchild containment (root)
-sudo -E BIN=./ninit-test sh ./scripts/test-state-machine.sh  # 8) State machine & telemetry (root)
-sh ./scripts/test-accounts.sh                               # 9) Account lifecycle & policy (no root)
-sh ./scripts/test-network.sh                                # 10) Networking: sane-net, DNS/DHCP, TLS (no root)
-sh ./scripts/test-network-fault.sh                          # 11) Network fault injection & recovery (no root)
-sh ./scripts/test-reliability.sh                            # 12) Snapshots, rollback, upgrades, recovery (no root)
+make test                              # 13 suites from TEST_SCRIPTS: 8 root-required + 5 unprivileged
+sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh           # 1) PID 1 smoke test (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-sigterm.sh         # 2) SIGTERM propagation to services (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-config.sh          # 3) Dependency sort + rescue + :on_fail=rescue + initctl (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-zombie-reap-500.sh # 4) PID 1 reaps 500 orphaned children -> 0 zombies (root)
+sh ./scripts/test-qemu-report.sh                              # 5) run-qemu.sh harness fixture validation (no root)
+sudo -E BIN=./ninit-test sh ./scripts/test-spawn-failure.sh   # 6) Spawn failure paths (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-cgroup-limits.sh   # 7) Cgroup v2 limits & orphan lifecycle (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-respawn-cleanup.sh # 8) Respawn cleanup & grandchild containment (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-state-machine.sh   # 9) State machine & telemetry (root)
+sh ./scripts/test-accounts.sh                                 # 10) Account lifecycle & policy (no root; sudo checks owners)
+sh ./scripts/test-network.sh                                  # 11) Networking: sane-net, DNS/DHCP, TLS (no root)
+sh ./scripts/test-network-fault.sh                            # 12) Network fault injection & recovery (no root)
+sh ./scripts/test-reliability.sh                              # 13) Snapshots, rollback, upgrades, recovery (no root)
 # Separate, not part of make test:
-make integration                       # real QEMU boot: fstab <-> kernel <-> services
-make test-lifecycle                    # seven QEMU account-lifecycle scenarios
+make integration                                              # real QEMU boot: fstab <-> kernel <-> services
+make test-lifecycle                                           # 9 QEMU lifecycle scenarios (scripts/qemu_lifecycle.py)
 ```
 
 ShellCheck gate details: `make lint-shell` runs
@@ -66,20 +66,23 @@ BusyBox inputs (never run it in the shared checkout).
 
 | Suite | Invocation | Measured result |
 |---|---|---|
-| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 299 passed, 0 failed |
-| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 301 passed, 0 failed |
-| Reliability | `sh scripts/test-reliability.sh` | 772 passed, 0 failed |
-| SPM | `bash scripts/test-spm.sh` | 36 passed, 0 failed |
-| Build package | `bash scripts/test-build-package.sh` (scratch) | 13 passed, 0 failed |
-| Build rootfs | `sh scripts/test-build-rootfs.sh` (scratch) | 25 passed, 0 failed |
-| Config / initctl | `sudo -n -E BIN=./ninit-test sh scripts/test-config.sh` | 171 `[ OK ]`, 0 `[ FAIL ]` |
-| QEMU report harness | `sh scripts/test-qemu-report.sh` | 21 `[ OK ]`, RESULT: PASS |
-| Networking | `sh scripts/test-network.sh` | 60 passed, 0 failed |
-| Network faults | `sh scripts/test-network-fault.sh` | 137 passed, 0 failed |
+| Zombie reap (500) | `sudo -E BIN=./ninit-test sh scripts/test-zombie-reap-500.sh` | 11 `[ OK ]`, 0 `[FAIL]` (`zombies_at_1s=0`, `I2 PASS`) |
+| PID 1 smoke test | `sudo -E BIN=./ninit-test sh scripts/smoke-test.sh` | 7 `[ OK ]`, 0 `[FAIL]` (`RESULT: PASS`) |
+| SIGTERM propagation | `sudo -E BIN=./ninit-test sh scripts/test-sigterm.sh` | 21 `[ OK ]`, 0 `[FAIL]` (`RESULT: PASS`) |
+| Config / initctl | `sudo -E BIN=./ninit-test sh scripts/test-config.sh` | 219 `[ OK ]`, 0 `[FAIL]` (`RESULT: PASS`) |
+| QEMU report harness | `sh scripts/test-qemu-report.sh` | 21 `[ OK ]`, 0 `[FAIL]` (`RESULT: PASS`) |
+| Cgroup v2 limits | `sudo -E BIN=./ninit-test sh scripts/test-cgroup-limits.sh` | 91 `[ OK ]`, 0 `[FAIL]` (`RESULT: PASS`) |
+| Respawn cleanup | `sudo -E BIN=./ninit-test sh scripts/test-respawn-cleanup.sh` | 15 `[ OK ]`, 0 `[FAIL]` (`RESULT: PASS`) |
+| Accounts (unprivileged) | `sh scripts/test-accounts.sh` | 299 passed, 0 failed *(prior baseline)* |
+| Accounts (root) | `sudo -n -E sh scripts/test-accounts.sh` | 301 passed, 0 failed *(prior baseline)* |
+| Reliability | `sh scripts/test-reliability.sh` | 772 passed, 0 failed *(prior baseline)* |
+| SPM | `bash scripts/test-spm.sh` | 36 passed, 0 failed *(prior baseline)* |
+| Build package | `bash scripts/test-build-package.sh` (scratch) | 13 passed, 0 failed *(prior baseline)* |
+| Build rootfs | `sh scripts/test-build-rootfs.sh` (scratch) | 25 passed, 0 failed *(prior baseline)* |
+| Networking | `sh scripts/test-network.sh` | 60 passed, 0 failed *(prior baseline)* |
+| Network faults | `sh scripts/test-network-fault.sh` | 137 passed, 0 failed *(prior baseline)* |
 
-The remaining root-required suites print their own pass/fail counts; CI runs
-the full 12-suite battery. Counts are re-measured at the final verification
-pass rather than copied from older documentation.
+CI runs the full 13-suite `make test` battery (running `test-accounts.sh` under `sudo -E` so root ownership checks execute). Rows marked *(prior baseline)* reflect pre-branch integration measurements.
 
 ### 1. PID 1 Smoke Test (`scripts/smoke-test.sh`)
 
@@ -145,17 +148,20 @@ Example passing log output:
 
 ### 3. Configuration & IPC Tests (`scripts/test-config.sh`)
 
-Validates dependency resolution, error handling, and control FIFO parsing across seven isolated runs:
+Validates dependency resolution, error handling, `:on_fail=rescue`, and `/run/initctl` streaming across isolated rootfs runs:
 
 | Section | Target Behavior |
 |---|---|
 | 1a | Diamond dependencies (`a:requires=b,c` + `b:requires=c`) run ordered as `c → b → a` without false cycle alerts |
 | 1b | Dense 64-service configuration (`root` requires `s2..s64`) runs 64/64 services without stack overflow |
-| 2 | Missing dependency (`web:once:echo web:requires=db`) → `FATAL: Dependency 'db' for 'web' not found` + rescue shell; `main loop ready` never logged |
+| 2 | Missing dependency (`web:once:echo web:requires=db`) → `FATAL: Dependency 'db' for 'web' not found` + supervised rescue shell; `main loop ready` never logged |
+| 2d | Fork-retry exhaustion (`pids.max=1`, `:on_fail=rescue`) → `SVC_STATE_FAILED` cancels dependents and enters supervised rescue shell |
+| 2e | Respawn crash-loop reaching `SVC_STATE_FAILED` with `:on_fail=rescue` → cancels dependents, stops active services, and enters supervised rescue shell |
 | 3a | `printf 'poweroff\nreboot\n' > /run/initctl` executes only the first command (`reboot` never executes) |
-| 3b | `printf 'status\npoweroff\n' > /run/initctl` logs unknown commands and processes `poweroff` on line 2 |
-| 4a | Unreadable config → `Config failed to read/parse!` + rescue shell; `main loop ready` never logged |
+| 3b | `printf 'status\npoweroff\n' > /run/initctl` logs `initctl cmd: 'status'` and executes `poweroff` on line 2 |
+| 4a | Unreadable config (and 0-service valid config) → supervised rescue shell; `main loop ready` never logged |
 | 4b | Circular dependency (`a:requires=b` + `b:requires=a`) → `FATAL: CYCLE DETECTED` + rescue shell with `SigBlk=0` (Ctrl+C works) |
+| 4c | Rescue shell exits (`exit`/`EOF`) → PID 1 stays alive, reaps child, and respawns shell within budget |
 
 **Why Section 1b matters**: The legacy `sort_services()` marked nodes when expanded rather than pushed, allowing pending nodes to be pushed repeatedly. On 64-service configurations, `stack_top` overflowed past 64, causing stack-buffer-overflows under AddressSanitizer:
 
@@ -268,9 +274,9 @@ Full init logs are recorded in `/tmp/myrootfs/var/log/ninit.log`.
 
 Runs on `ubuntu-latest` with SHA-pinned actions across five jobs:
 - `security-scan`: Scans git history for secret leaks using Gitleaks (`gitleaks-action`).
-- `build-and-smoke-test`: Installs dependencies (`build-essential`, `busybox-static`, `python3`, `shellcheck`, …) → `make` → verifies static binary via `readelf` (asserts no `INTERP`) → `make lint` (pattern/format + `lint-shell`) and a dedicated `make lint-shell` step → runs all 12 `make test` suites (7 privileged via `sudo -E BIN=./ninit-test`, 5 unprivileged: qemu-report, accounts, network, network-fault, reliability) → fuzz harness → rebuilds under `CFLAGS="-static -O2 -Wall -Werror -fstack-protector-strong"`.
-- `rootfs-distro`: Validates distro builder and QEMU boot paths: installs dependencies → `sudo sh ./scripts/build-rootfs.sh` → boots QEMU (`sudo SECS=20 sh ./scripts/run-qemu.sh`) → runs cross-layer integration boot (`sudo SECS=40 sh ./scripts/test-integration.sh`) → panic-path regression.
-- `boot-lifecycle`: Builds the disk image and runs the seven QEMU account-lifecycle scenarios (`make test-lifecycle`).
+- `build-and-smoke-test`: Installs dependencies (`build-essential`, `busybox-static`, `python3`, `shellcheck`, `openssl`, …) → `make` (default `-Werror -fstack-protector-strong`) → verifies static binary via `readelf` (asserts no `INTERP`) → `make lint` (pattern/format linters + `lint-shell` gate across 13 production scripts) → builds `./ninit-test` → runs all 13 `make test` suites (8 privileged via `sudo -E BIN=./ninit-test`, plus `sudo -E sh ./scripts/test-accounts.sh` for root owner checks, and the 4 other unprivileged suites) → checks zero `/sys/fs/cgroup/ninit*` cgroup leaks → fuzz harness.
+- `rootfs-distro`: Validates distro builder and QEMU boot paths: installs dependencies → builds `ninit` and `ninit-test` → `sudo sh ./scripts/build-rootfs.sh` → boots QEMU (`sudo SECS=20 sh ./scripts/run-qemu.sh`, with pinned SHA-256 verification for Alpine `vmlinuz-virt`) → runs cross-layer integration boot (`sudo SECS=40 sh ./scripts/test-integration.sh`) → panic-path regression (`BIN=./ninit-test`).
+- `boot-lifecycle`: Builds the disk image and runs the 9 QEMU lifecycle scenarios (`make test-lifecycle`), failing explicitly under `CI=true` if prerequisites or the image are missing instead of skipping.
 - `clawrza-packages`: Builds the three self-hosting recipe packages and installs them with `spm` into a temporary root, verifying payload checksums.
 
 ## Troubleshooting

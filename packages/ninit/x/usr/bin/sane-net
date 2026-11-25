@@ -19,9 +19,12 @@ done
 export SANE_ROOT="$ROOT"
 # SANE_PROC is a test hook for the process-identity source; production uses /proc.
 PROC=${SANE_PROC:-/proc}
+# SANE_SYS_NET is a test hook for sysfs net state; production uses /sys/class/net.
+SYS_NET=${SANE_SYS_NET:-/sys/class/net}
 RESOLV=$ROOT/etc/resolv.conf
 RESOLV_DEFAULT=$ROOT/etc/resolv.conf.default
 WPACONF=$ROOT/etc/wpa_supplicant.conf
+WPARUN=$ROOT/run/wpa_supplicant
 CABUNDLE=$ROOT/etc/ssl/certs/ca-certificates.crt
 
 usage() {
@@ -30,7 +33,7 @@ Usage: $PROG <command> [args]
 
   link IFACE [up|down]                 show or set link state
   static IFACE IP/CIDR GW [DNS ...]    configure a static address + DNS
-  dhcp IFACE                           start udhcpc in background
+  dhcp [-f|--foreground] IFACE         start udhcpc (background or -f foreground)
   dns SERVER [SERVER ...]              write /etc/resolv.conf atomically
   dns default                          restore /etc/resolv.conf.default
   wifi IFACE SSID PSK                  configure WPA2 and start supplicant
@@ -57,6 +60,51 @@ fault_inject() {
 # Escape a value for use inside a double-quoted wpa_supplicant.conf field.
 wpa_escape() {
 	printf '%s' "$1" | sed 's/[\\"]/\\&/g'
+}
+
+# Validate a Linux interface name (IFNAMSIZ-1 <= 15, no path traversal or flags).
+valid_iface() {
+	case "$1" in
+		''|.|..|-*|*[!A-Za-z0-9_.-]*|*..*) return 1 ;;
+	esac
+	[ "${#1}" -le 15 ]
+}
+
+# Detect whether IFACE link + carrier are up across both BusyBox `ip link`
+# (`<BROADCAST,MULTICAST,UP,LOWER_UP>`) and iproute2 (`state UP`) output.
+link_is_up() {
+	_li_iface=$1
+	_li_out=$(ip link show dev "$_li_iface" 2>/dev/null) || return 1
+	[ -n "$_li_out" ] || return 1
+	if printf '%s\n' "$_li_out" | grep -Eq '<([^>]*,)?NO-CARRIER(,[^>]*)?>' || \
+	   printf '%s\n' "$_li_out" | grep -q 'state DOWN'; then
+		return 1
+	fi
+	if ! printf '%s\n' "$_li_out" | grep -Eq '<([^>]*,)?UP(,[^>]*)?>'; then
+		return 1
+	fi
+	if printf '%s\n' "$_li_out" | grep -Eq '<([^>]*,)?LOWER_UP(,[^>]*)?>' || \
+	   printf '%s\n' "$_li_out" | grep -q 'state UP'; then
+		return 0
+	fi
+	if [ -r "$SYS_NET/$_li_iface/operstate" ]; then
+		[ "$(cat "$SYS_NET/$_li_iface/operstate" 2>/dev/null || true)" = "up" ] && return 0
+	fi
+	return 1
+}
+
+addr_present() {
+	_ap_iface=$1
+	_ap_cidr=$2
+	_ap_out=$(ip addr show dev "$_ap_iface" 2>/dev/null || true)
+	printf '%s\n' "$_ap_out" | {
+		while IFS= read -r _ap_line; do
+			case " $_ap_line " in
+				*" inet $_ap_cidr "*|*" inet6 $_ap_cidr "*) exit 0 ;;
+			esac
+		done
+		exit 1
+	}
 }
 
 # --- Nameserver validation --------------------------------------------------
@@ -161,7 +209,7 @@ write_resolv() {
 	dir=$(dirname "$file")
 	tmp=$(mktemp "$dir/.resolv.conf.XXXXXX") || die "cannot create temp file in $dir"
 	for ns in "$@"; do
-		printf 'nameserver %s\n' "$ns" >> "$tmp"
+		printf 'nameserver %s\n' "$ns" >> "$tmp" || { rm -f "$tmp"; die "cannot write temp file $tmp"; }
 	done
 	chmod 0644 "$tmp" || { rm -f "$tmp"; die "cannot set permissions on $tmp"; }
 	mv "$tmp" "$file" || { rm -f "$tmp"; die "cannot replace $file"; }
@@ -181,8 +229,9 @@ restore_default_resolv() {
 
 cmd_link() {
 	need ip
-	[ "${1:-}" ] || usage
+	[ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
 	iface=$1
+	valid_iface "$iface" || die "invalid interface: $iface"
 	case "${2:-}" in
 		'') ip link show dev "$iface" ;;
 		up) fault_inject ip-link; ip link set "$iface" up ;;
@@ -195,9 +244,19 @@ cmd_static() {
 	need ip
 	[ "$#" -ge 3 ] || usage
 	iface=$1; ip_cidr=$2; gw=$3; shift 3
+	valid_iface "$iface" || die "invalid interface: $iface"
+	case "$ip_cidr" in
+		''|-*|*[!0-9a-fA-F.:/]*) die "invalid IP/CIDR: $ip_cidr" ;;
+		*/*) ;;
+		*) die "invalid IP/CIDR: $ip_cidr" ;;
+	esac
+	valid_server "$gw" || die "invalid gateway: $gw"
+	for ns in "$@"; do
+		valid_server "$ns" || die "invalid DNS server: $ns"
+	done
 	fault_inject ip-link
 	ip link set "$iface" up || die "cannot bring up $iface"
-	if ! ip addr show dev "$iface" 2>/dev/null | grep -q "$ip_cidr"; then
+	if ! addr_present "$iface" "$ip_cidr"; then
 		fault_inject ip-addr
 		ip addr add "$ip_cidr" dev "$iface" || die "cannot add $ip_cidr to $iface"
 	fi
@@ -212,12 +271,23 @@ cmd_static() {
 
 cmd_dhcp() {
 	need ip; need udhcpc
-	[ "${1:-}" ] || usage
+	_dhcp_mode=-b
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-f|--foreground) _dhcp_mode=-f; shift ;;
+			--) shift; break ;;
+			-*) usage ;;
+			*) break ;;
+		esac
+	done
+	[ "$#" -eq 1 ] || usage
 	iface=$1
+	valid_iface "$iface" || die "invalid interface: $iface"
 	fault_inject ip-link
 	ip link set "$iface" up || die "cannot bring up $iface"
 	fault_inject udhcpc
-	exec udhcpc -b -R -p "${ROOT}/run/udhcpc-${iface}.pid" -i "$iface" \
+	stop_previous_dhcp "$iface" || exit 1
+	exec udhcpc "$_dhcp_mode" -R -p "${ROOT}/run/udhcpc-${iface}.pid" -i "$iface" \
 		-s "${ROOT}/usr/share/udhcpc/default.script"
 }
 
@@ -234,6 +304,7 @@ cmd_wifi() {
 	need ip; need wpa_supplicant
 	[ "$#" -eq 3 ] || { printf 'Usage: %s wifi IFACE SSID PSK\n' "$PROG" >&2; exit 1; }
 	iface=$1; ssid=$2; psk=$3
+	valid_iface "$iface" || die "invalid interface: $iface"
 	[ -n "$ssid" ] || die "SSID must not be empty"
 	case "$ssid" in *[![:print:]]*) die "SSID contains non-printable characters" ;; esac
 	[ "${#psk}" -ge 8 ] || die "PSK must be at least 8 characters"
@@ -242,8 +313,9 @@ cmd_wifi() {
 	psk_e=$(wpa_escape "$psk")
 	fault_inject ip-link
 	ip link set "$iface" up || die "cannot bring up $iface"
+	mkdir -p "$(dirname "$WPACONF")" "$WPARUN" || die "cannot create wpa_supplicant directories"
 	tmp=$(mktemp "$(dirname "$WPACONF")/.wpa_supplicant.XXXXXX") || die "cannot create temp file"
-	cat > "$tmp" <<EOF
+	if ! cat > "$tmp" <<EOF
 ctrl_interface=/run/wpa_supplicant
 update_config=1
 network={
@@ -252,14 +324,20 @@ network={
     key_mgmt=WPA-PSK
 }
 EOF
-	chmod 0600 "$tmp"
-	mv "$tmp" "$WPACONF"
+	then
+		rm -f "$tmp"
+		die "cannot write $WPACONF temp file"
+	fi
+	chmod 0600 "$tmp" || { rm -f "$tmp"; die "cannot set permissions on $tmp"; }
+	mv "$tmp" "$WPACONF" || { rm -f "$tmp"; die "cannot replace $WPACONF"; }
 	exec wpa_supplicant -B -i "$iface" -c "$WPACONF" -D wext
 }
 
 cmd_status() {
 	need ip
-	if [ "${1:-}" ]; then
+	[ "$#" -le 1 ] || usage
+	if [ "$#" -eq 1 ]; then
+		valid_iface "$1" || die "invalid interface: $1"
 		ip addr show dev "$1"
 	else
 		ip addr show
@@ -400,8 +478,9 @@ stop_previous_dhcp() {
 
 cmd_reconnect() {
 	need ip; need udhcpc
-	[ "${1:-}" ] || usage
+	[ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
 	iface=$1; limit=${2:-30}
+	valid_iface "$iface" || die "invalid interface: $iface"
 	case "$limit" in
 		''|*[!0-9]*) die "seconds must be numeric" ;;
 		0[0-9]*) die "seconds must not have leading zeros" ;;
@@ -413,8 +492,8 @@ cmd_reconnect() {
 	dhcp_max=3
 	dhcp_tries=0
 	i=0
-	while [ "$i" -lt "$limit" ]; do
-		if ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
+	while :; do
+		if link_is_up "$iface"; then
 			while [ "$dhcp_tries" -lt "$dhcp_max" ]; do
 				fault_inject udhcpc
 				stop_previous_dhcp "$iface" || exit 1
@@ -433,6 +512,7 @@ cmd_reconnect() {
 			done
 			die "DHCP failed on $iface after ${dhcp_max} attempts; default resolver restored"
 		fi
+		[ "$i" -lt "$limit" ] || break
 		fault_inject ip-link
 		ip link set "$iface" up 2>/dev/null || true
 		i=$((i + 1))
@@ -447,9 +527,14 @@ cmd_check() {
 	# Exits 0 only when all hold; every failure prints its own message.
 	[ "$#" -le 1 ] || usage
 	need ip
-	iface=${1:-eth0}
+	if [ "$#" -eq 1 ]; then
+		iface=$1
+	else
+		iface=eth0
+	fi
+	valid_iface "$iface" || die "invalid interface: $iface"
 	rc=0
-	if ! ip link show dev "$iface" 2>/dev/null | grep -q 'state UP'; then
+	if ! link_is_up "$iface"; then
 		printf '%s: check: link %s is not UP\n' "$PROG" "$iface" >&2
 		rc=1
 	fi

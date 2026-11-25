@@ -83,11 +83,15 @@ if ! ask_password sane; then
 	exit 1
 fi
 
-if ! printf 'done\n' > "$MARK"; then
+mark_tmp=$(mktemp /etc/.sane-firstboot-done.XXXXXX) || {
+	printf 'FATAL: could not create temp file for %s.\n' "$MARK" >&2
+	exit 1
+}
+if ! chmod 0600 "$mark_tmp" || ! printf 'done\n' > "$mark_tmp" || ! mv -fT -- "$mark_tmp" "$MARK"; then
+	rm -f -- "$mark_tmp"
 	printf 'FATAL: could not write %s.\n' "$MARK" >&2
 	exit 1
 fi
-chmod 0600 "$MARK" 2>/dev/null || true
 
 printf '\nFirst-boot setup complete. Continue with login on the console.\n'
 exit 0

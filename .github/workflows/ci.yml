@@ -37,7 +37,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev byacc bison shellcheck
+          sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev byacc bison shellcheck openssl
 
       - name: Static build
         run: make
@@ -52,14 +52,16 @@ jobs:
           fi
           echo "OK: no INTERP -> static binary"
 
-      - name: Lint log patterns & format strings
+      - name: Lint log patterns, format strings & ShellCheck
         run: make lint
 
-      - name: ShellCheck production scripts
-        run: make lint-shell
+      - name: Record host cgroups before test battery
+        run: |
+          PRE=$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null | tr '\n' ' ')
+          echo "PRE_CGROUPS=$PRE" >> "$GITHUB_ENV"
 
-      - name: Phase A account lifecycle & policy validation
-        run: sh ./scripts/test-accounts.sh
+      - name: Phase A account lifecycle & policy validation (root owner checks)
+        run: sudo -E sh ./scripts/test-accounts.sh
 
       - name: Phase B networking (sane-net, DNS, DHCP, TLS)
         run: sh ./scripts/test-network.sh
@@ -97,6 +99,16 @@ jobs:
       - name: Zombie reap stress (500 children)
         run: sudo -E BIN=./ninit-test sh ./scripts/test-zombie-reap-500.sh
 
+      - name: Verify no lingering /sys/fs/cgroup/ninit* leaks
+        run: |
+          POST=$(ls -d /sys/fs/cgroup/ninit* 2>/dev/null | tr '\n' ' ')
+          if [ "${PRE_CGROUPS:-}" != "$POST" ]; then
+            echo "FAIL: new lingering cgroups detected in /sys/fs/cgroup/ninit*:" >&2
+            echo "Before: ${PRE_CGROUPS:-}" >&2
+            echo "After : $POST" >&2
+            exit 1
+          fi
+
       - name: Package builder & validator parity tests
         run: bash ./scripts/test-build-package.sh
 
@@ -128,6 +140,7 @@ jobs:
       - name: rootfs + initramfs from source (BUSYBOX_MODE=auto)
         run: |
           make
+          make ninit-test
           sudo env SANE_WEAK_DEFAULT_CREDS=1 JOBS=$(nproc) sh ./scripts/build-rootfs.sh
           test -s distro/initramfs.cpio.gz
 
@@ -141,7 +154,7 @@ jobs:
         run: sudo env SANE_WEAK_DEFAULT_CREDS=1 SECS=40 sh ./scripts/test-integration.sh
 
       - name: Panic-path regression (QEMU)
-        run: sudo sh ./scripts/test-kernel-panic-specific.sh
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-kernel-panic-specific.sh
 
   boot-lifecycle:
     name: boot + account lifecycle scenarios (QEMU)

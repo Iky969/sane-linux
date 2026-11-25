@@ -48,10 +48,21 @@ EOF
 mkstub ip 'printf "ip %s\n" "$*" >> "'"$IP_CALLS"'"
 case "${1:-} ${2:-}" in
   "link show")
-    if [ "$(cat "'"$CARRIER"'")" = up ]; then
-      printf "2: ${3:-eth0}: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n"
+    st=$(cat "'"$CARRIER"'")
+    if [ "${STUB_IP_STYLE:-iproute2}" = busybox ]; then
+      if [ "$st" = up ]; then
+        printf "2: ${3:-eth0}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast qlen 1000\n"
+      elif [ "$st" = nocarrier ]; then
+        printf "2: ${3:-eth0}: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc pfifo_fast qlen 1000\n"
+      else
+        printf "2: ${3:-eth0}: <BROADCAST,MULTICAST> mtu 1500 qdisc pfifo_fast qlen 1000\n"
+      fi
     else
-      printf "2: ${3:-eth0}: <BROADCAST,MULTICAST> state DOWN mode DEFAULT\n"
+      if [ "$st" = up ]; then
+        printf "2: ${3:-eth0}: <BROADCAST,MULTICAST,UP> state UP mode DEFAULT\n"
+      else
+        printf "2: ${3:-eth0}: <BROADCAST,MULTICAST> state DOWN mode DEFAULT\n"
+      fi
     fi
     ;;
   "link set")
@@ -173,9 +184,11 @@ export SANE_PROC="$T/proc"
 # no command is allowed to touch the host resolver, routes, links or DHCP state.
 STAGED="$T/sane-net"
 sed -e "s|^ROOT=.*|ROOT=$T|" \
+    -e "s|^SYS_NET=.*|SYS_NET=$T/sys-net|" \
     -e "s|^RESOLV=.*|RESOLV=$T/etc/resolv.conf|" \
     -e "s|^RESOLV_DEFAULT=.*|RESOLV_DEFAULT=$T/etc/resolv.conf.default|" \
     -e "s|^WPACONF=.*|WPACONF=$T/etc/wpa_supplicant.conf|" \
+    -e "s|^WPARUN=.*|WPARUN=$T/run/wpa_supplicant|" \
     -e "s|^CABUNDLE=.*|CABUNDLE=$T/etc/ssl/certs/ca-certificates.crt|" \
     "$NET" > "$STAGED"
 chmod 0755 "$STAGED"
@@ -630,6 +643,65 @@ check "SANE_ROOT reconnect uses normalized pid and script paths" \
 HOST_RESOLV_AFTER=$(sha256sum /etc/resolv.conf)
 check "real SANE_ROOT tests leave host resolver bytes unchanged" \
 	test "$HOST_RESOLV_BEFORE" = "$HOST_RESOLV_AFTER"
+
+# --- BusyBox ip link format fault/recovery & P2 hardening (P1-18) ----------
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_ok "BusyBox format: check succeeds on <...,UP,LOWER_UP>" \
+	env STUB_IP_STYLE=busybox sh "$STAGED" check eth0
+
+reset_stubs
+printf 'nocarrier\n' > "$CARRIER"
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_fail "BusyBox format: check fails on <NO-CARRIER,...,UP>" \
+	env STUB_IP_STYLE=busybox sh "$STAGED" check eth0
+expect_ok "BusyBox format: reconnect recovers from NO-CARRIER to LOWER_UP" \
+	env STUB_IP_STYLE=busybox sh "$STAGED" reconnect eth0 3
+reset_stubs
+printf 'nocarrier\n' > "$CARRIER"
+expect_fail "BusyBox format: reconnect fails closed when NO-CARRIER persists" \
+	env STUB_IP_STYLE=busybox STUB_LINK_RECOVER=0 sh "$STAGED" reconnect eth0 2
+
+reset_stubs
+printf '41001\n' > "$T/run/udhcpc-eth0.pid"
+printf '41001\n' > "$LIVE_PIDS"
+mkdir -p "$T/proc/41001"
+printf 'udhcpc\n' > "$T/proc/41001/comm"
+printf '41001 (udhcpc) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 100 51001 1000 0\n' > "$T/proc/41001/stat"
+expect_ok "dhcp stops previous udhcpc client before starting new one" \
+	env SANE_ROOT="$T" sh "$STAGED" dhcp eth0
+check "dhcp TERMed previous udhcpc client" grep -q '^kill -TERM 41001' "$KILL_CALLS"
+check "dhcp waited/killed previous client before new udhcpc" sh -c "! grep -qx 41001 '$LIVE_PIDS'"
+
+reset_stubs
+printf 'yes\n' > "$ADDR_PRESENT"
+printf 'yes\n' > "$ROUTE_PRESENT"
+expect_ok "reconnect with SECONDS=0 succeeds when carrier is already up" \
+	run_net reconnect eth0 0
+printf 'down\n' > "$CARRIER"
+expect_fail "reconnect with SECONDS=0 fails without sleeping when carrier is down" \
+	env STUB_LINK_RECOVER=0 sh "$STAGED" reconnect eth0 0
+check "reconnect SECONDS=0 made no sleep call" test ! -s "$SLEEP_CALLS"
+
+reset_stubs
+expect_fail "static rejects invalid DNS before mutating link/addr/route" \
+	run_net static eth0 10.0.0.2/24 10.0.0.1 invalid.example
+check "static invalid DNS made no ip calls" test ! -s "$IP_CALLS"
+
+reset_stubs
+expect_ok "real binary foreground DHCP (-f) honors trailing-slash SANE_ROOT" \
+	env SANE_ROOT="$ROOTFS/" sh "$NET" dhcp -f eth0
+check "SANE_ROOT foreground DHCP passes -f -R and normalized paths" \
+	test "$(cat "$UDHCPC_CALLS")" = "udhcpc -f -R -p $ROOTFS/run/udhcpc-eth0.pid -i eth0 -s $ROOTFS/usr/share/udhcpc/default.script"
+
+reset_stubs
+set_fail_tool chmod
+expect_fail "wifi chmod failure exits nonzero" \
+	env PATH="$FAILBIN:$PATH" sh "$STAGED" wifi eth0 home-net secretpass
+check "wifi chmod failure leaves no temporary config with PSK" sh -c \
+	"! ls '$T/etc'/.wpa_supplicant.* >/dev/null 2>&1"
 
 printf '\nNetwork fault tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

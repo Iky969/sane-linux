@@ -23,12 +23,11 @@ teknis yang lebih dalam, dengan indeks di bawah.
 ## Fitur saat ini
 
 - **PID 1 + reaping** semua anak, termasuk proses yatim (orphan) yang diadopsi.
-- **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` dan
-  dependensi `:requires=` (urut topologis DFS, deteksi siklus, dependensi hilang
-  → rescue shell).
+- **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` (mode tak dikenal ditolak fail-closed),
+  dependensi `:requires=` (urut topologis DFS, deteksi siklus, dependensi hilang / 0 layanan → supervised rescue), pemisahan user `:user=`/`:group=`, `:grace=`, dan `:on_fail=rescue`.
 - **Respawn non-blocking**: jeda 2 detik dijalankan lewat timer `ppoll` 100 ms,
   bukan `sleep()`, sehingga init tetap responsif terhadap sinyal.
-- **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
+- **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace default 5 detik, dapat diatur per layanan via `:grace=N`) →
   `sync()` → `reboot()`; varian force untuk mem-bypass grace.
 - **Cgroups v2**: tiap layanan dipindahkan ke leaf `/sys/fs/cgroup/ninit/<nama>`
   dengan batas `memory.max`, `memory.swap.max=0`, `cpu.max`, dan `pids.max` yang
@@ -38,8 +37,8 @@ teknis yang lebih dalam, dengan indeks di bawah.
 - **Logging ganda**: `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus
   jalur `/run/log.fifo` agar output layanan ikut tercatat dengan prefiks
   `[service]`.
-- **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
-  `force-reboot`, dibaca per baris (satu penulisan boleh memuat beberapa perintah).
+- **IPC `/run/initctl`**: parser streaming per baris (`MAX_LINE = 1024`) untuk
+  `poweroff`, `reboot`, `force-poweroff`, `force-reboot`, `stop`, `start`, `restart`, dan `status`.
 - **Biner statis** (`gcc -static`), 0 warning dengan `-Wall -Werror`.
 
 ## Struktur repository
@@ -50,11 +49,19 @@ ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
-scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), initctl per baris
+scripts/test-config.sh  uji dependensi, rescue mode (+mask sinyal), :on_fail=rescue, initctl per baris
+scripts/test-zombie-reap-500.sh bukti PID 1 memanen 500 proses yatim dengan 0 zombie
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
 scripts/test-spawn-failure.sh uji dependensi jalur respawn + fork retry limit
 scripts/test-cgroup-limits.sh uji cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-respawn-cleanup.sh uji pembersihan pohon orphan saat respawn
+scripts/test-state-machine.sh uji transisi state-machine & telemetri :grace=
+scripts/test-accounts.sh uji kebijakan akun Phase A, doas & recovery
+scripts/test-network.sh  uji jaringan Phase B (sane-net, DNS/DHCP, TLS)
+scripts/test-network-fault.sh uji injeksi fault jaringan & recovery
+scripts/test-reliability.sh uji Phase C snapshots, rollback & recovery
 scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
+scripts/test-boot-lifecycle.sh 9 skenario lifecycle QEMU (scripts/qemu_lifecycle.py)
 scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
 scripts/run-qemu.sh     boot rootfs itu di QEMU (konsol serial & verifikasi boot)
 distro/                  hasil distro builder (rootfs/, cache/, initramfs) - gitignored
@@ -68,9 +75,9 @@ LICENSE                  MIT
 ## Mulai cepat
 
 ```bash
-make          # hasilkan biner statis ./ninit
-make test     # uji PID 1: smoke test + test SIGTERM + test konfigurasi + test spawn failure + test cgroup limits (+ pemeriksaan harness run-qemu.sh)
-              # (lima pertama butuh root/sudo)
+make          # hasilkan biner statis ./ninit (-Werror aktif default)
+make lint     # lint pola/format + gate ShellCheck pada 13 skrip produksi
+make test     # 13 suite TEST_SCRIPTS (8 butuh root/sudo + 5 tanpa root)
 ```
 
 Menjalankannya di sistem nyata berarti memasang biner ini sebagai `/sbin/init`
@@ -102,10 +109,8 @@ dijaga `scripts/test-config.sh`.
 - Belum ada `PIDFile`, `Restart=on-failure`, dependency berbasis event, atau mount
   namespace per layanan (namun pembatasan resource cgroup v2 untuk memory, cpu,
   dan pids sudah didukung penuh per layanan).
-- Tidak ada pengerasan (seccomp, MAC, user berbeda per layanan): tiap layanan
-  berjalan sebagai root, sama seperti init.
-- Shutdown masih memakai jendela grace tetap 5 detik; layanan yang mengabaikan
-  `SIGTERM` akan di-`SIGKILL` setelahnya.
+- Belum ada sandbox isolasi seccomp/MAC per layanan (namun penurunan hak akses user/grup fail-closed sudah didukung lewat `:user=`/`:group=`).
+- Layanan yang mengabaikan `SIGTERM` melewati jendela `:grace=` (default 5 detik) akan dihentikan lewat `SIGKILL`.
 - Pada sandbox/container tertentu, `reboot()` tidak kembali ke user-space (init
   berhenti di `pause()`); ini perilaku lingkungan, bukan bug init.
 
@@ -113,9 +118,7 @@ dijaga `scripts/test-config.sh`.
 
 Catatan arah pengembangan, bukan janji:
 
-- Hak akses & user privilege dropping (`:user=`/`:uid=`) per layanan.
-- Mode `restart=on-failure` yang eksplisit (timeout once & backoff/start-limit
-  respawn sudah tersedia; yang belum adalah kebijakan restart selektif).
+- Mode `restart=on-failure` yang eksplisit (`:on_fail=rescue` serta backoff/start-limit respawn sudah tersedia; yang belum adalah kebijakan restart selektif).
 - Dukungan mount namespace per layanan + `chroot` rootfs layanan.
 - Parser konfigurasi bergaya inittab SysV (`id:runlevels:action:proses`) atau
   unit file sederhana, plus dependensi berbasis event (`after=`, `wants=`).
