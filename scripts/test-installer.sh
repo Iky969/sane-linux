@@ -72,9 +72,13 @@ LOOP_DEV=""
 LOOP_GUARD=""
 MNT_GUARD=""
 MNT_TMP=""
+SYMLINK_GUARD=""
 
 cleanup() {
     set +e
+    if [ -n "$SYMLINK_GUARD" ] && [ -L "$SYMLINK_GUARD" ]; then
+        rm -f "$SYMLINK_GUARD" 2>/dev/null || true
+    fi
     if [ -n "$MNT_TMP" ] && [ -d "$MNT_TMP" ]; then
         if mountpoint -q "$MNT_TMP/boot" 2>/dev/null; then umount "$MNT_TMP/boot" 2>/dev/null || true; fi
         if mountpoint -q "$MNT_TMP/root" 2>/dev/null; then umount "$MNT_TMP/root" 2>/dev/null || true; fi
@@ -142,6 +146,17 @@ if [ "$rc" -ne 0 ]; then
 else
     die "Guard 3: Installer accepted a partition target ($PART_GUARD)"
 fi
+SYMLINK_GUARD="/tmp/sane-symlink-part-guard-$$"
+ln -sf "$PART_GUARD" "$SYMLINK_GUARD"
+rc=0
+"$INSTALLER_BIN" --target "$SYMLINK_GUARD" --unattended >/dev/null 2>&1 || rc=$?
+rm -f "$SYMLINK_GUARD"
+SYMLINK_GUARD=""
+if [ "$rc" -ne 0 ]; then
+    pass "Guard 3b: Symlink to partition target rejected via canonicalization"
+else
+    die "Guard 3b: Installer accepted a symlink to partition target ($PART_GUARD)"
+fi
 losetup -d "$LOOP_GUARD" || die "Guard 3: Failed to detach loop device"
 LOOP_GUARD=""
 rm -f "$TEST_IMG"
@@ -167,13 +182,19 @@ mount "$PART_GUARD" "$MNT_GUARD" || die "Guard 4: Failed to mount test partition
 
 rc=0
 "$INSTALLER_BIN" --target "$LOOP_GUARD" --unattended >/dev/null 2>&1 || rc=$?
+SYMLINK_GUARD="/tmp/sane-symlink-mnt-guard-$$"
+ln -sf "$LOOP_GUARD" "$SYMLINK_GUARD"
+rc_sym=0
+"$INSTALLER_BIN" --target "$SYMLINK_GUARD" --unattended >/dev/null 2>&1 || rc_sym=$?
+rm -f "$SYMLINK_GUARD"
+SYMLINK_GUARD=""
 umount "$MNT_GUARD" || die "Guard 4: Failed to unmount $MNT_GUARD"
 rmdir "$MNT_GUARD"
 MNT_GUARD=""
-if [ "$rc" -ne 0 ]; then
-    pass "Guard 4: Mounted disk/partition target rejected (fail-closed)"
+if [ "$rc" -ne 0 ] && [ "$rc_sym" -ne 0 ]; then
+    pass "Guard 4: Mounted disk/partition target and symlink rejected (fail-closed)"
 else
-    die "Guard 4: Installer allowed operating on a mounted disk"
+    die "Guard 4: Installer allowed operating on a mounted disk (rc=$rc rc_sym=$rc_sym)"
 fi
 losetup -d "$LOOP_GUARD" || die "Guard 4: Failed to detach loop device"
 LOOP_GUARD=""
@@ -205,10 +226,12 @@ LOOP_DEV="$(losetup -Pf --show "$TEST_IMG")"
 
 info "Attached test disk: $LOOP_DEV ($TEST_IMG)"
 
+TEST_PARTUUID="12345678-1234-4321-8765-123456789abc"
 rc=0
 "$INSTALLER_BIN" \
     --target "$LOOP_DEV" \
     --packages-dir "$PACKAGES_DIR" \
+    --partuuid "$TEST_PARTUUID" \
     --unattended \
     --no-reboot || rc=$?
 
@@ -256,33 +279,44 @@ pass "ESP bootloader files verified (bzImage, initramfs.cpio.gz, limine-bios.sys
 [ -f "$MNT_TMP/root/etc/init.conf" ] || die "Rootfs missing /etc/init.conf"
 [ -d "$MNT_TMP/root/var/lib/spm" ] || die "Rootfs missing /var/lib/spm database"
 
-# Check fstab contents
-if grep -q "PARTUUID=" "$MNT_TMP/root/etc/fstab"; then
-    pass "Rootfs /etc/fstab configured with resilient PARTUUID reference"
+# Check fstab contents (must not contain hardcoded /dev/vda, /dev/loop, or active '/')
+if grep -q "PARTUUID=$TEST_PARTUUID" "$MNT_TMP/root/etc/fstab" && \
+   ! grep -qE '/dev/(vda|loop)' "$MNT_TMP/root/etc/fstab" && \
+   ! grep -Eq '^[^#[:space:]]+[[:space:]]+/[[:space:]]' "$MNT_TMP/root/etc/fstab"; then
+    pass "Rootfs /etc/fstab references custom PARTUUID without hardcoded devices or active '/' mount"
 else
-    die "Rootfs /etc/fstab missing PARTUUID entry"
+    die "Rootfs /etc/fstab invalid: $(cat "$MNT_TMP/root/etc/fstab")"
 fi
 
 # Check limine.conf contents
-if grep -q "root=PARTUUID=" "$MNT_TMP/boot/limine.conf"; then
-    pass "Limine bootloader config uses root=PARTUUID= parameter"
+if grep -q "root=PARTUUID=$TEST_PARTUUID" "$MNT_TMP/boot/limine.conf"; then
+    pass "Limine bootloader config uses custom root=PARTUUID=$TEST_PARTUUID parameter"
 else
-    die "Limine bootloader config missing root=PARTUUID= parameter"
+    die "Limine bootloader config missing custom root=PARTUUID=$TEST_PARTUUID parameter"
 fi
 
 # Check init.conf contents
-if grep -E -q "console:respawn:cttyhack (/bin/sh -i|/sbin/getty)" "$MNT_TMP/root/etc/init.conf"; then
-    pass "Rootfs /etc/init.conf configured with cttyhack interactive console / getty"
+if grep -E -q "console:respawn:cttyhack (/bin/sh -i|/sbin/getty)" "$MNT_TMP/root/etc/init.conf" && \
+   ! grep -q "^firstboot:.*exec /bin/sh -i" "$MNT_TMP/root/etc/init.conf" && \
+   grep -Eq "^network:respawn:.*sane-net dhcp -f eth0.*:requires=firstboot$" "$MNT_TMP/root/etc/init.conf"; then
+    pass "Rootfs /etc/init.conf configured cleanly (firstboot on_fail=rescue, supervised network)"
 else
-    die "Rootfs /etc/init.conf missing cttyhack interactive console"
+    die "Rootfs /etc/init.conf failed wiring check"
 fi
 
-# Check SPM database records
+# Check SPM database records and sane-hello binary execution
 spm_installed="$(ls "$MNT_TMP/root/var/lib/spm/installed/" 2>/dev/null || true)"
-if echo "$spm_installed" | grep -q "ninit" && echo "$spm_installed" | grep -q "busybox"; then
-    pass "SPM database verified (ninit, busybox, and base packages registered)"
+if echo "$spm_installed" | grep -q "ninit" && echo "$spm_installed" | grep -q "busybox" && echo "$spm_installed" | grep -q "sane-hello"; then
+    pass "SPM database verified (ninit, busybox, sane-hello, and base packages registered)"
 else
     die "SPM database missing base packages: $spm_installed"
+fi
+[ -x "$MNT_TMP/root/usr/bin/sane-hello" ] || die "Rootfs missing /usr/bin/sane-hello"
+hello_out="$(chroot "$MNT_TMP/root" /usr/bin/sane-hello 2>&1 || true)"
+if echo "$hello_out" | grep -q "Hello from S.A.N.E Linux!"; then
+    pass "Installed sane-hello binary executes cleanly inside target rootfs"
+else
+    die "Installed sane-hello failed inside target rootfs: $hello_out"
 fi
 
 umount "$MNT_TMP/boot"
@@ -304,81 +338,83 @@ if [ "$QUICK_MODE" -eq 1 ]; then
 else
     command -v qemu-system-x86_64 >/dev/null 2>&1 || die "qemu-system-x86_64 required for INST-51 boot test"
 
-    CONSOLE_LOG="/tmp/sane-installer-qemu-console.log"
-    : > "$CONSOLE_LOG"
+    verify_qemu_boot() {
+        local mode="$1"
+        local log_file="$2"
+        shift 2
 
-    ACCEL_ARGS=()
-    if [ -w /dev/kvm ] 2>/dev/null; then
-        ACCEL_ARGS+=(-enable-kvm -cpu host)
-    else
-        ACCEL_ARGS+=(-cpu max)
-    fi
+        : > "$log_file"
+        info "Booting installed disk image in QEMU via Limine $mode..."
+        timeout -k 2 "${TIMEOUT_SECS}s" \
+            qemu-system-x86_64 \
+            "$@" \
+            -drive "file=$TEST_IMG,format=raw,if=virtio" \
+            -m 256M \
+            -serial "file:$log_file" \
+            -display none \
+            -no-reboot \
+            "${ACCEL_ARGS[@]}" >/dev/null 2>&1 &
+        local qpid=$!
 
-    info "Booting installed disk image in QEMU via Limine BIOS..."
-    timeout -k 2 "${TIMEOUT_SECS}s" \
-        qemu-system-x86_64 \
-        -drive "file=$TEST_IMG,format=raw,if=virtio" \
-        -m 256M \
-        -serial "file:$CONSOLE_LOG" \
-        -display none \
-        -no-reboot \
-        "${ACCEL_ARGS[@]}" >/dev/null 2>&1 &
-    QEMU_PID=$!
+        local deadline=$(( $(date +%s) + TIMEOUT_SECS ))
+        local switch_root_ok=0
+        local ninit_ok=0
+        local service_ok=0
 
-    # Monitor boot markers
-    DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
-    boot_ok=0
-    switch_root_ok=0
-    ninit_ok=0
-    hello_ok=0
-
-    while [ $(date +%s) -lt $DEADLINE ]; do
-        if [ -s "$CONSOLE_LOG" ]; then
-            if grep -qi "switch_root" "$CONSOLE_LOG"; then
-                switch_root_ok=1
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ -s "$log_file" ]; then
+                if grep -qi "switch_root" "$log_file"; then
+                    switch_root_ok=1
+                fi
+                if grep -qiE "main loop ready|ninit.*ready" "$log_file"; then
+                    ninit_ok=1
+                fi
+                if grep -qiE "started firstboot|=== S\.A\.N\.E Linux first boot ===|started console|started sane-hello|Hello from S.A.N.E Linux" "$log_file"; then
+                    service_ok=1
+                fi
+                if [ "$switch_root_ok" -eq 1 ] && [ "$ninit_ok" -eq 1 ] && [ "$service_ok" -eq 1 ]; then
+                    break
+                fi
             fi
-            if grep -qiE "main loop ready|ninit.*ready" "$CONSOLE_LOG"; then
-                ninit_ok=1
-            fi
-            if grep -qiE "started sane-hello|started hello|Hello from S.A.N.E Linux" "$CONSOLE_LOG"; then
-                hello_ok=1
-            fi
-            if [ "$switch_root_ok" -eq 1 ] && [ "$ninit_ok" -eq 1 ]; then
-                boot_ok=1
+            if ! kill -0 "$qpid" 2>/dev/null; then
                 break
             fi
+            sleep 0.2
+        done
+
+        kill -TERM "$qpid" 2>/dev/null || true
+        wait "$qpid" 2>/dev/null || true
+
+        if [ "$switch_root_ok" -eq 1 ]; then
+            pass "QEMU $mode boot: switch_root pivoted cleanly from initramfs to ext4 rootfs"
+        else
+            die "QEMU $mode boot failed: switch_root marker missing in console log"
         fi
-        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            break
+
+        if [ "$ninit_ok" -eq 1 ]; then
+            pass "QEMU $mode boot: ninit PID 1 started and reached 'main loop ready'"
+        else
+            die "QEMU $mode boot failed: ninit PID 1 ready marker missing in console log"
         fi
-        sleep 0.2
-    done
 
-    kill -TERM "$QEMU_PID" 2>/dev/null || true
-    wait "$QEMU_PID" 2>/dev/null || true
+        if [ "$service_ok" -eq 1 ]; then
+            pass "QEMU $mode boot: early userspace services / firstboot started cleanly"
+        else
+            die "QEMU $mode boot failed: no firstboot/console service marker in console log"
+        fi
 
-    if [ "$switch_root_ok" -eq 1 ]; then
-        pass "QEMU boot: switch_root pivoted cleanly from initramfs to ext4 rootfs"
-    else
-        die "QEMU boot failed: switch_root marker missing in console log"
-    fi
+        if grep -qiE "on_fail=rescue|crash-loop.*console" "$log_file"; then
+            die "QEMU $mode boot entered rescue or console crash-loop unexpectedly"
+        fi
 
-    if [ "$ninit_ok" -eq 1 ]; then
-        pass "QEMU boot: ninit PID 1 started and reached 'main loop ready'"
-    else
-        die "QEMU boot failed: ninit PID 1 ready marker missing in console log"
-    fi
+        if grep -qiE "kernel panic|attempted to kill init" "$log_file"; then
+            die "QEMU $mode boot detected kernel panic in console log"
+        fi
+        pass "QEMU $mode boot: Zero kernel panics ($mode test PASS)"
+    }
 
-    if [ "$hello_ok" -eq 1 ]; then
-        pass "QEMU boot: service execution confirmed (sane-hello / console)"
-    else
-        info "Notice: sane-hello service marker not yet captured, but ninit main loop is active"
-    fi
-
-    if grep -qi "kernel panic" "$CONSOLE_LOG"; then
-        die "QEMU boot detected kernel panic in console log"
-    fi
-    pass "QEMU BIOS boot: Zero kernel panics (BIOS test PASS)"
+    CONSOLE_LOG="/tmp/sane-installer-qemu-console.log"
+    verify_qemu_boot "BIOS" "$CONSOLE_LOG"
 
     # 4.2 UEFI Boot Verification if OVMF firmware available
     OVMF_BIN=""
@@ -399,55 +435,9 @@ else
     fi
 
     if [ -n "$OVMF_BIN" ]; then
-        info "Booting installed disk image in QEMU via Limine UEFI ($OVMF_BIN)..."
+        info "Using OVMF UEFI firmware: $OVMF_BIN"
         CONSOLE_LOG_UEFI="/tmp/sane-installer-qemu-uefi.log"
-        : > "$CONSOLE_LOG_UEFI"
-
-        timeout -k 2 "${TIMEOUT_SECS}s" \
-            qemu-system-x86_64 \
-            -bios "$OVMF_BIN" \
-            -drive "file=$TEST_IMG,format=raw,if=virtio" \
-            -m 256M \
-            -serial "file:$CONSOLE_LOG_UEFI" \
-            -display none \
-            -no-reboot \
-            "${ACCEL_ARGS[@]}" >/dev/null 2>&1 &
-        QEMU_UEFI_PID=$!
-
-        DEADLINE=$(( $(date +%s) + TIMEOUT_SECS ))
-        uefi_switch_root_ok=0
-        uefi_ninit_ok=0
-
-        while [ $(date +%s) -lt $DEADLINE ]; do
-            if [ -s "$CONSOLE_LOG_UEFI" ]; then
-                if grep -qi "switch_root" "$CONSOLE_LOG_UEFI"; then
-                    uefi_switch_root_ok=1
-                fi
-                if grep -qiE "main loop ready|ninit.*ready" "$CONSOLE_LOG_UEFI"; then
-                    uefi_ninit_ok=1
-                fi
-                if [ "$uefi_switch_root_ok" -eq 1 ] && [ "$uefi_ninit_ok" -eq 1 ]; then
-                    break
-                fi
-            fi
-            if ! kill -0 "$QEMU_UEFI_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 0.2
-        done
-
-        kill -TERM "$QEMU_UEFI_PID" 2>/dev/null || true
-        wait "$QEMU_UEFI_PID" 2>/dev/null || true
-
-        if grep -qi "kernel panic" "$CONSOLE_LOG_UEFI"; then
-            die "QEMU UEFI boot detected kernel panic in console log (UEFI test FAIL)"
-        fi
-
-        if [ "$uefi_switch_root_ok" -eq 1 ] && [ "$uefi_ninit_ok" -eq 1 ]; then
-            pass "QEMU UEFI boot: switch_root and ninit PID 1 started cleanly (UEFI test PASS)"
-        else
-            die "QEMU UEFI boot failed: switch_root or ninit ready marker missing (UEFI test FAIL)"
-        fi
+        verify_qemu_boot "UEFI" "$CONSOLE_LOG_UEFI" -bios "$OVMF_BIN"
     else
         skip "QEMU UEFI boot: OVMF firmware not detected on host (UEFI test SKIP)"
     fi
