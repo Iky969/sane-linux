@@ -115,6 +115,7 @@ typedef struct {
     int         need_drop;
     int         manual_stop;    /* FEAT-63: manually stopped via initctl */
     int         restart_pending;/* FEAT-63: restart requested via initctl */
+    int         on_fail_rescue; /* 1 = enter supervised rescue shell on SVC_STATE_FAILED */
     long long   stop_t0;
 } service_t;
 
@@ -1119,13 +1120,14 @@ static int parse_config(const char *path)
             continue;
         }
         
-        /* Scan for option tags (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group=) */
+        /* Scan for option tags (:requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group=, :on_fail=) */
         char *deps = "";
         char *mem_max = "";
         char *cpu_limit = "";
         char *pids_limit = "";
         int timeout_val = ONCE_START_TIMEOUT;
         int grace_val = SIGTERM_GRACE_SECS;   /* T13: SIGTERM -> SIGKILL grace window */
+        int on_fail_rescue_val = 0;
         char *user_opt = NULL;
         char *group_opt = NULL;
 
@@ -1137,6 +1139,7 @@ static int parse_config(const char *path)
         char *t_grace = strstr(cmd, ":grace=");
         char *t_user = strstr(cmd, ":user=");
         char *t_group = strstr(cmd, ":group=");
+        char *t_onfail = strstr(cmd, ":on_fail=");
 
         /* Find the earliest occurring tag so commands containing ':' remain intact */
         char *first_tag = NULL;
@@ -1148,6 +1151,7 @@ static int parse_config(const char *path)
         if (t_grace && (!first_tag || t_grace < first_tag)) first_tag = t_grace;
         if (t_user && (!first_tag || t_user < first_tag)) first_tag = t_user;
         if (t_group && (!first_tag || t_group < first_tag)) first_tag = t_group;
+        if (t_onfail && (!first_tag || t_onfail < first_tag)) first_tag = t_onfail;
 
         if (first_tag) {
             *first_tag = 0; /* Split cmd right before first option tag */
@@ -1213,6 +1217,16 @@ static int parse_config(const char *path)
                     } else {
                         init_log("Parse err: invalid grace format '%s' on service '%s', using default %ds",
                                  gr_str, name, SIGTERM_GRACE_SECS);
+                    }
+                } else if (strncmp(scan, "on_fail=", 8) == 0) {
+                    char *of_str = trim(scan + 8);
+                    if (strcmp(of_str, "rescue") == 0) {
+                        on_fail_rescue_val = 1;
+                    } else if (strcmp(of_str, "fail") == 0 || strcmp(of_str, "none") == 0) {
+                        on_fail_rescue_val = 0;
+                    } else {
+                        init_log("Parse err: invalid on_fail '%s' on service '%s', ignored",
+                                 of_str, name);
                     }
                 } else {
                     init_log("Warning: unknown option '%s' on service '%s'", scan, name);
@@ -1364,6 +1378,7 @@ static int parse_config(const char *path)
         services[num_services].need_drop    = need_drop;
         services[num_services].manual_stop  = 0;
         services[num_services].restart_pending = 0;
+        services[num_services].on_fail_rescue = on_fail_rescue_val;
         /* T10: registration is not a transition (the entry is already STOPPED),
            so it goes through the same single assignment point as everything else. */
         svc_set_state(&services[num_services], SVC_STATE_STOPPED);
@@ -2221,6 +2236,88 @@ static void prepare_filesystems(void)
         init_log("shutdown: / remounted read-only");
 }
 
+/* Graceful SIGTERM -> per-service grace wait -> SIGKILL sweep shared between
+   shutdown_all() and runtime rescue handoff. When log_dead_skip is nonzero,
+   logs dead-group SIGKILL skips identically to shutdown_all(). */
+static void stop_services_gracefully(int log_dead_skip)
+{
+    int any_alive = 0;
+    long long grace_t0_ms = monotonic_ms();
+
+    /* T13 phase 1 — SIGTERM to every live service, across BOTH its process group
+       and its cgroup: kill_service_group() reaches processes that left the
+       cgroup, the cgroup.procs sweep reaches processes that called setsid()/
+       setpgid() and would otherwise miss kill(-pgid) (SANE-01). cgroup.kill is
+       deliberately NOT used for the polite signal: it only implements SIGKILL and
+       would end the grace window before a well-behaved service could exit
+       (scripts/test-sigterm.sh scenario 1 asserts the trap really runs). */
+    for (int i = 0; i < num_services; i++) {
+        /* Probe before signaling (same as force shutdown path):
+           stale pgids are pruned first, ensuring only genuinely active
+           groups receive SIGTERM. */
+        if (service_still_alive(&services[i])) {
+            any_alive = 1;
+            services[i].manual_stop = 1;
+            svc_set_state(&services[i], SVC_STATE_STOPPING);
+            kill_service_group(&services[i], SIGTERM);
+        }
+    }
+
+    /* T13 phase 2 — per-service grace window (:grace=N, default
+       SIGTERM_GRACE_SECS), polled every 100 ms with nanosleep(). */
+    if (any_alive) {
+        for (;;) {
+            int alive = 0, waiting = 0;
+
+            reap_zombies();
+            drain_log_fifo();   /* capture last logs before death (e.g. "bye!") */
+            long long elapsed_ms = monotonic_ms() - grace_t0_ms;
+
+            for (int j = 0; j < num_services; j++) {
+                service_t *svc = &services[j];
+                if (!service_still_alive(svc)) continue;
+                alive = 1;
+                if (elapsed_ms >= (long long)svc->grace * 1000) {
+                    if (!svc->sigkill_sent) {
+                        svc->sigkill_sent = 1;
+                        init_log("%s: grace expired, SIGKILL", svc->name);
+                        kill_service_group(svc, SIGKILL);
+                    }
+                } else {
+                    waiting = 1;   /* still inside its grace window: keep polling */
+                }
+            }
+            if (!alive || !waiting) break;
+            sleep_ms(100);
+        }
+    }
+
+    if (!any_alive && !log_dead_skip) {
+        for (int i = 0; i < num_services; i++) {
+            cgroup_kill_service(services[i].name);
+            cleanup_cgroup(services[i].name);
+        }
+        return;
+    }
+
+    for (int i = 0; i < num_services; i++) {
+        service_t *svc = &services[i];
+        if (svc->sigkill_sent) {
+            cgroup_kill_service(svc->name);
+        } else if (service_still_alive(svc)) {
+            kill_service_group(svc, SIGKILL);
+        } else {
+            if (log_dead_skip)
+                init_log("%s: process group already dead, SIGKILL skipped", svc->name);
+            cgroup_kill_service(svc->name);
+        }
+        /* T12: the service is stopped: reset its generation counters so a
+           future start never inherits this run's crash-loop backoff. */
+        reset_respawn_counters(&services[i]);
+        cleanup_cgroup(services[i].name);
+    }
+}
+
 /* ---------- shutdown ---------- */
 static void shutdown_all(int reboot_cmd, int force)
 {
@@ -2252,84 +2349,8 @@ static void shutdown_all(int reboot_cmd, int force)
     }
 
     init_log("graceful shutdown (cmd=%d)", reboot_cmd);
-
-    /* T13 phase 1 — SIGTERM to every live service, across BOTH its process group
-       and its cgroup: kill_service_group() reaches processes that left the
-       cgroup, the cgroup.procs sweep reaches processes that called setsid()/
-       setpgid() and would otherwise miss kill(-pgid) (SANE-01). cgroup.kill is
-       deliberately NOT used for the polite signal: it only implements SIGKILL and
-       would end the grace window before a well-behaved service could exit
-       (scripts/test-sigterm.sh scenario 1 asserts the trap really runs). */
     if (rescue_shell_pid > 0) kill(rescue_shell_pid, SIGTERM);
-    long long grace_t0_ms = monotonic_ms();
-    for (int i = 0; i < num_services; i++) {
-        /* Probe before signaling (same as force shutdown path above):
-           stale pgids are pruned first, ensuring only genuinely active
-           groups receive SIGTERM. */
-        if (service_still_alive(&services[i])) {
-            svc_set_state(&services[i], SVC_STATE_STOPPING);
-            kill_service_group(&services[i], SIGTERM);
-        }
-    }
-
-    /* T13 phase 2 — per-service grace window (:grace=N, default
-       SIGTERM_GRACE_SECS), polled every 100 ms with nanosleep(). A service still
-       alive when its own window expires is escalated to SIGKILL immediately and
-       exactly once ("grace expired, SIGKILL"). The loop ends when nothing is
-       alive, or when every survivor has already been escalated, so the total
-       wait is bounded by the LONGEST configured grace instead of growing with
-       the number of services. */
-    for (;;) {
-        int alive = 0, waiting = 0;
-
-        reap_zombies();
-        drain_log_fifo();   /* capture last logs before death (e.g. "bye!") */
-        long long elapsed_ms = monotonic_ms() - grace_t0_ms;
-
-        /* Probe EVERY service, do not break on the first active one: only
-           service_still_alive() clears stale pgids. Breaking early would leave
-           services after an active one unprobed on the final pass, allowing
-           stale pgids to persist into the SIGKILL sweep below and hit recycled
-           process groups. */
-        for (int j = 0; j < num_services; j++) {
-            service_t *svc = &services[j];
-            if (!service_still_alive(svc)) continue;
-            alive = 1;
-            if (elapsed_ms >= (long long)svc->grace * 1000) {
-                if (!svc->sigkill_sent) {
-                    svc->sigkill_sent = 1;
-                    init_log("%s: grace expired, SIGKILL", svc->name);
-                    kill_service_group(svc, SIGKILL);
-                }
-            } else {
-                waiting = 1;   /* still inside its grace window: keep polling */
-            }
-        }
-        if (!alive || !waiting) break;
-        sleep_ms(100);
-    }
-
-    for (int i = 0; i < num_services; i++) {
-        service_t *svc = &services[i];
-        /* Probe once more before SIGKILL, matching force and SIGTERM paths:
-           groups may have exited after the last pass. Services with empty groups
-           only require cgroup.kill — signaling stale pgids with SIGKILL is dangerous.
-           A service already escalated when its own grace window expired (T13) is
-           not re-reported as a dead group: its SIGKILL was deliberate, and the
-           "already dead" message would misreport the escalation as a no-op. */
-        if (svc->sigkill_sent) {
-            cgroup_kill_service(svc->name);
-        } else if (service_still_alive(svc)) {
-            kill_service_group(svc, SIGKILL);
-        } else {
-            init_log("%s: process group already dead, SIGKILL skipped", svc->name);
-            cgroup_kill_service(svc->name);
-        }
-        /* T12: the service is stopped: reset its generation counters so a
-           future start never inherits this run's crash-loop backoff. */
-        reset_respawn_counters(&services[i]);
-        cleanup_cgroup(services[i].name);
-    }
+    stop_services_gracefully(1);
     if (rescue_shell_pid > 0) kill(rescue_shell_pid, SIGKILL);
     rmdir(CGROUP_BASE);
     prepare_filesystems();
@@ -3053,6 +3074,25 @@ static void enter_rescue_mode(const char *reason)
     rescue_loop();   /* never returns */
 }
 
+/* Transition to supervised rescue mode if any critical service flagged with
+   :on_fail=rescue reached SVC_STATE_FAILED (exit != 0, fork fail, or timeout). */
+static void check_rescue_on_fail(void)
+{
+    for (int i = 0; i < num_services; i++) {
+        if (services[i].on_fail_rescue && services[i].state == SVC_STATE_FAILED) {
+            drain_log_fifo();
+            cancel_dependents();
+            stop_services_gracefully(0);
+            drain_log_fifo();
+            char reason[256];
+            snprintf(reason, sizeof(reason),
+                     "FATAL: service '%.127s' failed (on_fail=rescue)",
+                     services[i].name);
+            enter_rescue_mode(reason);
+        }
+    }
+}
+
 /* ---------- main ---------- */
 int main(int argc, char **argv)
 {
@@ -3113,6 +3153,7 @@ int main(int argc, char **argv)
     g_log_fifo_fd = log_fifo_fd;
 
     spawn_eligible_services();
+    check_rescue_on_fail();
 
     init_log("main loop ready");
 
@@ -3179,6 +3220,7 @@ int main(int argc, char **argv)
         enforce_stop_timeout();
         respawn_services();
         spawn_eligible_services();
+        check_rescue_on_fail();
     }
     return 0;
 }

@@ -887,11 +887,42 @@ rebuild_shadow() {
 		fi
 	fi
 	mv "$tmp" "$SHADOW"
-	if [ -n "$root_hash" ]; then
+	if [ -n "$root_hash" ] && [ "$root_hash" != "!" ]; then
 		set_field "$SHADOW" root 2 "$root_hash"
 	fi
-	if [ -n "$sane_hash" ]; then
+	if [ -n "$sane_hash" ] && [ "$sane_hash" != "!" ]; then
 		set_field "$SHADOW" sane 2 "$sane_hash"
+	fi
+}
+
+# Inspect field 2 of an account in shadow and separate lock state ('!') from
+# hash validity so recovery never strips an administrator lock prefix.
+inspect_shadow_recovery() {
+	raw=$(field_of "$1" "$2" 2 || true)
+	case "$raw" in
+		'!'*) is_locked=1; bare=${raw#!} ;;
+		*)    is_locked=0; bare=$raw ;;
+	esac
+	if valid_sha512_hash "$bare"; then
+		hash_valid=1
+		clean_hash=$bare
+	else
+		hash_valid=0
+		clean_hash=
+	fi
+}
+
+# Format field 2 for merge_shadow/rebuild_shadow from separate validity & lock state.
+compose_shadow_field() {
+	valid=$1; locked=$2; hash=$3
+	if [ "$valid" -eq 1 ]; then
+		if [ "$locked" -eq 1 ]; then
+			printf '!%s\n' "$hash"
+		else
+			printf '%s\n' "$hash"
+		fi
+	else
+		printf '!\n'
 	fi
 }
 
@@ -902,22 +933,31 @@ cmd_recover() {
 	# structurally corrupt one is rebuilt from the template with valid,
 	# conflict-free extra lines restored. A policy-compliant doas.conf is
 	# preserved and only its mode/owner is repaired. A structurally sound shadow
-	# is merged (root/sane repaired only when their old hash is usable; every
-	# extra entry kept byte-for-byte); a corrupt one is rebuilt from the locked
-	# baseline with valid, conflict-free extra entries appended again. If no
-	# valid root/sane hash survives, remove the firstboot marker so the console
-	# setup runs again on this boot.
+	# is merged (root/sane repaired only when their old hash is usable, with
+	# intentional lock markers preserved; every extra entry kept byte-for-byte);
+	# a corrupt one is rebuilt from the locked baseline with valid, conflict-free
+	# extra entries appended again. If no valid root/sane hash survives, remove
+	# the firstboot marker so the console setup runs again on this boot.
 	ensure_etc
+	recover_root_valid=0
+	recover_root_locked=0
 	recover_root_hash=
+	recover_sane_valid=0
+	recover_sane_locked=0
 	recover_sane_hash=
 	if [ -f "$SHADOW" ]; then
-		h=$(field_of "$SHADOW" root 2 || true)
-		case "$h" in '!'*) h=${h#!} ;; esac
-		valid_sha512_hash "$h" && recover_root_hash=$h
-		h=$(field_of "$SHADOW" sane 2 || true)
-		case "$h" in '!'*) h=${h#!} ;; esac
-		valid_sha512_hash "$h" && recover_sane_hash=$h
+		inspect_shadow_recovery "$SHADOW" root
+		recover_root_valid=$hash_valid
+		recover_root_locked=$is_locked
+		recover_root_hash=$clean_hash
+
+		inspect_shadow_recovery "$SHADOW" sane
+		recover_sane_valid=$hash_valid
+		recover_sane_locked=$is_locked
+		recover_sane_hash=$clean_hash
 	fi
+	recover_root_field=$(compose_shadow_field "$recover_root_valid" "$recover_root_locked" "$recover_root_hash")
+	recover_sane_field=$(compose_shadow_field "$recover_sane_valid" "$recover_sane_locked" "$recover_sane_hash")
 
 	# doas.conf: keep policy-compliant content, repair mode/owner only.
 	if [ -f "$DOAS_CONF" ] && doas_policy_ok "$DOAS_CONF"; then
@@ -949,13 +989,13 @@ cmd_recover() {
 
 	# shadow: merge when structurally sound (extra hashes preserved
 	# byte-for-byte); otherwise rebuild the locked baseline and append back
-	# only valid, conflict-free extra entries. Usable root/sane hashes are
-	# restored in both paths, and the marker logic below is unchanged.
+	# only valid, conflict-free extra entries. Usable root/sane hashes (and
+	# any existing '!' lock prefix) are restored in both paths.
 	if [ -f "$SHADOW" ] && shadow_structurally_ok "$SHADOW"; then
-		merge_shadow "$recover_root_hash" "$recover_sane_hash"
+		merge_shadow "$recover_root_field" "$recover_sane_field"
 		printf 'recover: shadow merged (root/sane repaired when usable; extra entries preserved)\n'
 	else
-		rebuild_shadow "$recover_root_hash" "$recover_sane_hash"
+		rebuild_shadow "$recover_root_field" "$recover_sane_field"
 		printf 'recover: shadow rebuilt from baseline (structural corruption; valid extra entries restored)\n'
 	fi
 
@@ -965,7 +1005,7 @@ cmd_recover() {
 	chmod 0750 "$HOME_BASE/sane"
 
 	MARK="$ETC/.sane-firstboot-done"
-	if [ -z "$recover_root_hash" ] || [ -z "$recover_sane_hash" ]; then
+	if [ "$recover_root_valid" -ne 1 ] || [ "$recover_sane_valid" -ne 1 ]; then
 		rm -f "$MARK"
 		printf 'recover: no usable root/sane hash; first boot will ask for passwords again\n'
 	else

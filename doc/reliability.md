@@ -354,36 +354,28 @@ that runs journal-driven recovery before user services. The service is
 `reliability:once`, defined as:
 
 ```
-reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || echo "reliability: recover failed; continuing boot" >&2'
+reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':on_fail=rescue:timeout=0
 ```
 
-with `timeout=0`, which disables ninit's default 30 s once-service timeout so a
-slow recovery is not killed mid-transaction.
+with `:on_fail=rescue` and `timeout=0`, which disables ninit's default 30 s
+once-service timeout so a slow recovery is not killed mid-transaction while
+guaranteeing an interactive supervised rescue shell if recovery fails.
 
 Ordering: `network:once` and `recovery:once` (account recovery) carry
 `requires=reliability`; `firstboot` carries `requires=recovery`; `tty1`/console
 carry `requires=firstboot`. Consequently `reliability` runs **before** network,
 account recovery, firstboot and getty.
 
-Failure behaviour: ninit marks a once service `FAILED` on a nonzero exit and
-cancels its transitive dependents, so the wrapper deliberately exits `0` even
-when `recover` fails, emitting `reliability: recover failed; continuing boot`
-to stderr. Boot therefore continues to account recovery/firstboot — a recovery
-failure must **not** lock boot. A successful recovery is logged by
-`sane-reliability` itself (`INFO ... recovered`); a failure is logged `ERROR` in
+Failure behaviour: ninit marks a once service `FAILED` on a nonzero exit (or
+spawn failure) and cancels its transitive dependents — so `network`,
+`recovery`, `firstboot`, and `getty` never start on an unrepaired filesystem —
+and because `reliability:once` (like `recovery:once` and `firstboot:once`)
+carries `:on_fail=rescue`, ninit immediately transitions into its supervised
+rescue shell (`enter_rescue_mode()`) so the operator has console shell access
+(with cleared signal mask and active `/run/initctl`) to inspect and repair the
+system. A successful recovery is logged by `sane-reliability` itself
+(`INFO ... recovered`); a failure is logged `ERROR` in
 `/var/log/sane/reliability.log` in addition to the wrapper's stderr line.
-
-#### Spawn-failure boundary
-
-The fail-open wrapper guards the **exit code** of `recover`, not the spawn
-of the service itself. If the reliability service cannot be spawned at all
-(for example `/bin/sh` cannot be executed), ninit marks `reliability`
-`FAILED` and cancels its transitive dependents — including `network`,
-`recovery`, `firstboot` and the getty/console chain. ninit's rescue mode
-covers configuration failures (broken config, missing dependencies,
-cycles), not runtime spawn failures. This boundary is accepted: a broken
-`/bin/sh` would also fail getty directly, so the console would be
-unavailable regardless of where the reliability service sits in the graph.
 
 Install: `/usr/bin/sane-reliability` is installed mode `0755` by
 `build-rootfs.sh`, `make-image.sh` and `sane-install.sh` (the latter two use

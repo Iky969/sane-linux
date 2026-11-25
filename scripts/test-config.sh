@@ -440,13 +440,11 @@ HOLDER=""
 stop_init
 
 # --------------------------------------------------------------- scenario 2b
-# B1 boot-failure contract: the reliability:once wrapper must propagate a
-# failed `recover` as a NONZERO exit (with the message still logged), so ninit
-# marks the root service FAILED and cancels every dependent — boot must not
-# reach getty with an unrepaired filesystem. The wrapper line is read from the
-# builder itself, so a builder drifting back to the fail-open `|| echo` form
-# makes this regression fail.
-printf '\n== 2b. failed reliability recover -> FAILED, chain cancelled ==\n'
+# Boot-failure rescue contract (sane.md): the live reliability:once line uses
+# `:on_fail=rescue`, so a failed `recover` cancels its boot chain (network,
+# firstboot, getty never run) AND transitions PID 1 into the real supervised
+# rescue shell so the administrator has accessible recovery without login.
+printf '\n== 2b. failed reliability recover -> chain cancelled + supervised rescue ==\n'
 start_root reliability-fail
 LOG2B="$LOG"
 mkdir -p "$ROOT/usr/bin"
@@ -464,10 +462,14 @@ REL_LINE=$(grep -h '^reliability:once:' "$REPO_ROOT/scripts/build-rootfs.sh" | h
 	printf 'getty:once:echo GETTY_STARTED:requires=network\n'
 } > "$ROOT/etc/init.conf"
 
+mkfifo "$ROOT/rescue.stdin"
+sleep 15 > "$ROOT/rescue.stdin" &
+HOLDER=$!
+INIT_STDIN="$ROOT/rescue.stdin"
 run_init
-if ! wait_for 'state RUNNING -> FAILED'; then
+if ! wait_for 'Entering rescue mode'; then
 	sed 's/^/  | /' "$LOG"
-	bad "2b: failed reliability recover did not mark the root service FAILED"
+	bad "2b: failed reliability recover did not enter supervised rescue mode"
 fi
 check "2b: wrapper logs the boot-enters-rescue message" \
 	'reliability: recover failed; boot enters rescue'
@@ -475,14 +477,60 @@ check "2b: root once service is FAILED" 'reliability: state RUNNING -> FAILED'
 check "2b: root exited nonzero" 'exit status=0x100'
 check_absent "2b: dependent network never started" 'NETWORK_STARTED'
 check_absent "2b: transitive getty never started" 'GETTY_STARTED'
-# PID 1 survives a failed once service (it keeps supervising the main loop).
-INIT_PID_2B=$(find_init_pid || true)
-if [ -n "$INIT_PID_2B" ] && kill -0 "$INIT_PID_2B" 2>/dev/null; then
-	ok "2b: PID 1 alive after the root service FAILED"
-else
-	bad "2b: PID 1 gone after the root service FAILED"
+check "2b: on_fail=rescue fatal reason logged" "FATAL: service 'reliability' failed (on_fail=rescue)"
+check "2b: init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+assert_supervised_rescue "2b"
+INIT_STDIN=/dev/null
+kill "$HOLDER" 2>/dev/null || true
+HOLDER=""
+stop_init
+
+# --------------------------------------------------------------- scenario 2c
+# Opt-in scoping & timeout trigger for :on_fail=rescue:
+#   - Normal failing once services without :on_fail=rescue cancel their own
+#     dependents while staying in main loop (never hijacking boot into rescue).
+#   - A once timeout with :on_fail=rescue DOES enter supervised rescue and stops
+#     unrelated active services cleanly first.
+printf '\n== 2c. once failure without on_fail=rescue vs timeout with on_fail=rescue ==\n'
+start_root optin-norescue
+LOG2C_NO="$LOG"
+printf 'plainfail:once:exit 2\ndep:once:echo SHOULD_NOT_RUN:requires=plainfail\n' > "$ROOT/etc/init.conf"
+run_init
+if ! wait_for 'cancelled: dependency'; then
+	sed 's/^/  | /' "$LOG"
+	bad "2c-norescue: plain failure did not cancel dependent"
 fi
-INIT_PID="${INIT_PID_2B:-}"
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+check "2c-norescue: dependent cancelled" "service 'dep' cancelled: dependency 'plainfail' failed"
+check_absent "2c-norescue: without on_fail=rescue stays out of rescue mode" 'Entering rescue mode'
+
+start_root timeout-rescue
+LOG2C_TO="$LOG"
+ln -s /bin/sh "$ROOT/bin/sleep"
+{
+	printf 'bg:respawn:/bin/sleep 30\n'
+	printf 'reltimeout:once:/bin/sleep 20:on_fail=rescue:timeout=1\n'
+	printf 'getty:once:echo GETTY_TO_STARTED:requires=reltimeout\n'
+} > "$ROOT/etc/init.conf"
+mkfifo "$ROOT/rescue.stdin"
+sleep 15 > "$ROOT/rescue.stdin" &
+HOLDER=$!
+INIT_STDIN="$ROOT/rescue.stdin"
+run_init
+if ! wait_for 'Entering rescue mode'; then
+	sed 's/^/  | /' "$LOG"
+	bad "2c-timeout: timed-out on_fail=rescue service did not enter rescue mode"
+fi
+check "2c-timeout: service timed out and marked FAILED" 'reltimeout: once service exceeded 1 seconds timeout, marked failed'
+check "2c-timeout: unrelated active service stopped cleanly before rescue" 'bg: state RUNNING -> STOPPING'
+check_absent "2c-timeout: dependent getty cancelled" 'GETTY_TO_STARTED'
+check "2c-timeout: on_fail=rescue fatal reason logged" "FATAL: service 'reltimeout' failed (on_fail=rescue)"
+assert_supervised_rescue "2c-timeout"
+INIT_STDIN=/dev/null
+kill "$HOLDER" 2>/dev/null || true
+HOLDER=""
 stop_init
 
 # ninit emits the generic FATAL: Dependency / Entering rescue-mode pair only

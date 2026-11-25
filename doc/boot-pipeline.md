@@ -253,5 +253,6 @@ S.A.N.E enforces a fail-closed boot contract:
 | **Root Filesystem Corrupt** | `mount` of `/newroot` fails | Halts boot and opens emergency shell for `fsck.ext4` intervention. |
 | **`ninit` Missing / Invalid Config** | Missing `/etc/init.conf` or syntax error | `enter_rescue_mode()`: Clears signal mask (`sigprocmask`), resets `SIGPIPE`, closes FIFOs, and launches `/bin/sh`. |
 | **Dependency Missing or Cycle** | `:requires=unknown` or cyclical graph | `enter_rescue_mode()`: Halts half-configured boot and launches `/bin/sh`. |
+| **Critical Boot Service Failure (`:on_fail=rescue`)** | `reliability`, `recovery`, or `firstboot` exits nonzero, times out, or fails to spawn | Cancels dependent boot chain (never starts `getty`), stops unrelated active services, flushes logs, and calls `enter_rescue_mode()` so the supervised `/bin/sh` recovery shell is directly accessible. |
 
 In rescue mode, interactive control (Ctrl+C, job control) is fully restored, enabling administrator diagnosis and repair.

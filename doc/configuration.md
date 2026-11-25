@@ -7,7 +7,7 @@
 Line format:
 
 ```
-<name>:<mode>:<command>[:requires=<name1>,<name2>,...][:memory_max=<val>][:cpu_max=<val>][:pids_max=<val>][:timeout=<sec>]
+<name>:<mode>:<command>[:requires=<name1>,<name2>,...][:memory_max=<val>][:cpu_max=<val>][:pids_max=<val>][:timeout=<sec>][:grace=<sec>][:user=<user>][:group=<group>][:on_fail=rescue|fail|none]
 ```
 
 | Field | Rules & Behavior |
@@ -20,13 +20,14 @@ Line format:
 | `:cpu_max=` | Optional. CFS CPU bandwidth quota (max 63 characters). Written to `/sys/fs/cgroup/ninit/<name>/cpu.max`. Valid format: `<quota> <period>` consisting of two positive integers separated by exactly one space (e.g. `50000 100000` for 50% CPU quota per 100ms period). Malformed formats (non-numeric, multiple spaces, zero/negative values, missing period) are rejected gracefully (ignored with a warning). |
 | `:pids_max=` | Optional. Maximum number of processes permitted in the service's cgroup (max 63 characters). Written to `/sys/fs/cgroup/ninit/<name>/pids.max`. Valid format: `max` or a positive integer (e.g. `5`, `50`, `max`). Non-numeric, zero, or negative values are rejected gracefully (ignored with a warning). `fork()` attempts exceeding this limit are rejected by the kernel with `EAGAIN` (`Resource temporarily unavailable`). |
 | `:timeout=` | Optional (exclusive to `once` services, max 10 characters). Execution timeout in seconds (e.g. `:timeout=60`, `:timeout=120`). Default: 30 seconds (`ONCE_START_TIMEOUT`). If exceeded, the service is forcefully terminated (`SIGKILL`), marked `SVC_STATE_FAILED`, and all dependents are cancelled. Specifying `0`, `none`, or `infinity` disables the timeout. **Warning**: disabling timeouts risks hanging dependent services indefinitely if the command deadlocks. Out-of-range values (outside 1–86400s) default to 30 seconds. |
+| `:on_fail=` | Optional (`rescue`, `fail`, or `none`). Default `fail`/`none` cancels dependents and leaves PID 1 in its main loop when the service enters `SVC_STATE_FAILED`. Setting `:on_fail=rescue` cancels dependents, stops unrelated active services, flushes `/run/log.fifo`, and enters `ninit`'s supervised rescue shell (`enter_rescue_mode()`). Unrecognized values are ignored with a warning (`Parse err: invalid on_fail ... ignored`). |
 
 ### General Syntax Rules
 
 - Lines starting with `#` (optional leading whitespace) and empty lines are ignored.
 - Lines exceeding 1023 characters are rejected in full (`Parse err: line exceeds MAX_LINE ...`); subsequent lines continue to be processed. The same rule applies to `/etc/fstab`.
 - Lines missing the first or second `:` delimiter are logged as `Parse err: ...` and skipped.
-- Option tags (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`) may appear in any order following `<command>`.
+- Option tags (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`, `:grace=`, `:user=`, `:group=`, `:on_fail=`) may appear in any order following `<command>`.
 - Cgroup resource limits are applied to the leaf `/sys/fs/cgroup/ninit/<name>/` before the child PID is added to `cgroup.procs`. Writing controller masks (`+memory +cpu +pids`) to `/sys/fs/cgroup/cgroup.subtree_control` tolerates partial failures in nested/container environments without failing boot.
 - Graceful error handling: malformed resource limit values are ignored with a warning (`Parse err: ... invalid on service '...', limit ignored`), running the service unconstrained without crashing init or triggering a rescue shell.
 - Lifecycle orphan cleanup:

@@ -55,7 +55,7 @@ and `SC3013` (`-ef`) are documented exclusions: undefined in strict POSIX but
 supported by all target shells (dash, ash, BusyBox sh). Info/style severities
 are not gated; any warning fails the build.
 
-Boot recovery is fail-closed: a nonzero `reliability:once` recovery stops its dependency chain, so `firstboot` and `getty` do not start on an unrepaired filesystem. It does **not** enter the supervised rescue shell; that shell is reserved for invalid dependency/config errors (the config/initctl scenarios listed below).
+Boot recovery is fail-closed and accessible: `reliability:once`, `recovery:once`, and `firstboot:once` carry `:on_fail=rescue`, so a nonzero exit (or spawn failure/timeout) stops downstream boot services (`firstboot` and `getty` do not start on an unrepaired filesystem) **and** hands control to PID 1's supervised rescue shell alongside config/dependency failures.
 
 ### Measured suite counts (final pass)
 

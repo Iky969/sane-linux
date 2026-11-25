@@ -491,8 +491,8 @@ for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
 	check "firstboot in $tpl has :timeout=0" sh -c \
 		"grep -q '^firstboot:once:.*:timeout=0$' '$REPO_ROOT/scripts/$tpl'"
 	check "recovery service in $tpl precedes firstboot" sh -c \
-		"grep -q '^recovery:once:.*sane-account-recovery.*:timeout=0$' '$REPO_ROOT/scripts/$tpl' && \
-		 grep -q '^firstboot:once:.*:requires=recovery:timeout=0$' '$REPO_ROOT/scripts/$tpl'"
+		"grep -q '^recovery:once:.*sane-account-recovery.*:on_fail=rescue:timeout=0$' '$REPO_ROOT/scripts/$tpl' && \
+		 grep -q '^firstboot:once:.*:requires=recovery:on_fail=rescue:timeout=0$' '$REPO_ROOT/scripts/$tpl'"
 done
 
 check "firstboot clears stale passwd temp files" sh -c \
@@ -1062,13 +1062,14 @@ printf '\n--- reliability:once fail-closed wrapper (extracted wiring) ---\n'
 # performs no host operations (it only exits with the requested code).
 rel_line=$(grep '^reliability:once:' "$REPO_ROOT/scripts/build-rootfs.sh")
 check "reliability:once wiring present in build-rootfs.sh" test -n "$rel_line"
-check "reliability:once wiring carries timeout=0" sh -c \
-	"grep -q '^reliability:once:.*:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
+check "reliability:once wiring carries on_fail=rescue and timeout=0" sh -c \
+	"grep -q '^reliability:once:.*:on_fail=rescue:timeout=0\$' '$REPO_ROOT/scripts/build-rootfs.sh'"
 check "reliability:once wiring byte-identical across the 3 builders" sh -c \
-	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^b41ae02acee4b7648b9ef05472ef9554'"
+	"grep -h 'reliability:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^e2945f26938e65bae7a08ce841763f08'"
 check "network:once wiring byte-identical across the 3 builders" sh -c \
 	"grep -h 'network:once' '$REPO_ROOT/scripts/build-rootfs.sh' '$REPO_ROOT/scripts/make-image.sh' '$REPO_ROOT/scripts/sane-install.sh' | sort -u | md5sum | grep -q '^77a839731687c05b1e0fe2e0f1d0810a'"
 rel_cmd=${rel_line#reliability:once:}
+rel_cmd=${rel_cmd%:on_fail=rescue:timeout=0}
 rel_cmd=${rel_cmd%:timeout=0}
 rel_stub_cmd=$(printf '%s\n' "$rel_cmd" | sed "s|/usr/bin/sane-reliability|$T/stub-reliability|")
 
@@ -1169,6 +1170,96 @@ check "correct BIN_DIR/awk symlink keeps its target" sh -c \
 	"[ -L '$T/gbin/awk' ] && [ \"\$(readlink '$T/gbin/awk')\" = '$T/stub-busybox' ]"
 check "correct BIN_DIR/awk symlink is not recreated" \
 	test "$(stat -c %i "$T/gbin/awk")" = "$awk_inode"
+
+printf '\n--- lock preservation across recover merge & rebuild (sane.md) ---\n'
+# Intentionally locked root or sane accounts carrying a valid SHA-512 hash
+# ('!<hash>') must keep their lock prefix across both merge_shadow() and
+# rebuild_shadow(), while remaining unlockable via sane-accounts unlock.
+
+# 1. Locked root (valid SHA-512 hash) during merge recovery (mode-only doas.conf error)
+base_firstboot
+set_pw root 'LockedRootPass1!'
+set_pw sane 'ActiveSanePass1!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "lock root with valid hash before merge recovery" \
+	sh "$ACCOUNTS" --root "$T" lock root
+root_locked_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_unlocked_before=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+chmod 0644 "$T/etc/doas.conf"
+expect_ok "merge recover succeeds with locked root hash" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "merge recover keeps lock marker on root" sh -c \
+	"grep -q '^root:![\$]6[\$]' '$T/etc/shadow'"
+check "merge recover keeps locked root hash byte-for-byte" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_locked_before"
+check "merge recover leaves active sane hash unlocked" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_unlocked_before"
+check "merge recover keeps firstboot marker for locked valid root" \
+	test -f "$T/etc/.sane-firstboot-done"
+expect_ok "validate passes after merge recover with locked root" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "locked root can still be explicitly unlocked later" \
+	sh "$ACCOUNTS" --root "$T" unlock root
+
+# 2. Locked sane (valid SHA-512 hash) during merge recovery
+base_firstboot
+set_pw root 'ActiveRootPass1!'
+set_pw sane 'LockedSanePass1!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "lock sane with valid hash before merge recovery" \
+	sh "$ACCOUNTS" --root "$T" lock sane
+root_unlocked_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_locked_before=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+chmod 0644 "$T/etc/doas.conf"
+expect_ok "merge recover succeeds with locked sane hash" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "merge recover keeps lock marker on sane" sh -c \
+	"grep -q '^sane:![\$]6[\$]' '$T/etc/shadow'"
+check "merge recover keeps locked sane hash byte-for-byte" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_locked_before"
+check "merge recover leaves active root hash unlocked" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_unlocked_before"
+expect_ok "validate passes after merge recover with locked sane" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# 3. Both root and sane locked with valid hashes during corrupt-shadow rebuild
+base_firstboot
+set_pw root 'RebuildLockedRoot1!'
+set_pw sane 'RebuildLockedSane1!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "rebuild setup: lock root with valid hash" sh "$ACCOUNTS" --root "$T" lock root
+expect_ok "rebuild setup: lock sane with valid hash" sh "$ACCOUNTS" --root "$T" lock sane
+root_locked_rebuild=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+sane_locked_rebuild=$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")
+printf 'corrupt-line\n' >> "$T/etc/shadow"
+expect_ok "rebuild recover succeeds with locked root and sane" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "rebuild recover drops corrupt shadow line" sh -c \
+	"! grep -q '^corrupt-line$' '$T/etc/shadow'"
+check "rebuild recover keeps locked root hash byte-for-byte" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_locked_rebuild"
+check "rebuild recover keeps locked sane hash byte-for-byte" \
+	test "$(awk -F: '$1=="sane"{print $2}' "$T/etc/shadow")" = "$sane_locked_rebuild"
+expect_ok "validate passes after rebuild recover with locked baselines" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# 4. Locked valid root + missing sane hash -> root keeps locked hash, sane becomes '!', marker cleared
+base_firstboot
+set_pw root 'RebuildLockedRoot2!'
+set_pw sane 'TemporarySanePass1!'
+printf 'done\n' > "$T/etc/.sane-firstboot-done"
+expect_ok "partial setup: lock root with valid hash" sh "$ACCOUNTS" --root "$T" lock root
+root_partial_locked=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+awk -F: -v OFS=: '$1=="sane"{$2="!"} 1' "$T/etc/shadow" > "$T/etc/shadow.new"
+mv "$T/etc/shadow.new" "$T/etc/shadow"
+expect_ok "partial recover succeeds when root is locked-valid and sane has no hash" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "partial recover preserves locked valid root hash" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_partial_locked"
+check "partial recover keeps bare locked baseline for missing sane hash" sh -c \
+	"grep -q '^sane:!:19700:' '$T/etc/shadow'"
+check "partial recover clears firstboot marker when sane hash is missing" \
+	test ! -f "$T/etc/.sane-firstboot-done"
 
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -127,7 +127,7 @@ Each boot writes its serial transcript to `LIFECYCLE_LOGDIR` (default `/tmp/sane
 
 The recovery path is part of the image: `recovery:once:/usr/bin/sane-account-recovery` runs before `firstboot` and `getty`. A damaged `passwd`, `group`, `shadow`, or `doas.conf` is rebuilt from the baseline; if no valid password hash survives, the first-boot marker is removed so setup runs again instead of leaving the console locked.
 
-Boot-time reliability recovery is fail-closed: a failed `sane-reliability recover` exits nonzero and stops its `reliability:once` dependency chain, so `firstboot` and `getty` do not start on an unrepaired filesystem. It does **not** enter the supervised rescue shell; that shell is reserved for invalid dependency/config errors (missing dependencies, unreadable config, dependency cycles).
+Boot-time reliability recovery is fail-closed with an accessible recovery shell: `reliability:once`, `recovery:once`, and `firstboot:once` carry `:on_fail=rescue`, so a nonzero failure (or spawn failure/timeout) stops downstream services (`firstboot` and `getty` do not start on an unrepaired filesystem) **and** transitions PID 1 into the supervised rescue shell (`/bin/sh` with cleared signal mask and `/run/initctl` active), alongside invalid dependency/config errors.
 
 ### Manual Testing (chroot)
 
