@@ -1261,5 +1261,52 @@ check "partial recover keeps bare locked baseline for missing sane hash" sh -c \
 check "partial recover clears firstboot marker when sane hash is missing" \
 	test ! -f "$T/etc/.sane-firstboot-done"
 
+printf '\n--- atomic crash-consistency & interrupted staging resilience (F2) ---\n'
+base_firstboot
+set_pw root 'AtomicRootPass1!'
+set_pw sane 'AtomicSanePass1!'
+expect_ok "add custom user before interrupted recovery test" \
+	sh "$ACCOUNTS" --root "$T" add-user bob 1010 --skip-chown
+set_pw bob 'AtomicBobPass12!'
+root_before=$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")
+bob_before=$(awk -F: '$1=="bob"{print $2}' "$T/etc/shadow")
+
+# Simulate an interrupted prior recovery that left orphan temp files in /etc,
+# then corrupt shadow/doas.conf mode and verify recovery stays atomic, preserves
+# root/sane/bob hashes with 0600/0644 modes, and remains idempotent across runs.
+printf 'corrupted-partial-temp\n' > "$T/etc/.sane-accounts.stale99"
+printf 'corrupt-line\n' >> "$T/etc/shadow"
+chmod 0644 "$T/etc/doas.conf"
+chmod 0644 "$T/etc/shadow"
+expect_ok "recover succeeds with stale crash temp artifact present" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "shadow mode restored to 0600 after rebuild recover" \
+	test "$(stat -c %a "$T/etc/shadow")" = 600
+check "doas.conf mode restored to 0600 after rebuild recover" \
+	test "$(stat -c %a "$T/etc/doas.conf")" = 600
+check "passwd mode remains 0644 after recover" \
+	test "$(stat -c %a "$T/etc/passwd")" = 644
+check "group mode remains 0644 after recover" \
+	test "$(stat -c %a "$T/etc/group")" = 644
+check "rebuild recover restores root hash without transient '!' loss" \
+	test "$(awk -F: '$1=="root"{print $2}' "$T/etc/shadow")" = "$root_before"
+check "rebuild recover restores bob hash across rebuild" \
+	test "$(awk -F: '$1=="bob"{print $2}' "$T/etc/shadow")" = "$bob_before"
+expect_ok "repeated recover run stays idempotent" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after idempotent rebuild recover" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+rm -f "$T/etc/.sane-accounts.stale99"
+
+# Fail-closed guard: --allow-weak-defaults must reject missing test passwords
+# cleanly without creating partial identity files.
+WFAIL="$T/weak_fail"
+mkdir -p "$WFAIL/etc" "$WFAIL/home"
+expect_fail_msg "--allow-weak-defaults without env vars fails closed before writing" \
+	'SANE_TEST_ROOT_PASSWORD' \
+	sh -c "unset SANE_TEST_ROOT_PASSWORD SANE_TEST_SANE_PASSWORD; exec sh '$ACCOUNTS' --root '$WFAIL' init --allow-weak-defaults"
+check "failed --allow-weak-defaults leaves no partial passwd or shadow" \
+	sh -c "[ ! -e '$WFAIL/etc/passwd' ] && [ ! -e '$WFAIL/etc/shadow' ]"
+
 printf '\nPhase A account tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

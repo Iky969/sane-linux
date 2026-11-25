@@ -733,6 +733,7 @@ merge_passwd() {
 		rm -f "$tmp"
 		die "failed to merge $PASSWD"
 	fi
+	chmod 0644 "$tmp"
 	mv "$tmp" "$PASSWD"
 }
 
@@ -767,6 +768,7 @@ merge_group() {
 		rm -f "$tmp"
 		die "failed to merge $GROUP"
 	fi
+	chmod 0644 "$tmp"
 	mv "$tmp" "$GROUP"
 }
 
@@ -792,6 +794,7 @@ rebuild_passwd() {
 			die "failed to rebuild $PASSWD"
 		fi
 	fi
+	chmod 0644 "$tmp"
 	mv "$tmp" "$PASSWD"
 }
 
@@ -817,6 +820,7 @@ rebuild_group() {
 			die "failed to rebuild $GROUP"
 		fi
 	fi
+	chmod 0644 "$tmp"
 	mv "$tmp" "$GROUP"
 }
 
@@ -842,6 +846,7 @@ merge_shadow() {
 		rm -f "$tmp"
 		die "failed to merge $SHADOW"
 	fi
+	chmod 0600 "$tmp"
 	mv "$tmp" "$SHADOW"
 }
 
@@ -849,9 +854,14 @@ rebuild_shadow() {
 	# Baseline locked template + every extra entry that is itself valid and
 	# conflict-free: unique name still present in passwd, complete 9 fields,
 	# numeric age fields, and a valid active SHA-512 or lock/disable marker.
+	# Write final root/sane fields into "$tmp" before atomic mv(1) so an
+	# interrupted recovery never leaves a temporary locked state on disk.
 	root_hash=$1; sane_hash=$2
+	rh_out=$root_hash; [ -n "$rh_out" ] || rh_out='!'
+	sh_out=$sane_hash; [ -n "$sh_out" ] || sh_out='!'
 	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$tmp"
+	chmod 0600 "$tmp"
+	printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' "$rh_out" "$sh_out" > "$tmp"
 	if [ -f "$SHADOW" ]; then
 		if ! awk -F: -v passwd_file="$PASSWD" '
 			function shadow_hash_ok(h, a) {
@@ -886,13 +896,8 @@ rebuild_shadow() {
 			die "failed to rebuild $SHADOW"
 		fi
 	fi
+	chmod 0600 "$tmp"
 	mv "$tmp" "$SHADOW"
-	if [ -n "$root_hash" ] && [ "$root_hash" != "!" ]; then
-		set_field "$SHADOW" root 2 "$root_hash"
-	fi
-	if [ -n "$sane_hash" ] && [ "$sane_hash" != "!" ]; then
-		set_field "$SHADOW" sane 2 "$sane_hash"
-	fi
 }
 
 # Inspect field 2 of an account in shadow and separate lock state ('!') from
@@ -965,9 +970,11 @@ cmd_recover() {
 		[ "$(id -u)" = 0 ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
 		printf 'recover: doas.conf preserved (policy ok; mode/owner repaired)\n'
 	else
-		printf 'permit persist :wheel\n' > "$DOAS_CONF"
-		chmod 0600 "$DOAS_CONF"
-		[ "$(id -u)" = 0 ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
+		tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+		chmod 0600 "$tmp"
+		[ "$(id -u)" = 0 ] && chown 0:0 "$tmp" 2>/dev/null || true
+		printf 'permit persist :wheel\n' > "$tmp"
+		mv "$tmp" "$DOAS_CONF"
 		printf 'recover: doas.conf rebuilt from baseline (missing or policy violation)\n'
 	fi
 
@@ -1009,8 +1016,10 @@ cmd_recover() {
 		rm -f "$MARK"
 		printf 'recover: no usable root/sane hash; first boot will ask for passwords again\n'
 	else
-		printf 'done\n' > "$MARK"
-		chmod 0600 "$MARK"
+		tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+		chmod 0600 "$tmp"
+		printf 'done\n' > "$tmp"
+		mv "$tmp" "$MARK"
 		printf 'recover: preserved usable password hashes\n'
 	fi
 	note "identity recovery complete under $ETC"

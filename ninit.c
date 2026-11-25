@@ -1067,6 +1067,36 @@ static int lookup_group(const char *name_or_gid, gid_t *out_gid)
     return found ? 0 : -1;
 }
 
+/* Find the earliest ninit option tag outside single/double quotes so
+ * commands containing ':' or quoted option-looking strings remain intact. */
+static char *find_option_tag_start(char *cmd)
+{
+    static const char *const tags[] = {
+        ":requires=", ":memory_max=", ":cpu_max=", ":pids_max=",
+        ":timeout=", ":grace=", ":user=", ":group=", ":on_fail="
+    };
+    char quote = 0;
+
+    for (char *p = cmd; *p; p++) {
+        if (quote) {
+            if (*p == quote)
+                quote = 0;
+            continue;
+        }
+        if (*p == '"' || *p == '\'') {
+            quote = *p;
+            continue;
+        }
+        if (*p == ':') {
+            for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+                if (strncmp(p, tags[i], strlen(tags[i])) == 0)
+                    return p;
+            }
+        }
+    }
+    return NULL;
+}
+
 static int parse_config(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -1131,27 +1161,8 @@ static int parse_config(const char *path)
         char *user_opt = NULL;
         char *group_opt = NULL;
 
-        char *t_req = strstr(cmd, ":requires=");
-        char *t_mem = strstr(cmd, ":memory_max=");
-        char *t_cpu = strstr(cmd, ":cpu_max=");
-        char *t_pid = strstr(cmd, ":pids_max=");
-        char *t_tout = strstr(cmd, ":timeout=");
-        char *t_grace = strstr(cmd, ":grace=");
-        char *t_user = strstr(cmd, ":user=");
-        char *t_group = strstr(cmd, ":group=");
-        char *t_onfail = strstr(cmd, ":on_fail=");
-
-        /* Find the earliest occurring tag so commands containing ':' remain intact */
-        char *first_tag = NULL;
-        if (t_req && (!first_tag || t_req < first_tag)) first_tag = t_req;
-        if (t_mem && (!first_tag || t_mem < first_tag)) first_tag = t_mem;
-        if (t_cpu && (!first_tag || t_cpu < first_tag)) first_tag = t_cpu;
-        if (t_pid && (!first_tag || t_pid < first_tag)) first_tag = t_pid;
-        if (t_tout && (!first_tag || t_tout < first_tag)) first_tag = t_tout;
-        if (t_grace && (!first_tag || t_grace < first_tag)) first_tag = t_grace;
-        if (t_user && (!first_tag || t_user < first_tag)) first_tag = t_user;
-        if (t_group && (!first_tag || t_group < first_tag)) first_tag = t_group;
-        if (t_onfail && (!first_tag || t_onfail < first_tag)) first_tag = t_onfail;
+        /* Find the earliest occurring tag outside quotes so commands containing ':' remain intact */
+        char *first_tag = find_option_tag_start(cmd);
 
         if (first_tag) {
             *first_tag = 0; /* Split cmd right before first option tag */

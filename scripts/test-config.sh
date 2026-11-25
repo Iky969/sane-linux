@@ -1567,6 +1567,123 @@ else
 	bad "paired user+group service failed privilege drop"
 fi
 
+# --------------------------------------------------------------- scenario 22
+# Isolated uid-1000 access check on guest /run/initctl (F3 audit): proves
+# non-root cannot control PID 1 over /run/initctl without touching host state.
+printf '\n== 22. isolated uid-1000 /run/initctl rejection & PID 1 responsiveness ==\n'
+start_root initctl-uid1000
+LOG25="$LOG"
+cp "$BUSYBOX" "$ROOT/bin/id"
+cp "$BUSYBOX" "$ROOT/bin/sleep"
+cp "$BUSYBOX" "$ROOT/bin/stat"
+chmod 0777 "$ROOT/var"
+cat > "$ROOT/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+testuser:x:1000:1000:Test User:/nonexistent:/bin/false
+EOF
+cat > "$ROOT/etc/group" <<'EOF'
+root:x:0:
+testuser:x:1000:
+EOF
+cat > "$ROOT/etc/init.conf" <<'EOF'
+unpriv1000:once:/bin/sh -c '/bin/id -u > /var/unpriv.uid; { if printf "status\n" > /run/initctl; then echo UNPRIV_WROTE > /var/initctl.res; else echo UNPRIV_DENIED > /var/initctl.res; fi; } 2>/var/initctl.err':user=testuser:group=testuser
+stopper:once:/bin/sh -c '/bin/sleep 1; /bin/stat -c "%a:%u:%g" /run/initctl > /var/initctl.stat; printf "poweroff\n" > /run/initctl':requires=unpriv1000
+EOF
+
+run_init
+wait_for 'graceful shutdown' || true
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+if [ -f "$ROOT/var/unpriv.uid" ] && [ "$(cat "$ROOT/var/unpriv.uid")" = 1000 ]; then
+	ok "isolated unpriv1000 service ran as uid 1000"
+else
+	bad "isolated unpriv1000 service did not run as uid 1000"
+fi
+if [ -f "$ROOT/var/initctl.res" ] && [ "$(cat "$ROOT/var/initctl.res")" = "UNPRIV_DENIED" ]; then
+	ok "uid 1000 write to guest /run/initctl rejected"
+else
+	bad "uid 1000 write to guest /run/initctl was not rejected"
+fi
+if [ -f "$ROOT/var/initctl.err" ] && grep -qi 'permission denied' "$ROOT/var/initctl.err"; then
+	ok "uid 1000 /run/initctl write failed with permission denied"
+else
+	bad "uid 1000 /run/initctl stderr did not report permission denied"
+fi
+if [ -f "$ROOT/var/initctl.stat" ] && [ "$(cat "$ROOT/var/initctl.stat")" = "600:0:0" ]; then
+	ok "guest /run/initctl has mode 600 and owner 0:0"
+else
+	bad "guest /run/initctl permission/ownership mismatch: '$(cat "$ROOT/var/initctl.stat" 2>/dev/null || printf missing)'"
+fi
+check_absent "rejected uid 1000 write did not trigger initctl command log" "initctl cmd: 'status'"
+check "guest PID 1 stayed responsive to authorized root poweroff" "initctl cmd: 'poweroff'"
+check "guest PID 1 executed graceful shutdown after uid 1000 rejection" 'graceful shutdown'
+
+# --------------------------------------------------------------- scenario 23
+# Cross-parser snippet & quote-tag parity (F4 audit):
+#   1. spm validate-source accepts 'par_ok:once:/bin/echo "hello world" status=ok:on_fail=fail'
+#      and rejects 'once:/bin/echo "hello :user=root"'.
+#   2. ninit keeps quoted ':user=root' inside <cmd> intact instead of splitting
+#      a privilege drop mid-quote, while un-named 'once:/bin/echo ...' is rejected.
+printf '\n== 23. spm <-> ninit snippet & quote-tag parser parity ==\n'
+start_root parity
+LOG26="$LOG"
+cp "$BUSYBOX" "$ROOT/bin/echo"
+cp "$BUSYBOX" "$ROOT/bin/sleep"
+chmod 0777 "$ROOT/var"
+
+PAR_SRC=$(mktemp -d /tmp/ninit-spm-parity.XXXXXX)
+ROOTS="$ROOTS $PAR_SRC"
+mkdir -p "$PAR_SRC/.META" "$PAR_SRC/x/usr/share/ninit/services"
+cat > "$PAR_SRC/.META/package" <<'EOF'
+name=parity-pkg
+version=1.0.0
+release=1
+arch=x86_64
+description=snippet parity check
+base=false
+EOF
+printf 'par_ok:once:/bin/echo "hello world" status=ok:on_fail=fail\n' \
+	> "$PAR_SRC/x/usr/share/ninit/services/par_ok.service"
+if sh "$REPO_ROOT/scripts/spm" validate-source "$PAR_SRC" >/dev/null 2>&1; then
+	ok "spm validate-source accepted clean snippet with :on_fail=fail"
+else
+	bad "spm validate-source rejected valid snippet with :on_fail=fail"
+fi
+
+cat > "$PAR_SRC/x/usr/share/ninit/services/par_ok.service" <<'EOF'
+once:/bin/echo "hello :user=root"
+EOF
+if sh "$REPO_ROOT/scripts/spm" validate-source "$PAR_SRC" >/dev/null 2>&1; then
+	bad "spm validate-source accepted missing-name/quoted-colon snippet"
+else
+	ok "spm validate-source rejected missing-name/quoted-colon snippet"
+fi
+
+cat > "$ROOT/etc/init.conf" <<'EOF'
+par_ok:once:/bin/echo "hello world" status=ok:on_fail=fail
+quotecolon:once:/bin/sh -c '/bin/echo "hello :user=root" > /var/qcolon.out'
+once:/bin/echo "hello :user=root"
+stopper:once:/bin/sh -c '/bin/sleep 1 && echo poweroff > /run/initctl':requires=par_ok,quotecolon
+EOF
+
+run_init
+wait_for 'graceful shutdown' || true
+init_pid=$(find_init_pid || true)
+INIT_PID="${init_pid:-}"
+stop_init
+
+check "ninit started spm-validated service with :on_fail=fail" 'ninit: started par_ok'
+check "ninit preserved quoted ':user=root' instead of parsing inside quotes" 'ninit: started quotecolon'
+check_absent "ninit did not split fake :user=root inside quotes" "unknown user 'root\"'"
+if [ -f "$ROOT/var/qcolon.out" ] && grep -q 'hello :user=root' "$ROOT/var/qcolon.out"; then
+	ok "quotecolon command received literal 'hello :user=root'"
+else
+	bad "quotecolon output lost or corrupted"
+fi
+check "ninit rejected un-named 'once:/bin/echo ...' snippet" "Parse err: unknown mode '/bin/echo \"hello ' for 'once', entry rejected"
+
 # --------------------------------------------------------------- summary
 printf '\n== log 1a (dependency order) ==\n'
 sed 's/^/  | /' "$LOG1"
@@ -1621,6 +1738,10 @@ printf '\n== log 20 (unknown mode) ==\n'
 sed 's/^/  | /' "$LOG23"
 printf '\n== log 21 (group-only rejection) ==\n'
 sed 's/^/  | /' "$LOG24"
+printf '\n== log 22 (isolated uid-1000 initctl rejection) ==\n'
+sed 's/^/  | /' "$LOG25"
+printf '\n== log 23 (spm <-> ninit parity) ==\n'
+sed 's/^/  | /' "$LOG26"
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nRESULT: PASS (all checks)\n'

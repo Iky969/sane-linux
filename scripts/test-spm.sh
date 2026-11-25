@@ -2435,21 +2435,43 @@ test_snippet_vocabulary() {
     local root="$tdir/root"
     mkdir -p "$tdir" "$root"
 
-    local all_keys='respawn:/bin/true :requires=base :memory_max=64M :cpu_max=50 :pids_max=32 :timeout=0 :grace=5 :user=svc :group=svc'
+    local all_keys='respawn:/bin/true :requires=base :memory_max=64M :cpu_max=50000 100000 :pids_max=32 :timeout=0 :grace=5 :user=svc :group=svc :on_fail=rescue'
     if ! python_pkg_helper create_forbidden_service "$tdir/keys.spm.tar.xz" "vocab-keys" "svc" "$all_keys"; then
         test_fail "F2 snippet vocabulary" "cannot build fixture package"
         return
     fi
     if ! sh "$SPM_BIN" --root "$root" install "$tdir/keys.spm.tar.xz" >"$tdir/keys.out" 2>"$tdir/keys.err"; then
-        test_fail "F2 snippet vocabulary" "all eight valid keys rejected: $(cat "$tdir/keys.err")"
+        test_fail "F2 snippet vocabulary" "all nine valid keys rejected: $(cat "$tdir/keys.err")"
         return
     fi
 
-    # Ordinary arguments may be quoted or carry '='; quotes must balance.
-    local quoted='respawn:/bin/echo "hello world" status=running'
+    # Ordinary arguments may be quoted or carry '='; quotes must balance and
+    # must not hide ':' delimiters that would confuse ninit.c option parsing (F4).
+    local quoted='respawn:/bin/echo "hello world" status=running :on_fail=fail'
     python_pkg_helper create_forbidden_service "$tdir/quoted.spm.tar.xz" "vocab-quoted" "svcq" "$quoted"
     if ! sh "$SPM_BIN" --root "$root" install "$tdir/quoted.spm.tar.xz" >/dev/null 2>"$tdir/quoted.err"; then
         test_fail "F2 snippet vocabulary" "balanced quoted argument rejected: $(cat "$tdir/quoted.err")"
+        return
+    fi
+
+    local quoted_colon='once:/bin/echo "hello :user=root"'
+    python_pkg_helper create_forbidden_service "$tdir/qcolon.spm.tar.xz" "vocab-qcolon" "svcqc" "$quoted_colon"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/qcolon.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "colon inside quoted argument accepted"
+        return
+    fi
+
+    local bad_onfail='respawn:/bin/true :on_fail=panic'
+    python_pkg_helper create_forbidden_service "$tdir/bad_onfail.spm.tar.xz" "vocab-onfail" "svcof" "$bad_onfail"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/bad_onfail.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "invalid :on_fail value accepted"
+        return
+    fi
+
+    local bare_opt='respawn:/bin/true :bogus'
+    python_pkg_helper create_forbidden_service "$tdir/bare_opt.spm.tar.xz" "vocab-bare" "svcbare" "$bare_opt"
+    if sh "$SPM_BIN" --root "$root" install "$tdir/bare_opt.spm.tar.xz" >/dev/null 2>&1; then
+        test_fail "F2 snippet vocabulary" "malformed bare :bogus option accepted"
         return
     fi
 
@@ -2468,7 +2490,7 @@ test_snippet_vocabulary() {
         test_fail "F2 snippet vocabulary" "legacy :deps= key accepted"
         return
     fi
-    for needle in ':requires=' ':memory_max=' ':cpu_max=' ':pids_max=' ':timeout=' ':grace=' ':user=' ':group='; do
+    for needle in ':requires=' ':memory_max=' ':cpu_max=' ':pids_max=' ':timeout=' ':grace=' ':user=' ':group=' ':on_fail='; do
         printf '%s\n' "$err" | grep -q -- "$needle" || {
             test_fail "F2 snippet vocabulary" "unknown-key diagnostic missing $needle"
             return
@@ -2720,7 +2742,8 @@ EOF
     fi
     rm -f "$src/.META/alias"
 
-    # Shared snippet vocabulary: legacy :deps= rejected with migration hint.
+    # Shared snippet vocabulary: legacy :deps= rejected with migration hint, and
+    # colon inside quoted args rejected so snippets match ninit.c (F4 audit).
     printf 'respawn:/bin/true :deps=base\n' > "$src/x/usr/share/ninit/services/v.service"
     if err=$(sh "$SPM_BIN" validate-source "$src" 2>&1 >/dev/null); then
         test_fail "X8 validate-source" "legacy :deps= snippet accepted"
@@ -2730,6 +2753,11 @@ EOF
         test_fail "X8 validate-source" "vocabulary diagnostic lacks :requires= hint"
         return
     }
+    printf 'once:/bin/echo "hello :user=root"\n' > "$src/x/usr/share/ninit/services/v.service"
+    if sh "$SPM_BIN" validate-source "$src" >/dev/null 2>&1; then
+        test_fail "X8 validate-source" "colon inside quoted argument accepted"
+        return
+    fi
     test_pass "X8: validate-source is read-only, shares symlink/snippet policy, rejects unsupported absolute links"
 }
 

@@ -757,13 +757,14 @@ validate_service_snippets() {
     local service_dir="$staging_root/x/usr/share/ninit/services"
     [ -d "$service_dir" ] || return 0
 
-    local sfile sname line_count content tok key val
+    local sfile sname line_count content cmd_and_opts rest tok key val
     local user_seen=false group_seen=false user_val="" group_val=""
     # Ordinary arguments may be balanced double- or single-quoted strings,
-    # or plain tokens (now including '='). No shell evaluation is performed.
+    # or plain tokens (including '='), but must never contain ':' so they cannot
+    # collide with ninit.c's name:mode:cmd or :option= delimiters.
     local sq="'"
-    local arg_pat="(\"[^\"]*\"|${sq}[^${sq}]*${sq}|[a-zA-Z0-9_/.=+-]+)"
-    local syntax_re="^([a-zA-Z0-9_-]+:)?(once|respawn):[a-zA-Z0-9_/.-]+([[:space:]]+${arg_pat})*([[:space:]]*:[a-zA-Z0-9_=., -]+)*$"
+    local arg_pat="(\"[^\":]*\"|${sq}[^${sq}:]*${sq}|[a-zA-Z0-9_/.=+-]+)"
+    local syntax_re="^([a-zA-Z0-9_-]+:)?(once|respawn):[a-zA-Z0-9_/.-]+([[:space:]]+${arg_pat})*([[:space:]]*:[a-zA-Z0-9_]+=[a-zA-Z0-9_., -]*)*$"
 
     for sfile in "$service_dir"/*; do
         [ -e "$sfile" ] || [ -L "$sfile" ] || continue
@@ -801,30 +802,56 @@ validate_service_snippets() {
             die "Forbidden shell metacharacters detected in service snippet: $sname"
         fi
 
-        # Tail options: strict key vocabulary, migration hint for legacy :deps=.
+        # Tail options: peel leading [name:]mode: prefix, then isolate ':key=val'
+        # options from the first ':' (safe from splitting inside quoted args because
+        # arg_pat forbids ':') and split on ':' boundaries to match ninit.c.
+        case "$content" in
+            once:*|respawn:*) cmd_and_opts="${content#*:}" ;;
+            *) cmd_and_opts="${content#*:}"; cmd_and_opts="${cmd_and_opts#*:}" ;;
+        esac
         user_seen=false
         group_seen=false
         user_val=""
         group_val=""
-        for tok in $content; do
-            case "$tok" in
-                :*=*)
-                    key="${tok%%=*}"
-                    key="${key#:}"
-                    val="${tok#*=}"
-                    case "$key" in
-                        requires|memory_max|cpu_max|pids_max|timeout|grace|user|group) ;;
+        case "$cmd_and_opts" in
+            *:*)
+                rest="${cmd_and_opts#*:}"
+                while :; do
+                    case "$rest" in
+                        *:*) tok="${rest%%:*}"; rest="${rest#*:}" ;;
+                        *)   tok="$rest"; rest="" ;;
+                    esac
+                    tok="${tok%"${tok##*[![:space:]]}"}"
+                    [ -n "$tok" ] || die "Empty service option '::' in $sname"
+                    case "$tok" in
+                        *=*)
+                            key="${tok%%=*}"
+                            val="${tok#*=}"
+                            case "$key" in
+                                requires|memory_max|cpu_max|pids_max|timeout|grace|user|group|on_fail) ;;
+                                *)
+                                    die "Unknown service option ':$key' in $sname; valid options: :requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group=, :on_fail= (use :requires= for dependencies)"
+                                    ;;
+                            esac
+                            case "$key" in
+                                user)    user_seen=true;  user_val="$val" ;;
+                                group)   group_seen=true; group_val="$val" ;;
+                                on_fail)
+                                    case "$val" in
+                                        rescue|fail|none) ;;
+                                        *) die "Invalid ':on_fail=$val' in $sname; expected rescue, fail, or none" ;;
+                                    esac
+                                    ;;
+                            esac
+                            ;;
                         *)
-                            die "Unknown service option ':$key' in $sname; valid options: :requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group= (use :requires= for dependencies)"
+                            die "Malformed service option ':$tok' in $sname; expected :key=value"
                             ;;
                     esac
-                    case "$key" in
-                        user)  user_seen=true;  user_val="$val" ;;
-                        group) group_seen=true; group_val="$val" ;;
-                    esac
-                    ;;
-            esac
-        done
+                    [ -n "$rest" ] || break
+                done
+                ;;
+        esac
         if [ "$group_seen" = true ] && [ "$user_seen" = false ]; then
             die "':group=' requires ':user=' in $sname"
         fi

@@ -94,6 +94,15 @@ jobs:
       - name: State machine formalization & telemetry (T10/T11/T13)
         run: sudo -E BIN=./ninit-test sh ./scripts/test-state-machine.sh
 
+      - name: Zombie reap stress (500 children)
+        run: sudo -E BIN=./ninit-test sh ./scripts/test-zombie-reap-500.sh
+
+      - name: Package builder & validator parity tests
+        run: bash ./scripts/test-build-package.sh
+
+      - name: SPM package manager adversarial & snippet parity suite
+        run: bash ./scripts/test-spm.sh
+
       - name: ASan+UBSan parser fuzz harness
         run: sh ./scripts/fuzz-parsers.sh
 
