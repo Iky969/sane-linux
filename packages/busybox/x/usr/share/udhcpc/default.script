@@ -102,15 +102,21 @@ write_resolv() {
 	if [ -n "${domain:-}" ]; then
 		case "$domain" in
 			''|*[!a-zA-Z0-9._-]*) ;;
-			*) printf 'domain %s\n' "$domain" >> "$tmp" ;;
+			*) printf 'domain %s\n' "$domain" >> "$tmp" || { rm -f "$tmp"; return 1; } ;;
 		esac
 	fi
+	ns_count=0
 	for ns in "$@"; do
 		valid_server "$ns" || continue
-		printf 'nameserver %s\n' "$ns" >> "$tmp"
+		printf 'nameserver %s\n' "$ns" >> "$tmp" || { rm -f "$tmp"; return 1; }
+		ns_count=$((ns_count + 1))
 	done
-	chmod 0644 "$tmp"
-	mv -f "$tmp" "$RESOLV_CONF"
+	if [ "$ns_count" -eq 0 ]; then
+		rm -f "$tmp"
+		return 1
+	fi
+	chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+	mv -f "$tmp" "$RESOLV_CONF" || { rm -f "$tmp"; return 1; }
 }
 
 restore_default_resolv() {
@@ -141,14 +147,20 @@ case "$1" in
         ip addr add "${ip}${NETMASK}" dev "$interface"
 
         if [ -n "${router:-}" ]; then
+            set -f
+            # shellcheck disable=SC2086
             for r in $router; do
                 ip route add default via "$r" dev "$interface" 2>/dev/null || true
                 break
             done
+            set +f
         fi
 
         if [ -n "${dns:-}" ]; then
+            set -f
+            # shellcheck disable=SC2086
             write_resolv $dns || true
+            set +f
         fi
         ;;
     nak|leasefail)

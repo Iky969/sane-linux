@@ -14,8 +14,34 @@ EXPECTED_SHA256="7b031dac64a59eb6ee3304f7ffb75dad33ab8c9d279c847f92c89fb846068f9
 
 mkdir -p "$OUT_DIR"
 
+verify_static_elf() {
+    local bin="$1"
+    command -v readelf >/dev/null 2>&1 || {
+        printf 'ERROR: readelf is required for static ELF verification\n' >&2
+        exit 1
+    }
+    [ -x "$bin" ] || {
+        printf 'ERROR: Missing executable payload: %s\n' "$bin" >&2
+        exit 1
+    }
+    if ! readelf -h "$bin" >/dev/null 2>&1; then
+        printf 'ERROR: %s is not a valid ELF binary\n' "$bin" >&2
+        exit 1
+    fi
+    if readelf -lW "$bin" 2>/dev/null | grep -E -q '(^|[[:space:]])INTERP([[:space:]]|$)|PT_INTERP'; then
+        printf 'ERROR: %s contains dynamic INTERP segment (must be statically linked)\n' "$bin" >&2
+        exit 1
+    fi
+    if readelf -lW "$bin" 2>/dev/null | grep -E -q '[[:space:]]DYNAMIC[[:space:]]'; then
+        printf 'ERROR: %s contains DYNAMIC segment (must be statically linked)\n' "$bin" >&2
+        exit 1
+    fi
+}
+
 if [ -f "$PKG_DIR/x/usr/lib/libssl.a" ] && [ -f "$PKG_DIR/x/usr/bin/openssl" ] && [ "${REBUILD:-0}" != "1" ]; then
     printf 'Using prebuilt LibreSSL payload in %s/x\n' "$PKG_DIR"
+    verify_static_elf "$PKG_DIR/x/usr/bin/openssl"
+    [ -e "$PKG_DIR/x/usr/bin/ocspcheck" ] && verify_static_elf "$PKG_DIR/x/usr/bin/ocspcheck"
     chmod -R u+rwX,go+rX "$PKG_DIR/x"
     "$REPO_ROOT/scripts/build-package.sh" --source "$PKG_DIR" --output "$OUT_DIR"
     exit 0
@@ -73,7 +99,9 @@ rm -f "$PKG_DIR/x/usr/lib"/*.la 2>/dev/null || true
 strip -s "$PKG_DIR/x/usr/bin"/* 2>/dev/null || true
 strip --strip-debug "$PKG_DIR/x/usr/lib"/*.a 2>/dev/null || true
 
-# 7. Standardize permissions
+# 7. Verify static ELF and standardize permissions
+verify_static_elf "$PKG_DIR/x/usr/bin/openssl"
+[ -e "$PKG_DIR/x/usr/bin/ocspcheck" ] && verify_static_elf "$PKG_DIR/x/usr/bin/ocspcheck"
 chmod -R u+rwX,go+rX "$PKG_DIR/x"
 
 # 8. Package
