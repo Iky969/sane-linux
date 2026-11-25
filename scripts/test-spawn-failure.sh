@@ -404,6 +404,53 @@ check_in  "dependent cancelled when the once service timed out" "$L5" \
 absent_in "hanger did not finish successfully" "$L5" 'hanger (pid .* exit status=0x0'
 absent_in "dependent never ran" "$L5" 'started dep'
 
+# ------------------------------------------------------------- Scenario 6
+# P1-3: a once service with :on_fail=rescue whose fork() fails with EAGAIN
+# retries MAX_SPAWN_RETRY times, hits FAILED, enters supervised rescue, and
+# prevents independent services from being spawned afterward.
+printf '\n== Scenario 6: fork EAGAIN on :on_fail=rescue once service ==\n'
+if [ "$pids_ok" -ne 1 ]; then
+	skip "scenario 6 skipped: cgroup v2 + pids controller unavailable/undelegated"
+else
+	R6=$(new_root)
+	L6=$(new_log)
+	ROOTS="$ROOTS $R6"
+	LOGS="$LOGS $L6"
+	printf 'crit:once:exit 0:on_fail=rescue\nafter:once:echo AFTER > /var/after.txt\n' > "$R6/etc/init.conf"
+	boot_guest "$R6" 6 "$SCENARIO3_CG" >"$L6" 2>&1
+
+	check_in  "crit entered FAILED after fork EAGAIN retries" "$L6" 'crit: state STARTING -> FAILED'
+	check_in  "on_fail=rescue fatal reason logged" "$L6" "FATAL: service 'crit' failed (on_fail=rescue)"
+	check_in  "init entered supervised rescue mode" "$L6" 'Entering rescue mode (shell)'
+	absent_in "independent service not spawned after on_fail=rescue failure" "$L6" 'started after'
+	absent_in "no illegal transition during fork-fail rescue" "$L6" 'illegal state transition'
+fi
+
+# ------------------------------------------------------------- Scenario 7
+# P1-3: a respawn service with :on_fail=rescue that crash-loops to FAILED
+# cancels dependents, stops active services cleanly, and enters supervised rescue.
+printf '\n== Scenario 7: respawn crash-loop with :on_fail=rescue ==\n'
+R7=$(new_root sleep)
+L7=$(new_log)
+ROOTS="$ROOTS $R7"
+LOGS="$LOGS $L7"
+cp "$BIN_FAST" "$R7/ninit"
+cat > "$R7/etc/init.conf" << 'EOF'
+slow:once:/bin/sleep 3
+bg:respawn:/bin/sleep 30
+crash_crit:respawn:exit 1:on_fail=rescue
+dep:once:echo DEP_RAN > /var/dep.txt:requires=crash_crit,slow
+EOF
+boot_guest "$R7" 7 "" >"$L7" 2>&1
+
+check_in  "crash_crit detected crash-loop and marked FAILED" "$L7" 'crash_crit: crash-loop detected'
+check_in  "dependent cancelled cleanly" "$L7" "service 'dep' cancelled: dependency 'crash_crit' failed"
+check_in  "unrelated active service stopped cleanly" "$L7" 'bg: state RUNNING -> STOPPING'
+check_in  "on_fail=rescue fatal reason logged for crash_crit" "$L7" "FATAL: service 'crash_crit' failed (on_fail=rescue)"
+check_in  "init entered supervised rescue mode" "$L7" 'Entering rescue mode (shell)'
+absent_in "no illegal state transition during crash-loop rescue" "$L7" 'illegal state transition'
+absent_in "dependent never ran" "$L7" 'started dep'
+
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nRESULT: PASS (all checks)\n'
 else

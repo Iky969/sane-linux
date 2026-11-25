@@ -25,7 +25,7 @@ usage() {
 
 send_cmd() {
     cmd="$1"
-    if [ ! -p "$INITCTL" ] && [ ! -e "$INITCTL" ]; then
+    if [ -L "$INITCTL" ] || [ ! -p "$INITCTL" ]; then
         printf 'sane-ctl: control fifo %s not found\n' "$INITCTL" >&2
         exit 1
     fi
@@ -41,7 +41,7 @@ case "$cmd" in
         [ -z "$target" ] || require_service_name "$target"
         if [ -n "$target" ]; then
             state_file="/run/ninit-${target}.state"
-            if [ -f "$state_file" ]; then
+            if [ -f "$state_file" ] && [ ! -L "$state_file" ]; then
                 cat "$state_file"
             else
                 printf 'sane-ctl: service '\''%s'\'' state not found\n' "$target" >&2
@@ -50,7 +50,7 @@ case "$cmd" in
         else
             found=0
             for f in /run/ninit-*.state; do
-                if [ -f "$f" ]; then
+                if [ -f "$f" ] && [ ! -L "$f" ]; then
                     found=1
                     svc="${f#/run/ninit-}"
                     svc="${svc%.state}"
@@ -68,26 +68,42 @@ case "$cmd" in
         [ -n "$target" ] || { printf 'Usage: sane-ctl stop <name>\n' >&2; exit 1; }
         require_service_name "$target"
         state_file="/run/ninit-${target}.state"
-        if [ ! -f "$state_file" ]; then
+        if [ ! -f "$state_file" ] || [ -L "$state_file" ]; then
             printf 'sane-ctl: service '\''%s'\'' not found\n' "$target" >&2
             exit 1
         fi
         send_cmd "stop $target"
+        timeout_tenths=""
+        if [ -n "${SANE_CTL_STOP_TIMEOUT:-}" ]; then
+            case "$SANE_CTL_STOP_TIMEOUT" in
+                *[!0-9]*)
+                    printf 'sane-ctl: invalid SANE_CTL_STOP_TIMEOUT %s\n' "'$SANE_CTL_STOP_TIMEOUT'" >&2
+                    exit 1
+                    ;;
+                *)
+                    timeout_tenths=$((SANE_CTL_STOP_TIMEOUT * 10))
+                    ;;
+            esac
+        fi
         i=0
-        while [ "$i" -lt 50 ]; do
-            if [ ! -f "$state_file" ]; then
+        while :; do
+            if [ ! -e "$state_file" ]; then
                 exit 0
+            fi
+            if [ -L "$state_file" ]; then
+                printf 'sane-ctl: refusing symlink state file %s\n' "$state_file" >&2
+                exit 1
             fi
             st="$(cat "$state_file" 2>/dev/null || true)"
             if [ "$st" = "STOPPED" ]; then
                 exit 0
             fi
-            sleep 0.1
+            if [ -n "$timeout_tenths" ] && [ "$i" -ge "$timeout_tenths" ]; then
+                break
+            fi
+            sleep 0.1 2>/dev/null || sleep 1
             i=$((i + 1))
         done
-        if [ ! -f "$state_file" ] || [ "$(cat "$state_file" 2>/dev/null || true)" = "STOPPED" ]; then
-            exit 0
-        fi
         printf 'sane-ctl: service '\''%s'\'' stop timed out\n' "$target" >&2
         exit 1
         ;;
