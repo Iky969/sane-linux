@@ -624,21 +624,22 @@ check "rejected chain restore left the journal idle" \
 	grep -q '^state=idle$' "$T/var/lib/sane/reliability/journal"
 
 # (c) An internal relative chain (including '..' that stays inside the staging
-# root after normalization) must be accepted and installed.
+# root after normalization) inside a manifest-verified snapshot must be accepted.
 base
-mkdir -p "$T/good/var/lib/sane/reliability/snapshots/sub" "$T/good/var/log/sane"
-ln -s sub/b "$T/good/var/lib/sane/reliability/snapshots/a"
-ln -s ../c "$T/good/var/lib/sane/reliability/snapshots/sub/b"
-printf 'internal-payload\n' > "$T/good/var/lib/sane/reliability/snapshots/c"
+mkdir -p "$T/good/var/lib/sane/reliability/snapshots/chain/sub" "$T/good/var/log/sane"
+ln -s sub/b "$T/good/var/lib/sane/reliability/snapshots/chain/a"
+ln -s ../c "$T/good/var/lib/sane/reliability/snapshots/chain/sub/b"
+printf 'internal-payload\n' > "$T/good/var/lib/sane/reliability/snapshots/chain/c"
+(cd "$T/good/var/lib/sane/reliability/snapshots/chain" && sha256sum c > manifest.sha256)
 printf 'log\n' > "$T/good/var/log/sane/reliability.log"
 tar -czf "$T/internal-chain.tar.gz" -C "$T/good" var
 T2=$(mktemp -d)
 expect_ok "restore accepts an internal relative symlink chain" sh -c \
 	"sh '$TOOL' --root '$T2' restore '$T/internal-chain.tar.gz'"
 check "internal chain symlinks installed with targets preserved" sh -c \
-	"test -L '$T2/var/lib/sane/reliability/snapshots/a' && test -L '$T2/var/lib/sane/reliability/snapshots/sub/b' && [ \"\$(readlink '$T2/var/lib/sane/reliability/snapshots/a')\" = sub/b ] && [ \"\$(readlink '$T2/var/lib/sane/reliability/snapshots/sub/b')\" = ../c ]"
+	"test -L '$T2/var/lib/sane/reliability/snapshots/chain/a' && test -L '$T2/var/lib/sane/reliability/snapshots/chain/sub/b' && [ \"\$(readlink '$T2/var/lib/sane/reliability/snapshots/chain/a')\" = sub/b ] && [ \"\$(readlink '$T2/var/lib/sane/reliability/snapshots/chain/sub/b')\" = ../c ]"
 check "internal chain final file installed" \
-	grep -q '^internal-payload$' "$T2/var/lib/sane/reliability/snapshots/c"
+	grep -q '^internal-payload$' "$T2/var/lib/sane/reliability/snapshots/chain/c"
 check "internal chain restore ends with an idle journal" \
 	grep -q '^state=idle$' "$T2/var/lib/sane/reliability/journal"
 rm -rf -- "$T2"
@@ -2023,6 +2024,306 @@ check "C1 relative internal state landed" \
 	test -d "$T/realvar/lib/sane/reliability/snapshots"
 
 rm -rf -- "$CW"
+
+printf '\n--- P1-8: cmd_restore tar inspection, post-extract tree & snapshot manifest checks ---\n'
+base
+run init
+python3 - "$T/hardlink.tar.gz" <<'PY'
+import hashlib, io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    data = b'timestamp=2026-11-25T00:00:00Z\n'
+    h = hashlib.sha256(data).hexdigest()
+    mdata = f'{h}  ./meta\n'.encode()
+    for name, payload in [
+        ('var/lib/sane/reliability/snapshots/s1/meta', data),
+        ('var/lib/sane/reliability/snapshots/s1/manifest.sha256', mdata),
+        ('var/log/sane/reliability.log', b'log\n'),
+    ]:
+        ti = tarfile.TarInfo(name)
+        ti.size = len(payload)
+        tf.addfile(ti, io.BytesIO(payload))
+    hl = tarfile.TarInfo('var/lib/sane/reliability/snapshots/s1/hl')
+    hl.type = tarfile.LNKTYPE
+    hl.linkname = '/etc/shadow'
+    tf.addfile(hl)
+PY
+expect_fail "P1-8 restore rejects archive with hardlink (GNU tar)" run restore "$T/hardlink.tar.gz"
+check "P1-8 hardlink was not restored" test ! -e "$T/var/lib/sane/reliability/snapshots/s1/hl"
+if command -v busybox >/dev/null 2>&1; then
+	mkdir -p "$T/bbbin"
+	ln -sf "$(command -v busybox)" "$T/bbbin/tar"
+	expect_fail "P1-8 restore rejects BusyBox hardlink '-... -> target'" \
+		env PATH="$T/bbbin:$PATH" sh "$TOOL" --root "$T" restore "$T/hardlink.tar.gz"
+fi
+
+base
+run init
+python3 - "$T/fifo.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    ti = tarfile.TarInfo('var/lib/sane/reliability/snapshots')
+    ti.type = tarfile.DIRTYPE
+    ti.mode = 0o755
+    tf.addfile(ti)
+    fi = tarfile.TarInfo('var/log/sane/pipe')
+    fi.type = tarfile.FIFOTYPE
+    fi.mode = 0o644
+    tf.addfile(fi)
+PY
+expect_fail "P1-8 restore rejects FIFO in archive" run restore "$T/fifo.tar.gz"
+check "P1-8 FIFO was not restored" test ! -e "$T/var/log/sane/pipe"
+
+base
+run init
+python3 - "$T/dev.tar.gz" <<'PY'
+import sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    ti = tarfile.TarInfo('var/lib/sane/reliability/snapshots')
+    ti.type = tarfile.DIRTYPE
+    ti.mode = 0o755
+    tf.addfile(ti)
+    di = tarfile.TarInfo('var/log/sane/null')
+    di.type = tarfile.CHRTYPE
+    di.devmajor = 1
+    di.devminor = 3
+    di.mode = 0o666
+    tf.addfile(di)
+PY
+expect_fail "P1-8 restore rejects device node in archive" run restore "$T/dev.tar.gz"
+
+base
+run init
+python3 - "$T/suid.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    ti = tarfile.TarInfo('var/lib/sane/reliability/snapshots')
+    ti.type = tarfile.DIRTYPE
+    ti.mode = 0o755
+    tf.addfile(ti)
+    si = tarfile.TarInfo('var/log/sane/suid')
+    si.size = 4
+    si.mode = 0o4755
+    tf.addfile(si, io.BytesIO(b'suid'))
+PY
+expect_fail "P1-8 restore rejects setuid file in archive" run restore "$T/suid.tar.gz"
+check "P1-8 setuid file was not restored" test ! -e "$T/var/log/sane/suid"
+
+base
+run init
+python3 - "$T/sgid.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    ti = tarfile.TarInfo('var/lib/sane/reliability/snapshots')
+    ti.type = tarfile.DIRTYPE
+    ti.mode = 0o755
+    tf.addfile(ti)
+    si = tarfile.TarInfo('var/log/sane/sgid')
+    si.size = 4
+    si.mode = 0o2755
+    tf.addfile(si, io.BytesIO(b'sgid'))
+PY
+expect_fail "P1-8 restore rejects setgid file in archive" run restore "$T/sgid.tar.gz"
+
+base
+run init
+mkdir -p "$T/nomanifest/var/lib/sane/reliability/snapshots/unverified/etc" "$T/nomanifest/var/log/sane"
+printf 'sneaky\n' > "$T/nomanifest/var/lib/sane/reliability/snapshots/unverified/etc/passwd"
+printf 'log\n' > "$T/nomanifest/var/log/sane/reliability.log"
+tar -czf "$T/nomanifest.tar.gz" -C "$T/nomanifest" var
+expect_fail "P1-8 restore rejects snapshot dir missing manifest.sha256" run restore "$T/nomanifest.tar.gz"
+check "P1-8 unverified snapshot dir was not installed" test ! -e "$T/var/lib/sane/reliability/snapshots/unverified"
+
+base
+run init
+run snapshot good1
+run backup "$T/good1.tar.gz"
+mkdir -p "$T/extrafile"
+tar -xzf "$T/good1.tar.gz" -C "$T/extrafile"
+printf 'unlisted\n' > "$T/extrafile/var/lib/sane/reliability/snapshots/good1/sneaky"
+tar -czf "$T/extrafile.tar.gz" -C "$T/extrafile" var
+T2=$(mktemp -d)
+expect_fail "P1-8 restore rejects unmanifested file inside snapshot dir" sh -c \
+	"sh '$TOOL' --root '$T2' restore '$T/extrafile.tar.gz'"
+check "P1-8 unmanifested snapshot file was not installed" test ! -e "$T2/var/lib/sane/reliability/snapshots/good1/sneaky"
+rm -rf -- "$T2"
+
+# Pre-extract symlink + member write escape must be blocked before extraction.
+base
+run init
+OUTSIDE=$(mktemp -d)
+python3 - "$T/symwrite.tar.gz" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], 'w:gz') as tf:
+    d = tarfile.TarInfo('var/lib/sane/reliability/snapshots')
+    d.type = tarfile.DIRTYPE
+    d.mode = 0o755
+    tf.addfile(d)
+    l1 = tarfile.TarInfo('var/lib/sane/reliability/snapshots/a')
+    l1.type = tarfile.SYMTYPE
+    l1.linkname = 'b/sub'
+    tf.addfile(l1)
+    l2 = tarfile.TarInfo('var/lib/sane/reliability/snapshots/b')
+    l2.type = tarfile.SYMTYPE
+    l2.linkname = '../../../../../../outside'
+    tf.addfile(l2)
+    f = tarfile.TarInfo('var/lib/sane/reliability/snapshots/a/pwned')
+    f.size = 5
+    tf.addfile(f, io.BytesIO(b'pwned'))
+PY
+expect_fail "P1-8 restore rejects multi-hop symlink + member escape pre-extract" run restore "$T/symwrite.tar.gz"
+rm -rf -- "$OUTSIDE"
+
+printf '\n--- P1-9: multi-hop symlink escape & sti_cand==sti_root ---\n'
+base
+run init
+OUTSIDE=$(mktemp -d)
+mkdir -p "$OUTSIDE/sub"
+printf 'keep-outside\n' > "$OUTSIDE/sub/pwned"
+ln -s "$OUTSIDE" "$T/etc/escape"
+ln -s escape/sub "$T/etc/tricky"
+mkdir -p "$T/payload/etc/tricky"
+printf 'pwned\n' > "$T/payload/etc/tricky/pwned"
+(cd "$T/payload" && sha256sum etc/tricky/pwned > manifest.sha256)
+expect_fail "P1-9 upgrade rejects multi-hop symlink escape (tricky -> escape/sub)" \
+	run upgrade "$T/payload"
+check "P1-9 upgrade left external file intact" \
+	grep -q '^keep-outside$' "$OUTSIDE/sub/pwned"
+
+base
+run init
+OUTSIDE=$(mktemp -d)
+mkdir -p "$OUTSIDE/sub"
+printf 'keep-outside\n' > "$OUTSIDE/sub/pwned"
+run snapshot mhop_rb
+mkdir -p "$T/var/lib/sane/reliability/snapshots/mhop_rb/etc/tricky"
+printf 'pwned\n' > "$T/var/lib/sane/reliability/snapshots/mhop_rb/etc/tricky/pwned"
+(cd "$T/var/lib/sane/reliability/snapshots/mhop_rb" && \
+	find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
+ln -s "$OUTSIDE" "$T/etc/escape"
+ln -s escape/sub "$T/etc/tricky"
+expect_fail "P1-9 rollback rejects multi-hop symlink escape" run rollback mhop_rb
+check "P1-9 rollback left external file intact" \
+	grep -q '^keep-outside$' "$OUTSIDE/sub/pwned"
+
+base
+run init
+OUTSIDE=$(mktemp -d)
+mkdir -p "$OUTSIDE/sub"
+printf 'keep-outside\n' > "$OUTSIDE/sub/pwned"
+run snapshot mhop_nf
+printf 'etc/tricky/pwned\n' > "$T/var/lib/sane/reliability/snapshots/mhop_nf/new-files"
+(cd "$T/var/lib/sane/reliability/snapshots/mhop_nf" && \
+	find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
+ln -s "$OUTSIDE" "$T/etc/escape"
+ln -s escape/sub "$T/etc/tricky"
+expect_fail "P1-9 new-files deletion rejects multi-hop symlink escape" run rollback mhop_nf
+check "P1-9 new-files deletion did not delete external file" test -f "$OUTSIDE/sub/pwned"
+
+base
+run init
+OUTSIDE=$(mktemp -d)
+mkdir -p "$OUTSIDE/sub"
+run snapshot mhop_sym
+printf 'etc/hostname\n%s\n' "$T/etc/tricky/pwned" \
+	> "$T/var/lib/sane/reliability/snapshots/mhop_sym/symlinks"
+(cd "$T/var/lib/sane/reliability/snapshots/mhop_sym" && \
+	find . -type f ! -name manifest.sha256 -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum > manifest.sha256)
+ln -s "$OUTSIDE" "$T/etc/escape"
+ln -s escape/sub "$T/etc/tricky"
+expect_fail "P1-9 symlink_target_inside rejects multi-hop escaping target" run rollback mhop_sym
+check "P1-9 symlink_target_inside created no escaping symlink" test ! -L "$T/etc/hostname"
+rm -rf -- "$OUTSIDE"
+
+# sti_cand == sti_root must be accepted cleanly (relative '..' and absolute $ROOT)
+base
+run init
+ln -s .. "$T/etc/hostname"
+expect_ok "P1-9 snapshot records symlink targeting root (..)" run snapshot rootrel
+rm -f "$T/etc/hostname"
+printf 'placeholder\n' > "$T/etc/hostname"
+expect_ok "P1-9 rollback restores symlink targeting root (..)" run rollback rootrel
+check "P1-9 root-targeting symlink preserved '..'" test "$(readlink "$T/etc/hostname")" = ".."
+
+base
+run init
+ln -s "$T" "$T/etc/hostname"
+expect_ok "P1-9 snapshot records symlink targeting absolute root" run snapshot rootabs
+rm -f "$T/etc/hostname"
+printf 'placeholder\n' > "$T/etc/hostname"
+expect_ok "P1-9 rollback restores symlink targeting absolute root" run rollback rootabs
+check "P1-9 absolute root-targeting symlink preserved" test "$(readlink "$T/etc/hostname")" = "$T"
+
+printf '\n--- P2#7/#8 & P3#13: mv -fT, net-recover containment, LOCK_OWNED ---\n'
+base
+run init
+mkdir -p "$T/etc/initdir"
+rm -f "$T/etc/init.conf"
+ln -s initdir "$T/etc/init.conf"
+mkdir -p "$T/payload/etc"
+printf 'network:once:/bin/sleep 9\n' > "$T/payload/etc/init.conf"
+(cd "$T/payload" && sha256sum etc/init.conf > manifest.sha256)
+expect_ok "P2#8 upgrade replaces destination symlink-to-dir atomically" run upgrade "$T/payload"
+check "P2#8 upgrade replaced symlink with regular file" sh -c \
+	"[ -f '$T/etc/init.conf' ] && [ ! -L '$T/etc/init.conf' ]"
+check "P2#8 upgrade did not leak temp inside symlinked dir" sh -c \
+	"! ls '$T/etc/initdir/.sane-rel.'* >/dev/null 2>&1"
+
+setup_net_recovery
+OUTSIDE=$(mktemp -d)
+printf 'nameserver 8.8.8.8\n' > "$OUTSIDE/resolv"
+rm -f "$T/etc/resolv.conf"
+ln -s "$OUTSIDE/resolv" "$T/etc/resolv.conf"
+expect_fail "P2#8 net-recover rejects escaping etc/resolv.conf symlink" run_net_recover
+check "P2#8 net-recover did not touch external resolv target" \
+	grep -q '^nameserver 8\.8\.8\.8$' "$OUTSIDE/resolv"
+rm -rf -- "$OUTSIDE"
+
+setup_net_recovery
+mkdir -p "$T/etc/resolvdir"
+rm -f "$T/etc/resolv.conf"
+ln -s resolvdir "$T/etc/resolv.conf"
+expect_ok "P2#8 net-recover replaces internal symlink-to-dir atomically" run_net_recover
+check "P2#8 net-recover replaced symlink with regular resolv.conf" sh -c \
+	"[ -f '$T/etc/resolv.conf' ] && [ ! -L '$T/etc/resolv.conf' ]"
+check "P2#8 net-recover leaked nothing inside resolvdir" sh -c \
+	"! ls '$T/etc/resolvdir/.sane-net-recover.'* >/dev/null 2>&1"
+
+# PID reuse: exec keeps $$, so lock/pid == $$ on disk with LOCK_OWNED=0 must
+# still be treated as stale, run heal_snapshot_swaps, and release lock on exit.
+base
+run init
+run snapshot healme
+mv "$T/var/lib/sane/reliability/snapshots/healme" \
+	"$T/var/lib/sane/reliability/snapshots/.old.healme"
+expect_ok "P2#7 PID reuse steals stale lock, heals swap, and releases lock" \
+	sh -c 'mkdir -p "$1/var/lib/sane/reliability/lock" && printf "%s\n" "$$" > "$1/var/lib/sane/reliability/lock/pid" && exec sh "$2" --root "$1" snapshot reused' \
+	sh "$T" "$TOOL"
+check "P2#7 PID reuse healed interrupted swap" test -d "$T/var/lib/sane/reliability/snapshots/healme"
+check "P2#7 PID reuse created new snapshot" test -d "$T/var/lib/sane/reliability/snapshots/reused"
+check "P2#7 PID reuse released lock on exit" test ! -e "$T/var/lib/sane/reliability/lock"
+
+# P3#13: dangling abs-symlink root has no '//'; backup refuses dangling symlink;
+# upgrade blocks metadata-colliding target new-files.
+base
+ln -s "$T/fresh-abs-target" "$T/absdangling"
+OUT_V=$(sh "$TOOL" -v --root "$T/absdangling" init)
+check "P3#13 canonicalize_root emits no doubled slash" sh -c \
+	"printf '%s\n' '$OUT_V' | grep -q 'in $T/fresh-abs-target/var/lib/sane/reliability' && ! printf '%s\n' '$OUT_V' | grep -q '//'"
+
+base
+run init
+run snapshot keepb
+ln -s "$T/does-not-exist" "$T/dangling-backup.tar.gz"
+expect_fail "P3#13 backup refuses to overwrite dangling symlink without --force" \
+	run backup "$T/dangling-backup.tar.gz"
+
+base
+run init
+mkdir -p "$T/payload"
+printf 'collision\n' > "$T/payload/new-files"
+(cd "$T/payload" && sha256sum new-files > manifest.sha256)
+expect_fail "P3#13 upgrade rejects payload target colliding with snapshot metadata" \
+	run upgrade "$T/payload"
 
 printf '\nPhase C reliability tests: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

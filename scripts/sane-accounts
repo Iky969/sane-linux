@@ -52,6 +52,170 @@ EOF
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 note() { [ "$VERBOSE" -eq 1 ] && printf 'ok: %s\n' "$*"; return 0; }
 
+TMP_1='' TMP_2='' TMP_3='' TMP_4=''
+cleanup_temps() {
+	rm -f -- ${TMP_1:+"$TMP_1"} ${TMP_2:+"$TMP_2"} ${TMP_3:+"$TMP_3"} ${TMP_4:+"$TMP_4"} 2>/dev/null || true
+}
+trap cleanup_temps EXIT HUP INT TERM
+
+atomic_mv_replace() {
+	amr_src=$1; amr_dst=$2
+	if mv -fT -- "$amr_src" "$amr_dst" 2>/dev/null; then
+		return 0
+	fi
+	if [ -L "$amr_dst" ]; then
+		rm -f -- "$amr_dst" && mv -fT -- "$amr_src" "$amr_dst"
+		return $?
+	fi
+	mv -fT -- "$amr_src" "$amr_dst"
+}
+
+normalize_path() {
+	np_in=$1
+	case "$np_in" in /*) ;; *) return 1 ;; esac
+	np_out=
+	np_rest=${np_in#/}
+	while [ -n "$np_rest" ]; do
+		case "$np_rest" in
+			*/*) np_comp=${np_rest%%/*}; np_rest=${np_rest#*/} ;;
+			*) np_comp=$np_rest; np_rest= ;;
+		esac
+		case "$np_comp" in
+			''|.) continue ;;
+			..) np_out=${np_out%/*} ;;
+			*) np_out="$np_out/$np_comp" ;;
+		esac
+	done
+	printf '%s\n' "${np_out:-/}"
+}
+
+canonicalize_root() {
+	cr_path=$ROOT
+	while [ "${cr_path%/}" != "$cr_path" ]; do cr_path=${cr_path%/}; done
+	[ -n "$cr_path" ] || cr_path=/
+	cr_tail=
+	while [ ! -d "$cr_path" ]; do
+		cr_tail="/${cr_path##*/}$cr_tail"
+		cr_path=${cr_path%/*}
+		[ -n "$cr_path" ] || cr_path=/
+	done
+	cr_base=$(cd -P "$cr_path" && pwd) || die "cannot resolve --root: $ROOT"
+	cr_rest=${cr_tail#/}
+	cr_hops=0
+	while [ -n "$cr_rest" ]; do
+		case "$cr_rest" in
+			*/*) cr_comp=${cr_rest%%/*}; cr_rest=${cr_rest#*/} ;;
+			*) cr_comp=$cr_rest; cr_rest= ;;
+		esac
+		case "$cr_comp" in
+			''|.) continue ;;
+			..) cr_base=${cr_base%/*}; [ -n "$cr_base" ] || cr_base=/; continue ;;
+		esac
+		if [ -L "$cr_base/$cr_comp" ]; then
+			cr_hops=$((cr_hops + 1))
+			[ "$cr_hops" -le 40 ] || die "too many symlink hops in --root: $ROOT"
+			cr_target=$(readlink "$cr_base/$cr_comp" 2>/dev/null) || \
+				die "cannot read root symlink: $cr_base/$cr_comp"
+			[ -n "$cr_target" ] || die "empty root symlink target: $cr_base/$cr_comp"
+			case "$cr_target" in
+				/*) cr_base=/; cr_rest="${cr_target#/}/$cr_rest" ;;
+				*) cr_rest="$cr_target/$cr_rest" ;;
+			esac
+			continue
+		fi
+		if [ "$cr_base" = "/" ]; then
+			cr_base="/$cr_comp"
+		else
+			cr_base="$cr_base/$cr_comp"
+		fi
+	done
+	ROOT=$(normalize_path "$cr_base") || die "cannot normalize --root: $ROOT"
+}
+
+resolve_abs_no_contain() {
+	rac_base=/
+	rac_rest=${1#/}
+	rac_hops=0
+	while [ -n "$rac_rest" ]; do
+		case "$rac_rest" in
+			*/*) rac_comp=${rac_rest%%/*}; rac_rest=${rac_rest#*/} ;;
+			*) rac_comp=$rac_rest; rac_rest= ;;
+		esac
+		case "$rac_comp" in
+			''|.) continue ;;
+		esac
+		rac_cand=$(normalize_path "$rac_base/$rac_comp") || return 1
+		if [ -L "$rac_cand" ]; then
+			rac_hops=$((rac_hops + 1))
+			[ "$rac_hops" -le 40 ] || return 1
+			rac_target=$(readlink "$rac_cand" 2>/dev/null) || return 1
+			[ -n "$rac_target" ] || return 1
+			case "$rac_target" in
+				/*) rac_base=/; rac_rest="${rac_target#/}/$rac_rest" ;;
+				*)  rac_base=$(dirname "$rac_cand")
+				    rac_rest="$rac_target/$rac_rest" ;;
+			esac
+			continue
+		fi
+		rac_base=$rac_cand
+	done
+	printf '%s\n' "$rac_base"
+}
+
+symlink_resolve_contained() {
+	src_root=$(normalize_path "$ROOT") || return 1
+	src_base=$src_root
+	src_rest=$1
+	src_hops=0
+	while [ -n "$src_rest" ]; do
+		case "$src_rest" in
+			*/*) src_comp=${src_rest%%/*}; src_rest=${src_rest#*/} ;;
+			*) src_comp=$src_rest; src_rest= ;;
+		esac
+		case "$src_comp" in
+			''|.) continue ;;
+		esac
+		src_cand=$(normalize_path "$src_base/$src_comp") || return 1
+		if [ "$src_root" != "/" ]; then
+			case "$src_cand/" in
+				"$src_root/"*) ;;
+				*) return 1 ;;
+			esac
+		fi
+		if [ -L "$src_cand" ]; then
+			src_hops=$((src_hops + 1))
+			[ "$src_hops" -le 40 ] || return 1
+			src_target=$(readlink "$src_cand" 2>/dev/null) || return 1
+			[ -n "$src_target" ] || return 1
+			case "$src_target" in
+				/*)
+					src_abs=$(resolve_abs_no_contain "$src_target") || return 1
+					if [ "$src_root" != "/" ]; then
+						case "$src_abs/" in
+							"$src_root/"*) ;;
+							*) return 1 ;;
+						esac
+					fi
+					src_base=$src_abs
+					;;
+				*)  src_base=$(dirname "$src_cand")
+				    src_rest="$src_target/$src_rest" ;;
+			esac
+			continue
+		fi
+		src_base=$src_cand
+	done
+	return 0
+}
+
+require_contained_rel() {
+	symlink_resolve_contained "$1" || die "path escapes root: $1"
+}
+
+reject_symlink() {
+	[ ! -L "$1" ] || die "refusing symlink path: $1"
+}
+
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 		--root)
@@ -77,9 +241,15 @@ case "$ROOT" in
 	/*) ;;
 	*) die "--root must be an absolute path" ;;
 esac
+canonicalize_root
 
-ETC="$ROOT/etc"
-HOME_BASE="$ROOT/home"
+if [ "$ROOT" = "/" ]; then
+	ETC=/etc
+	HOME_BASE=/home
+else
+	ETC="$ROOT/etc"
+	HOME_BASE="$ROOT/home"
+fi
 PASSWD="$ETC/passwd"
 GROUP="$ETC/group"
 SHADOW="$ETC/shadow"
@@ -94,11 +264,11 @@ owner_of() {
 }
 
 # A SHA-512 crypt hash is $6$<salt>$<checksum>: salt 1-16 chars, checksum
-# exactly 86 chars, both from [./A-Za-z0-9]. A bare "$6$" prefix (e.g. a hash
-# truncated by an interrupted passwd) must NOT count as usable, otherwise the
-# recovery service accepts it and firstboot stays marked done with no login.
+# exactly 86 chars, both from [./A-Za-z0-9]. Reject truncated hashes as well
+# as the pre-v1.3.0 deterministic weak-default salts 'root' and 'sane'.
 valid_sha512_hash() {
 	case "$1" in
+		'$6$root$'*|'$6$sane$'*) return 1 ;;
 		'$6$'*) ;;
 		*) return 1 ;;
 	esac
@@ -113,16 +283,36 @@ valid_sha512_hash() {
 }
 
 ensure_etc() {
+	require_contained_rel "etc"
 	[ -d "$ETC" ] || die "target root has no /etc: $ETC"
+}
+
+write_atomic_text() {
+	# write_atomic_text DEST MODE TEXT
+	wat_dest=$1; wat_mode=$2; wat_text=$3
+	wat_dir=$(dirname "$wat_dest")
+	TMP_1=$(mktemp "$wat_dir/.sane-accounts.XXXXXX") || die "cannot create temp file in $wat_dir"
+	if ! chmod "$wat_mode" "$TMP_1" || ! printf '%s' "$wat_text" > "$TMP_1" || ! mv -fT -- "$TMP_1" "$wat_dest"; then
+		rm -f -- "$TMP_1"; TMP_1=''
+		die "failed to write $wat_dest"
+	fi
+	TMP_1=''
 }
 
 ensure_base() {
 	ensure_etc
-	[ -f "$PASSWD" ] || printf 'root:x:0:0:root:/root:/bin/sh\n' > "$PASSWD"
-	[ -f "$GROUP" ] || printf 'root:x:0:\n' > "$GROUP"
-	[ -f "$SHADOW" ] || printf 'root:!:19700:0:99999:7:::\n' > "$SHADOW"
-	chmod 0644 "$PASSWD" "$GROUP"
-	chmod 0600 "$SHADOW"
+	require_contained_rel "etc/passwd"
+	require_contained_rel "etc/group"
+	require_contained_rel "etc/shadow"
+	reject_symlink "$PASSWD"
+	reject_symlink "$GROUP"
+	reject_symlink "$SHADOW"
+	[ -f "$PASSWD" ] || write_atomic_text "$PASSWD" 0644 'root:x:0:0:root:/root:/bin/sh
+'
+	[ -f "$GROUP" ]  || write_atomic_text "$GROUP"  0644 'root:x:0:
+'
+	[ -f "$SHADOW" ] || write_atomic_text "$SHADOW" 0600 'root:!:19700:0:99999:7:::
+'
 }
 
 # Password policy (S3): at least 12 characters, and never the account name
@@ -155,16 +345,17 @@ field_of() {
 }
 
 set_field() {
-	# set_field FILE NAME FIELD VALUE -- atomic rewrite via unpredictable temp
-	file=$1; name=$2; field=$3; value=$4
+	# set_field FILE NAME FIELD VALUE MODE -- atomic rewrite via unpredictable temp
+	file=$1; name=$2; field=$3; value=$4; mode=${5:-0600}
+	reject_symlink "$file"
 	dir=$(dirname "$file")
-	tmp=$(mktemp "$dir/.sane-accounts.XXXXXX") || die "cannot create temp file in $dir"
-	if ! awk -v n="$name" -v f="$field" -v v="$value" \
-		'BEGIN{FS=OFS=":"} $1==n {$f=v} {print}' "$file" > "$tmp"; then
-		rm -f "$tmp"
+	TMP_1=$(mktemp "$dir/.sane-accounts.XXXXXX") || die "cannot create temp file in $dir"
+	if ! chmod "$mode" "$TMP_1" || ! awk -v n="$name" -v f="$field" -v v="$value" \
+		'BEGIN{FS=OFS=":"} $1==n {$f=v} {print}' "$file" > "$TMP_1" || ! mv -fT -- "$TMP_1" "$file"; then
+		rm -f -- "$TMP_1"; TMP_1=''
 		die "failed to rewrite $file"
 	fi
-	mv "$tmp" "$file"
+	TMP_1=''
 }
 
 next_id() {
@@ -179,19 +370,16 @@ next_id() {
 }
 
 cmd_init() {
-	# --force is also accepted after the subcommand for convenience.
-	if [ "${1:-}" = "--force" ]; then
-		FORCE=1
-	fi
-	if [ "${1:-}" = "--firstboot" ]; then
-		FIRSTBOOT=1
-	fi
-	if [ "${2:-}" = "--firstboot" ]; then
-		FIRSTBOOT=1
-	fi
-	if [ "${1:-}" = "--allow-weak-defaults" ] || [ "${2:-}" = "--allow-weak-defaults" ]; then
-		ALLOW_WEAK_DEFAULTS=1
-	fi
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--force) FORCE=1 ;;
+			--firstboot) FIRSTBOOT=1 ;;
+			--allow-weak-defaults) ALLOW_WEAK_DEFAULTS=1 ;;
+			-*) die "unknown init option: $1" ;;
+			*) die "unexpected argument to init: $1" ;;
+		esac
+		shift
+	done
 	# Fail closed BEFORE writing anything (K1): without --firstboot there is
 	# no password to write any more, and without --allow-weak-defaults plus
 	# runtime passwords there is nothing safe to fall back to. Validate the
@@ -206,18 +394,29 @@ cmd_init() {
 		check_password_policy root "$SANE_TEST_ROOT_PASSWORD"
 		check_password_policy sane "$SANE_TEST_SANE_PASSWORD"
 	fi
+	ensure_etc
+	require_contained_rel "etc/passwd"
+	require_contained_rel "etc/group"
+	require_contained_rel "etc/shadow"
+	require_contained_rel "etc/doas.conf"
+	require_contained_rel "home"
+	require_contained_rel "home/sane"
+	reject_symlink "$HOME_BASE/sane"
+	if [ -e "$HOME_BASE/sane" ] && [ ! -d "$HOME_BASE/sane" ]; then
+		die "home path exists but is not a directory: $HOME_BASE/sane"
+	fi
 	if [ "$FORCE" -ne 1 ]; then
 		for f in "$PASSWD" "$GROUP" "$SHADOW" "$DOAS_CONF"; do
-			[ -e "$f" ] && die "refusing to overwrite existing ${f#$ROOT}; use --force"
+			if [ -e "$f" ] || [ -L "$f" ]; then
+				die "refusing to overwrite existing ${f#$ROOT}; use --force"
+			fi
 		done
 	fi
-	ensure_etc
-	mkdir -p "$HOME_BASE/sane"
-	printf 'root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh\n' > "$PASSWD"
-	printf 'root:x:0:\nwheel:x:10:root,sane\nsane:x:1000:\n' > "$GROUP"
 	if [ "$FIRSTBOOT" -eq 1 ]; then
 		# No public password: accounts stay locked until sane-firstboot sets them.
-		printf 'root:!:19700:0:99999:7:::\nsane:!:19700:0:99999:7:::\n' > "$SHADOW"
+		shadow_content='root:!:19700:0:99999:7:::
+sane:!:19700:0:99999:7:::
+'
 	elif [ "$ALLOW_WEAK_DEFAULTS" -eq 1 ]; then
 		# Test-only path (K1): there is no deterministic hash any more.
 		# Passwords must be supplied at runtime via the environment
@@ -231,16 +430,27 @@ cmd_init() {
 		command -v openssl >/dev/null 2>&1 || die "openssl is required to hash passwords"
 		root_hash=$(printf '%s' "$root_pw" | openssl passwd -6 -salt "$(openssl rand -hex 8)" -stdin) || die "failed to hash root password"
 		sane_hash=$(printf '%s' "$sane_pw" | openssl passwd -6 -salt "$(openssl rand -hex 8)" -stdin) || die "failed to hash sane password"
-		printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' \
-			"$root_hash" "$sane_hash" > "$SHADOW"
+		shadow_content=$(printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' "$root_hash" "$sane_hash")
 	else
 		die "refusing to write password accounts without --firstboot; use --firstboot (locked accounts), or set passwords explicitly with set-password"
 	fi
-	printf 'permit persist :wheel\n' > "$DOAS_CONF"
-	chmod 0644 "$PASSWD" "$GROUP"
-	chmod 0600 "$SHADOW" "$DOAS_CONF"
-	[ "$ROOT" = "/" ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
+	mkdir -p "$HOME_BASE/sane"
 	chmod 0750 "$HOME_BASE/sane"
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	TMP_2=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	TMP_3=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	TMP_4=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	chmod 0644 "$TMP_1" "$TMP_2" || die "cannot set staged identity file modes"
+	chmod 0600 "$TMP_3" "$TMP_4" || die "cannot set staged secret file modes"
+	[ "$(id -u)" = 0 ] && chown 0:0 "$TMP_4" 2>/dev/null || true
+	printf 'root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh\n' > "$TMP_1"
+	printf 'root:x:0:\nwheel:x:10:root,sane\nsane:x:1000:\n' > "$TMP_2"
+	printf '%s' "$shadow_content" > "$TMP_3"
+	printf 'permit persist :wheel\n' > "$TMP_4"
+	atomic_mv_replace "$TMP_1" "$PASSWD"; TMP_1=''
+	atomic_mv_replace "$TMP_2" "$GROUP"; TMP_2=''
+	atomic_mv_replace "$TMP_3" "$SHADOW"; TMP_3=''
+	atomic_mv_replace "$TMP_4" "$DOAS_CONF"; TMP_4=''
 	note "baseline identity files written to $ETC"
 }
 
@@ -304,7 +514,11 @@ cmd_add_user() {
 	esac
 
 	# Create the home FIRST: if that fails, no identity entry is left behind.
+	require_contained_rel "home"
+	require_contained_rel "home/$name"
 	home="$HOME_BASE/$name"
+	reject_symlink "$HOME_BASE"
+	reject_symlink "$home"
 	if [ -e "$home" ] && [ ! -d "$home" ]; then
 		die "home path exists but is not a directory: $home"
 	fi
@@ -321,62 +535,76 @@ cmd_add_user() {
 
 	rollback_add() {
 		# Undo every partial edit so a failed add cannot leave a ghost account.
-		for file in "$PASSWD" "$SHADOW"; do
-			tmp=$(mktemp "$(dirname "$file")/.sane-accounts.XXXXXX") || continue
-			awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$file" > "$tmp"
-			mv "$tmp" "$file"
+		for rb_spec in "$PASSWD:0644" "$SHADOW:0600"; do
+			rb_file=${rb_spec%:*}
+			rb_mode=${rb_spec##*:}
+			rb_tmp=$(mktemp "$(dirname "$rb_file")/.sane-accounts.XXXXXX") || continue
+			if chmod "$rb_mode" "$rb_tmp" && \
+				awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$rb_file" > "$rb_tmp"; then
+				mv -fT -- "$rb_tmp" "$rb_file" || rm -f -- "$rb_tmp"
+			else
+				rm -f -- "$rb_tmp"
+			fi
 		done
-		tmp=$(mktemp "$(dirname "$GROUP")/.sane-accounts.XXXXXX") || return 0
-		if [ "$created_group" -eq 1 ]; then
-			# The group was created for this account but is named independently
-			# ($group), so it must be removed by group name, not account name.
-			awk -v n="$group" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$GROUP" > "$tmp"
-		else
-			awk -v n="$name" 'BEGIN{FS=OFS=":"} {
-				if ($4!="") {
-					out=""; c=0; k=split($4,a,",")
-					for (i=1;i<=k;i++) if (a[i]!="" && a[i]!=n) {
-						out=out (c?",":"") a[i]; c++
+		rb_gtmp=$(mktemp "$(dirname "$GROUP")/.sane-accounts.XXXXXX") || { rmdir "$home" 2>/dev/null || true; return 0; }
+		if chmod 0644 "$rb_gtmp"; then
+			if [ "$created_group" -eq 1 ]; then
+				awk -v n="$group" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$GROUP" > "$rb_gtmp"
+			else
+				awk -v n="$name" 'BEGIN{FS=OFS=":"} {
+					if ($4!="") {
+						out=""; c=0; k=split($4,a,",")
+						for (i=1;i<=k;i++) if (a[i]!="" && a[i]!=n) {
+							out=out (c?",":"") a[i]; c++
+						}
+						$4=out
 					}
-					$4=out
-				}
-				print
-			}' "$GROUP" > "$tmp"
+					print
+				}' "$GROUP" > "$rb_gtmp"
+			fi
+			mv -fT -- "$rb_gtmp" "$GROUP" || rm -f -- "$rb_gtmp"
+		else
+			rm -f -- "$rb_gtmp"
 		fi
-		mv "$tmp" "$GROUP"
-		# mktemp files are 0600; restore the canonical modes after replacing
-		# passwd/group/shadow with those temp files.
-		chmod 0644 "$PASSWD" "$GROUP" 2>/dev/null || true
-		chmod 0600 "$SHADOW" 2>/dev/null || true
 		rmdir "$home" 2>/dev/null || true
 	}
 
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || { rmdir "$home" 2>/dev/null || true; die "cannot create temp file"; }
+	if ! chmod 0644 "$TMP_1"; then
+		rm -f -- "$TMP_1"; TMP_1=''; rmdir "$home" 2>/dev/null || true
+		die "cannot set group temp mode"
+	fi
 	if [ "$created_group" -eq 1 ]; then
-		if ! printf '%s:x:%s:\n' "$group" "$gid" >> "$GROUP"; then
-			rmdir "$home" 2>/dev/null || true
+		if ! { cat "$GROUP" && printf '%s:x:%s:\n' "$group" "$gid"; } > "$TMP_1" || ! mv -fT -- "$TMP_1" "$GROUP"; then
+			rm -f -- "$TMP_1"; TMP_1=''; rmdir "$home" 2>/dev/null || true
 			die "failed to write group entry"
 		fi
 	else
-		tmp=$(mktemp "$(dirname "$GROUP")/.sane-accounts.XXXXXX") || die "cannot create temp file"
 		if ! awk -v n="$name" -v g="$group" 'BEGIN{FS=OFS=":"} $1==g {
 			k=split($4,a,","); found=0
 			for (i=1;i<=k;i++) if (a[i]==n) found=1
 			if (!found) $4 = ($4=="" ? n : $4 "," n)
-		} {print}' "$GROUP" > "$tmp"; then
-			rm -f "$tmp"; rmdir "$home" 2>/dev/null || true
+		} {print}' "$GROUP" > "$TMP_1" || ! mv -fT -- "$TMP_1" "$GROUP"; then
+			rm -f -- "$TMP_1"; TMP_1=''; rmdir "$home" 2>/dev/null || true
 			die "failed to update group membership"
 		fi
-		mv "$tmp" "$GROUP"
 	fi
+	TMP_1=''
 
-	if ! printf '%s:x:%s:%s:%s:/home/%s:/bin/sh\n' \
-		"$name" "$uid" "$gid" "$name" "$name" >> "$PASSWD"; then
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || { rollback_add; die "cannot create temp file"; }
+	if ! chmod 0644 "$TMP_1" || ! { cat "$PASSWD" && printf '%s:x:%s:%s:%s:/home/%s:/bin/sh\n' \
+		"$name" "$uid" "$gid" "$name" "$name"; } > "$TMP_1" || ! mv -fT -- "$TMP_1" "$PASSWD"; then
+		rm -f -- "$TMP_1"; TMP_1=''
 		rollback_add; die "failed to write passwd entry"
 	fi
-	if ! printf '%s:!:19700:0:99999:7:::\n' "$name" >> "$SHADOW"; then
+	TMP_1=''
+
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || { rollback_add; die "cannot create temp file"; }
+	if ! chmod 0600 "$TMP_1" || ! { cat "$SHADOW" && printf '%s:!:19700:0:99999:7:::\n' "$name"; } > "$TMP_1" || ! mv -fT -- "$TMP_1" "$SHADOW"; then
+		rm -f -- "$TMP_1"; TMP_1=''
 		rollback_add; die "failed to write shadow entry"
 	fi
-	chmod 0644 "$PASSWD" "$GROUP"; chmod 0600 "$SHADOW"
+	TMP_1=''
 	note "created $name (uid=$uid gid=$gid, locked, home=/home/$name)"
 }
 
@@ -391,6 +619,14 @@ cmd_del_user() {
 	valid_name "$name" || die "invalid account name: $name"
 	[ "$name" = "root" ] && die "refusing to delete the reserved 'root' account"
 	ensure_base
+	if [ "$remove_home" -eq 1 ]; then
+		case "$name" in
+			''|*/*|.|..) die "unsafe home name: $name" ;;
+		esac
+		require_contained_rel "home"
+		require_contained_rel "home/$name"
+		reject_symlink "$HOME_BASE/$name"
+	fi
 	user_exists "$name" || die "no such account: $name"
 
 	# Never delete a private group that another account still relies on.
@@ -410,12 +646,13 @@ cmd_del_user() {
 		fi
 	fi
 
-	for file in "$PASSWD" "$SHADOW"; do
-		tmp=$(mktemp "$(dirname "$file")/.sane-accounts.XXXXXX") || die "cannot create temp file"
-		awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$file" > "$tmp"
-		mv "$tmp" "$file"
-	done
-	tmp=$(mktemp "$(dirname "$GROUP")/.sane-accounts.XXXXXX") || die "cannot create temp file"
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file"
+	TMP_2=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file"
+	TMP_3=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file"
+	chmod 0644 "$TMP_1" "$TMP_3" || die "cannot set temp modes"
+	chmod 0600 "$TMP_2" || die "cannot set temp mode"
+	awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$PASSWD" > "$TMP_1" || die "failed to update passwd"
+	awk -v n="$name" 'BEGIN{FS=OFS=":"} $1!=n {print}' "$SHADOW" > "$TMP_2" || die "failed to update shadow"
 	awk -v n="$name" -v keep="$keep_group" 'BEGIN{FS=OFS=":"} {
 		if ($1==n && keep!="1") next
 		if ($4!="") {
@@ -426,15 +663,13 @@ cmd_del_user() {
 			$4=out
 		}
 		print
-	}' "$GROUP" > "$tmp"
-	mv "$tmp" "$GROUP"
+	}' "$GROUP" > "$TMP_3" || die "failed to update group"
+	mv -fT -- "$TMP_1" "$PASSWD"; TMP_1=''
+	mv -fT -- "$TMP_2" "$SHADOW"; TMP_2=''
+	mv -fT -- "$TMP_3" "$GROUP"; TMP_3=''
 	if [ "$remove_home" -eq 1 ]; then
-		case "$name" in
-			''|*/*|.|..) die "unsafe home name: $name" ;;
-		esac
 		[ -d "$HOME_BASE/$name" ] && rm -rf -- "${HOME_BASE:?}/${name:?}"
 	fi
-	chmod 0644 "$PASSWD" "$GROUP"; chmod 0600 "$SHADOW"
 	note "removed $name"
 }
 
@@ -458,8 +693,7 @@ cmd_set_password() {
 	esac
 	# Drop a lock marker so the new password is usable.
 	hash=$(printf '%s' "$hash")
-	set_field "$SHADOW" "$name" 2 "$hash"
-	chmod 0600 "$SHADOW"
+	set_field "$SHADOW" "$name" 2 "$hash" 0600
 	note "password updated for $name (SHA-512 crypt)"
 }
 
@@ -468,7 +702,7 @@ cmd_lock() {
 	name=$1; ensure_base; user_exists "$name" || die "no such account: $name"
 	h=$(field_of "$SHADOW" "$name" 2)
 	case "$h" in '!'*) note "$name already locked"; return 0 ;; esac
-	set_field "$SHADOW" "$name" 2 "!$h"; chmod 0600 "$SHADOW"
+	set_field "$SHADOW" "$name" 2 "!$h" 0600
 	note "locked $name"
 }
 
@@ -477,17 +711,23 @@ cmd_unlock() {
 	name=$1; ensure_base; user_exists "$name" || die "no such account: $name"
 	h=$(field_of "$SHADOW" "$name" 2)
 	case "$h" in
-		'!'*) h=${h#\!} ;;
+		'!'*) ;;
 		*) note "$name already unlocked"; return 0 ;;
 	esac
+	while :; do
+		case "$h" in
+			'!'*) h=${h#!} ;;
+			*) break ;;
+		esac
+	done
 	# A lock marker without a real hash must never become an empty password
 	# field: some login implementations treat that as passwordless access.
 	case "$h" in
-		''|'*'|'!'*) die "account '$name' has no usable password hash; run set-password first" ;;
-		'$6$'*) ;;
+		''|'*') die "account '$name' has no usable password hash; run set-password first" ;;
+		'$6$'*) valid_sha512_hash "$h" || die "account '$name' has a weak or invalid password hash; run set-password first" ;;
 		*) die "account '$name' has an unsupported password hash; refusing to unlock" ;;
 	esac
-	set_field "$SHADOW" "$name" 2 "$h"; chmod 0600 "$SHADOW"
+	set_field "$SHADOW" "$name" 2 "$h" 0600
 	note "unlocked $name"
 }
 
@@ -500,60 +740,233 @@ cmd_list() {
 FAIL=0
 audit_fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 
-# doas policy scans shared by validate and recover so both enforce the
-# identical rule boundary. Inline comments are stripped first so comment
-# text is never a grant, and tokens are compared strictly so a setenv value
-# like X=nopass is not mistaken for the nopass option. A setenv { ... }
-# block is skipped as a whole: "as" and "cmd" INSIDE the braces are
-# environment variable names, not option terminators, so a nopass after the
-# closing brace is still an option. The remaining boundary: a literal cmd
-# or as token OUTSIDE a setenv block ends the option part; everything after
-# it is a command argument or target identity, not a doas option. Examples:
-#   "permit setenv { as } :wheel cmd /usr/bin/echo nopass" -> valid
-#   "permit setenv { as } nopass :wheel" -> a nopass grant, rejected
-#   "permit setenv { as } :wheel" -> valid :wheel identity, accepted
-doas_has_nopass() {
-	awk '{sub(/#.*/, "")} $1 == "permit" {
-		in_setenv = 0
-		for (i = 2; i <= NF; i++) {
-			if (in_setenv) {
-				if ($i ~ /\}$/) in_setenv = 0
+# Quote-, brace-, and comment-aware doas.conf lexer/parser aligned with
+# OpenDoas rules:
+# - '#' starts a comment ONLY outside double quotes (and unescaped quotes).
+# - '{' and '}' split tokens outside quotes (handling 'setenv{' and '}nopass').
+# - Supports '\' + newline continuation inside an open setenv { ... } block.
+# - Tracks last-match-wins effective :wheel grant across permit/deny rules
+#   (so trailing unconditional 'deny :wheel' revokes earlier grants), while
+#   flagging any 'permit' rule with an unquoted 'nopass' option before cmd/as.
+doas_audit_awk() {
+	awk -v mode="$1" '
+	BEGIN {
+		has_nopass = 0
+		effective_wheel = 0
+		wheel_cmd = ""
+		syntax_err = 0
+		cont_setenv = 0
+	}
+	{
+		line = $0
+		n = length(line)
+		ntok = 0
+		tok = ""
+		has_tok = 0
+		tok_q = 0
+		in_q = 0
+		esc = 0
+		cont_bs = 0
+
+		if (cont_setenv) {
+			# Check if continued setenv line ends with unescaped backslash outside quotes/comments.
+			# We lex normally and handle continuation at the end of the line.
+		}
+		for (i = 1; i <= n; i++) {
+			c = substr(line, i, 1)
+			if (in_q) {
+				if (esc) {
+					tok = tok c
+					esc = 0
+				} else if (c == "\\") {
+					esc = 1
+				} else if (c == "\"") {
+					in_q = 0
+				} else {
+					tok = tok c
+				}
+			} else {
+				if (c == "#") {
+					break
+				} else if (c == " " || c == "\t" || c == "\r") {
+					if (has_tok) {
+						ntok++
+						toks[ntok] = tok
+						qs[ntok] = tok_q
+						tok = ""
+						has_tok = 0
+						tok_q = 0
+					}
+				} else if (c == "{" || c == "}") {
+					if (has_tok) {
+						ntok++
+						toks[ntok] = tok
+						qs[ntok] = tok_q
+						tok = ""
+						has_tok = 0
+						tok_q = 0
+					}
+					ntok++
+					toks[ntok] = c
+					qs[ntok] = 0
+				} else if (c == "\"") {
+					in_q = 1
+					tok_q = 1
+					has_tok = 1
+				} else {
+					tok = tok c
+					has_tok = 1
+				}
+			}
+		}
+		if (in_q || esc) {
+			syntax_err = 1
+			cont_setenv = 0
+			next
+		}
+		if (has_tok) {
+			ntok++
+			toks[ntok] = tok
+			qs[ntok] = tok_q
+		}
+		if (!cont_setenv) {
+			if (ntok == 0) next
+			if (qs[1] || (toks[1] != "permit" && toks[1] != "deny")) {
+				syntax_err = 1
+				next
+			}
+			c_action = toks[1]
+			c_in_setenv = 0
+			c_expect_brace = 0
+			c_saw_nopass = 0
+			c_ident = ""
+			c_target = ""
+			c_cmd = ""
+			c_has_cmd = 0
+			c_rule_err = 0
+			start_i = 2
+		} else {
+			cont_setenv = 0
+			start_i = 1
+		}
+
+		for (i = start_i; i <= ntok; i++) {
+			t = toks[i]
+			tq = qs[i]
+			if (c_expect_brace) {
+				c_expect_brace = 0
+				if (!tq && t == "{") {
+					c_in_setenv = 1
+					continue
+				}
+				if (!tq && t ~ /=/) {
+					continue
+				}
+				c_rule_err = 1
+			}
+			if (c_in_setenv) {
+				if (!tq && t == "}" ) {
+					c_in_setenv = 0
+				}
 				continue
 			}
-			if ($i == "setenv") { in_setenv = 1; continue }
-			if ($i == "cmd" || $i == "as") break
-			if ($i == "nopass") bad = 1
-		}
-	} END {exit !bad}' "$1"
-}
-
-doas_has_effective_wheel() {
-	# ONE permit rule with :wheel as the identity suffices for the whole
-	# file; a :wheel that is only a command argument does not count.
-	awk '{sub(/#.*/, "")} $1 == "permit" {
-		in_setenv = 0
-		for (i = 2; i <= NF; i++) {
-			if (in_setenv) {
-				if ($i ~ /\}$/) in_setenv = 0
+			if (!tq && (t == "{" || t == "}")) {
+				c_rule_err = 1
+				break
+			}
+			if (!tq && t == "setenv") {
+				if (c_ident != "") { c_rule_err = 1; break }
+				c_expect_brace = 1
 				continue
 			}
-			if ($i == "setenv") { in_setenv = 1; continue }
-			if ($i == "cmd" || $i == "as") break
-			if ($i == ":wheel") found = 1
+			if (!tq && t == "nopass") {
+				if (c_ident != "") { c_rule_err = 1; break }
+				c_saw_nopass = 1
+				continue
+			}
+			if (!tq && (t == "persist" || t == "keepenv" || t == "nolog")) {
+				if (c_ident != "") { c_rule_err = 1; break }
+				continue
+			}
+			if (!tq && t == "as") {
+				if (c_ident == "" || i + 1 > ntok) { c_rule_err = 1; break }
+				i++
+				c_target = toks[i]
+				continue
+			}
+			if (!tq && t == "cmd") {
+				if (c_ident == "" || i + 1 > ntok) { c_rule_err = 1; break }
+				c_has_cmd = 1
+				c_cmd = toks[i + 1]
+				break
+			}
+			if (c_ident == "") {
+				c_ident = t
+			} else {
+				c_rule_err = 1
+				break
+			}
 		}
-	} END {exit !found}' "$1"
+
+		if (c_in_setenv && ntok > 0 && !qs[ntok] && substr(toks[ntok], length(toks[ntok]), 1) == "\\") {
+			cont_setenv = 1
+			next
+		}
+		if (c_in_setenv || c_expect_brace || c_ident == "") {
+			c_rule_err = 1
+		}
+		if (c_action == "permit" && c_saw_nopass) {
+			has_nopass = 1
+		}
+		if (c_rule_err) {
+			syntax_err = 1
+			next
+		}
+		if (c_action == "permit") {
+			if (c_ident == ":wheel" && (c_target == "" || c_target == "root" || c_target == "0")) {
+				if (!c_has_cmd) {
+					effective_wheel = 1
+					wheel_cmd = ""
+				} else if (!effective_wheel) {
+					effective_wheel = 1
+					wheel_cmd = c_cmd
+				}
+			}
+		} else {
+			if ((c_ident == ":wheel" || c_ident == "sane") && (c_target == "" || c_target == "root" || c_target == "0")) {
+				if (!c_has_cmd) {
+					effective_wheel = 0
+					wheel_cmd = ""
+				} else if (wheel_cmd != "" && c_cmd == wheel_cmd) {
+					effective_wheel = 0
+					wheel_cmd = ""
+				}
+			}
+		}
+	}
+	END {
+		if (cont_setenv) syntax_err = 1
+		if (mode == "nopass") exit !has_nopass
+		if (mode == "syntax") exit syntax_err
+		if (mode == "wheel") exit (syntax_err || !effective_wheel)
+		exit (syntax_err || has_nopass || !effective_wheel)
+	}' "$2"
 }
 
-doas_policy_ok() {
-	if doas_has_nopass "$1"; then return 1; fi
-	doas_has_effective_wheel "$1"
-}
+doas_has_nopass() { doas_audit_awk nopass "$1"; }
+doas_syntax_ok() { doas_audit_awk syntax "$1"; }
+doas_has_effective_wheel() { doas_audit_awk wheel "$1"; }
+doas_policy_ok() { doas_audit_awk policy "$1"; }
 
 cmd_validate() {
 	ensure_etc
 	MARK="$ETC/.sane-firstboot-done"
+	for rel in etc/passwd etc/group etc/shadow etc/doas.conf usr usr/bin usr/bin/doas; do
+		symlink_resolve_contained "$rel" || audit_fail "path escapes root: $rel"
+	done
 	for f in "$PASSWD" "$GROUP" "$SHADOW" "$DOAS_CONF"; do
 		[ -f "$f" ] || audit_fail "missing file: ${f#$ROOT}"
+		[ ! -L "$f" ] || audit_fail "refusing symlink identity file: ${f#$ROOT}"
 	done
 	[ "$FAIL" -eq 0 ] || return 1
 
@@ -566,14 +979,20 @@ cmd_validate() {
 			audit_fail "doas.conf owner $o (expected 0:0)"
 	fi
 
-	awk -F: '$3!~/^[0-9]+$/ || $4!~/^[0-9]+$/ {bad=1} END{exit !bad}' "$PASSWD" && \
-		audit_fail "passwd contains non-numeric uid/gid"
-	awk -F: -v n=0 '$1!="root" && $3==0 {bad=1} END{exit !bad}' "$PASSWD" && \
+	awk -F: 'NF!=7 || $3!~/^[0-9]+$/ || $4!~/^[0-9]+$/ {bad=1} END{exit !bad}' "$PASSWD" && \
+		audit_fail "passwd contains malformed entry or non-numeric uid/gid"
+	awk -F: '$1!="root" && $3==0 {bad=1} END{exit !bad}' "$PASSWD" && \
 		audit_fail "non-root account has uid 0"
 	awk -F: '{if (seen[$3]++) {bad=1}} END{exit !bad}' "$PASSWD" && \
 		audit_fail "duplicate uid in passwd"
+	awk -F: '{if (seen[$1]++) {bad=1}} END{exit !bad}' "$PASSWD" && \
+		audit_fail "duplicate username in passwd"
+	awk -F: '$1=="root" && $3==0 {r=1} $1=="sane" && $3==1000 {s=1} END{exit !(r && s)}' "$PASSWD" || \
+		audit_fail "passwd missing baseline root(0) or sane(1000)"
 	awk -F: '{if (seen[$3]++) {bad=1}} END{exit !bad}' "$GROUP" && \
 		audit_fail "duplicate gid in group"
+	awk -F: '{if (seen[$1]++) {bad=1}} END{exit !bad}' "$GROUP" && \
+		audit_fail "duplicate group name in group"
 
 	# An active hash must be a complete SHA-512 crypt value, not just a "$6$"
 	# prefix. A truncated hash passes a prefix-only check and leaves the
@@ -582,7 +1001,12 @@ cmd_validate() {
 	weak_default=0
 	while IFS=: read -r _u _p _uid _gid _gecos _home _shell _rest; do
 		h=$_p; [ -z "$h" ] && { bad=1; continue; }
-		case "$h" in '!'*) h=${h#!} ;; esac
+		while :; do
+			case "$h" in
+				'!'*) h=${h#!} ;;
+				*) break ;;
+			esac
+		done
 		# K1: the pre-v1.3.0 deterministic hashes used the salts 'root' and
 		# 'sane'. Any live hash with those salts is a known weak default
 		# credential from an old image; rotate both passwords.
@@ -606,17 +1030,12 @@ cmd_validate() {
 		audit_fail "wheel group does not include 'sane'"
 	fi
 
-	# Scan every option token after 'permit', not just the first: options
-	# may be reordered (permit persist nopass :wheel). The scan shares the
-	# effective-rule boundary below: tokens after the first 'cmd'/'as' are
-	# command arguments, not options (see doas_has_nopass).
 	if doas_has_nopass "$DOAS_CONF"; then
 		audit_fail "doas.conf grants 'nopass' (passwordless escalation)"
 	fi
-	# Effective-rule token scan: ONE permit rule with :wheel as the
-	# identity suffices for the whole file (see doas_has_effective_wheel
-	# for the documented cmd/as terminator boundary).
-	if ! doas_has_effective_wheel "$DOAS_CONF"; then
+	if ! doas_syntax_ok "$DOAS_CONF"; then
+		audit_fail "doas.conf has invalid syntax"
+	elif ! doas_has_effective_wheel "$DOAS_CONF"; then
 		audit_fail "doas.conf has no effective permit rule for :wheel"
 	fi
 	if [ -e "$ROOT/usr/bin/doas" ]; then
@@ -636,7 +1055,12 @@ cmd_validate() {
 	if [ -f "$MARK" ]; then
 		for req in root sane; do
 			h=$(field_of "$SHADOW" "$req" 2 || true)
-			case "$h" in '!'*) h=${h#!} ;; esac
+			while :; do
+				case "$h" in
+					'!'*) h=${h#!} ;;
+					*) break ;;
+				esac
+			done
 			valid_sha512_hash "$h" || \
 				audit_fail "required account $req has no usable hash after firstboot"
 		done
@@ -687,19 +1111,23 @@ group_structurally_ok() {
 # uid for root/sane), numeric age fields, and a complete active SHA-512 hash
 # or a lock/disable marker. Passwd has already been merged when this runs, so
 # a name that only a corrupt passwd could supply is no longer in the way.
+AWK_SHADOW_HASH_OK='
+	function shadow_hash_ok(h, a) {
+		if (h == "") return 0
+		if (h ~ /^!+/) sub(/^!+/, "", h)
+		if (h == "*" || h == "") return 1
+		if (h ~ /^\$6\$(root|sane)\$/) return 0
+		if (h !~ /^\$6\$/) return 0
+		sub(/^\$6\$/, "", h)
+		if (split(h, a, "\\$") != 2) return 0
+		if (a[1] == "" || length(a[1]) > 16 || a[1] ~ /[^.\/A-Za-z0-9]/) return 0
+		if (length(a[2]) != 86 || a[2] ~ /[^.\/A-Za-z0-9]/) return 0
+		return 1
+	}
+'
+
 shadow_structurally_ok() {
-	awk -F: -v passwd_file="$PASSWD" '
-		function shadow_hash_ok(h, a) {
-			if (h == "") return 0
-			if (h ~ /^!/) sub(/^!/, "", h)
-			if (h == "*" || h == "") return 1
-			if (h !~ /^\$6\$/) return 0
-			sub(/^\$6\$/, "", h)
-			if (split(h, a, "\\$") != 2) return 0
-			if (a[1] == "" || length(a[1]) > 16 || a[1] ~ /[^.\/A-Za-z0-9]/) return 0
-			if (length(a[2]) != 86 || a[2] ~ /[^.\/A-Za-z0-9]/) return 0
-			return 1
-		}
+	awk -F: -v passwd_file="$PASSWD" "$AWK_SHADOW_HASH_OK"'
 		FILENAME == passwd_file { puid[$1] = $3; next }
 		{
 			if (NF != 9) { bad = 1; next }
@@ -721,28 +1149,27 @@ shadow_structurally_ok() {
 merge_passwd() {
 	# Ensure root/sane match the baseline exactly (replace the line when
 	# present, append when missing); every other line survives byte-for-byte.
-	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	if ! awk -F: '
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	if ! chmod 0644 "$TMP_1" || ! awk -F: '
 		$1 == "root" { print "root:x:0:0:root:/root:/bin/sh"; r = 1; next }
 		$1 == "sane" { print "sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh"; s = 1; next }
 		{ print }
 		END {
 			if (!r) print "root:x:0:0:root:/root:/bin/sh"
 			if (!s) print "sane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh"
-		}' "$PASSWD" > "$tmp"; then
-		rm -f "$tmp"
+		}' "$PASSWD" > "$TMP_1" || ! mv -fT -- "$TMP_1" "$PASSWD"; then
+		rm -f -- "$TMP_1"; TMP_1=''
 		die "failed to merge $PASSWD"
 	fi
-	chmod 0644 "$tmp"
-	mv "$tmp" "$PASSWD"
+	TMP_1=''
 }
 
 merge_group() {
 	# Ensure root/wheel/sane exist with baseline gids and wheel contains
 	# root and sane. Existing memberships and all non-baseline lines are
 	# preserved; missing baseline groups are appended.
-	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	if ! awk -F: 'BEGIN { OFS = ":" }
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	if ! chmod 0644 "$TMP_1" || ! awk -F: 'BEGIN { OFS = ":" }
 		$1 == "root" { $2 = "x"; $3 = "0"; print; r = 1; next }
 		$1 == "sane" { $2 = "x"; $3 = "1000"; print; s = 1; next }
 		$1 == "wheel" {
@@ -764,12 +1191,11 @@ merge_group() {
 			if (!r) print "root:x:0:"
 			if (!w) print "wheel:x:10:root,sane"
 			if (!s) print "sane:x:1000:"
-		}' "$GROUP" > "$tmp"; then
-		rm -f "$tmp"
+		}' "$GROUP" > "$TMP_1" || ! mv -fT -- "$TMP_1" "$GROUP"; then
+		rm -f -- "$TMP_1"; TMP_1=''
 		die "failed to merge $GROUP"
 	fi
-	chmod 0644 "$tmp"
-	mv "$tmp" "$GROUP"
+	TMP_1=''
 }
 
 rebuild_passwd() {
@@ -777,8 +1203,9 @@ rebuild_passwd() {
 	# itself valid and conflict-free: 7 fields, numeric uid/gid, uid >=
 	# 1000, uid and name unique against the template and already-restored
 	# lines. Conflicting or malformed lines are dropped.
-	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	printf 'root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh\n' > "$tmp"
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	chmod 0644 "$TMP_1" || { rm -f -- "$TMP_1"; TMP_1=''; die "cannot set mode on temp $PASSWD"; }
+	printf 'root:x:0:0:root:/root:/bin/sh\nsane:x:1000:1000:S.A.N.E User:/home/sane:/bin/sh\n' > "$TMP_1"
 	if [ -f "$PASSWD" ]; then
 		if ! awk -F: '
 			BEGIN { seen[0] = 1; seen[1000] = 1; names["root"] = 1; names["sane"] = 1 }
@@ -789,21 +1216,22 @@ rebuild_passwd() {
 			seen[$3]++ { next }
 			names[$1]++ { next }
 			{ print }
-		' "$PASSWD" >> "$tmp"; then
-			rm -f "$tmp"
+		' "$PASSWD" >> "$TMP_1"; then
+			rm -f -- "$TMP_1"; TMP_1=''
 			die "failed to rebuild $PASSWD"
 		fi
 	fi
-	chmod 0644 "$tmp"
-	mv "$tmp" "$PASSWD"
+	mv -fT -- "$TMP_1" "$PASSWD" || { rm -f -- "$TMP_1"; TMP_1=''; die "failed to install $PASSWD"; }
+	TMP_1=''
 }
 
 rebuild_group() {
 	# Same policy as rebuild_passwd: baseline template + valid,
 	# conflict-free non-baseline groups (4 fields, numeric gid >= 1000,
 	# unique gid and name).
-	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	printf 'root:x:0:\nwheel:x:10:root,sane\nsane:x:1000:\n' > "$tmp"
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	chmod 0644 "$TMP_1" || { rm -f -- "$TMP_1"; TMP_1=''; die "cannot set mode on temp $GROUP"; }
+	printf 'root:x:0:\nwheel:x:10:root,sane\nsane:x:1000:\n' > "$TMP_1"
 	if [ -f "$GROUP" ]; then
 		if ! awk -F: '
 			BEGIN { seen[0] = 1; seen[10] = 1; seen[1000] = 1
@@ -815,13 +1243,13 @@ rebuild_group() {
 			seen[$3]++ { next }
 			names[$1]++ { next }
 			{ print }
-		' "$GROUP" >> "$tmp"; then
-			rm -f "$tmp"
+		' "$GROUP" >> "$TMP_1"; then
+			rm -f -- "$TMP_1"; TMP_1=''
 			die "failed to rebuild $GROUP"
 		fi
 	fi
-	chmod 0644 "$tmp"
-	mv "$tmp" "$GROUP"
+	mv -fT -- "$TMP_1" "$GROUP" || { rm -f -- "$TMP_1"; TMP_1=''; die "failed to install $GROUP"; }
+	TMP_1=''
 }
 
 merge_shadow() {
@@ -829,8 +1257,8 @@ merge_shadow() {
 	# usable (otherwise the locked marker). Every other line is printed
 	# verbatim, so additional accounts keep their hashes byte-for-byte.
 	root_hash=$1; sane_hash=$2
-	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	if ! awk -F: -v rh="$root_hash" -v sh="$sane_hash" '
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	if ! chmod 0600 "$TMP_1" || ! awk -F: -v rh="$root_hash" -v sh="$sane_hash" '
 		$1 == "root" {
 			print "root:" (rh == "" ? "!" : rh) ":19700:0:99999:7:::"; r = 1; next
 		}
@@ -842,39 +1270,27 @@ merge_shadow() {
 			if (!r) print "root:" (rh == "" ? "!" : rh) ":19700:0:99999:7:::"
 			if (!s) print "sane:" (sh == "" ? "!" : sh) ":19700:0:99999:7:::"
 		}
-	' "$SHADOW" > "$tmp"; then
-		rm -f "$tmp"
+	' "$SHADOW" > "$TMP_1" || ! mv -fT -- "$TMP_1" "$SHADOW"; then
+		rm -f -- "$TMP_1"; TMP_1=''
 		die "failed to merge $SHADOW"
 	fi
-	chmod 0600 "$tmp"
-	mv "$tmp" "$SHADOW"
+	TMP_1=''
 }
 
 rebuild_shadow() {
 	# Baseline locked template + every extra entry that is itself valid and
 	# conflict-free: unique name still present in passwd, complete 9 fields,
 	# numeric age fields, and a valid active SHA-512 or lock/disable marker.
-	# Write final root/sane fields into "$tmp" before atomic mv(1) so an
+	# Write final root/sane fields into "$TMP_1" before atomic mv(1) so an
 	# interrupted recovery never leaves a temporary locked state on disk.
 	root_hash=$1; sane_hash=$2
 	rh_out=$root_hash; [ -n "$rh_out" ] || rh_out='!'
 	sh_out=$sane_hash; [ -n "$sh_out" ] || sh_out='!'
-	tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-	chmod 0600 "$tmp"
-	printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' "$rh_out" "$sh_out" > "$tmp"
+	TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+	chmod 0600 "$TMP_1" || { rm -f -- "$TMP_1"; TMP_1=''; die "cannot set mode on temp $SHADOW"; }
+	printf 'root:%s:19700:0:99999:7:::\nsane:%s:19700:0:99999:7:::\n' "$rh_out" "$sh_out" > "$TMP_1"
 	if [ -f "$SHADOW" ]; then
-		if ! awk -F: -v passwd_file="$PASSWD" '
-			function shadow_hash_ok(h, a) {
-				if (h == "") return 0
-				if (h ~ /^!/) sub(/^!/, "", h)
-				if (h == "*" || h == "") return 1
-				if (h !~ /^\$6\$/) return 0
-				sub(/^\$6\$/, "", h)
-				if (split(h, a, "\\$") != 2) return 0
-				if (a[1] == "" || length(a[1]) > 16 || a[1] ~ /[^.\/A-Za-z0-9]/) return 0
-				if (length(a[2]) != 86 || a[2] ~ /[^.\/A-Za-z0-9]/) return 0
-				return 1
-			}
+		if ! awk -F: -v passwd_file="$PASSWD" "$AWK_SHADOW_HASH_OK"'
 			FILENAME == passwd_file { pname[$1] = 1; next }
 			$1 == "root" || $1 == "sane" { next }
 			NF != 9 { next }
@@ -891,23 +1307,27 @@ rebuild_shadow() {
 			!($1 in pname) { next }
 			seen[$1]++ { next }
 			{ print }
-		' "$PASSWD" "$SHADOW" >> "$tmp"; then
-			rm -f "$tmp"
+		' "$PASSWD" "$SHADOW" >> "$TMP_1"; then
+			rm -f -- "$TMP_1"; TMP_1=''
 			die "failed to rebuild $SHADOW"
 		fi
 	fi
-	chmod 0600 "$tmp"
-	mv "$tmp" "$SHADOW"
+	mv -fT -- "$TMP_1" "$SHADOW" || { rm -f -- "$TMP_1"; TMP_1=''; die "failed to install $SHADOW"; }
+	TMP_1=''
 }
 
 # Inspect field 2 of an account in shadow and separate lock state ('!') from
 # hash validity so recovery never strips an administrator lock prefix.
 inspect_shadow_recovery() {
 	raw=$(field_of "$1" "$2" 2 || true)
-	case "$raw" in
-		'!'*) is_locked=1; bare=${raw#!} ;;
-		*)    is_locked=0; bare=$raw ;;
-	esac
+	is_locked=0
+	bare=$raw
+	while :; do
+		case "$bare" in
+			'!'*) is_locked=1; bare=${bare#!} ;;
+			*) break ;;
+		esac
+	done
 	if valid_sha512_hash "$bare"; then
 		hash_valid=1
 		clean_hash=$bare
@@ -932,25 +1352,22 @@ compose_shadow_field() {
 }
 
 cmd_recover() {
-	# Merge, not rewrite (X6): repair each identity file individually and
-	# preserve everything still valid. A structurally sound passwd/group is
-	# merged (baseline ensured, extra lines and memberships kept); only a
-	# structurally corrupt one is rebuilt from the template with valid,
-	# conflict-free extra lines restored. A policy-compliant doas.conf is
-	# preserved and only its mode/owner is repaired. A structurally sound shadow
-	# is merged (root/sane repaired only when their old hash is usable, with
-	# intentional lock markers preserved; every extra entry kept byte-for-byte);
-	# a corrupt one is rebuilt from the locked baseline with valid, conflict-free
-	# extra entries appended again. If no valid root/sane hash survives, remove
-	# the firstboot marker so the console setup runs again on this boot.
 	ensure_etc
+	require_contained_rel "etc/passwd"
+	require_contained_rel "etc/group"
+	require_contained_rel "etc/shadow"
+	require_contained_rel "etc/doas.conf"
+	require_contained_rel "etc/.sane-firstboot-done"
+	require_contained_rel "home"
+	require_contained_rel "home/sane"
+	reject_symlink "$HOME_BASE/sane"
 	recover_root_valid=0
 	recover_root_locked=0
 	recover_root_hash=
 	recover_sane_valid=0
 	recover_sane_locked=0
 	recover_sane_hash=
-	if [ -f "$SHADOW" ]; then
+	if [ -f "$SHADOW" ] && [ ! -L "$SHADOW" ]; then
 		inspect_shadow_recovery "$SHADOW" root
 		recover_root_valid=$hash_valid
 		recover_root_locked=$is_locked
@@ -965,20 +1382,20 @@ cmd_recover() {
 	recover_sane_field=$(compose_shadow_field "$recover_sane_valid" "$recover_sane_locked" "$recover_sane_hash")
 
 	# doas.conf: keep policy-compliant content, repair mode/owner only.
-	if [ -f "$DOAS_CONF" ] && doas_policy_ok "$DOAS_CONF"; then
+	if [ -f "$DOAS_CONF" ] && [ ! -L "$DOAS_CONF" ] && doas_policy_ok "$DOAS_CONF"; then
 		chmod 0600 "$DOAS_CONF"
 		[ "$(id -u)" = 0 ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
 		printf 'recover: doas.conf preserved (policy ok; mode/owner repaired)\n'
 	else
-		tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-		chmod 0600 "$tmp"
-		[ "$(id -u)" = 0 ] && chown 0:0 "$tmp" 2>/dev/null || true
-		printf 'permit persist :wheel\n' > "$tmp"
-		mv "$tmp" "$DOAS_CONF"
+		TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+		chmod 0600 "$TMP_1"
+		[ "$(id -u)" = 0 ] && chown 0:0 "$TMP_1" 2>/dev/null || true
+		printf 'permit persist :wheel\n' > "$TMP_1"
+		atomic_mv_replace "$TMP_1" "$DOAS_CONF"; TMP_1=''
 		printf 'recover: doas.conf rebuilt from baseline (missing or policy violation)\n'
 	fi
 
-	if [ -f "$PASSWD" ] && passwd_structurally_ok "$PASSWD"; then
+	if [ -f "$PASSWD" ] && [ ! -L "$PASSWD" ] && passwd_structurally_ok "$PASSWD"; then
 		merge_passwd
 		printf 'recover: passwd merged (root/sane ensured; extra entries preserved)\n'
 	else
@@ -986,7 +1403,7 @@ cmd_recover() {
 		printf 'recover: passwd rebuilt from baseline (structural corruption; valid extra entries restored)\n'
 	fi
 
-	if [ -f "$GROUP" ] && group_structurally_ok "$GROUP"; then
+	if [ -f "$GROUP" ] && [ ! -L "$GROUP" ] && group_structurally_ok "$GROUP"; then
 		merge_group
 		printf 'recover: group merged (root/wheel/sane ensured; extra entries preserved)\n'
 	else
@@ -998,7 +1415,7 @@ cmd_recover() {
 	# byte-for-byte); otherwise rebuild the locked baseline and append back
 	# only valid, conflict-free extra entries. Usable root/sane hashes (and
 	# any existing '!' lock prefix) are restored in both paths.
-	if [ -f "$SHADOW" ] && shadow_structurally_ok "$SHADOW"; then
+	if [ -f "$SHADOW" ] && [ ! -L "$SHADOW" ] && shadow_structurally_ok "$SHADOW"; then
 		merge_shadow "$recover_root_field" "$recover_sane_field"
 		printf 'recover: shadow merged (root/sane repaired when usable; extra entries preserved)\n'
 	else
@@ -1008,18 +1425,21 @@ cmd_recover() {
 
 	chmod 0644 "$PASSWD" "$GROUP"
 	chmod 0600 "$SHADOW" "$DOAS_CONF"
+	if [ -e "$HOME_BASE/sane" ] && [ ! -d "$HOME_BASE/sane" ]; then
+		die "home path exists but is not a directory: $HOME_BASE/sane"
+	fi
 	mkdir -p "$HOME_BASE/sane"
 	chmod 0750 "$HOME_BASE/sane"
 
 	MARK="$ETC/.sane-firstboot-done"
 	if [ "$recover_root_valid" -ne 1 ] || [ "$recover_sane_valid" -ne 1 ]; then
-		rm -f "$MARK"
+		rm -f -- "$MARK"
 		printf 'recover: no usable root/sane hash; first boot will ask for passwords again\n'
 	else
-		tmp=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
-		chmod 0600 "$tmp"
-		printf 'done\n' > "$tmp"
-		mv "$tmp" "$MARK"
+		TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+		chmod 0600 "$TMP_1"
+		printf 'done\n' > "$TMP_1"
+		mv -fT -- "$TMP_1" "$MARK"; TMP_1=''
 		printf 'recover: preserved usable password hashes\n'
 	fi
 	note "identity recovery complete under $ETC"
