@@ -76,20 +76,44 @@ $SUDO true 2>/dev/null || fail "root or passwordless sudo required (unshare + ch
 
 ROOTS=""
 LOGS=""
+HELPERS=""
 JOB=""
 INIT_PID=""
 HOLDER=""
+SLOT_HOLDER=""
 INIT_STDIN=/dev/null
+INIT_CG_TARGET=""
 
 RUN_ID="ninit-config-$$-$(date +%s%N 2>/dev/null || date +%s)"
 SUITE_CG="/sys/fs/cgroup/$RUN_ID"
 SUITE_CG_BASE="$SUITE_CG/ninit"
+STARVE_CG=""
+STARVE_CG_DEV_INO=""
 if [ -e "$SUITE_CG" ]; then
 	fail "cgroup collision: path '$SUITE_CG' already exists before test starts"
 fi
 $SUDO mkdir "$SUITE_CG" || fail "failed to create isolation root '$SUITE_CG'"
 SUITE_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$SUITE_CG" 2>/dev/null || true)
 [ -n "$SUITE_CG_DEV_INO" ] || fail "failed to read dev:ino for '$SUITE_CG'"
+$SUDO mkdir -p "$SUITE_CG/init"
+
+is_descendant_of() {
+	_cand=$1
+	_anc=$2
+	_hops=0
+	[ -n "$_anc" ] || return 1
+	while [ "$_hops" -lt 32 ]; do
+		[ "$_cand" = "$_anc" ] && return 0
+		[ "$_cand" = "0" ] && return 1
+		_ppid=$(awk '/^PPid:/ { print $2 }' "/proc/$_cand/status" 2>/dev/null || true)
+		[ -n "${_ppid:-}" ] || return 1
+		[ "$_ppid" = "$_anc" ] && return 0
+		[ "$_ppid" = "$_cand" ] && return 1
+		_cand=$_ppid
+		_hops=$((_hops + 1))
+	done
+	return 1
+}
 
 is_test_process() {
 	p=$1
@@ -101,7 +125,7 @@ is_test_process() {
 		fi
 		[ -n "$p_cg_path" ] || return 1
 		case "/sys/fs/cgroup$p_cg_path" in
-			"$SUITE_CG"|"$SUITE_CG"/*) ;;
+			"$SUITE_CG"|"$SUITE_CG"/*|"${STARVE_CG:-}"|"${STARVE_CG:-}"/*) ;;
 			*) return 1 ;;
 		esac
 		[ -d "/sys/fs/cgroup$p_cg_path" ] || return 1
@@ -186,14 +210,17 @@ clean_suite_leaves() {
 }
 
 cleanup() {
+	[ -n "${SLOT_HOLDER:-}" ] && $SUDO kill -KILL "$SLOT_HOLDER" 2>/dev/null || true
+	clean_suite_cgroup "${STARVE_CG:-}" "${STARVE_CG_DEV_INO:-}" || true
 	clean_suite_cgroup "${SUITE_CG:-}" "${SUITE_CG_DEV_INO:-}" || printf 'WARN: clean_suite_cgroup failed (status %d), continuing...\n' $? >&2
 	[ -n "${HOLDER:-}" ] && kill "$HOLDER" 2>/dev/null || true
-	[ -n "${INIT_PID:-}" ] && $SUDO kill -KILL "$INIT_PID" 2>/dev/null || true
+	[ -n "${INIT_PID:-}" ] && is_test_process "$INIT_PID" && $SUDO kill -KILL "$INIT_PID" 2>/dev/null || true
 	for d in ${ROOTS:-}; do
 		$SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
 	done
 	for f in ${LOGS:-}; do rm -f "$f"; done
+	for h in ${HELPERS:-}; do rm -f "$h"; done
 }
 trap cleanup EXIT INT TERM
 
@@ -212,10 +239,14 @@ start_root() {
 
 # Run ninit as PID 1 inside a new PID + mount namespace.
 run_init() {
+	cg_target="${INIT_CG_TARGET:-$SUITE_CG/init}"
+	if [ "$cg_target" = "$SUITE_CG/init" ]; then
+		$SUDO mkdir -p "$cg_target"
+	fi
 	(
 		$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 			--mount --propagation private ${TEST_UNSHARE_OPTS:-} \
-			sh -c "umask ${TEST_UMASK:-0022}; mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit ${INIT_ARGS:-}" \
+			sh -c "umask ${TEST_UMASK:-0022}; mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && echo \$\$ > '$cg_target/cgroup.procs' && exec chroot '$ROOT' /ninit ${INIT_ARGS:-}" \
 			>"$LOG" 2>&1 <"$INIT_STDIN"
 	) &
 	JOB=$!
@@ -223,11 +254,26 @@ run_init() {
 }
 
 find_init_pid() {
-	if command -v pgrep >/dev/null 2>&1; then
-		pgrep -x ninit 2>/dev/null | head -n 1
-	else
-		ps -eo pid,args 2>/dev/null | awk '$2 == "/ninit" { print $1; exit }'
-	fi
+	target_root=${1:-$ROOT}
+	parent_pid=${2:-${JOB:-}}
+	cg_target="${INIT_CG_TARGET:-$SUITE_CG/init}"
+	cg_procs=$($SUDO cat "$cg_target/cgroup.procs" 2>/dev/null || true)
+	for p in $cg_procs; do
+		[ -d "/proc/$p" ] || continue
+		comm=$(cat "/proc/$p/comm" 2>/dev/null || true)
+		[ "$comm" = "ninit" ] || continue
+		p_root=$($SUDO readlink "/proc/$p/root" 2>/dev/null || true)
+		[ "$p_root" = "$target_root" ] || continue
+		is_test_process "$p" || continue
+		if [ -n "$parent_pid" ]; then
+			is_descendant_of "$p" "$parent_pid" || continue
+		fi
+		ns_inner=$(awk '/^NSpid:/ { if (NF >= 2) print $NF }' "/proc/$p/status" 2>/dev/null || true)
+		[ "$ns_inner" = "1" ] || continue
+		printf '%s\n' "$p"
+		return 0
+	done
+	return 1
 }
 
 # Wait until the pattern appears in the log. 0 = found, 1 = timeout.
@@ -242,7 +288,7 @@ wait_for() {
 }
 
 stop_init() {
-	if [ -n "${INIT_PID:-}" ]; then $SUDO kill -KILL "$INIT_PID" 2>/dev/null || true; fi
+	if [ -n "${INIT_PID:-}" ] && is_test_process "$INIT_PID"; then $SUDO kill -KILL "$INIT_PID" 2>/dev/null || true; fi
 	wait "$JOB" 2>/dev/null || true
 	INIT_PID=""
 	clean_suite_leaves
@@ -257,6 +303,7 @@ stop_init() {
 find_rescue_pid() {
 	for s in /proc/[0-9]*/status; do
 		p=${s#/proc/}; p=${p%/status}
+		is_test_process "$p" || continue
 		r=$(readlink "/proc/$p/root" 2>/dev/null) || continue
 		[ "$r" = "$ROOT" ] || continue
 		[ "$p" = "${INIT_PID:-}" ] && continue
@@ -532,6 +579,136 @@ INIT_STDIN=/dev/null
 kill "$HOLDER" 2>/dev/null || true
 HOLDER=""
 stop_init
+
+# --------------------------------------------------------------- scenario 2d
+# Fork-retry exhaustion (MAX_SPAWN_RETRY) on a service with :on_fail=rescue:
+#   - pids.max=2 with 1 external slot holder leaves 1 slot for PID 1 ninit, so
+#     fork() deterministically hits EAGAIN across MAX_SPAWN_RETRY (3) retries.
+#   - Service transitions STARTING -> FAILED, cancels dependents, and triggers
+#     check_rescue_on_fail() into supervised rescue. Releasing the slot holder
+#     then lets the supervised rescue shell spawn under PID 1.
+printf '\n== 2d. fork-retry exhaustion (MAX_SPAWN_RETRY) with :on_fail=rescue ==\n'
+LOG2D=""
+STARVE_CG="/sys/fs/cgroup/ninit-cfg-starve-$$-$(date +%s%N 2>/dev/null || date +%s)"
+pids_starve_ok=0
+if [ -r /sys/fs/cgroup/cgroup.controllers ] \
+   && $SUDO grep -qw pids /sys/fs/cgroup/cgroup.controllers 2>/dev/null \
+   && $SUDO mkdir "$STARVE_CG" 2>/dev/null; then
+	STARVE_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$STARVE_CG" 2>/dev/null || true)
+	if [ -e "$STARVE_CG/pids.max" ] && printf '1\n' | $SUDO tee "$STARVE_CG/pids.max" >/dev/null 2>&1; then
+		pids_starve_ok=1
+	fi
+fi
+
+if [ "$pids_starve_ok" -ne 1 ]; then
+	printf '  [SKIP]   2d skipped: cgroup v2 + pids controller unavailable\n'
+	clean_suite_cgroup "${STARVE_CG:-}" "${STARVE_CG_DEV_INO:-}" || true
+	STARVE_CG=""
+	STARVE_CG_DEV_INO=""
+else
+	start_root fork-rescue
+	LOG2D="$LOG"
+	cp "$BUSYBOX" "$ROOT/bin/echo"
+	chmod 0777 "$ROOT/var"
+	cat > "$ROOT/etc/init.conf" <<'EOCFG'
+forkfail:once:exit 0:on_fail=rescue
+dep:once:/bin/echo DEP_RAN > /var/dep.txt:requires=forkfail
+EOCFG
+	mkfifo "$ROOT/rescue.stdin"
+	sleep 15 > "$ROOT/rescue.stdin" &
+	HOLDER=$!
+	INIT_STDIN="$ROOT/rescue.stdin"
+
+	INIT_CG_TARGET="$STARVE_CG"
+	run_init
+	if ! wait_for 'Entering rescue mode'; then
+		sed 's/^/  | /' "$LOG"
+		bad "2d: fork-retry exhaustion with :on_fail=rescue did not enter rescue mode"
+	fi
+	# Release pids.max cap so rescue_loop() can spawn the supervised /bin/sh child.
+	printf '8\n' | $SUDO tee "$STARVE_CG/pids.max" >/dev/null 2>&1 || true
+	wait_for 'rescue shell started' || true
+
+	check "2d: fork EAGAIN exhausted MAX_SPAWN_RETRY (3 retries)" 'fork EAGAIN after 3 retries for forkfail'
+	check "2d: fork-failed service reached terminal FAILED state" 'forkfail: state STARTING -> FAILED'
+	check "2d: dependent cancelled" "service 'dep' cancelled: dependency 'forkfail' failed"
+	check_absent "2d: dependent never started" 'started dep'
+	if [ -f "$ROOT/var/dep.txt" ]; then
+		bad "2d: dependent ran despite forkfail failure"
+	else
+		ok "2d: dependent output file not created"
+	fi
+	check "2d: on_fail=rescue fatal reason logged" "FATAL: service 'forkfail' failed (on_fail=rescue)"
+	check "2d: init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+	assert_supervised_rescue "2d"
+
+	INIT_STDIN=/dev/null
+	kill "$HOLDER" 2>/dev/null || true
+	HOLDER=""
+	stop_init
+	INIT_CG_TARGET=""
+	clean_suite_cgroup "${STARVE_CG:-}" "${STARVE_CG_DEV_INO:-}" || true
+	STARVE_CG=""
+	STARVE_CG_DEV_INO=""
+fi
+
+# --------------------------------------------------------------- scenario 2e
+# Respawn crash-loop reaching SVC_STATE_FAILED with :on_fail=rescue:
+#   - Compiles a fast-crash test binary (-DCRASH_LIMIT=2 -DBACKOFF_MAX=1
+#     -DNINIT_TESTING) so crash-loop detection completes in ~3 seconds.
+#   - Verifies crash-loop triggers SVC_STATE_FAILED, cancels dependents,
+#     stops unrelated active services cleanly, and enters supervised rescue.
+printf '\n== 2e. respawn crash-loop SVC_STATE_FAILED with :on_fail=rescue ==\n'
+LOG2E=""
+if ! command -v gcc >/dev/null 2>&1; then
+	printf '  [SKIP]   2e skipped: gcc unavailable for fast CRASH_LIMIT build\n'
+else
+	BIN_FAST=$(mktemp /tmp/ninit-cfg-fast.XXXXXX)
+	HELPERS="$HELPERS $BIN_FAST"
+	gcc -static -O2 -Wall -Werror -DCRASH_LIMIT=2 -DBACKOFF_MAX=1 -DNINIT_TESTING \
+		"$REPO_ROOT/ninit.c" -o "$BIN_FAST"
+
+	start_root respawn-rescue
+	LOG2E="$LOG"
+	cp "$BIN_FAST" "$ROOT/ninit"
+	cp "$BUSYBOX" "$ROOT/bin/sleep"
+	cp "$BUSYBOX" "$ROOT/bin/echo"
+	chmod 0777 "$ROOT/var"
+	cat > "$ROOT/etc/init.conf" <<'EOCFG'
+bg:respawn:/bin/sleep 30
+gate:once:/bin/sleep 4
+crasher:respawn:exit 1:on_fail=rescue
+dep:once:/bin/echo DEP_RAN > /var/dep.txt:requires=gate,crasher
+EOCFG
+	mkfifo "$ROOT/rescue.stdin"
+	sleep 15 > "$ROOT/rescue.stdin" &
+	HOLDER=$!
+	INIT_STDIN="$ROOT/rescue.stdin"
+
+	run_init
+	if ! wait_for 'Entering rescue mode'; then
+		sed 's/^/  | /' "$LOG"
+		bad "2e: respawn crash-loop with :on_fail=rescue did not enter rescue mode"
+	fi
+	check "2e: crash-loop detected on respawn service" 'crasher: crash-loop detected'
+	check "2e: respawn service transitioned to FAILED" 'crasher: state STOPPED -> FAILED'
+	check "2e: dependent cancelled" "service 'dep' cancelled: dependency 'crasher' failed"
+	check_absent "2e: dependent never started" 'started dep'
+	if [ -f "$ROOT/var/dep.txt" ]; then
+		bad "2e: dependent ran despite crasher failure"
+	else
+		ok "2e: dependent output file not created"
+	fi
+	check "2e: unrelated active service stopped cleanly before rescue" 'bg: state RUNNING -> STOPPING'
+	check "2e: on_fail=rescue fatal reason logged" "FATAL: service 'crasher' failed (on_fail=rescue)"
+	check "2e: init enters rescue mode (shell)" 'Entering rescue mode (shell)'
+	assert_supervised_rescue "2e"
+
+	INIT_STDIN=/dev/null
+	kill "$HOLDER" 2>/dev/null || true
+	HOLDER=""
+	stop_init
+fi
 
 # ninit emits the generic FATAL: Dependency / Entering rescue-mode pair only
 # for CONFIG-level dependency errors (checked before any service is spawned),
@@ -1694,6 +1871,16 @@ printf '\n== log 2 (missing dependency) ==\n'
 sed 's/^/  | /' "$LOG3"
 printf '\n== log 2b (failed reliability recover) ==\n'
 sed 's/^/  | /' "$LOG2B"
+printf '\n== log 2c-timeout (on_fail=rescue timeout) ==\n'
+sed 's/^/  | /' "$LOG2C_TO"
+if [ -n "${LOG2D:-}" ] && [ -f "$LOG2D" ]; then
+	printf '\n== log 2d (fork-retry exhaustion on_fail=rescue) ==\n'
+	sed 's/^/  | /' "$LOG2D"
+fi
+if [ -n "${LOG2E:-}" ] && [ -f "$LOG2E" ]; then
+	printf '\n== log 2e (respawn crash-loop on_fail=rescue) ==\n'
+	sed 's/^/  | /' "$LOG2E"
+fi
 printf '\n== log 2b-rescue (unreachable chain dependency) ==\n'
 sed 's/^/  | /' "$LOG2BR"
 printf '\n== log 3a (/run/initctl: poweroff + reboot) ==\n'

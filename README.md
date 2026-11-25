@@ -25,13 +25,13 @@ The event loop is built on `ppoll`, keeping init responsive to signals even duri
 ## Features
 
 - **PID 1 + Child Reaping**: reaps all terminated child processes, including adopted orphan processes.
-- **Service Configuration (`/etc/init.conf`)**: supports `respawn` and `once` modes with `:requires=` dependencies (DFS topological sort without recursion/stack overflow, `once` services waited on until success before dependents start, cycle detection, and missing dependencies trigger a rescue shell).
+- **Service Configuration (`/etc/init.conf`)**: supports `respawn` and `once` modes (unknown modes are rejected fail-closed) with `:requires=` dependencies (DFS topological sort without recursion/stack overflow, `once` services waited on until success before dependents start, cycle detection, missing dependencies, 0-service configs, and `:on_fail=rescue` trigger supervised rescue).
 - **Non-blocking Respawn**: a 2-second delay is handled via 100 ms `ppoll` timers instead of blocking `sleep()`, ensuring init never misses signals.
-- **Clean Shutdown**: `SIGTERM`/`SIGINT` → stop services (5-second grace period) → `sync()` → `reboot()`; force variants bypass the grace period for immediate reboot/poweroff.
+- **Clean Shutdown**: `SIGTERM`/`SIGINT` → stop services (default 5-second grace period, configurable per service via `:grace=N`) → `sync()` → `reboot()`; force variants bypass the grace period for immediate reboot/poweroff.
 - **Cgroups v2**: each service is placed into a leaf `/sys/fs/cgroup/ninit/<name>` with resource limits enforced by the kernel (`:memory_max=`, `:cpu_max=`, `:pids_max=`), swap escape prevention (`memory.swap.max=0`), and automatic orphan cleanup via `cgroup.kill`.
 - **Filesystem Mounting (`/etc/fstab`)**: mounts filesystems with flags and data options (`size=`, `mode=`, `uid=`, ...) forwarded to `mount()`; `defaults` is ignored like in `mount(8)`.
 - **Dual Logging**: outputs to `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus a `/run/log.fifo` path capturing service stdout/stderr with a `[service]` prefix.
-- **IPC (`/run/initctl`)**: line-by-line command handling for `poweroff`, `reboot`, `force-poweroff`, and `force-reboot`, preventing dropped commands on multi-line writes.
+- **IPC (`/run/initctl`)**: streaming line-by-line handling (`MAX_LINE = 1024`) for `poweroff`, `reboot`, `force-poweroff`, `force-reboot`, `stop`, `start`, `restart`, and `status`, preventing dropped commands on multi-line writes.
 - **Privilege Separation (`:user=`, `:group=`)**: services run as `root` by default; `:user=` drops to an unprivileged user from `/etc/passwd`. `:group=` is optional and must be paired with `:user=` (group-only is rejected fail-closed). Supplementary groups are dropped (`setgroups`). Lookup errors fail closed. A numeric `:user=`/`:group=` must exist in `/etc/passwd`/`/etc/group`, and numeric `0` is rejected -- write `:user=root` / `:group=root` instead.
 - **`sane-ctl` Daemon Control**: unified CLI tool to `start`, `stop`, `restart`, and `status` daemons over `/run/initctl` FIFO with state tracking in `/run/ninit-*.state` and stop grace timeout escalation.
 - **S.A.N.E Package Manager (`spm`)**: POSIX `/bin/sh` package manager supporting atomic `rename(2)` staging, binary active replacement (anti-`ETXTBSY`), reverse dependency protection, archive hardening, and power-cut journal recovery.
@@ -63,25 +63,26 @@ Requires `build-essential` and (for testing) `busybox-static`:
 ```bash
 sudo apt-get install build-essential busybox-static python3 shellcheck
 
-make          # Build static binary ./ninit
+make          # Build static binary ./ninit (-Werror enabled by default)
 make lint     # Pattern/format linters + ShellCheck gate on 13 production scripts
-make test     # 12 suites: 7 root-required + 5 unprivileged (root/sudo for namespaces)
+make test     # 13 suites: 8 root-required + 5 unprivileged (root/sudo for namespaces)
 make rootfs   # Build minimal distro rootfs + initramfs (static BusyBox, ninit as PID 1)
 make qemu     # Boot rootfs in QEMU with serial console (requires qemu-system-x86)
 make clean    # Remove build artifacts
 ```
 
-`make test` runs all **12** suites from `TEST_SCRIPTS` with `./ninit-test`
-(`-DNINIT_TESTING` per-run cgroup isolation): **7 require root/sudo** because
+`make test` runs all **13** suites from `TEST_SCRIPTS` with `./ninit-test`
+(`-DNINIT_TESTING` per-run cgroup isolation): **8 require root/sudo** because
 they launch PID 1 in isolated namespaces and exercise cgroups, and **5 run
 unprivileged** against temporary roots. The separate QEMU integration boot
 (`make integration`) and lifecycle/image suites are not part of `make test`.
 
-Root-required (7):
+Root-required (8):
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — Startup banner, event loop readiness (`main loop ready`), service startup, `graceful shutdown`, zero respawns after shutdown, and shutdown latency < 5000 ms.
 - **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — Verifies that `SIGTERM` actually reaches service processes (trap executes, `exit status=0x0` rather than `0x9`, clean child signal mask, shutdown completes before the 5-second grace window expires).
-- **[`scripts/test-config.sh`](scripts/test-config.sh)** — Topological sort of `:requires=` (diamond dependencies `a→b,c ; b→c` and dense configurations up to 64 services without stack overflow), unreadable config / missing dependencies / cycle detection triggering `FATAL` + rescue shell (signal mask cleared so Ctrl+C works), and line-by-line `/run/initctl` reading (`poweroff\nreboot` executes only `poweroff`).
+- **[`scripts/test-config.sh`](scripts/test-config.sh)** — Topological sort of `:requires=` (diamond dependencies `a→b,c ; b→c` and dense configurations up to 64 services without stack overflow), unreadable config / 0-service config / missing dependencies / cycle detection / `:on_fail=rescue` (fork-retry exhaustion & respawn `SVC_STATE_FAILED`) triggering supervised rescue (`SigBlk=0`), and streaming `/run/initctl` reading (`poweroff\nreboot` executes only `poweroff`).
+- **[`scripts/test-zombie-reap-500.sh`](scripts/test-zombie-reap-500.sh)** — Boots `./ninit-test` as PID 1 inside isolated `unshare` + `chroot` + `NINIT_CGROUP_BASE`, spawns 500 short-lived orphaned children, and proves PID 1 reaps them all with 0 lingering zombies.
 - **[`scripts/test-spawn-failure.sh`](scripts/test-spawn-failure.sh)** — Spawn failure paths: dependency cancellation propagation on respawn paths, fork EAGAIN retry limits on `once` services, and process group liveness probing before the final SIGKILL.
 - **[`scripts/test-cgroup-limits.sh`](scripts/test-cgroup-limits.sh)** — Cgroup v2 resource limits: memory limits & deterministic OOM (`memory_max`), process limits (`pids_max`), orphan cleanup on respawn (`cgroup.kill`), and cgroup leaf lifecycle verification.
 - **[`scripts/test-respawn-cleanup.sh`](scripts/test-respawn-cleanup.sh)** — Respawn cleanup and grandchild containment: orphaned process trees are killed with their cgroup leaf on respawn; generation counters reset cleanly (T12).
@@ -90,12 +91,12 @@ Root-required (7):
 Unprivileged (5):
 
 - **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — Validates the test harness itself: console logs with crashed or respawning console services are strictly flagged as FAIL. Runs against log fixtures via `REPORT_ONLY=1` without requiring root or QEMU.
-- **[`scripts/test-accounts.sh`](scripts/test-accounts.sh)** — Phase A account lifecycle and policy: `sane-accounts`, merge-based recovery, `doas` vocabulary and first-free UID allocation; runs against a temporary target root.
+- **[`scripts/test-accounts.sh`](scripts/test-accounts.sh)** — Phase A account lifecycle and policy: `sane-accounts`, merge-based recovery, `doas` vocabulary and first-free UID allocation; runs against a temporary target root (owner checks run when invoked with `sudo`).
 - **[`scripts/test-network.sh`](scripts/test-network.sh)** — Phase B networking: `sane-net`, DNS/DHCP, Wi-Fi and outbound TLS helpers.
 - **[`scripts/test-network-fault.sh`](scripts/test-network-fault.sh)** — Network fault injection and recovery paths for the reconnect/TLS stack.
 - **[`scripts/test-reliability.sh`](scripts/test-reliability.sh)** — Phase C: snapshots, verified rollback, staged upgrades, crash-window recovery, backup and restore.
 
-Separately, **[`scripts/test-integration.sh`](scripts/test-integration.sh)** performs the cross-layer `fstab` ↔ kernel ↔ services check in one real QEMU boot (`make integration`), and `make test-lifecycle` drives the seven QEMU account-lifecycle scenarios.
+Separately, **[`scripts/test-integration.sh`](scripts/test-integration.sh)** performs the cross-layer `fstab` ↔ kernel ↔ services check in one real QEMU boot (`make integration`), and `make test-lifecycle` drives the **9** QEMU lifecycle scenarios (`scripts/qemu_lifecycle.py`).
 
 Detailed outputs and test explanations are available in [doc/build-and-test.md](doc/build-and-test.md).
 
@@ -115,11 +116,11 @@ See [doc/distro-builder.md](doc/distro-builder.md) for architectural details, si
 
 ### Boot and Lifecycle Testing
 
-`make test-lifecycle` boots a persistent disk image in QEMU and drives the console through the account setup state machine. It covers: first boot with no default credentials, interrupted setup, reboot before setup completes, a rejected password followed by a successful retry, normal login, repeated reboots without repeating setup, and recovery after a corrupted account configuration.
+`make test-lifecycle` boots a persistent disk image in QEMU and drives the console through **9** lifecycle scenarios covering account setup, crash recovery, and fail-closed rescue: first boot with no default credentials, interrupted setup, reboot before setup completes, a rejected password followed by a successful retry, normal login, repeated reboots without repeating setup, recovery after a corrupted account configuration, reliability recovery across reboot, and `:on_fail=rescue` transitioning to PID 1's rescue shell.
 
 ```bash
 make image            # required once: builds distro/sane.img
-make test-lifecycle   # seven QEMU scenarios; skips cleanly without root/QEMU/losetup or a built image
+make test-lifecycle   # 9 QEMU scenarios; fails loudly under CI=true without prerequisites/image, skips (77) locally
 LIFECYCLE_LOGDIR=/tmp/my-logs make test-lifecycle
 ```
 
@@ -186,11 +187,19 @@ ninit.c                       Complete init system (single C file)
 Makefile                      make / make test / make lint / make clean
 scripts/smoke-test.sh         Automated PID 1 test in isolated chroot + unshare
 scripts/test-sigterm.sh       Verifies SIGTERM delivery to services (not SIGKILL)
-scripts/test-config.sh        Verifies dependency sorting, rescue mode, line-by-line initctl
+scripts/test-config.sh        Verifies dependency sorting, rescue mode, :on_fail=rescue, initctl
+scripts/test-zombie-reap-500.sh Proves PID 1 reaps 500 orphaned children with 0 zombies
 scripts/test-qemu-report.sh   Validates run-qemu.sh report() logic against log fixtures
 scripts/test-spawn-failure.sh Tests respawn dependency cancellation & fork retry limits
 scripts/test-cgroup-limits.sh Tests cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-respawn-cleanup.sh Tests respawn orphan cleanup & grandchild containment
+scripts/test-state-machine.sh Tests service state-machine transitions & :grace= telemetry
+scripts/test-accounts.sh      Tests Phase A account lifecycle, doas policy & recovery
+scripts/test-network.sh       Tests Phase B networking (sane-net, DNS/DHCP, TLS)
+scripts/test-network-fault.sh Tests Phase B network fault injection & recovery
+scripts/test-reliability.sh   Tests Phase C snapshots, rollback, staged upgrades & recovery
 scripts/test-integration.sh   Cross-layer fstab <-> kernel <-> services test via real QEMU boot
+scripts/test-boot-lifecycle.sh Runs 9 QEMU lifecycle scenarios (via scripts/qemu_lifecycle.py)
 scripts/build-rootfs.sh       Assembles minimal distro rootfs (static BusyBox + ninit)
 scripts/run-qemu.sh           Boots rootfs in QEMU: serial console & milestone verification
 scripts/lint-log-patterns.py  Linter for log strings, assertions, and legacy markers

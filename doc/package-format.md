@@ -242,13 +242,13 @@ Packages may provide declarative service definitions for `ninit`:
 2. **Metadata Link**: Optional `./.META/service` referencing the service file.
 3. **Service File Format**:
    ```
-   <name>:<mode>:<command>[:requires=<dependencies>][:memory_max=<mem>][:cpu_max=<cpu>][:pids_max=<pids>][:timeout=<sec>]
+   <name>:<mode>:<command>[:requires=<dependencies>][:memory_max=<mem>][:cpu_max=<cpu>][:pids_max=<pids>][:timeout=<sec>][:grace=<sec>][:user=<user>][:group=<group>][:on_fail=rescue|fail|none]
    ```
    Example:
    ```
    sane-hello:once:/usr/bin/sane-hello:memory_max=8M:timeout=10
    ```
-4. **Lifecycle**: Upon installation, `spm` appends or links the service definition into the system configuration (`/etc/init.conf` or `/etc/init.conf.d/`). Upon package uninstallation, `spm` sends IPC commands to `ninit` via `/run/initctl` to stop the service before removing binaries.
+4. **Lifecycle**: At package build time and during `spm install` / `spm verify`, `spm` validates `/usr/share/ninit/services/*.service` snippets against `ninit`'s parser rules and normalizes permissions (`0644`). By design, `spm` never executes install scripts, never mutates `/etc/init.conf`, and never touches `/run/initctl`; registering a service into `/etc/init.conf` is done explicitly by the image/rootfs builder (`scripts/build-rootfs.sh`, `scripts/make-image.sh`, `scripts/sane-install.sh`) or operator.
 
 ---
 

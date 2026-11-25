@@ -25,13 +25,13 @@ Event loop ninit berbasis `ppoll`, jadi init tetap responsif terhadap sinyal bah
 ## Fitur
 
 - **PID 1 + reaping** semua anak, termasuk proses yatim (orphan) yang diadopsi.
-- **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` dan
+- **Konfigurasi layanan** `/etc/init.conf` dengan mode `respawn`/`once` (mode tak dikenal ditolak fail-closed) dan
   dependensi `:requires=` (urut topologis DFS tanpa stack overflow, layanan once
   ditunggu hingga sukses selesai sebelum dependensinya jalan, deteksi
-  siklus, dan dependensi hilang → rescue shell).
+  siklus, dependensi hilang, 0 layanan, dan `:on_fail=rescue` → supervised rescue loop).
 - **Respawn non-blocking**: jeda 2 detik dijalankan lewat timer `ppoll` 100 ms,
   bukan `sleep()`, sehingga init tidak pernah buta terhadap sinyal.
-- **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace 5 detik) →
+- **Shutdown bersih**: `SIGTERM`/`SIGINT` → hentikan layanan (grace default 5 detik, dapat diatur per layanan via `:grace=N`) →
   `sync()` → `reboot()`; ada varian force untuk mem-bypass grace.
 - **Cgroups v2**: tiap layanan dipindahkan ke leaf `/sys/fs/cgroup/ninit/<nama>`
   dengan penegakan batas resource (`:memory_max=`, `:cpu_max=`, `:pids_max=`),
@@ -41,9 +41,10 @@ Event loop ninit berbasis `ppoll`, jadi init tetap responsif terhadap sinyal bah
   `mode=`, `uid=`, …) diteruskan ke `mount()`; `defaults` dibuang seperti `mount(8)`.
 - **Logging ganda**: `/dev/kmsg`, console, `/var/log/ninit.log`, plus jalur
   `/run/log.fifo` agar output layanan ikut tercatat dengan prefiks `[service]`.
-- **IPC `/run/initctl`**: perintah `poweroff`, `reboot`, `force-poweroff`,
-  `force-reboot`, dibaca **per baris** sehingga beberapa perintah dalam satu
-  penulisan tidak saling menelan.
+- **IPC `/run/initctl`**: parser streaming **per baris** (`MAX_LINE = 1024`) untuk
+  `poweroff`, `reboot`, `force-poweroff`, `force-reboot`, `stop`, `start`,
+  `restart`, dan `status`, sehingga beberapa perintah dalam satu penulisan tidak
+  saling menelan.
 - **Pemisahan Hak Akses (`:user=`, `:group=`)**: layanan berjalan sebagai `root` secara default; `:user=` menurunkan hak ke user non-root dari `/etc/passwd`. `:group=` opsional dan **harus berpasangan** dengan `:user=` (group-only ditolak fail-closed sejak round 2). Supplementary groups dibuang (`setgroups`). Kesalahan lookup menyebabkan kegagalan fail-closed. Nilai numerik `:user=`/`:group=` harus ada di `/etc/passwd`/`/etc/group`, dan numerik `0` ditolak -- tulis `:user=root` / `:group=root`.
 - **Kontrol Daemon `sane-ctl`**: CLI terpadu untuk `start`, `stop`, `restart`, dan `status` daemon lewat FIFO `/run/initctl` dengan pelacakan state di `/run/ninit-*.state` dan eskalasi SIGKILL jika stop grace timeout habis.
 - **S.A.N.E Package Manager (`spm`)**: manajer paket POSIX `/bin/sh` dengan atomic staging `rename(2)`, penggantian binary aktif tanpa `ETXTBSY`, proteksi reverse dependency, hardening keamanan arsip, dan pemulihan transaksi mati lampu (power-cut journal recovery).
@@ -74,24 +75,25 @@ Butuh `build-essential` dan (untuk uji) `busybox-static`:
 ```bash
 sudo apt-get install build-essential busybox-static python3 shellcheck
 
-make          # hasilkan biner statis ./ninit
+make          # hasilkan biner statis ./ninit (-Werror aktif default)
 make lint     # lint pola/format + gate ShellCheck pada 13 skrip produksi
-make test     # 12 suite: 7 butuh root/sudo + 5 tanpa root (namespace PID 1)
+make test     # 13 suite: 8 butuh root/sudo + 5 tanpa root (namespace PID 1)
 make rootfs   # rootfs distro minimal + initramfs (busybox statis, ninit PID 1)
 make qemu     # boot rootfs itu di QEMU, konsol serial (butuh qemu-system-x86)
 make clean
 ```
 
-`make test` menjalankan ke-**12** suite dari `TEST_SCRIPTS` dengan `./ninit-test`
-(`-DNINIT_TESTING` isolasi cgroup per run): 7 butuh root/sudo (smoke, sigterm,
-config, spawn-failure, cgroup-limits, respawn-cleanup, state-machine) karena
-menjalankan PID 1 di namespace terisolasi dan menguji cgroup; 5 jalan tanpa
-root (qemu-report, accounts, network, network-fault, reliability) terhadap
-rootfs sementara. `make integration` dan suite lifecycle/image terpisah dari
+`make test` menjalankan ke-**13** suite dari `TEST_SCRIPTS` dengan `./ninit-test`
+(`-DNINIT_TESTING` isolasi cgroup per run): **8** butuh root/sudo (`smoke`, `sigterm`,
+`config`, `zombie-reap-500`, `spawn-failure`, `cgroup-limits`, `respawn-cleanup`,
+`state-machine`) karena menjalankan PID 1 di namespace terisolasi dan menguji
+cgroup; **5** jalan tanpa root (`qemu-report`, `accounts`, `network`, `network-fault`,
+`reliability`) terhadap rootfs sementara. `make integration` dan suite
+lifecycle/image (`make test-lifecycle`, **9** skenario QEMU) terpisah dari
 `make test`.
 
 - **[`scripts/smoke-test.sh`](scripts/smoke-test.sh)** — banner, event loop
-  (`main loop siap`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
+  (`main loop ready`), layanan dijalankan, `graceful shutdown`, tidak ada respawn
   setelah shutdown, latensi shutdown < 5000 ms (mengirim `SIGTERM`; diukur lewat
   `sync()` sehingga ambangnya longgar, override lewat `LATENCY_LIMIT_MS`).
 - **[`scripts/test-sigterm.sh`](scripts/test-sigterm.sh)** — `SIGTERM` benar-benar
@@ -99,10 +101,15 @@ rootfs sementara. `make integration` dan suite lifecycle/image terpisah dari
   mask sinyal anak bersih, penutupan terjadi sebelum jendela grace 5 detik.
 - **[`scripts/test-config.sh`](scripts/test-config.sh)** — urut topologis
   `:requires=` (berlian `a→b,c ; b→c` dan konfigurasi padat 64 layanan → tanpa
-  stack overflow), config tak terbaca / dependensi hilang / siklus → `FATAL` +
-  rescue shell (signal mask-nya kosong, jadi Ctrl+C berfungsi), dan
+  stack overflow), config tak terbaca / 0 layanan / dependensi hilang / siklus /
+  `:on_fail=rescue` (fork-retry & crash-loop `SVC_STATE_FAILED`) → `FATAL` +
+  supervised rescue shell (`SigBlk=0`, Ctrl+C berfungsi), dan
   `/run/initctl` dibaca per baris (`poweroff\nreboot` → hanya `poweroff` yang
   dieksekusi).
+- **[`scripts/test-zombie-reap-500.sh`](scripts/test-zombie-reap-500.sh)** — mem-boot
+  `./ninit-test` sebagai PID 1 di `unshare` + `chroot` + `NINIT_CGROUP_BASE`,
+  menelurkan 500 anak yatim berumur pendek, dan membuktikan PID 1 memanen semuanya
+  dengan 0 zombie tersisa.
 - **[`scripts/test-qemu-report.sh`](scripts/test-qemu-report.sh)** — menjaga
   pemeriksaan otomatis `run-qemu.sh` tidak longgar: log konsol tempat layanan
   console mati dan di-respawn ulang (`exit status`, `respawn ditunda`, lebih
@@ -215,11 +222,19 @@ ninit.c                  seluruh init system (satu file)
 Makefile                 make / make test / make clean
 scripts/smoke-test.sh    uji PID 1 otomatis di chroot + unshare
 scripts/test-sigterm.sh uji SIGTERM sampai ke layanan (bukan SIGKILL)
-scripts/test-config.sh  uji urut dependensi, rescue mode, dan initctl per baris
+scripts/test-config.sh  uji urut dependensi, rescue mode, :on_fail=rescue, initctl per baris
+scripts/test-zombie-reap-500.sh bukti PID 1 memanen 500 proses yatim (0 zombie)
 scripts/test-qemu-report.sh uji pemeriksaan report() run-qemu.sh via fixture log
 scripts/test-spawn-failure.sh uji dependensi jalur respawn + fork retry limit
 scripts/test-cgroup-limits.sh uji cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-respawn-cleanup.sh uji pembersihan orphan respawn & grandchild (T12)
+scripts/test-state-machine.sh uji transisi state-machine & telemetri :grace=
+scripts/test-accounts.sh uji akun Phase A, policy doas & recovery
+scripts/test-network.sh  uji jaringan Phase B (sane-net, DNS/DHCP, TLS)
+scripts/test-network-fault.sh uji injeksi fault jaringan & pemulihan
+scripts/test-reliability.sh uji Phase C snapshot, rollback & recovery
 scripts/test-integration.sh uji silang-lapisan fstab<->kernel<->layanan via 1 boot QEMU
+scripts/test-boot-lifecycle.sh 9 skenario lifecycle QEMU (via scripts/qemu_lifecycle.py)
 scripts/build-rootfs.sh rootfs distro minimal (busybox statis + ninit PID 1)
 scripts/run-qemu.sh     boot rootfs itu di QEMU: konsol serial + cek penanda
                         boot + cek liveness layanan console

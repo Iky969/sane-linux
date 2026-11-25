@@ -47,8 +47,9 @@ unduhan), `distro/build/` (sumber BusyBox + hasil `make install`),
 2. `KERNEL_MODE=host` → `/boot/vmlinuz-$(uname -r)` (di sandbox/container `/boot`
    biasanya kosong).
 3. `KERNEL_MODE=auto` (default) → kernel host bila ada, kalau tidak mengunduh
-   Alpine `vmlinuz-virt` (`ALPINE_BRANCH=v3.20`, `ALPINE_FLAVOR=virt`).
-   Checksum hasil unduhan dicatat di `distro/cache/vmlinuz-*.sha256`.
+   Alpine `vmlinuz-virt` (`ALPINE_BRANCH=v3.20`, `ALPINE_RELEASE=3.20.10`, `ALPINE_FLAVOR=virt`).
+   Unduhan maupun berkas cache diverifikasi ketat terhadap `KERNEL_SHA256` yang dipin
+   (fail-closed bila checksum kosong atau tidak cocok), lalu digest dicatat di `distro/cache/vmlinuz-*.sha256`.
 
 ## Perintah QEMU
 
@@ -175,7 +176,7 @@ reboot (dipakai uji otomatis).
 | Variabel | Default | Arti |
 |---|---|---|
 | `DISTRO_DIR` | `distro` | direktori kerja |
-| `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / hash resmi | sumber BusyBox (kosongkan `BB_SHA256` untuk melewati verifikasi) |
+| `BB_VERSION` / `BB_URL` / `BB_SHA256` | `1.36.1` / busybox.net / hash resmi | sumber BusyBox (`BB_SHA256` wajib diisi; nilai kosong menggagalkan build) |
 | `BUSYBOX_MODE` | `auto` | `auto` \| `source` (wajib kompilasi) \| `prebuilt` (pakai `/bin/busybox` statis). Pada `auto`, unduh/kompilasi/install yang gagal menjatuhkan build ke busybox cadangan; `source` menuntut berhasil. |
 | `BUSYBOX_PREBUILT` | `/bin/busybox` | cadangan bila build dari sumber gagal; hanya biner ini yang dipakai rootfs (pohon `make install` sisa run lama diabaikan) |
 | `BUSYBOX_FORCE` | `0` | `1` = unduh/kompilasi ulang |
@@ -190,7 +191,8 @@ reboot (dipakai uji otomatis).
 |---|---|---|
 | `SECS` | (kosong) | detik boot otomatis; tanpa ini QEMU interaktif |
 | `KERNEL` / `KERNEL_MODE` | — / `auto` | kernel yang dipakai |
-| `ALPINE_BRANCH` / `ALPINE_FLAVOR` | `v3.20` / `virt` | sumber kernel unduhan |
+| `ALPINE_BRANCH` / `ALPINE_RELEASE` / `ALPINE_FLAVOR` | `v3.20` / `3.20.10` / `virt` | sumber kernel unduhan |
+| `KERNEL_SHA256` | hash default ter-pin untuk `v3.20`/`3.20.10`/`virt` | checksum SHA-256 wajib (64-hex); unduhan & cache diverifikasi fail-closed |
 | `MEM` | `256` | RAM guest (MB) |
 | `NO_REBOOT` | `1` | `0` = tanpa `-no-reboot`, sehingga reboot guest benar-benar me-reset mesin |
 | `REBUILD` | `0` | `1` = bangun ulang rootfs dulu |
@@ -203,16 +205,16 @@ reboot (dipakai uji otomatis).
   ke-0 (mis. `printf … | run-qemu.sh`) sering termakan, sehingga perintah tidak
   pernah sampai ke guest. Beri jeda ~6 detik (`sleep 6`) atau ketik langsung di
   terminal.
-- **Belum ada `getty`/`login`.** Yang berjalan masih shell konsol langsung
-  (`console:respawn:cttyhack /bin/sh -i`) sebagai root, tanpa autentikasi.
-- **Belum ada persistensi disk.** Hanya initramfs (RAM): tidak ada disk image,
-  `-hda rootfs.img` belum dipakai, semua perubahan hilang saat boot ulang.
+- **Pengaturan awal pada konsol image disk.** Image disk baru tanpa kredensial bawaan
+  menjalankan `sane-firstboot` untuk meminta kata sandi `root` dan `sane` di konsol
+  sebelum `getty` aktif; build CI memakai kata sandi acak per-run saat `SANE_WEAK_DEFAULT_CREDS`
+  aktif (lihat [account-security.md](../account-security.md)).
+- **Persistensi disk:** Rootfs `make rootfs` berjalan dari initramfs (perubahan
+  hilang saat reboot); persistensi penuh tersedia pada image disk `make image`
+  yang diuji oleh `make test-lifecycle`.
 - **Kernel masih pinjam Alpine.** Kernel proyek ini belum dikompilasi sendiri;
-  yang dipakai Alpine `vmlinuz-virt` (v3.20) yang diunduh ke `distro/cache/`.
-- Belum ada manajer paket, jaringan, dan modul kernel; BusyBox dibangun dengan
-  `defconfig` minus applet `tc` (401 applet). `tc` dimatikan karena
-  `networking/tc.c` masih memakai definisi CBQ yang sudah tidak ada di kernel
-  headers terbaru — dengan Ubuntu 24.04 build `defconfig` penuh gagal kompilasi.
-- Job CI `rootfs-distro` membangun rootfs dan mem-boot initramfs di QEMU (TCG,
-  tanpa `/dev/kvm`). Yang masih belum ada: uji interaktif (ketikan ke serial
-  console) dan uji `poweroff`/`reboot` dari dalam guest.
+  yang dipakai kernel host atau Alpine `vmlinuz-virt` (`v3.20`/`3.20.10`) terverifikasi SHA-256 di `distro/cache/`.
+- BusyBox dibangun dengan `defconfig` minus applet `tc` (401 applet) untuk
+  menghindari ketidakcocokan header CBQ legacy pada kernel terbaru; sementara paket
+  userspace jaringan (`sane-net`), akun (`sane-accounts`), dan manajer paket (`spm`)
+  sudah terintegrasi lewat modul Phase A–C.

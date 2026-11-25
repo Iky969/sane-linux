@@ -43,11 +43,19 @@ ninit.c                       Complete init system implementation (single C file
 Makefile                      make / make test / make lint / make clean
 scripts/smoke-test.sh         Automated PID 1 test in isolated chroot + unshare
 scripts/test-sigterm.sh       Verifies SIGTERM delivery to service processes
-scripts/test-config.sh        Tests dependency sorting, rescue mode, line-by-line initctl
+scripts/test-config.sh        Tests dependency sorting, rescue mode, :on_fail=rescue, initctl
+scripts/test-zombie-reap-500.sh Proves PID 1 reaps 500 orphaned children with 0 zombies
 scripts/test-qemu-report.sh   Validates run-qemu.sh report() logic against log fixtures
 scripts/test-spawn-failure.sh Tests respawn dependency cancellation & fork retry limits
 scripts/test-cgroup-limits.sh Tests cgroup v2 limits (memory, cpu, pids) & lifecycle
+scripts/test-respawn-cleanup.sh Tests respawn orphan tree cleanup & generation counters
+scripts/test-state-machine.sh Tests service state-machine transitions & :grace= telemetry
+scripts/test-accounts.sh      Tests Phase A account lifecycle, doas policy & recovery
+scripts/test-network.sh       Tests Phase B networking (sane-net, DNS/DHCP, TLS)
+scripts/test-network-fault.sh Tests Phase B network fault injection & recovery
+scripts/test-reliability.sh   Tests Phase C snapshots, rollback, staged upgrades & recovery
 scripts/test-integration.sh   Cross-layer fstab <-> kernel <-> services test via real QEMU boot
+scripts/test-boot-lifecycle.sh Runs QEMU lifecycle scenarios 1-9 (via scripts/qemu_lifecycle.py)
 scripts/build-rootfs.sh       Assembles minimal distro rootfs (static BusyBox + ninit)
 scripts/run-qemu.sh           Boots rootfs in QEMU: serial console & milestone verification
 scripts/build-package.sh      Deterministic package builder CLI for .spm.tar.xz containers
@@ -64,9 +72,9 @@ LICENSE                       MIT License
 ## Quick Start
 
 ```bash
-make          # Build static binary ./ninit
-make lint     # Run pattern linter and format string verifier
-make test     # Test PID 1: smoke test + SIGTERM test + config test + spawn failure + cgroup limits
+make          # Build static binary ./ninit (-Werror enabled by default)
+make lint     # Run pattern/format linters + ShellCheck gate on 13 production scripts
+make test     # Run 13 suites from TEST_SCRIPTS (8 root-required + 5 unprivileged)
 ```
 
 To run `ninit` on a real system, install the compiled binary as `/sbin/init` and provide `/etc/init.conf`. For safe experimentation, use chroot + `unshare` as detailed in [build-and-test.md](build-and-test.md).
@@ -78,9 +86,9 @@ See [RELEASE-NOTES-v1.2.0.md](../RELEASE-NOTES-v1.2.0.md) and [CHANGELOG.md](../
 
 Recent reliability enhancements include:
 - Topological sort bounded by `MAX_SERVICES` preventing stack overflow,
-- `validate_dependencies()` dropping init into a rescue shell if `:requires=` references a missing service,
-- Line-by-line reading on `/run/initctl`,
-- Functional rescue shell with cleared signal mask (ensuring interactive Ctrl+C works).
+- `validate_dependencies()`, 0-service configs, and `:on_fail=rescue` routing PID 1 into a supervised rescue loop (`enter_rescue_mode()`) without PID 1 ever exiting,
+- Streaming line-by-line parsing (`MAX_LINE = 1024`) on `/run/initctl`,
+- Functional supervised rescue shell with cleared child signal mask and active `/run/initctl`.
 
 All behaviors are verified by automated test suites in `scripts/`.
 

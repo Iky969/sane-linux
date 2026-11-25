@@ -361,10 +361,10 @@ with `:on_fail=rescue` and `timeout=0`, which disables ninit's default 30 s
 once-service timeout so a slow recovery is not killed mid-transaction while
 guaranteeing an interactive supervised rescue shell if recovery fails.
 
-Ordering: `network:once` and `recovery:once` (account recovery) carry
-`requires=reliability`; `firstboot` carries `requires=recovery`; `tty1`/console
-carry `requires=firstboot`. Consequently `reliability` runs **before** network,
-account recovery, firstboot and getty.
+Ordering: `recovery:once` (account recovery) carries
+`requires=reliability`; `firstboot` carries `requires=recovery`; `network:respawn`
+and `tty1`/console carry `requires=firstboot`. Consequently `reliability` runs
+**before** account recovery, firstboot, network, and getty.
 
 Failure behaviour: ninit marks a once service `FAILED` on a nonzero exit (or
 spawn failure) and cancels its transitive dependents — so `network`,
