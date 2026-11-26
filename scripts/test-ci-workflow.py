@@ -257,8 +257,10 @@ def test_static_analysis_gates() -> str | None:
     workflow = ROOT / ".github/workflows/codeql.yml"
     if not workflow.is_file():
         return "codeql.yml is missing"
-    if "github/codeql-action/init@74c1aea9df7c0f02e9b7bfe4a8935abf2e5e3aa6" not in workflow.read_text():
-        return "CodeQL action is not SHA-pinned to v3"
+    codeql = workflow.read_text()
+    for step in ("init", "analyze"):
+        if not re.search(r"github/codeql-action/" + step + r"@[0-9a-f]{40}(?:\s|$)", codeql):
+            return f"CodeQL {step} is not pinned to a 40-hex commit SHA"
     makefile = (ROOT / "Makefile").read_text()
     if "ubsan:" not in makefile or "-fsanitize=undefined" not in makefile:
         return "Makefile has no static UBSan target"
