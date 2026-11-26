@@ -224,7 +224,7 @@ expect_ok "validate ignores nopass in an inline comment" \
 # nopass is not a doas option; a false positive here fails validation and
 # triggers a recovery rebuild of a perfectly valid policy.
 base
-printf 'permit :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+printf 'permit :wheel\npermit :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate accepts nopass as a cmd argument (whole file)" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
@@ -234,7 +234,7 @@ expect_fail_msg "validate rejects nopass option before the cmd terminator" \
 	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
-printf 'permit :wheel as root cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+printf 'permit :wheel\npermit :wheel as root cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate accepts nopass as a cmd argument after as (whole file)" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
@@ -244,7 +244,7 @@ expect_fail_msg "validate rejects nopass option before the as terminator" \
 	"grants 'nopass'" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
-printf 'permit :wheel cmd /usr/bin/echo x # nopass\n' > "$T/etc/doas.conf"
+printf 'permit :wheel\npermit :wheel cmd /usr/bin/echo x # nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate ignores nopass in an inline comment after cmd arguments" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
@@ -267,7 +267,7 @@ expect_ok "validate accepts :wheel identity after a setenv { as } block" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 base
-printf 'permit setenv { as } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
+printf 'permit :wheel\npermit setenv { as } :wheel cmd /usr/bin/echo nopass\n' > "$T/etc/doas.conf"
 expect_ok "validate accepts a cmd argument after a setenv { as } block" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
@@ -424,6 +424,16 @@ check "surviving account keeps its primary gid" sh -c \
 base
 printf 'permit persist :admins\n' > "$T/etc/doas.conf"
 expect_fail "validate rejects a doas rule that does not grant wheel" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+base
+printf 'permit :wheel cmd /bin/false\n' > "$T/etc/doas.conf"
+expect_fail "validate rejects command-restricted-only wheel permit" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+printf 'permit :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts unrestricted wheel permit" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+printf 'permit :wheel cmd /bin/false\npermit :wheel\n' > "$T/etc/doas.conf"
+expect_ok "validate accepts mixed restricted and unrestricted wheel permits" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -723,6 +733,19 @@ check "rebuild preserves the alice private group" sh -c \
 	"grep -q '^alice:x:1005:' '$T/etc/group'"
 check "rebuild keeps root and sane baseline entries" sh -c \
 	"grep -q '^root:x:0:0:' '$T/etc/passwd' && grep -q '^sane:x:1000:1000:' '$T/etc/passwd'"
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'broken:x:1201:1201\n' >> "$T/etc/passwd"
+expect_fail "validate flags malformed short passwd entry" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+expect_ok "recover succeeds with malformed short passwd entry" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after malformed passwd recovery" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "recovery drops malformed short passwd entry" sh -c \
+	"! grep -q '^broken:' '$T/etc/passwd'"
 
 # D: a missing sane entry is restored without touching extra accounts.
 base_firstboot
