@@ -177,12 +177,107 @@ def test_installer_boot_uses_cpu_compatible_qemu_args() -> str | None:
     return None
 
 
+def test_third_party_licenses() -> str | None:
+    notice = ROOT / "THIRD_PARTY_LICENSES.md"
+    if not notice.is_file():
+        return "THIRD_PARTY_LICENSES.md is missing"
+    text = notice.read_text()
+    expected = {
+        "busybox": "GPL-2.0",
+        "linux kernel": "GPL-2.0",
+        "libressl": "ISC",
+        "curl": "curl",
+        "wpa_supplicant": "BSD-3-Clause",
+        "musl": "MIT",
+        "limine": "BSD-2-Clause",
+    }
+    for component, license_id in expected.items():
+        if component.lower() not in text.lower() or license_id.lower() not in text.lower():
+            return f"third-party notice is missing {component} / {license_id}"
+    if re.search(r"^\|\s*clawrza", text, re.M | re.I):
+        return "maintainer-owned clawrza packages must not be listed as third-party"
+    for link in ("THIRD_PARTY_LICENSES.md", "NOTICE"):
+        if link not in (ROOT / "README.md").read_text():
+            return f"README.md does not link {link}"
+    return None
+
+
+def test_security_scope_and_signing_freeze() -> str | None:
+    for name in ("SECURITY.md", "SECURITY.id.md"):
+        text = (ROOT / name).read_text().lower()
+        for term in ("spm", "installer", "sane-accounts", "sane-net", "snapshot", "rollback"):
+            if term not in text:
+                return f"{name} does not cover {term}"
+        if "frozen" not in text:
+            return f"{name} does not record the frozen package-signature item"
+    return None
+
+
+def test_docs_sync() -> str | None:
+    doc_readme = (ROOT / "doc/README.md").read_text()
+    for command in ("start", "stop", "restart", "status"):
+        if command not in doc_readme:
+            return f"doc/README.md IPC list is missing {command}"
+    for item in ("spm", "sane-install.sh", "sane-firstboot"):
+        if item not in doc_readme:
+            return f"doc/README.md structure is missing {item}"
+    root_readme = (ROOT / "README.md").read_text()
+    for item in ("boot-pipeline.md", "package-format.md", "package-manager.md"):
+        if item not in root_readme:
+            return f"root README documentation index is missing {item}"
+    builder = (ROOT / "doc/distro-builder.md").read_text()
+    image = (ROOT / "doc/distro-image-builder.md").read_text()
+    if "distro-image-builder.md" not in builder or "distro-builder.md" not in image:
+        return "builder docs do not cross-link each other"
+    return None
+
+
+def test_community_files() -> str | None:
+    required = [
+        "CONTRIBUTING.md", "CODE_OF_CONDUCT.md",
+        ".github/ISSUE_TEMPLATE/bug_report.md",
+        ".github/ISSUE_TEMPLATE/feature_request.md",
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/PULL_REQUEST_TEMPLATE.md", ".github/CODEOWNERS",
+        ".github/dependabot.yml",
+    ]
+    for name in required:
+        if not (ROOT / name).is_file():
+            return f"missing community file: {name}"
+    dependabot = (ROOT / ".github/dependabot.yml").read_text()
+    if "github-actions" not in dependabot:
+        return "dependabot.yml has no github-actions ecosystem"
+    return None
+
+
+def test_static_analysis_gates() -> str | None:
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    if "cppcheck" not in ci:
+        return "ci.yml has no cppcheck gate"
+    workflow = ROOT / ".github/workflows/codeql.yml"
+    if not workflow.is_file():
+        return "codeql.yml is missing"
+    if "github/codeql-action/init@74c1aea9df7c0f02e9b7bfe4a8935abf2e5e3aa6" not in workflow.read_text():
+        return "CodeQL action is not SHA-pinned to v3"
+    makefile = (ROOT / "Makefile").read_text()
+    if "ubsan:" not in makefile or "-fsanitize=undefined" not in makefile:
+        return "Makefile has no static UBSan target"
+    if not (ROOT / "scripts/test-ubsan.sh").is_file():
+        return "scripts/test-ubsan.sh is missing"
+    return None
+
+
 def main() -> int:
     tests = [
         ("static gate rejects missing artifact and accepts a static build", test_static_gate),
         ("workflow environment builds and runs production and test binaries", test_workflow_builds_and_runs_both_binaries),
         ("cgroup snapshots tolerate no matches and detect leaks", test_cgroup_snapshots_allow_no_matches_and_detect_leaks),
         ("installer boot check uses KVM host CPU or TCG -cpu max", test_installer_boot_uses_cpu_compatible_qemu_args),
+        ("third-party license notice covers bundled components", test_third_party_licenses),
+        ("security policy covers all components and freezes SPM signing", test_security_scope_and_signing_freeze),
+        ("documentation index and IPC list are current", test_docs_sync),
+        ("community and dependabot files exist", test_community_files),
+        ("static analysis and UBSan gates are configured", test_static_analysis_gates),
     ]
     failures = 0
     for name, test in tests:

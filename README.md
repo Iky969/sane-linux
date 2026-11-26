@@ -219,6 +219,9 @@ LICENSE                       MIT License
 | [doc/account-security.md](doc/account-security.md) | Phase A: default accounts, password policy, `sane-accounts` lifecycle CLI, and `doas` escalation policy |
 | [doc/configuration.md](doc/configuration.md) | Syntax and semantics of `/etc/init.conf`, `/etc/fstab`, `/run/initctl`, and log paths |
 | [doc/build-and-test.md](doc/build-and-test.md) | Static build, test harnesses, CI workflow, manual chroot testing, troubleshooting |
+| [doc/boot-pipeline.md](doc/boot-pipeline.md) | Boot sequence, initramfs, Limine BIOS/UEFI and `switch_root` handoff |
+| [doc/package-format.md](doc/package-format.md) | `.spm.tar.xz` archive layout, checksums and journal format |
+| [doc/package-manager.md](doc/package-manager.md) | `spm` install/remove/rollback semantics and dependency policy |
 | [doc/distro-builder.md](doc/distro-builder.md) | Rootfs assembly, initramfs packaging, QEMU headless validation |
 | [doc/glossary-i18n.md](doc/glossary-i18n.md) | Internationalization glossary, terminology mapping, and log string tables |
 | [doc/networking.md](doc/networking.md) | Phase B: `sane-net`, DNS/DHCP, Wi-Fi, reconnect, and outbound TLS |
@@ -244,3 +247,6 @@ Current release: **v1.2.0** (See full release details in [RELEASE-NOTES-v1.2.0.m
 ## License
 
 [MIT](LICENSE) © 2026 Iky969. Security issues: do not open public issues — please follow [SECURITY.md](SECURITY.md).
+
+Bundled third-party components keep their upstream licenses; see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and [NOTICE](NOTICE).

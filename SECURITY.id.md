@@ -3,9 +3,11 @@
 *[Bahasa Indonesia](SECURITY.id.md) | [English](SECURITY.md)*
 
 `ninit` adalah **init system (PID 1) eksperimental** untuk eksperimen build
-distro/OS sendiri. Ia berjalan dengan hak penuh root, jadi bug di sini bisa
-berakibat fatal pada sistem yang memakainya. Dokumen ini menjelaskan cara
-melaporkan masalah keamanan dan apa saja yang termasuk/ tidak termasuk cakupan.
+distro/OS sendiri, bagian dari distribusi S.A.N.E Linux (`spm`, installer, alat
+akun, jaringan, dan tool reliability ikut tercakup). Ia berjalan dengan hak
+penuh root, jadi bug di sini bisa berakibat fatal pada sistem yang memakainya.
+Dokumen ini menjelaskan cara melaporkan masalah keamanan dan apa saja yang
+termasuk/ tidak termasuk cakupan.
 
 ## Versi yang didukung
 
@@ -52,6 +54,28 @@ mencantumkan kredit pelapor di advisory bila diinginkan.
   akses oleh non-root, kebocoran isi memori.
 - Penulisan cgroup (`/sys/fs/cgroup/ninit/<nama>`): path traversal lewat nama
   layanan, salah target cgroup.
+- Package manager `spm`: containment path arsip/symlink/hardlink, validasi
+  checksum, pemulihan jurnal, retensi rollback, dan penegakan reverse-dependency.
+- Installer offline (`sane-install.sh`): validasi target block device, keamanan
+  mount/partisi, pembersihan saat sinyal pada langkah destruktif, dan integritas
+  payload initramfs/bootloader.
+- Akun: parsing `sane-accounts`, `sane-firstboot`, `sane-account-recovery`, dan
+  `doas.conf`, pelestarian status lock password, validasi identitas duplikat,
+  serta kebijakan grant hak.
+- Jaringan (`sane-net`, DHCP, Wi-Fi, TLS keluar via curl): parsing konfigurasi,
+  validasi sertifikat/hostname, dan penanganan kredensial.
+- Reliability: parsing jurnal snapshot/rollback, pemulihan upgrade bertahap,
+  retensi backup, dan perilaku fail-closed setelah restore gagal.
+
+### Ditunda (frozen): paket SPM bertanda tangan
+
+Tanda tangan kriptografis untuk arsip SPM sedang **frozen** (ditunda), bukan
+ditolak, menunggu keputusan tentang penyimpanan kunci dan distribusi trust.
+Saat ini arsip memuat checksum SHA-256 di dalam arsip yang sama: itu mendeteksi
+kerusakan, **bukan** autentisitas. Jangan menyebut instalasi paket sebagai
+"terautentikasi". Sebelum skema (mis. minisign/ed25519) dipilih dan
+didokumentasikan, laporan terkait tanda tangan adalah diskusi desain, bukan
+kerentanan pada kontrol yang sudah dirilis.
 
 **Di luar cakupan:**
 
