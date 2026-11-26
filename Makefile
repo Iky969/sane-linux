@@ -102,7 +102,7 @@ fuzz test-fuzz:
 	exit $$rc
 
 clean:
-	rm -f $(BIN) $(TESTBIN)
+	rm -f $(BIN) $(TESTBIN) $(UBSANBIN)
 
 clean-distro:
 	rm -rf distro/rootfs distro/build distro/cache distro/packages distro/initramfs.cpio.gz \

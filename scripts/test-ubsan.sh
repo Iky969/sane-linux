@@ -4,7 +4,9 @@
 # ASan cannot cover these suites: they copy $BIN into a minimal chroot that has
 # no libasan/libubsan runtime. `make ubsan` links UBSan statically instead, so
 # the same suites can exercise the instrumented PID 1 binary without extra
-# payload. Keep this list to suites that are fast and non-root-safe.
+# payload. Keep this list to suites that are bounded and use the same
+# root/passwordless-sudo requirement as the main battery (the runner has
+# passwordless sudo); they are not usable by an arbitrary unprivileged user.
 set -eu
 
 REPO_ROOT=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd -P)

@@ -5,7 +5,7 @@ source is MIT-licensed ([LICENSE](LICENSE)); the components below keep their
 upstream licenses. This notice accompanies distributed rootfs, initramfs and
 raw disk images. Full license texts are available at the upstream source URLs.
 
-| Component | Version in image | License | Upstream source |
+| Component | S.A.N.E package version | License | Upstream source |
 |---|---|---|---|
 | BusyBox | 1.36.1 | GPL-2.0-only | <https://busybox.net/downloads/busybox-1.36.1.tar.bz2> (see upstream `LICENSE`) |
 | Linux kernel (`bzImage`/`vmlinuz-virt`) | 6.6.134 | GPL-2.0-only | <https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.134.tar.xz>; binary from Alpine v3.20.10 netboot, patches in <https://git.alpinelinux.org/aports/> |
@@ -15,8 +15,8 @@ raw disk images. Full license texts are available at the upstream source URLs.
 | musl libc (headers and static objects) | 1.2.5 | MIT | <https://musl.libc.org/releases/musl-1.2.5.tar.gz> |
 | doas (OpenDoas) | 6.8.2 | ISC | <https://github.com/Duncaen/OpenDoas/releases/download/v6.8.2/opendoas-6.8.2.tar.gz> |
 | Limine bootloader (BIOS/UEFI payloads) | 12.9.6 | BSD-2-Clause | <https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.6/limine-binary.tar.xz> (license in upstream `COPYING`) |
-| ca-certificates bundle | 2024.11 | Individual CA terms; Debian `ca-certificates` packaging GPL-2.0+ | <https://salsa.debian.org/debian/ca-certificates> |
-| disk-tools (`sgdisk`, `mke2fs`, `mkfs.fat`) | 1.0.0 | GPL-2.0 (gptfdisk, e2fsprogs), GPL-3.0 (dosfstools) | <https://sourceforge.net/projects/gptfdisk/>, <https://e2fsprogs.sourceforge.net/>, <https://github.com/dosfstools/dosfstools> |
+| ca-certificates bundle | 2024.11 (S.A.N.E package; upstream bundle varies by build host, e.g. `20250419+deb13u1`) | Individual CA terms; Debian `ca-certificates` packaging GPL-2.0+ | <https://salsa.debian.org/debian/ca-certificates> |
+| disk-tools (`sgdisk`, `mke2fs`, `mkfs.fat`) | 1.0.0 (S.A.N.E package; upstream tool versions vary by build host) | GPL-2.0 (gptfdisk, e2fsprogs), GPL-3.0 (dosfstools) | <https://sourceforge.net/projects/gptfdisk/>, <https://e2fsprogs.sourceforge.net/>, <https://github.com/dosfstools/dosfstools> |
 
 Notes:
 
