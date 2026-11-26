@@ -923,14 +923,9 @@ doas_audit_awk() {
 			next
 		}
 		if (c_action == "permit") {
-			if (c_ident == ":wheel" && (c_target == "" || c_target == "root" || c_target == "0")) {
-				if (!c_has_cmd) {
-					effective_wheel = 1
-					wheel_cmd = ""
-				} else if (!effective_wheel) {
-					effective_wheel = 1
-					wheel_cmd = c_cmd
-				}
+			if (c_ident == ":wheel" && (c_target == "" || c_target == "root" || c_target == "0") && !c_has_cmd) {
+				effective_wheel = 1
+				wheel_cmd = ""
 			}
 		} else {
 			if ((c_ident == ":wheel" || c_ident == "sane") && (c_target == "" || c_target == "root" || c_target == "0")) {
@@ -957,6 +952,7 @@ doas_has_nopass() { doas_audit_awk nopass "$1"; }
 doas_syntax_ok() { doas_audit_awk syntax "$1"; }
 doas_has_effective_wheel() { doas_audit_awk wheel "$1"; }
 doas_policy_ok() { doas_audit_awk policy "$1"; }
+doas_has_deny() { grep -Eq '^[[:space:]]*deny([[:space:]]|$)' "$1"; }
 
 cmd_validate() {
 	ensure_etc
@@ -1081,10 +1077,11 @@ cmd_validate() {
 # i.e. a state that still fails validation. Recover must never produce one.
 passwd_structurally_ok() {
 	awk -F: '
+		NF != 7 || $1 == "" { bad = 1 }
 		$3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ { bad = 1 }
 		$1 != "root" && $3 == 0 { bad = 1 }
 		$1 != "sane" && $3 == 1000 { bad = 1 }
-		{ if (seen[$3]++) bad = 1 }
+		{ if (seen[$3]++ || names[$1]++) bad = 1 }
 		$1 == "root" { rc++ }
 		$1 == "sane" { sc++ }
 		END { if (rc > 1 || sc > 1) bad = 1; exit bad }
@@ -1093,6 +1090,7 @@ passwd_structurally_ok() {
 
 group_structurally_ok() {
 	awk -F: '
+		NF != 4 || $1 == "" { bad = 1 }
 		$3 !~ /^[0-9]+$/ { bad = 1 }
 		$1 != "root" && $3 == 0 { bad = 1 }
 		$1 != "wheel" && $3 == 10 { bad = 1 }
@@ -1381,11 +1379,26 @@ cmd_recover() {
 	recover_root_field=$(compose_shadow_field "$recover_root_valid" "$recover_root_locked" "$recover_root_hash")
 	recover_sane_field=$(compose_shadow_field "$recover_sane_valid" "$recover_sane_locked" "$recover_sane_hash")
 
-	# doas.conf: keep policy-compliant content, repair mode/owner only.
+	# doas.conf: keep policy-compliant content, repair mode/owner only. A
+	# syntactically valid custom rule that only grants a restricted command
+	# is not sufficient for the daily workstation policy; append the
+	# unrestricted baseline rule instead of discarding the custom rule.
 	if [ -f "$DOAS_CONF" ] && [ ! -L "$DOAS_CONF" ] && doas_policy_ok "$DOAS_CONF"; then
 		chmod 0600 "$DOAS_CONF"
 		[ "$(id -u)" = 0 ] && chown 0:0 "$DOAS_CONF" 2>/dev/null || true
 		printf 'recover: doas.conf preserved (policy ok; mode/owner repaired)\n'
+	elif [ -f "$DOAS_CONF" ] && [ ! -L "$DOAS_CONF" ] && \
+	     doas_syntax_ok "$DOAS_CONF" && ! doas_has_nopass "$DOAS_CONF" && \
+	     ! doas_has_deny "$DOAS_CONF"; then
+		TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
+		chmod 0600 "$TMP_1"
+		[ "$(id -u)" = 0 ] && chown 0:0 "$TMP_1" 2>/dev/null || true
+		if ! cp "$DOAS_CONF" "$TMP_1" || ! printf 'permit persist :wheel\n' >> "$TMP_1" || \
+		   ! atomic_mv_replace "$TMP_1" "$DOAS_CONF"; then
+			rm -f "$TMP_1"
+			die "failed to add unrestricted wheel rule to doas.conf"
+		fi
+		printf 'recover: unrestricted wheel rule appended; custom rules preserved\n'
 	else
 		TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
 		chmod 0600 "$TMP_1"
