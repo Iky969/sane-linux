@@ -409,6 +409,18 @@ if [ "$QUICK_MODE" -eq 1 ]; then
 else
     command -v qemu-system-x86_64 >/dev/null 2>&1 || die "qemu-system-x86_64 required for INST-51 boot test"
 
+    # The host toolchain emits x86-64-v3/AVX instructions in the static busybox
+    # used by the initramfs. QEMU's default qemu64 CPU lacks AVX, so PID 1 dies
+    # with SIGILL and the boot test reports a misleading "switch_root missing".
+    # Match run-qemu.sh and test-image-boot.sh: use the host CPU with KVM, or
+    # -cpu max under TCG.
+    ACCEL_ARGS=()
+    if [ -w /dev/kvm ] 2>/dev/null; then
+        ACCEL_ARGS+=(-enable-kvm -cpu host)
+    else
+        ACCEL_ARGS+=(-cpu max)
+    fi
+
     verify_qemu_boot() {
         local mode="$1"
         local log_file="$2"

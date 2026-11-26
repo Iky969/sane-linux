@@ -535,7 +535,11 @@ class Runner:
                 b.send("printf 'RESCUE_SHELL_%s\\n' ALIVE")
                 self.check("S9 supervised rescue shell accepts interactive commands",
                            b.expect(r"RESCUE_SHELL_ALIVE", timeout=30), b.save())
-                b.send("poweroff")
+                # BusyBox ash registers `poweroff` as a built-in applet, so a bare
+                # `poweroff` sends SIGUSR2 (force reboot) and never reaches the
+                # /sbin/poweroff wrapper. Exercise the documented control channel
+                # directly, as the rest of the test suite does.
+                b.send("echo poweroff > /run/initctl")
                 self.check("S9 rescue shell retains clean poweroff via /run/initctl",
                            b.expect(r"graceful shutdown|Power down", timeout=30), b.save())
             else:

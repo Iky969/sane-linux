@@ -165,11 +165,24 @@ def test_cgroup_snapshots_allow_no_matches_and_detect_leaks() -> str | None:
     return None
 
 
+def test_installer_boot_uses_cpu_compatible_qemu_args() -> str | None:
+    """The installer boot check must not fall back to QEMU's AVX-less qemu64 CPU."""
+    script = (ROOT / "scripts/test-installer.sh").read_text()
+    if "ACCEL_ARGS=()" not in script:
+        return "test-installer.sh no longer configures ACCEL_ARGS"
+    if "-enable-kvm -cpu host" not in script or "-cpu max" not in script:
+        return "test-installer.sh is missing a KVM or TCG CPU compatibility branch"
+    if '"${ACCEL_ARGS[@]}"' not in script:
+        return "test-installer.sh does not pass ACCEL_ARGS to qemu-system-x86_64"
+    return None
+
+
 def main() -> int:
     tests = [
         ("static gate rejects missing artifact and accepts a static build", test_static_gate),
         ("workflow environment builds and runs production and test binaries", test_workflow_builds_and_runs_both_binaries),
         ("cgroup snapshots tolerate no matches and detect leaks", test_cgroup_snapshots_allow_no_matches_and_detect_leaks),
+        ("installer boot check uses KVM host CPU or TCG -cpu max", test_installer_boot_uses_cpu_compatible_qemu_args),
     ]
     failures = 0
     for name, test in tests:
