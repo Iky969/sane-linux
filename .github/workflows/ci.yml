@@ -33,7 +33,12 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev byacc bison shellcheck openssl
+          sudo apt-get install -y build-essential busybox-static python3 musl-tools musl-dev byacc bison shellcheck openssl cppcheck
+
+      - name: Static analysis (cppcheck)
+        run: |
+          cppcheck --enable=warning,performance,portability --check-level=exhaustive \
+            --error-exitcode=1 --std=c11 --inline-suppr ninit.c
 
       - name: Static build
         run: make
@@ -229,3 +234,20 @@ jobs:
           done
           bash scripts/spm list --root "$root"
           ( cd "$root" && sha256sum -c "$GITHUB_WORKSPACE/packages/clawrza-gcc/.META/sha256" )
+
+  ubsan-battery:
+    name: static UBSan battery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential busybox-static file
+
+      - name: Build statically linked UBSan binary
+        run: make ubsan
+
+      - name: Run UBSan suite subset
+        run: sh scripts/test-ubsan.sh

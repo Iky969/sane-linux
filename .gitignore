@@ -2,6 +2,7 @@
 /ninit
 /ninit.exe
 /ninit-test
+/ninit-ubsan
 
 # artefak Python (py_compile / harness)
 __pycache__/
