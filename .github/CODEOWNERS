@@ -1,0 +1,10 @@
+# Default owners for everything in the repository.
+* @Iky969
+
+# Core engine and package manager: maintainer review required.
+/ninit.c @Iky969
+/scripts/spm @Iky969
+/scripts/build-rootfs.sh @Iky969
+/scripts/make-image.sh @Iky969
+/scripts/sane-install.sh @Iky969
+/.github/workflows/ @Iky969

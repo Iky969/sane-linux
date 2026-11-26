@@ -46,6 +46,14 @@ $(BIN): $(SRC)
 $(TESTBIN): $(SRC)
 	$(CC) $(CFLAGS) -DNINIT_TESTING -o $@ $<
 
+# Static UBSan build. Static linking is required: the chroot-based suites copy
+# this binary into a minimal rootfs that has no sanitizer runtime libraries.
+# ASan cannot be used here for that reason; see scripts/test-ubsan.sh.
+UBSANBIN ?= ninit-ubsan
+ubsan: $(SRC)
+	$(CC) -static -O1 -g -Wall -Werror -fsanitize=undefined \
+		-fno-omit-frame-pointer -DNINIT_TESTING -o $(UBSANBIN) $<
+
 TEST_SCRIPTS := scripts/smoke-test.sh scripts/test-sigterm.sh scripts/test-config.sh \
                 scripts/test-qemu-report.sh scripts/test-spawn-failure.sh \
                 scripts/test-cgroup-limits.sh scripts/test-respawn-cleanup.sh \
@@ -94,7 +102,7 @@ fuzz test-fuzz:
 	exit $$rc
 
 clean:
-	rm -f $(BIN) $(TESTBIN)
+	rm -f $(BIN) $(TESTBIN) $(UBSANBIN)
 
 clean-distro:
 	rm -rf distro/rootfs distro/build distro/cache distro/packages distro/initramfs.cpio.gz \
@@ -170,4 +178,4 @@ test-lifecycle:
 test-installer installer-test: packages
 	sudo bash ./scripts/test-installer.sh
 
-.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint lint-shell packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-network-fault test-build-rootfs test-reliability
+.PHONY: all test test-panic fuzz rootfs qemu integration clean clean-distro lint lint-shell packages clawrza test-pkg test-spm image test-image test-image-bios test-image-uefi test-installer installer-test test-lifecycle test-accounts test-network test-network-fault test-build-rootfs test-reliability ubsan

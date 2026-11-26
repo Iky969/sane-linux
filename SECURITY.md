@@ -2,7 +2,7 @@
 
 *[English](SECURITY.md) | [Bahasa Indonesia](SECURITY.id.md)*
 
-`ninit` is an **experimental init system (PID 1)** designed for research and custom Linux distribution builds. Because it executes with full root privileges, defects at this layer can have severe system-wide impacts. This document outlines vulnerability reporting procedures, supported versions, and scope boundaries.
+`ninit` is an **experimental init system (PID 1)** designed for research and custom Linux distribution builds, shipped as part of the S.A.N.E Linux distribution (`spm`, installer, account tools, networking and reliability tooling included). Because these components execute with full root privileges, defects at this layer can have severe system-wide impacts. This document outlines vulnerability reporting procedures, supported versions, and scope boundaries.
 
 ## Supported Versions
 
@@ -40,6 +40,20 @@ This is an independent open-source project without a formal SLA. Reports are typ
 - Process management: PID leaks, zombie accumulation, unintended `execl()` argument passing, or missing child process isolation.
 - Control channels (`/run/initctl` and `/run/log.fifo`): blocking I/O stalling init, non-root access, memory leaks, or FIFO denial of service.
 - Cgroup operations (`/sys/fs/cgroup/ninit/<name>`): path traversal through service names, target cgroup corruption, or failure to cleanup leaf hierarchies.
+- `spm` package manager: archive/symlink/hardlink path containment, checksum validation, journal recovery, rollback retention, and reverse-dependency enforcement.
+- Offline installer (`sane-install.sh`): block-device target validation, mount/partition safety, signal cleanup during destructive steps, and initramfs/bootloader payload integrity.
+- Accounts: `sane-accounts`, `sane-firstboot`, `sane-account-recovery` and `doas.conf` parsing, password-lock preservation, duplicate-identity checks, and privilege-grant policy.
+- Networking (`sane-net`, DHCP, Wi-Fi, outbound TLS via curl): configuration parsing, certificate/hostname validation, and credential handling.
+- Reliability: snapshot/rollback journal parsing, staged-upgrade recovery, backup retention, and fail-closed behavior after a failed restore.
+
+### Deferred (frozen): signed SPM packages
+
+Cryptographic signatures for SPM archives are **frozen**, pending a key-custody
+and trust-distribution decision. Current archives carry a SHA-256 checksum
+inside the same archive: that detects corruption, **not** authenticity. Do not
+describe package installation as authenticated. Until a scheme (for example
+minisign/ed25519) is chosen and documented, signature-related reports are
+design discussions rather than vulnerabilities in a shipped control.
 
 **Out-of-Scope**:
 

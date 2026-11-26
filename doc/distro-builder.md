@@ -2,6 +2,10 @@
 
 *[English](distro-builder.md) | [Bahasa Indonesia](id/distro-builder.md)*
 
+> **Scope:** this document covers the rootfs + direct `-kernel`/`-initrd` QEMU
+> boot stage. For the persistent GPT image, Limine dual-boot and installer
+> pipeline, see [distro-image-builder.md](distro-image-builder.md).
+
 This milestone demonstrates that `ninit` operates as a real **PID 1 inside a complete system**, rather than merely inside a `chroot` or container namespace: a rootfs is built from scratch, packaged into an initramfs, and booted by QEMU with a serial console.
 
 ```bash

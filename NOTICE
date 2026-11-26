@@ -1,0 +1,13 @@
+S.A.N.E Linux — Third-Party Notices
+===================================
+
+The MIT license for this project is in LICENSE.
+
+Distributed images bundle third-party binaries (BusyBox, Linux kernel,
+LibreSSL, curl, wpa_supplicant, musl, doas, Limine, ca-certificates and
+disk-tools). Their licenses, versions and upstream source locations are
+listed in THIRD_PARTY_LICENSES.md, which is part of this distribution.
+
+Redistributors must keep LICENSE and THIRD_PARTY_LICENSES.md with the image
+and comply with the upstream license terms, including source offers where
+required by GPL components.

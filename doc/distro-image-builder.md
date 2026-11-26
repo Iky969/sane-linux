@@ -2,6 +2,10 @@
 
 *[English](distro-image-builder.md)*
 
+> **Scope:** this document covers the persistent raw GPT image, Limine
+> BIOS/UEFI boot and offline installer. For the earlier rootfs assembly and
+> direct `-kernel`/`-initrd` QEMU stage, see [distro-builder.md](distro-builder.md).
+
 This document specifies the technical architecture, storage layout, bootloader configuration, and automated headless verification for the S.A.N.E Linux raw GPT disk image (`sane.img`), constructed via `scripts/make-image.sh` and verified via `scripts/test-image-boot.sh`.
 
 ---
