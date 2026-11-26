@@ -32,7 +32,7 @@ For a high-level overview, quick start guide, and configuration examples, see th
 - **Cgroups v2**: each service is placed into a leaf cgroup at `/sys/fs/cgroup/ninit/<name>` with limits on `memory.max`, `memory.swap.max=0`, `cpu.max`, and `pids.max` enforced by the kernel (fail-open fallback when cgroups are unavailable).
 - **`/etc/fstab`**: mounts filesystems with flags and data options (`size=`, `mode=`, `uid=`, ...) forwarded to `mount()`.
 - **Dual Logging**: outputs to `/dev/kmsg`, console (stderr), `/var/log/ninit.log`, plus a `/run/log.fifo` path capturing service output with a `[service]` prefix.
-- **IPC (`/run/initctl`)**: line-by-line reading of `poweroff`, `reboot`, `force-poweroff`, and `force-reboot` commands.
+- **IPC (`/run/initctl`)**: line-by-line reading of `poweroff`, `reboot`, `force-poweroff`, `force-reboot`, `stop`, `start`, `restart`, and `status` commands (multi-line writes no longer drop commands).
 - **Static Binary**: compiles cleanly with `gcc -static` with zero compiler warnings under `-Wall -Werror`.
 
 ## Repository Structure
@@ -60,6 +60,9 @@ scripts/build-rootfs.sh       Assembles minimal distro rootfs (static BusyBox + 
 scripts/run-qemu.sh           Boots rootfs in QEMU: serial console & milestone verification
 scripts/build-package.sh      Deterministic package builder CLI for .spm.tar.xz containers
 scripts/spm                   Standalone S.A.N.E Package Manager CLI
+scripts/sane-install.sh       Offline live installer (GPT, Limine BIOS + UEFI)
+scripts/sane-firstboot        First-boot root/sane password setup on the console
+scripts/sane-accounts         Account lifecycle CLI (create/delete/password/lock)
 scripts/lint-log-patterns.py  Linter for log strings, assertions, and legacy markers
 scripts/verify-format-strings.py Linter for printf format specifier safety (-Wformat=2)
 distro/                       Distro builder output directory (rootfs/, cache/, initramfs) - gitignored
