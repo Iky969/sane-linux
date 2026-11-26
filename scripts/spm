@@ -128,6 +128,7 @@ CURRENT_STAGING_DIR=""
 CURRENT_PKG_NAME=""
 IN_TRANSACTION=false
 CLEANUP_DONE=false
+ROLLBACK_INCOMPLETE=false
 
 atomic_restore_path() {
     local src="$1"
@@ -142,11 +143,17 @@ atomic_restore_path() {
     return 1
 }
 
+rollback_fail() {
+    warn "rollback restore failed for $1"
+    ROLLBACK_INCOMPLETE=true
+}
+
 do_rollback() {
     local staging_dir="${1:-$CURRENT_STAGING_DIR}"
     local pkg="${2:-$CURRENT_PKG_NAME}"
     [ -n "$staging_dir" ] && [ -d "$staging_dir" ] || return 0
 
+    ROLLBACK_INCOMPLETE=false
     trap '' INT TERM
 
     local rjournal="$staging_dir/.journal"
@@ -162,15 +169,25 @@ do_rollback() {
         done
     fi
 
-    # Restore replaced and obsolete files from backup
+    # Restore replaced and obsolete files from backup. Iterate from a file,
+    # not a pipeline, so a restore failure remains visible to this process.
     if [ -d "$rbackup" ]; then
-        find -H "$rbackup" \( -type f -o -type l \) | while IFS= read -r bfile || [ -n "$bfile" ]; do
-            [ -n "$bfile" ] || continue
-            local brel="${bfile#$rbackup/}"
-            local rdst="${TARGET_ROOT}/$brel"
-            mkdir -p "$(dirname "$rdst")"
-            mv -fT "$bfile" "$rdst" 2>/dev/null || true
-        done
+        local restore_list="$rjournal/.restore-list.$$"
+        if ! : > "$restore_list" || \
+           ! find -H "$rbackup" \( -type f -o -type l \) > "$restore_list" 2>/dev/null; then
+            rollback_fail "cannot enumerate backup files"
+        else
+            while IFS= read -r bfile || [ -n "$bfile" ]; do
+                [ -n "$bfile" ] || continue
+                local brel="${bfile#$rbackup/}"
+                local rdst="${TARGET_ROOT}/$brel"
+                if ! mkdir -p "$(dirname "$rdst")" 2>/dev/null || \
+                   ! mv -fT "$bfile" "$rdst" 2>/dev/null; then
+                    rollback_fail "$brel"
+                fi
+            done < "$restore_list"
+        fi
+        rm -f "$restore_list"
     fi
 
     # Clean up empty directories from manifest in reverse depth order
@@ -191,7 +208,12 @@ do_rollback() {
             rm -rf "$tmp_inst"
             if cp -a "$rjournal/installed_pkg" "$tmp_inst" 2>/dev/null; then
                 rm -rf "${INSTALLED_DIR:?}/${pkg:?}"
-                mv -fT "$tmp_inst" "$INSTALLED_DIR/$pkg" 2>/dev/null || rm -rf "$tmp_inst"
+                if ! mv -fT "$tmp_inst" "$INSTALLED_DIR/$pkg" 2>/dev/null; then
+                    rm -rf "$tmp_inst"
+                    rollback_fail "installed/$pkg"
+                fi
+            else
+                rollback_fail "installed/$pkg snapshot"
             fi
         elif [ -f "$rjournal/no_installed_pkg" ]; then
             rm -rf "${INSTALLED_DIR:?}/${pkg:?}" 2>/dev/null || true
@@ -199,13 +221,13 @@ do_rollback() {
     fi
 
     if [ -f "$rjournal/providers" ]; then
-        atomic_restore_path "$rjournal/providers" "$PROVIDERS_FILE" || true
+        atomic_restore_path "$rjournal/providers" "$PROVIDERS_FILE" || rollback_fail "providers"
     elif [ -f "$rjournal/no_providers" ]; then
         rm -f "$PROVIDERS_FILE" 2>/dev/null || true
     fi
 
     if [ -f "$rjournal/world" ]; then
-        atomic_restore_path "$rjournal/world" "$WORLD_FILE" || true
+        atomic_restore_path "$rjournal/world" "$WORLD_FILE" || rollback_fail "world"
     elif [ -f "$rjournal/no_world" ]; then
         rm -f "$WORLD_FILE" 2>/dev/null || true
     fi
@@ -215,11 +237,22 @@ do_rollback() {
         rm -rf "$tmp_rdeps"
         if cp -a "$rjournal/rdeps" "$tmp_rdeps" 2>/dev/null; then
             rm -rf "$RDEPS_DIR"
-            mv -fT "$tmp_rdeps" "$RDEPS_DIR" 2>/dev/null || rm -rf "$tmp_rdeps"
+            if ! mv -fT "$tmp_rdeps" "$RDEPS_DIR" 2>/dev/null; then
+                rm -rf "$tmp_rdeps"
+                rollback_fail "rdeps"
+            fi
+        else
+            rollback_fail "rdeps snapshot"
         fi
     elif [ -f "$rjournal/no_rdeps" ]; then
         rm -rf "$RDEPS_DIR" 2>/dev/null || true
     fi
+
+    if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+        warn "rollback incomplete; journal preserved at $staging_dir for manual recovery"
+        return 1
+    fi
+    return 0
 }
 
 cleanup_all() {
@@ -230,10 +263,14 @@ cleanup_all() {
     [ -z "$VALIDATE_SOURCE_TMP" ] || { rm -f "$VALIDATE_SOURCE_TMP"; VALIDATE_SOURCE_TMP=""; }
     if [ "${IN_TRANSACTION:-false}" = true ]; then
         IN_TRANSACTION=false
-        do_rollback "${CURRENT_STAGING_DIR:-}" "${CURRENT_PKG_NAME:-}"
+        do_rollback "${CURRENT_STAGING_DIR:-}" "${CURRENT_PKG_NAME:-}" || true
     fi
 
-    if [ -n "${CURRENT_STAGING_DIR:-}" ] && [ -d "$CURRENT_STAGING_DIR" ]; then
+    # An incomplete rollback leaves the only known-good recovery copy in the
+    # staging directory; deleting it would turn a recoverable fault into loss.
+    if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+        warn "staging and journal retained after incomplete rollback: ${CURRENT_STAGING_DIR:-unknown}"
+    elif [ -n "${CURRENT_STAGING_DIR:-}" ] && [ -d "$CURRENT_STAGING_DIR" ]; then
         rm -rf "$CURRENT_STAGING_DIR" 2>/dev/null || true
     fi
     release_lock
@@ -310,10 +347,15 @@ recover_interrupted_journals() {
             fi
 
             trap '' INT TERM
-            do_rollback "$staging_dir" "$pkg_name"
-            rm -rf "$staging_dir"
+            ROLLBACK_INCOMPLETE=false
+            do_rollback "$staging_dir" "$pkg_name" || true
+            if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+                warn "Interrupted transaction still needs recovery; journal preserved at $staging_dir"
+            else
+                rm -rf "$staging_dir"
+                warn "Interrupted transaction recovered: rolled back $pkg_name and cleaned $staging_dir"
+            fi
             trap on_signal INT TERM
-            warn "Interrupted transaction recovered: rolled back $pkg_name and cleaned $staging_dir"
         else
             # Interrupted pre-journal staging (Step 4 / .journal.prep) or post-commit cleanup
             rm -rf "$staging_dir"

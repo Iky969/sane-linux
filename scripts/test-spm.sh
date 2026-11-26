@@ -3307,6 +3307,88 @@ PY
 }
 
 # -----------------------------------------------------------------------------
+# Scenario 33: failed rollback must retain its recovery journal and backups
+# -----------------------------------------------------------------------------
+test_rollback_failure_preserves_journal() {
+    local tdir="$TEST_TMP/scenario33_rollback_fail"
+    local root="$tdir/root"
+    local bin="$tdir/bin"
+    mkdir -p "$root" "$bin"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 33" "init failed"; return; }
+
+    python_pkg_helper create_valid "$tdir/v1.spm.tar.xz" "rb-fail-test" "1.0.0" "false" \
+        "Rollback failure test v1" "usr/bin/tool:v1-content"
+    "$SPM_BIN" install "$tdir/v1.spm.tar.xz" --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 33" "Initial install failed"; return; }
+
+    python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "rb-fail-test" "2.0.0" "false" \
+        "Rollback failure test v2" "usr/bin/tool:v2-content"
+
+    local real_mv
+    real_mv="$(command -v mv)"
+    cat > "$bin/mv" <<'SHIM'
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        */.journal/backup/*)
+            marker="${SPM_RESTORE_MARKER:-}"
+            if [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+                touch "$marker.done" 2>/dev/null || :
+                echo "injected restore failure" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+    "$SPM_ROOT"/var/lib/spm/staging/*) ;;
+    "$SPM_ROOT"/*)
+        marker="${SPM_COMMIT_MARKER:-}"
+        if [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+            touch "$marker.done" 2>/dev/null || :
+            echo "injected commit failure" >&2
+            exit 1
+        fi
+        ;;
+esac
+exec "$SPM_REAL_MV" "$@"
+SHIM
+    chmod +x "$bin/mv"
+
+    local output rc
+    set +e
+    output=$(PATH="$bin:$PATH" SPM_ROOT="$root" SPM_REAL_MV="$real_mv" \
+        SPM_COMMIT_MARKER="$tdir/commit" SPM_RESTORE_MARKER="$tdir/restore" \
+        "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" 2>&1)
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 0 ]; then
+        test_fail "Scenario 33" "Upgrade unexpectedly succeeded after injected failures"
+        return
+    fi
+    if [ ! -f "$tdir/commit.done" ] || [ ! -f "$tdir/restore.done" ]; then
+        test_fail "Scenario 33" "Fault injection did not fire both failure points (commit=$([ -f "$tdir/commit.done" ] && echo yes || echo no), restore=$([ -f "$tdir/restore.done" ] && echo yes || echo no))"
+        return
+    fi
+    if ! printf '%s\n' "$output" | grep -q 'journal preserved'; then
+        test_fail "Scenario 33" "Rollback did not report that the journal was preserved"
+        return
+    fi
+
+    local staging
+    staging=$(find "$root/var/lib/spm/staging" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed -n 1p)
+    if [ -z "$staging" ] || [ ! -d "$staging/.journal/backup" ]; then
+        test_fail "Scenario 33" "Incomplete rollback discarded its journal or backups"
+        return
+    fi
+    test_pass "Scenario 33: incomplete rollback reports failure and preserves journal/backups"
+}
+
+# -----------------------------------------------------------------------------
 # Main Runner
 # -----------------------------------------------------------------------------
 main() {
@@ -3345,6 +3427,7 @@ main() {
     test_power_cut_journal_recovery
     test_invalid_metadata_rejection
     test_failed_upgrade_rollback
+    test_rollback_failure_preserves_journal
     test_sigkill_interrupted_install_recovery
     test_uninstall_with_shared_file
     test_concurrent_installs
