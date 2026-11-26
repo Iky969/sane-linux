@@ -160,13 +160,22 @@ do_rollback() {
     local rbackup="$rjournal/backup"
     local rcreated="$rjournal/created"
 
-    # Remove newly created files in reverse order
+    # Remove newly created files in reverse order, in the parent shell so
+    # removal failures are recorded instead of lost in a pipeline.
     if [ -s "$rcreated" ]; then
-        awk '{a[NR]=$0} END {for (i=NR; i>=1; i--) print a[i]}' "$rcreated" | while IFS= read -r cfile || [ -n "$cfile" ]; do
-            [ -n "$cfile" ] || continue
-            rm -f -- "$cfile" 2>/dev/null || true
-            rmdir "$(dirname "$cfile")" 2>/dev/null || true
-        done
+        local created_list="$rjournal/.created-list.$$"
+        if ! awk '{a[NR]=$0} END {for (i=NR; i>=1; i--) print a[i]}' "$rcreated" > "$created_list" 2>/dev/null; then
+            rollback_fail "cannot enumerate created paths"
+        else
+            while IFS= read -r cfile || [ -n "$cfile" ]; do
+                [ -n "$cfile" ] || continue
+                if ! rm -f -- "$cfile" 2>/dev/null; then
+                    rollback_fail "created path $cfile"
+                fi
+                rmdir "$(dirname "$cfile")" 2>/dev/null || true
+            done < "$created_list"
+        fi
+        rm -f "$created_list"
     fi
 
     # Restore replaced and obsolete files from backup. Iterate from a file,
@@ -216,20 +225,26 @@ do_rollback() {
                 rollback_fail "installed/$pkg snapshot"
             fi
         elif [ -f "$rjournal/no_installed_pkg" ]; then
-            rm -rf "${INSTALLED_DIR:?}/${pkg:?}" 2>/dev/null || true
+            if ! rm -rf "${INSTALLED_DIR:?}/${pkg:?}" 2>/dev/null; then
+                rollback_fail "installed/$pkg removal"
+            fi
         fi
     fi
 
     if [ -f "$rjournal/providers" ]; then
         atomic_restore_path "$rjournal/providers" "$PROVIDERS_FILE" || rollback_fail "providers"
     elif [ -f "$rjournal/no_providers" ]; then
-        rm -f "$PROVIDERS_FILE" 2>/dev/null || true
+        if ! rm -f "$PROVIDERS_FILE" 2>/dev/null; then
+            rollback_fail "providers removal"
+        fi
     fi
 
     if [ -f "$rjournal/world" ]; then
         atomic_restore_path "$rjournal/world" "$WORLD_FILE" || rollback_fail "world"
     elif [ -f "$rjournal/no_world" ]; then
-        rm -f "$WORLD_FILE" 2>/dev/null || true
+        if ! rm -f "$WORLD_FILE" 2>/dev/null; then
+            rollback_fail "world removal"
+        fi
     fi
 
     if [ -d "$rjournal/rdeps" ]; then
@@ -245,10 +260,13 @@ do_rollback() {
             rollback_fail "rdeps snapshot"
         fi
     elif [ -f "$rjournal/no_rdeps" ]; then
-        rm -rf "$RDEPS_DIR" 2>/dev/null || true
+        if ! rm -rf "$RDEPS_DIR" 2>/dev/null; then
+            rollback_fail "rdeps removal"
+        fi
     fi
 
     if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+        : > "$staging_dir/.rollback-incomplete"
         warn "rollback incomplete; journal preserved at $staging_dir for manual recovery"
         return 1
     fi
@@ -331,6 +349,11 @@ recover_interrupted_journals() {
     [ -d "$STAGING_BASE" ] || return 0
     for staging_dir in "$STAGING_BASE"/tx-*; do
         [ -d "$staging_dir" ] || continue
+
+        if [ -f "$staging_dir/.rollback-incomplete" ]; then
+            trap on_signal INT TERM
+            die "incomplete rollback journal preserved at $staging_dir; manual recovery required"
+        fi
 
         if [ -d "$staging_dir/.journal" ] && [ ! -e "$staging_dir/.committed" ]; then
             local pkg_name=""

@@ -436,6 +436,21 @@ printf 'permit :wheel cmd /bin/false\npermit :wheel\n' > "$T/etc/doas.conf"
 expect_ok "validate accepts mixed restricted and unrestricted wheel permits" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
 
+base
+printf 'permit :wheel\ndeny :sane\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a later deny of the daily user's group" \
+	"no effective permit rule" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit :wheel\ndeny :wheel\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a later deny of the wheel group" \
+	"no effective permit rule" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+base
+printf 'permit :wheel\ndeny 1000\n' > "$T/etc/doas.conf"
+expect_fail_msg "validate rejects a later numeric deny of the daily user" \
+	"no effective permit rule" sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
 if [ "$(id -u)" -eq 0 ]; then
 	base
 	chown 1000:1000 "$T/etc/doas.conf"
@@ -695,6 +710,30 @@ check "recover repairs doas.conf mode to 600" \
 	test "$(stat -c %a "$T/etc/doas.conf")" = 600
 expect_ok "validate passes after the merge recover" \
 	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+
+# A restricted policy without a trailing newline must still gain an independent
+# unrestricted rule; appending directly would merge the two lines.
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf 'permit :wheel cmd /bin/false' > "$T/etc/doas.conf"
+expect_ok "recover succeeds when restricted doas policy lacks a final newline" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+expect_ok "validate passes after newline-safe recovery" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS validate
+check "recovery keeps the restricted rule on its own line" \
+	grep -qxF 'permit :wheel cmd /bin/false' "$T/etc/doas.conf"
+check "recovery appends an independent unrestricted wheel rule" \
+	grep -qxF 'permit persist :wheel' "$T/etc/doas.conf"
+
+base_firstboot
+set_pw root 'LifecyclePass1!'
+set_pw sane 'LifecyclePass2!'
+printf '# custom note' > "$T/etc/doas.conf"
+expect_ok "recover succeeds when a comment lacks a final newline" \
+	sh "$ACCOUNTS" --root "$T" $VFLAGS recover
+check "comment-only recovery yields an independent wheel rule" \
+	grep -qxF 'permit persist :wheel' "$T/etc/doas.conf"
 
 # B: a policy-violating doas.conf must still be replaced by the baseline.
 base_firstboot

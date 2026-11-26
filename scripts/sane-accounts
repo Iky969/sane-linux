@@ -928,7 +928,8 @@ doas_audit_awk() {
 				wheel_cmd = ""
 			}
 		} else {
-			if ((c_ident == ":wheel" || c_ident == "sane") && (c_target == "" || c_target == "root" || c_target == "0")) {
+			if ((c_ident == ":wheel" || c_ident == "sane" || c_ident == ":sane" || \
+		     c_ident == "1000") && (c_target == "" || c_target == "root" || c_target == "0")) {
 				if (!c_has_cmd) {
 					effective_wheel = 0
 					wheel_cmd = ""
@@ -1393,7 +1394,9 @@ cmd_recover() {
 		TMP_1=$(mktemp "$ETC/.sane-accounts.XXXXXX") || die "cannot create temp file in $ETC"
 		chmod 0600 "$TMP_1"
 		[ "$(id -u)" = 0 ] && chown 0:0 "$TMP_1" 2>/dev/null || true
-		if ! cp "$DOAS_CONF" "$TMP_1" || ! printf 'permit persist :wheel\n' >> "$TMP_1" || \
+		if ! cp "$DOAS_CONF" "$TMP_1" || \
+		   ! printf '\npermit persist :wheel\n' >> "$TMP_1" || \
+		   ! doas_policy_ok "$TMP_1" || \
 		   ! atomic_mv_replace "$TMP_1" "$DOAS_CONF"; then
 			rm -f "$TMP_1"
 			die "failed to add unrestricted wheel rule to doas.conf"

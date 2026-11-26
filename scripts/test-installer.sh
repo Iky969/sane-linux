@@ -244,15 +244,30 @@ if [ "$banner_seen" -ne 1 ]; then
     die "Signal guard: installer did not reach its cancellation trap"
 fi
 
-kill -TERM "$SIG_PID" 2>/dev/null || true
+term_sent=0
+if kill -TERM "$SIG_PID" 2>/dev/null; then
+    term_sent=1
+fi
+exited=0
 for _ in $(seq 1 100); do
-    kill -0 "$SIG_PID" 2>/dev/null || break
+    if ! kill -0 "$SIG_PID" 2>/dev/null; then
+        exited=1
+        break
+    fi
     sleep 0.1
 done
-if kill -0 "$SIG_PID" 2>/dev/null; then
+if [ "$term_sent" -ne 1 ] || [ "$exited" -ne 1 ]; then
     kill -KILL "$SIG_PID" 2>/dev/null || true
+    wait "$SIG_PID" 2>/dev/null || true
+    die "Signal guard: TERM was not delivered or installer did not exit promptly"
 fi
-wait "$SIG_PID" 2>/dev/null || true
+set +e
+wait "$SIG_PID"
+sig_rc=$?
+set -e
+if [ "$sig_rc" -ne 130 ]; then
+    die "Signal guard: installer exited $sig_rc after TERM (expected 130)"
+fi
 
 partition_created=0
 for _ in $(seq 1 20); do

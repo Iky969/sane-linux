@@ -3385,7 +3385,114 @@ SHIM
         test_fail "Scenario 33" "Incomplete rollback discarded its journal or backups"
         return
     fi
-    test_pass "Scenario 33: incomplete rollback reports failure and preserves journal/backups"
+    if [ ! -f "$staging/.rollback-incomplete" ]; then
+        test_fail "Scenario 33" "Incomplete rollback did not mark the journal as incomplete"
+        return
+    fi
+
+    python_pkg_helper create_valid "$tdir/v3.spm.tar.xz" "rb-fail-test2" "1.0.0" "false" \
+        "Rollback incomplete blocks mutations" "usr/bin/tool2:blocked-content"
+    set +e
+    output=$(PATH="$bin:$PATH" SPM_ROOT="$root" SPM_REAL_MV="$real_mv" \
+        "$SPM_BIN" install "$tdir/v3.spm.tar.xz" --root "$root" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        test_fail "Scenario 33" "A new transaction proceeded while the rollback journal was incomplete"
+        return
+    fi
+    if ! printf '%s\n' "$output" | grep -q 'incomplete rollback journal'; then
+        test_fail "Scenario 33" "Second operation did not explain the incomplete rollback journal"
+        return
+    fi
+    if [ -e "$root/usr/bin/tool2" ] || [ -d "$root/var/lib/spm/installed/rb-fail-test2" ]; then
+        test_fail "Scenario 33" "Blocked transaction wrote payload or database state"
+        return
+    fi
+    test_pass "Scenario 33: incomplete rollback reports failure, preserves journal/backups, and blocks further mutations"
+}
+
+# -----------------------------------------------------------------------------
+# Scenario 34: failure to remove created payload must retain the journal
+# -----------------------------------------------------------------------------
+test_rollback_created_removal_failure() {
+    local tdir="$TEST_TMP/scenario34_created_rm_fail"
+    local root="$tdir/root"
+    local bin="$tdir/bin"
+    mkdir -p "$root" "$bin"
+    "$SPM_BIN" init --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 34" "init failed"; return; }
+
+    python_pkg_helper create_valid "$tdir/v1.spm.tar.xz" "rb-rm-test" "1.0.0" "false" \
+        "Created-file rollback test v1" "usr/bin/base:v1-content"
+    "$SPM_BIN" install "$tdir/v1.spm.tar.xz" --root "$root" >/dev/null 2>&1 \
+        || { test_fail "Scenario 34" "Initial install failed"; return; }
+
+    python_pkg_helper create_valid "$tdir/v2.spm.tar.xz" "rb-rm-test" "2.0.0" "false" \
+        "Created-file rollback test v2" "usr/bin/new:v2-content" "usr/bin/base:v2-content"
+
+    local real_mv real_rm
+    real_mv="$(command -v mv)"
+    real_rm="$(command -v rm)"
+    cat > "$bin/mv" <<'SHIM'
+#!/bin/sh
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+    "$SPM_ROOT"/var/lib/spm/staging/*) ;;
+    "$SPM_ROOT"/var/lib/spm/*)
+        marker="${SPM_COMMIT_MARKER:-}"
+        if [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+            touch "$marker.done" 2>/dev/null || :
+            echo "injected commit failure" >&2
+            exit 1
+        fi
+        ;;
+esac
+exec "$SPM_REAL_MV" "$@"
+SHIM
+    cat > "$bin/rm" <<'SHIM'
+#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "$SPM_ROOT/usr/bin/new" ]; then
+        marker="${SPM_RM_MARKER:-}"
+        if [ -n "$marker" ] && [ ! -f "$marker.done" ]; then
+            touch "$marker.done" 2>/dev/null || :
+            echo "injected created-file removal failure" >&2
+            exit 1
+        fi
+    fi
+done
+exec "$SPM_REAL_RM" "$@"
+SHIM
+    chmod +x "$bin/mv" "$bin/rm"
+
+    local output rc
+    set +e
+    output=$(PATH="$bin:$PATH" SPM_ROOT="$root" SPM_REAL_MV="$real_mv" SPM_REAL_RM="$real_rm" \
+        SPM_COMMIT_MARKER="$tdir/commit" SPM_RM_MARKER="$tdir/rm" \
+        "$SPM_BIN" install "$tdir/v2.spm.tar.xz" --root "$root" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        test_fail "Scenario 34" "Upgrade unexpectedly succeeded after injected failures"
+        return
+    fi
+    if [ ! -f "$tdir/commit.done" ] || [ ! -f "$tdir/rm.done" ]; then
+        test_fail "Scenario 34" "Fault injection did not fire both failure points (commit=$([ -f "$tdir/commit.done" ] && echo yes || echo no), rm=$([ -f "$tdir/rm.done" ] && echo yes || echo no))"
+        return
+    fi
+    if ! printf '%s\n' "$output" | grep -q 'rollback restore failed for'; then
+        test_fail "Scenario 34" "Created-file removal failure was not reported"
+        return
+    fi
+    local staging
+    staging=$(find "$root/var/lib/spm/staging" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed -n 1p)
+    if [ -z "$staging" ] || [ ! -d "$staging/.journal/backup" ]; then
+        test_fail "Scenario 34" "Journal was discarded after created-file removal failure"
+        return
+    fi
+    test_pass "Scenario 34: failed created-file removal is reported and journal is retained"
 }
 
 # -----------------------------------------------------------------------------
@@ -3428,6 +3535,7 @@ main() {
     test_invalid_metadata_rejection
     test_failed_upgrade_rollback
     test_rollback_failure_preserves_journal
+    test_rollback_created_removal_failure
     test_sigkill_interrupted_install_recovery
     test_uninstall_with_shared_file
     test_concurrent_installs
