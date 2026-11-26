@@ -318,7 +318,7 @@ truncate -s "${SIZE_MB}M" "$OUTPUT_FILE"
 # Layout:
 # - Partition 3: BIOS Boot Partition (type ef02) in sectors 34..2047 (for Limine BIOS stage 2 embedding)
 # - Partition 1: 64MB FAT32 EFI System Partition (type ef00, label SANE_BOOT) at sector 2048
-# - Partition 2: Remainder ext4 Rootfs (type 8300, label sane_root, PARTUUID=44444444-4444-4444-8888-888888888888)
+# - Partition 2: Remainder ext4 Rootfs (type 8300, label sane_root, PARTUUID=$PARTUUID)
 log "Step 2/8: Partitioning image with GUID Partition Table (GPT)..."
 sgdisk -Z "$OUTPUT_FILE" >/dev/null
 sgdisk -o "$OUTPUT_FILE" >/dev/null
@@ -329,8 +329,8 @@ sgdisk -a 1 -n 3:34:2047 -t 3:ef02 -c 3:bios_boot "$OUTPUT_FILE" >/dev/null
 # Partition 1: 64MB ESP / Boot
 sgdisk -a 2048 -n 1:2048:+64M -t 1:ef00 -c 1:SANE_BOOT "$OUTPUT_FILE" >/dev/null
 
-# Partition 2: 448MB ext4 Rootfs
-sgdisk -n 2:0:0 -t 2:8300 -c 2:sane_root -u 2:44444444-4444-4444-8888-888888888888 "$OUTPUT_FILE" >/dev/null
+# Partition 2: ext4 Rootfs with configured PARTUUID
+sgdisk -n 2:0:0 -t 2:8300 -c 2:sane_root -u "2:$PARTUUID" "$OUTPUT_FILE" >/dev/null
 
 # Step 3: Attach loop device
 log "Step 3/8: Attaching loop device with partition scanning..."
@@ -360,16 +360,114 @@ $SUDO mount "${LOOP_DEV}p1" "$MNT_DIR/boot"
 log "Step 6/8: Installing S.A.N.E base packages via SPM..."
 $SUDO bash "${REPO_ROOT}/scripts/spm" --root "$MNT_DIR/root" init >/dev/null
 
-declare -A installed_pkgs
-for pkg in "$PACKAGES_DIR"/*.spm.tar.xz; do
-    [ -f "$pkg" ] || continue
-    pkg_name=$(basename "$pkg" | sed -E 's/-[0-9]+(\.[0-9]+)*.*//')
-    if [ -z "${installed_pkgs[$pkg_name]:-}" ]; then
-        installed_pkgs[$pkg_name]=1
-        info "Installing package: $(basename "$pkg")"
-        $SUDO bash "${REPO_ROOT}/scripts/spm" --root "$MNT_DIR/root" install "$pkg" >/dev/null
+resolve_package_install_order() {
+    local pkg_dir="$1"
+    local meta_list
+    meta_list="$(mktemp /tmp/sane-pkg-meta.XXXXXX)"
+    declare -A seen_pkgs
+
+    for pkg in "$pkg_dir"/*.spm.tar.xz; do
+        [ -f "$pkg" ] || continue
+        local pkg_manifest pkg_name pkg_deps
+        pkg_manifest=$(tar -xJOf "$pkg" ./.META/package 2>/dev/null || tar -xJOf "$pkg" .META/package 2>/dev/null || true)
+        pkg_name=$(printf '%s\n' "$pkg_manifest" | grep -E '^[[:space:]]*name=' | head -n1 | cut -d= -f2- | tr -d '\r\n' || true)
+        if [ -z "$pkg_name" ]; then
+            pkg_name=$(basename "$pkg" | sed -E 's/-[0-9]+(\.[0-9]+)*.*//')
+        fi
+        if [ -n "${seen_pkgs[$pkg_name]:-}" ]; then
+            continue
+        fi
+        seen_pkgs[$pkg_name]=1
+
+        pkg_deps=$(tar -xJOf "$pkg" ./.META/depends 2>/dev/null || tar -xJOf "$pkg" .META/depends 2>/dev/null || true)
+        pkg_deps=$(printf '%s\n' "$pkg_deps" | tr ',\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+        if [ -z "$pkg_deps" ]; then
+            pkg_deps=$(printf '%s\n' "$pkg_manifest" | grep -E '^[[:space:]]*dependencies=' | head -n1 | cut -d= -f2- | tr ',\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' || true)
+        fi
+        printf '%s|%s|%s\n' "$pkg_name" "$pkg" "$pkg_deps" >> "$meta_list"
+    done
+
+    local sort_out rc=0
+    sort_out=$(LC_ALL=C sort "$meta_list" | awk -F'|' '
+        BEGIN { n = 0 }
+        {
+            name = $1; path = $2; deps_str = $3
+            n++
+            pkgs[n] = name
+            paths[name] = path
+            present[name] = 1
+            dc = split(deps_str, darr, /[[:space:]]+/)
+            dep_cnt[name] = 0
+            for (i = 1; i <= dc; i++) {
+                if (darr[i] != "") {
+                    dep_cnt[name]++
+                    dep[name, dep_cnt[name]] = darr[i]
+                }
+            }
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                p = pkgs[i]
+                for (j = 1; j <= dep_cnt[p]; j++) {
+                    d = dep[p, j]
+                    if (!(d in present)) {
+                        printf "ERR|missing dependency %s required by %s\n", d, p
+                        exit 2
+                    }
+                }
+            }
+            emitted = 0
+            while (emitted < n) {
+                progressed = 0
+                for (i = 1; i <= n; i++) {
+                    p = pkgs[i]
+                    if (done[p]) continue
+                    ready = 1
+                    for (j = 1; j <= dep_cnt[p]; j++) {
+                        d = dep[p, j]
+                        if (!done[d]) { ready = 0; break }
+                    }
+                    if (ready) {
+                        done[p] = 1
+                        emitted++
+                        order[emitted] = paths[p]
+                        progressed = 1
+                        break
+                    }
+                }
+                if (!progressed) {
+                    cyc = ""
+                    for (i = 1; i <= n; i++) {
+                        if (!done[pkgs[i]]) {
+                            cyc = (cyc == "" ? pkgs[i] : cyc ", " pkgs[i])
+                        }
+                    }
+                    printf "ERR|dependency cycle among: %s\n", cyc
+                    exit 3
+                }
+            }
+            for (i = 1; i <= emitted; i++) {
+                print order[i]
+            }
+        }
+    ') || rc=$?
+    rm -f "$meta_list"
+    if [ "$rc" -ne 0 ]; then
+        local err_msg
+        err_msg=$(printf '%s\n' "$sort_out" | grep '^ERR|' | head -n1 | cut -d'|' -f2- || true)
+        die "Package dependency resolution failed: ${err_msg:-exit $rc}"
     fi
-done
+    printf '%s\n' "$sort_out"
+}
+
+PKG_INSTALL_ORDER=$(resolve_package_install_order "$PACKAGES_DIR")
+while IFS= read -r pkg; do
+    [ -n "$pkg" ] || continue
+    info "Installing package: $(basename "$pkg")"
+    $SUDO bash "${REPO_ROOT}/scripts/spm" --root "$MNT_DIR/root" install "$pkg" >/dev/null
+done <<EOF
+$PKG_INSTALL_ORDER
+EOF
 
 # Install kernel modules to rootfs /lib/modules
 if [ -d "$ROOTFS/lib/modules" ]; then
@@ -396,10 +494,11 @@ $SUDO chmod 1777 "$MNT_DIR/root/tmp"
 
 # Configure /etc/fstab
 log "Configuring /etc/fstab and /etc/init.conf..."
-cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/fstab" >/dev/null
+cat <<EOF | $SUDO tee "$MNT_DIR/root/etc/fstab" >/dev/null
 # /etc/fstab: S.A.N.E Linux filesystem table
-/dev/vda2 / ext4 remount,rw,relatime 0 1
-/dev/vda1 /boot vfat rw 0 2
+# Rootfs (PARTUUID=$PARTUUID) is mounted rw by initramfs before switch_root.
+# Do not add an active '/' entry here: ninit mounts pseudo-filesystems
+# automatically and mount_fstab() detaches recorded entries on shutdown.
 EOF
 
 # Install the reliability toolkit used by the reliability boot service.
@@ -409,10 +508,10 @@ $SUDO install -m 0755 "$REPO_ROOT/scripts/sane-reliability" "$MNT_DIR/root/usr/b
 # Configure /etc/init.conf
 cat <<'EOF' | $SUDO tee "$MNT_DIR/root/etc/init.conf" >/dev/null
 # /etc/init.conf -- S.A.N.E Linux service supervision
-reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':timeout=0
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi":requires=reliability
-recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:timeout=0
-firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':requires=recovery:timeout=0
+reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':on_fail=rescue:timeout=0
+recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:on_fail=rescue:timeout=0
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot':requires=recovery:on_fail=rescue:timeout=0
+network:respawn:/bin/sh -c 'modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; trap "kill \$! 2>/dev/null; exit 0" TERM INT; while [ ! -d /sys/class/net/eth0 ]; do sleep 5 & wait $!; done; exec sane-net dhcp -f eth0':requires=firstboot
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
 EOF
@@ -490,10 +589,10 @@ set -eu
 
 # 1. Mount essential early pseudo-filesystems
 mkdir -p /proc /sys /dev /run /newroot
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t proc proc /proc || { echo "ERROR: failed to mount /proc"; exec /bin/sh; }
+mount -t sysfs sysfs /sys || { echo "ERROR: failed to mount /sys"; exec /bin/sh; }
+mount -t devtmpfs devtmpfs /dev || { echo "ERROR: failed to mount /dev"; exec /bin/sh; }
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run || { echo "ERROR: failed to mount /run"; exec /bin/sh; }
 
 # 2. Load essential storage and filesystem kernel modules
 for mod in crc32c_generic crc32c-intel libcrc32c crc16 mbcache jbd2 ext4 virtio_blk nls_cp437 nls_iso8859-1 nls_utf8 fat vfat; do
@@ -541,37 +640,47 @@ while [ -z "$RESOLVED_DEV" ] && [ $COUNT -lt 50 ]; do
                 for duevent in /sys/class/block/*/uevent; do
                     [ -f "$duevent" ] || continue
                     if grep -q '^DEVTYPE=disk' "$duevent" 2>/dev/null; then
-                        dname=$(grep '^DEVNAME=' "$duevent" | cut -d= -f2)
-                        dmaj=$(grep '^MAJOR=' "$duevent" | cut -d= -f2)
-                        dmin=$(grep '^MINOR=' "$duevent" | cut -d= -f2)
+                        dname=$(grep '^DEVNAME=' "$duevent" | cut -d= -f2 || true)
+                        dmaj=$(grep '^MAJOR=' "$duevent" | cut -d= -f2 || true)
+                        dmin=$(grep '^MINOR=' "$duevent" | cut -d= -f2 || true)
                         [ -n "$dname" ] || continue
                         [ -b "/dev/$dname" ] || mknod "/dev/$dname" b "$dmaj" "$dmin" 2>/dev/null || true
                         [ -b "/dev/$dname" ] || continue
                         for puevent in /sys/class/block/*/uevent; do
                             [ -f "$puevent" ] || continue
                             if grep -q '^DEVTYPE=partition' "$puevent" 2>/dev/null; then
-                                pname=$(grep '^DEVNAME=' "$puevent" | cut -d= -f2)
-                                pnum=$(grep '^PARTN=' "$puevent" | cut -d= -f2)
-                                pmaj=$(grep '^MAJOR=' "$puevent" | cut -d= -f2)
-                                pmin=$(grep '^MINOR=' "$puevent" | cut -d= -f2)
-                                case "$pname" in
-                                    ${dname}*)
-                                        if [ -n "$pnum" ]; then
-                                            sk=$(( 1024 + (pnum - 1) * 128 + 16 ))
-                                            raw_hex=$(dd if="/dev/$dname" bs=1 skip=$sk count=16 2>/dev/null | hexdump -e '16/1 "%02x "' || true)
-                                            if [ -n "$raw_hex" ]; then
-                                                calc_uuid=$(echo "$raw_hex" | awk '{print $4$3$2$1"-"$6$5"-"$8$7"-"$9$10"-"$11$12$13$14$15$16}')
-                                                if [ -n "$calc_uuid" ] && echo "$calc_uuid" | grep -qi "^${target_uuid}$"; then
-                                                    [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
-                                                    if [ -b "/dev/$pname" ]; then
-                                                        RESOLVED_DEV="/dev/$pname"
-                                                        break 2
-                                                    fi
-                                                fi
-                                            fi
-                                        fi
+                                pname=$(grep '^DEVNAME=' "$puevent" | cut -d= -f2 || true)
+                                pnum=$(grep '^PARTN=' "$puevent" | cut -d= -f2 || true)
+                                pmaj=$(grep '^MAJOR=' "$puevent" | cut -d= -f2 || true)
+                                pmin=$(grep '^MINOR=' "$puevent" | cut -d= -f2 || true)
+                                [ -n "$pname" ] || continue
+                                [ ! -d "/sys/block/$dname" ] || [ -d "/sys/block/$dname/$pname" ] || continue
+                                case "$dname" in
+                                    *[0-9])
+                                        case "$pname" in "${dname}"p[0-9]*) ;; *) continue ;; esac
+                                        psuf=${pname#"${dname}p"}
+                                        ;;
+                                    *)
+                                        case "$pname" in "${dname}"[0-9]*) ;; *) continue ;; esac
+                                        psuf=${pname#"$dname"}
                                         ;;
                                 esac
+                                case "$psuf" in ''|*[!0-9]*) continue ;; esac
+                                case "$pnum" in ''|*[!0-9]*) pnum="" ;; esac
+                                if [ -n "$pnum" ]; then
+                                    sk=$(( 1024 + (pnum - 1) * 128 + 16 ))
+                                    raw_hex=$(dd if="/dev/$dname" bs=1 skip=$sk count=16 2>/dev/null | hexdump -e '16/1 "%02x "' || true)
+                                    if [ -n "$raw_hex" ]; then
+                                        calc_uuid=$(echo "$raw_hex" | awk '{print $4$3$2$1"-"$6$5"-"$8$7"-"$9$10"-"$11$12$13$14$15$16}')
+                                        if [ -n "$calc_uuid" ] && echo "$calc_uuid" | grep -qi "^${target_uuid}$"; then
+                                            [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
+                                            if [ -b "/dev/$pname" ]; then
+                                                RESOLVED_DEV="/dev/$pname"
+                                                break 2
+                                            fi
+                                        fi
+                                    fi
+                                fi
                             fi
                         done
                     fi
@@ -604,17 +713,17 @@ fi
 ROOT_DEV="$RESOLVED_DEV"
 
 # 5. Mount target root filesystem
-mount -t ext4 -o rw "$ROOT_DEV" /newroot
+mount -t ext4 -o rw "$ROOT_DEV" /newroot || { echo "ERROR: failed to mount root device $ROOT_DEV"; exec /bin/sh; }
 
 # 6. Move pseudo-filesystems into newroot
-mount --move /run /newroot/run
-mount --move /dev /newroot/dev
-mount --move /sys /newroot/sys
-mount --move /proc /newroot/proc
+mount --move /run /newroot/run || { echo "ERROR: failed to move /run"; exec /bin/sh; }
+mount --move /dev /newroot/dev || { echo "ERROR: failed to move /dev"; exec /bin/sh; }
+mount --move /sys /newroot/sys || { echo "ERROR: failed to move /sys"; exec /bin/sh; }
+mount --move /proc /newroot/proc || { echo "ERROR: failed to move /proc"; exec /bin/sh; }
 
 # 7. Execute switch_root handoff to ninit
 echo "switch_root: pivoting to $ROOT_DEV"
-exec switch_root /newroot /sbin/init
+exec switch_root /newroot /sbin/init || { echo "ERROR: switch_root failed"; exec /bin/sh; }
 EOF
 chmod 0755 "$INITRAMFS_STAGING/init"
 
@@ -634,7 +743,9 @@ elif cpio --help 2>&1 | grep -q -- '-0'; then
 fi
 
 # Pack initramfs into boot partition
-( cd "$INITRAMFS_STAGING" && find . -print0 | cpio $CPIO_NULL -o -H newc $CPIO_OWNER 2>/dev/null | gzip -9 > "$MNT_DIR/boot/initramfs.cpio.gz" )
+# shellcheck disable=SC2086
+( cd "$INITRAMFS_STAGING" && find . -print0 | cpio $CPIO_NULL -o -H newc $CPIO_OWNER | gzip -9 > "$MNT_DIR/boot/initramfs.cpio.gz" )
+[ -s "$MNT_DIR/boot/initramfs.cpio.gz" ] || die "Failed to assemble initramfs.cpio.gz"
 rm -rf "$INITRAMFS_STAGING"
 INITRAMFS_STAGING=""
 

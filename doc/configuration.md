@@ -7,26 +7,30 @@
 Line format:
 
 ```
-<name>:<mode>:<command>[:requires=<name1>,<name2>,...][:memory_max=<val>][:cpu_max=<val>][:pids_max=<val>][:timeout=<sec>]
+<name>:<mode>:<command>[:requires=<name1>,<name2>,...][:memory_max=<val>][:cpu_max=<val>][:pids_max=<val>][:timeout=<sec>][:grace=<sec>][:user=<user>][:group=<group>][:on_fail=rescue|fail|none]
 ```
 
 | Field | Rules & Behavior |
 |---|---|
-| `<name>` | Max 127 characters. Longer entries are **rejected** (`Parse err: service name too long ... entry rejected`) rather than silently truncated. Must not contain `/` (as the name maps to a cgroup leaf directory). Used in log prefixes and cgroup leaf paths `/sys/fs/cgroup/ninit/<name>`. |
-| `<mode>` | `respawn` (re-spawned automatically on termination) or `once` (executed once). Unknown modes trigger a warning and default to `once`. |
-| `<command>` | Max 511 characters. Longer commands are **rejected** rather than truncated. Executed via `/bin/sh -c`. May contain colons (split at the earliest recognized option tag). |
+| `<name>` | Max 127 characters. Longer entries are **rejected** (`Parse err: service name too long ... entry rejected`) rather than silently truncated. Must not be empty, `.`, `..`, contain `..`, contain `/` (used in cgroup leaf paths `/sys/fs/cgroup/ninit/<name>`), or duplicate an existing service name. Used in log prefixes and cgroup directories. |
+| `<mode>` | `respawn` (re-spawned automatically on termination) or `once` (executed once). Unknown modes are **rejected** (`Parse err: unknown mode '<mode>' for '<name>', entry rejected`); if zero valid services remain, PID 1 enters supervised rescue mode. |
+| `<command>` | Max 511 characters. Longer commands are **rejected** rather than truncated. Executed via `/bin/sh -c`. May contain colons outside quotes (split at the earliest recognized option tag). |
 | `:requires=` | Optional. Comma-separated list of service dependencies (max 255 characters; longer entries are rejected). `once` services must succeed (`exit 0`) before dependent services execute. `respawn` services only need to be running (`pid > 0`). If a `respawn` dependency crash-loops to `SVC_STATE_FAILED`, or a `once` dependency fails/times out, dependent services are automatically cancelled (`SVC_STATE_FAILED`). |
 | `:memory_max=` | Optional. Service memory limit (max 63 characters). Written to cgroup v2 leaf `/sys/fs/cgroup/ninit/<name>/memory.max`. Valid values: `max` or a positive integer with an optional unit suffix (`K`/`k`, `M`/`m`, `G`/`g`, or plain bytes; e.g. `16M`, `256M`, `1G`, `max`). Exceeding limits deterministically triggers the kernel OOM killer (`SIGKILL`, exit `0x9`). Malformed formats (negative values, multi-character units like `64MB`, random text, or zero) are rejected gracefully (ignored with a warning). |
 | `:cpu_max=` | Optional. CFS CPU bandwidth quota (max 63 characters). Written to `/sys/fs/cgroup/ninit/<name>/cpu.max`. Valid format: `<quota> <period>` consisting of two positive integers separated by exactly one space (e.g. `50000 100000` for 50% CPU quota per 100ms period). Malformed formats (non-numeric, multiple spaces, zero/negative values, missing period) are rejected gracefully (ignored with a warning). |
 | `:pids_max=` | Optional. Maximum number of processes permitted in the service's cgroup (max 63 characters). Written to `/sys/fs/cgroup/ninit/<name>/pids.max`. Valid format: `max` or a positive integer (e.g. `5`, `50`, `max`). Non-numeric, zero, or negative values are rejected gracefully (ignored with a warning). `fork()` attempts exceeding this limit are rejected by the kernel with `EAGAIN` (`Resource temporarily unavailable`). |
 | `:timeout=` | Optional (exclusive to `once` services, max 10 characters). Execution timeout in seconds (e.g. `:timeout=60`, `:timeout=120`). Default: 30 seconds (`ONCE_START_TIMEOUT`). If exceeded, the service is forcefully terminated (`SIGKILL`), marked `SVC_STATE_FAILED`, and all dependents are cancelled. Specifying `0`, `none`, or `infinity` disables the timeout. **Warning**: disabling timeouts risks hanging dependent services indefinitely if the command deadlocks. Out-of-range values (outside 1–86400s) default to 30 seconds. |
+| `:grace=` | Optional (default `5` seconds, valid range `0`–`3600` seconds). Per-service `SIGTERM`-to-`SIGKILL` shutdown/stop grace window; `0` escalates immediately. Invalid or out-of-range values fall back to `5` seconds with a `Parse err:` log. |
+| `:user=` | Optional. Drops child privileges to the specified user in `/etc/passwd` (clears supplementary groups via `setgroups()`). Empty, unresolvable, or numeric `0` values are **rejected** fail-closed at parse time (use `:user=root` for UID 0). |
+| `:group=` | Optional primary group override from `/etc/group`. Must be paired with `:user=` (group-only entries, empty values, numeric `0`, or unresolvable groups are **rejected** fail-closed at parse time). |
+| `:on_fail=` | Optional (`rescue`, `fail`, or `none`). Default `fail`/`none` cancels dependents and leaves PID 1 in its main loop when the service enters `SVC_STATE_FAILED`. Setting `:on_fail=rescue` cancels dependents, stops unrelated active services, flushes `/run/log.fifo`, and enters `ninit`'s supervised rescue shell (`enter_rescue_mode()`). Unrecognized values are ignored with a warning (`Parse err: invalid on_fail ... ignored`). |
 
 ### General Syntax Rules
 
 - Lines starting with `#` (optional leading whitespace) and empty lines are ignored.
 - Lines exceeding 1023 characters are rejected in full (`Parse err: line exceeds MAX_LINE ...`); subsequent lines continue to be processed. The same rule applies to `/etc/fstab`.
 - Lines missing the first or second `:` delimiter are logged as `Parse err: ...` and skipped.
-- Option tags (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`) may appear in any order following `<command>`.
+- Option tags (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`, `:grace=`, `:user=`, `:group=`, `:on_fail=`) may appear in any order following `<command>`.
 - Cgroup resource limits are applied to the leaf `/sys/fs/cgroup/ninit/<name>/` before the child PID is added to `cgroup.procs`. Writing controller masks (`+memory +cpu +pids`) to `/sys/fs/cgroup/cgroup.subtree_control` tolerates partial failures in nested/container environments without failing boot.
 - Graceful error handling: malformed resource limit values are ignored with a warning (`Parse err: ... invalid on service '...', limit ignored`), running the service unconstrained without crashing init or triggering a rescue shell.
 - Lifecycle orphan cleanup:
@@ -178,6 +182,10 @@ Line-based control FIFO (mode `0600`):
 | `reboot` | Graceful shutdown (`RB_AUTOBOOT`) |
 | `force-poweroff` | Force immediate shutdown |
 | `force-reboot` | Force immediate reboot |
+| `stop <name>` | Stop a running service (`SIGTERM` → per-service `:grace=` escalation to `SIGKILL`) and update `/run/ninit-<name>.state` |
+| `start <name>` | Start a stopped/manual service (`initctl_start_service`) |
+| `restart <name>` | Gracefully stop (if running) and restart `<name>` (`initctl_restart_service`) |
+| `status [name]` | Query and log/publish service runtime state (`sane-ctl` consumes `/run/ninit-<name>.state`) |
 
 ```bash
 echo reboot > /run/initctl
@@ -190,7 +198,7 @@ printf 'poweroff\nreboot\n' > /run/initctl   # First command executes immediatel
 ```
 
 > [!NOTE]
-> `/run/initctl` is a streaming line-buffered FIFO. Commands **must be newline-terminated** (e.g. `echo poweroff > /run/initctl` or `printf "poweroff\n" > /run/initctl`). Writing raw bytes without a trailing newline (e.g. `printf "poweroff" > /run/initctl`) will hold the data in the input buffer awaiting a delimiter, and will not take effect until a newline is delivered or the buffer limit (255 bytes) is reached.
+> `/run/initctl` is a streaming line-buffered FIFO. Commands **must be newline-terminated** (e.g. `echo poweroff > /run/initctl` or `printf "poweroff\n" > /run/initctl`). Writing raw bytes without a trailing newline (e.g. `printf "poweroff" > /run/initctl`) will hold the data in the input buffer awaiting a delimiter, and will not take effect until a newline is delivered or the line is discarded at the buffer limit (`1023` bytes; `MAX_LINE - 1`, `MAX_LINE = 1024`).
 
 Empty lines and trailing whitespace/`\r` are ignored. Unrecognized commands are logged.
 

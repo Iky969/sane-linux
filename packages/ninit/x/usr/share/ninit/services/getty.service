@@ -1,1 +1,1 @@
-respawn:/sbin/getty 115200 ttyS0
+getty:respawn:/sbin/getty 115200 ttyS0

@@ -127,34 +127,76 @@ LOCK_FD=9
 CURRENT_STAGING_DIR=""
 CURRENT_PKG_NAME=""
 IN_TRANSACTION=false
+CLEANUP_DONE=false
+ROLLBACK_INCOMPLETE=false
+
+atomic_restore_path() {
+    local src="$1"
+    local dst="$2"
+    local tmp_dst="${dst}.rb.$$"
+    rm -rf "$tmp_dst"
+    if cp -a "$src" "$tmp_dst" 2>/dev/null; then
+        mv -fT "$tmp_dst" "$dst" 2>/dev/null || { rm -rf "$tmp_dst"; return 1; }
+        return 0
+    fi
+    rm -rf "$tmp_dst"
+    return 1
+}
+
+rollback_fail() {
+    warn "rollback restore failed for $1"
+    ROLLBACK_INCOMPLETE=true
+}
 
 do_rollback() {
     local staging_dir="${1:-$CURRENT_STAGING_DIR}"
     local pkg="${2:-$CURRENT_PKG_NAME}"
     [ -n "$staging_dir" ] && [ -d "$staging_dir" ] || return 0
 
+    ROLLBACK_INCOMPLETE=false
+    trap '' INT TERM
+
     local rjournal="$staging_dir/.journal"
     local rbackup="$rjournal/backup"
     local rcreated="$rjournal/created"
 
-    # Remove newly created files in reverse order
+    # Remove newly created files in reverse order, in the parent shell so
+    # removal failures are recorded instead of lost in a pipeline.
     if [ -s "$rcreated" ]; then
-        awk '{a[NR]=$0} END {for (i=NR; i>=1; i--) print a[i]}' "$rcreated" | while IFS= read -r cfile || [ -n "$cfile" ]; do
-            [ -n "$cfile" ] || continue
-            rm -f -- "$cfile" 2>/dev/null || true
-            rmdir "$(dirname "$cfile")" 2>/dev/null || true
-        done
+        local created_list="$rjournal/.created-list.$$"
+        if ! awk '{a[NR]=$0} END {for (i=NR; i>=1; i--) print a[i]}' "$rcreated" > "$created_list" 2>/dev/null; then
+            rollback_fail "cannot enumerate created paths"
+        else
+            while IFS= read -r cfile || [ -n "$cfile" ]; do
+                [ -n "$cfile" ] || continue
+                if ! rm -f -- "$cfile" 2>/dev/null; then
+                    rollback_fail "created path $cfile"
+                fi
+                rmdir "$(dirname "$cfile")" 2>/dev/null || true
+            done < "$created_list"
+        fi
+        rm -f "$created_list"
     fi
 
-    # Restore replaced and obsolete files from backup
+    # Restore replaced and obsolete files from backup. Iterate from a file,
+    # not a pipeline, so a restore failure remains visible to this process.
     if [ -d "$rbackup" ]; then
-        find "$rbackup" \( -type f -o -type l \) | while IFS= read -r bfile || [ -n "$bfile" ]; do
-            [ -n "$bfile" ] || continue
-            local brel="${bfile#$rbackup/}"
-            local rdst="${TARGET_ROOT}/$brel"
-            mkdir -p "$(dirname "$rdst")"
-            mv -f "$bfile" "$rdst" 2>/dev/null || true
-        done
+        local restore_list="$rjournal/.restore-list.$$"
+        if ! : > "$restore_list" || \
+           ! find -H "$rbackup" \( -type f -o -type l \) > "$restore_list" 2>/dev/null; then
+            rollback_fail "cannot enumerate backup files"
+        else
+            while IFS= read -r bfile || [ -n "$bfile" ]; do
+                [ -n "$bfile" ] || continue
+                local brel="${bfile#$rbackup/}"
+                local rdst="${TARGET_ROOT}/$brel"
+                if ! mkdir -p "$(dirname "$rdst")" 2>/dev/null || \
+                   ! mv -fT "$bfile" "$rdst" 2>/dev/null; then
+                    rollback_fail "$brel"
+                fi
+            done < "$restore_list"
+        fi
+        rm -f "$restore_list"
     fi
 
     # Clean up empty directories from manifest in reverse depth order
@@ -168,57 +210,106 @@ do_rollback() {
         done
     fi
 
-    # Restore database state from snapshot
+    # Restore database state from snapshot (never wipe DB unless negative sentinel exists)
     if [ -n "$pkg" ]; then
-        if [ -f "$rjournal/had_installed_pkg" ]; then
-            rm -rf "${INSTALLED_DIR:?}/${pkg:?}"
-            cp -a "$rjournal/installed_pkg" "$INSTALLED_DIR/$pkg" 2>/dev/null || true
+        if [ -d "$rjournal/installed_pkg" ] && [ -f "$rjournal/had_installed_pkg" ]; then
+            local tmp_inst="${INSTALLED_DIR}/.${pkg}.rb.$$"
+            rm -rf "$tmp_inst"
+            if cp -a "$rjournal/installed_pkg" "$tmp_inst" 2>/dev/null; then
+                rm -rf "${INSTALLED_DIR:?}/${pkg:?}"
+                if ! mv -fT "$tmp_inst" "$INSTALLED_DIR/$pkg" 2>/dev/null; then
+                    rm -rf "$tmp_inst"
+                    rollback_fail "installed/$pkg"
+                fi
+            else
+                rollback_fail "installed/$pkg snapshot"
+            fi
         elif [ -f "$rjournal/no_installed_pkg" ]; then
-            rm -rf "${INSTALLED_DIR:?}/${pkg:?}" 2>/dev/null || true
+            if ! rm -rf "${INSTALLED_DIR:?}/${pkg:?}" 2>/dev/null; then
+                rollback_fail "installed/$pkg removal"
+            fi
         fi
     fi
 
     if [ -f "$rjournal/providers" ]; then
-        cp -a "$rjournal/providers" "$PROVIDERS_FILE" 2>/dev/null || true
-    else
-        rm -f "$PROVIDERS_FILE" 2>/dev/null || true
+        atomic_restore_path "$rjournal/providers" "$PROVIDERS_FILE" || rollback_fail "providers"
+    elif [ -f "$rjournal/no_providers" ]; then
+        if ! rm -f "$PROVIDERS_FILE" 2>/dev/null; then
+            rollback_fail "providers removal"
+        fi
     fi
 
     if [ -f "$rjournal/world" ]; then
-        cp -a "$rjournal/world" "$WORLD_FILE" 2>/dev/null || true
-    else
-        rm -f "$WORLD_FILE" 2>/dev/null || true
+        atomic_restore_path "$rjournal/world" "$WORLD_FILE" || rollback_fail "world"
+    elif [ -f "$rjournal/no_world" ]; then
+        if ! rm -f "$WORLD_FILE" 2>/dev/null; then
+            rollback_fail "world removal"
+        fi
     fi
 
     if [ -d "$rjournal/rdeps" ]; then
-        rm -rf "$RDEPS_DIR"
-        cp -a "$rjournal/rdeps" "$RDEPS_DIR" 2>/dev/null || true
-    else
-        rm -rf "$RDEPS_DIR" 2>/dev/null || true
+        local tmp_rdeps="${RDEPS_DIR}.rb.$$"
+        rm -rf "$tmp_rdeps"
+        if cp -a "$rjournal/rdeps" "$tmp_rdeps" 2>/dev/null; then
+            rm -rf "$RDEPS_DIR"
+            if ! mv -fT "$tmp_rdeps" "$RDEPS_DIR" 2>/dev/null; then
+                rm -rf "$tmp_rdeps"
+                rollback_fail "rdeps"
+            fi
+        else
+            rollback_fail "rdeps snapshot"
+        fi
+    elif [ -f "$rjournal/no_rdeps" ]; then
+        if ! rm -rf "$RDEPS_DIR" 2>/dev/null; then
+            rollback_fail "rdeps removal"
+        fi
     fi
+
+    if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+        : > "$staging_dir/.rollback-incomplete"
+        warn "rollback incomplete; journal preserved at $staging_dir for manual recovery"
+        return 1
+    fi
+    return 0
 }
 
 cleanup_all() {
+    [ "$CLEANUP_DONE" = true ] && return 0
+    CLEANUP_DONE=true
+    trap '' INT TERM
+
     [ -z "$VALIDATE_SOURCE_TMP" ] || { rm -f "$VALIDATE_SOURCE_TMP"; VALIDATE_SOURCE_TMP=""; }
     if [ "${IN_TRANSACTION:-false}" = true ]; then
         IN_TRANSACTION=false
-        do_rollback "${CURRENT_STAGING_DIR:-}" "${CURRENT_PKG_NAME:-}"
+        do_rollback "${CURRENT_STAGING_DIR:-}" "${CURRENT_PKG_NAME:-}" || true
     fi
 
-    if [ -n "${CURRENT_STAGING_DIR:-}" ] && [ -d "$CURRENT_STAGING_DIR" ]; then
+    # An incomplete rollback leaves the only known-good recovery copy in the
+    # staging directory; deleting it would turn a recoverable fault into loss.
+    if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+        warn "staging and journal retained after incomplete rollback: ${CURRENT_STAGING_DIR:-unknown}"
+    elif [ -n "${CURRENT_STAGING_DIR:-}" ] && [ -d "$CURRENT_STAGING_DIR" ]; then
         rm -rf "$CURRENT_STAGING_DIR" 2>/dev/null || true
     fi
     release_lock
 }
-trap cleanup_all EXIT INT TERM
+
+on_signal() {
+    trap '' INT TERM
+    cleanup_all
+    exit 1
+}
+
+trap cleanup_all EXIT
+trap on_signal INT TERM
 
 acquire_lock() {
     mkdir -p "$SPM_DB_DIR"
     touch "$LOCK_FILE"
-    eval "exec ${LOCK_FD}>\"$LOCK_FILE\""
-    if ! flock -n -x $LOCK_FD 2>/dev/null; then
+    exec 9>"$LOCK_FILE"
+    if ! flock -n -x "$LOCK_FD" 2>/dev/null; then
         log "Waiting for exclusive lock on $LOCK_FILE..."
-        flock -x $LOCK_FD
+        flock -x "$LOCK_FD"
     fi
     recover_interrupted_journals
 }
@@ -226,13 +317,13 @@ acquire_lock() {
 acquire_shared_lock() {
     mkdir -p "$SPM_DB_DIR"
     touch "$LOCK_FILE"
-    eval "exec ${LOCK_FD}<\"$LOCK_FILE\""
-    flock -s $LOCK_FD
+    exec 9<"$LOCK_FILE"
+    flock -s "$LOCK_FD"
 }
 
 release_lock() {
-    flock -u $LOCK_FD 2>/dev/null || true
-    eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    { exec 9>&-; } 2>/dev/null || true
 }
 
 # Helper to read key=value manifest
@@ -248,55 +339,87 @@ get_val_from_str() {
     printf '%s\n' "$str" | grep -E "^[[:space:]]*${key}=" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d '\r\n' || true
 }
 
+validate_pkg_name() {
+    local pname="$1"
+    printf '%s\n' "$pname" | grep -qE '^[a-z0-9][a-z0-9-]*$' || die "Invalid package name '$pname'"
+}
+
 # Recover leftover journals from interrupted power cuts or crashes
 recover_interrupted_journals() {
     [ -d "$STAGING_BASE" ] || return 0
-    for jdir in "$STAGING_BASE"/tx-*/.journal; do
-        [ -d "$jdir" ] || continue
-        local staging_dir="${jdir%/.journal}"
+    for staging_dir in "$STAGING_BASE"/tx-*; do
         [ -d "$staging_dir" ] || continue
 
-        local pkg_name=""
-        if [ -f "$staging_dir/.META/package" ]; then
-            pkg_name="$(get_val "$staging_dir/.META/package" "name")"
-        elif [ -f "$staging_dir/.journal/installed_pkg/package" ]; then
-            pkg_name="$(get_val "$staging_dir/.journal/installed_pkg/package" "name")"
-        fi
-        if [ -z "$pkg_name" ]; then
-            local tx_base
-            tx_base="$(basename "$staging_dir")"
-            pkg_name="${tx_base#tx-}"
-            pkg_name="${pkg_name%-[0-9]*}"
+        if [ -f "$staging_dir/.rollback-incomplete" ]; then
+            trap on_signal INT TERM
+            die "incomplete rollback journal preserved at $staging_dir; manual recovery required"
         fi
 
-        do_rollback "$staging_dir" "$pkg_name"
-        rm -rf "$staging_dir"
-        warn "Interrupted transaction recovered: rolled back $pkg_name and cleaned $staging_dir"
+        if [ -d "$staging_dir/.journal" ] && [ ! -e "$staging_dir/.committed" ]; then
+            local pkg_name=""
+            if [ -f "$staging_dir/.META/package" ]; then
+                pkg_name="$(get_val "$staging_dir/.META/package" "name")"
+            elif [ -f "$staging_dir/.journal/installed_pkg/package" ]; then
+                pkg_name="$(get_val "$staging_dir/.journal/installed_pkg/package" "name")"
+            fi
+            if [ -z "$pkg_name" ]; then
+                local tx_base
+                tx_base="$(basename "$staging_dir")"
+                pkg_name="${tx_base#tx-}"
+                pkg_name="${pkg_name%-[0-9]*}"
+            fi
+
+            trap '' INT TERM
+            ROLLBACK_INCOMPLETE=false
+            do_rollback "$staging_dir" "$pkg_name" || true
+            if [ "$ROLLBACK_INCOMPLETE" = true ]; then
+                warn "Interrupted transaction still needs recovery; journal preserved at $staging_dir"
+            else
+                rm -rf "$staging_dir"
+                warn "Interrupted transaction recovered: rolled back $pkg_name and cleaned $staging_dir"
+            fi
+            trap on_signal INT TERM
+        else
+            # Interrupted pre-journal staging (Step 4 / .journal.prep) or post-commit cleanup
+            rm -rf "$staging_dir"
+        fi
     done
 }
 
 # Helper to verify archive entries (anti-tar-slip)
 verify_archive_entries() {
     local pkg="$1"
-    local member
+    local member trimmed
     local tmp_tar
     tmp_tar="$(mktemp "${TMPDIR:-/tmp}/spm-entries.XXXXXX")"
     tar -tf "$pkg" > "$tmp_tar" 2>/dev/null || { rm -f "$tmp_tar"; die "Failed to read archive: $pkg"; }
 
     while IFS= read -r member || [ -n "$member" ]; do
         [ -n "$member" ] || continue
-        # Reject leading slashes
+        # Reject leading slashes and double slashes
         case "$member" in
             /*)
                 rm -f "$tmp_tar"
                 die "Archive entry has forbidden leading slash: $member"
                 ;;
+            *//*)
+                rm -f "$tmp_tar"
+                die "Archive entry has forbidden double slash: $member"
+                ;;
         esac
         # Reject path traversal components
-        if echo "$member" | grep -qE '(^|/)\.\.(/|$)'; then
+        if printf '%s\n' "$member" | grep -qE '(^|/)\.\.(/|$)'; then
             rm -f "$tmp_tar"
             die "Path traversal detected in archive entry: $member"
         fi
+        # Reject embedded or trailing dot segments (after optional leading ./)
+        trimmed="${member#./}"
+        case "$trimmed" in
+            .|*/.|*/./*|./*)
+                rm -f "$tmp_tar"
+                die "Invalid dot component detected in archive entry: $member"
+                ;;
+        esac
         # Entries must strictly start with ./.META/ or ./x/
         case "$member" in
             ./.META|./.META/*|./x|./x/*)
@@ -315,10 +438,13 @@ verify_symlink_safety() {
     local link_path="$1"
     local link_target="$2"
 
-    # Reject symlinks in .META/
-    case "$link_path" in
+    # Reject symlinks in .META/ and for ./x itself
+    case "${link_path%/}" in
         ./.META|./.META/*)
             die "Symlinks are strictly forbidden in .META directory: $link_path"
+            ;;
+        ./x)
+            die "Symlinks are strictly forbidden for payload root: $link_path"
             ;;
     esac
 
@@ -328,12 +454,12 @@ verify_symlink_safety() {
     case "$link_target" in
         /*)
             # Reject path traversal components in absolute targets
-            if echo "$link_target" | grep -qE '(^|/)\.\.(/|$)'; then
+            if printf '%s\n' "$link_target" | grep -qE '(^|/)\.\.(/|$)'; then
                 die "Path traversal detected in absolute symlink target: $link_path -> $link_target"
             fi
             # Forbidden sensitive host paths
             case "$link_target" in
-                /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc/*|/sys/*|/dev/*|/root/*|/home/*)
+                /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/home|/home/*)
                     die "Symlink escape attack: forbidden system target $link_target"
                     ;;
             esac
@@ -357,6 +483,7 @@ verify_symlink_safety() {
         local old_ifs="$IFS"
         IFS='/'
         set -f
+        # shellcheck disable=SC2086
         set -- $dir_part
         set +f
         IFS="$old_ifs"
@@ -367,6 +494,7 @@ verify_symlink_safety() {
     local old_ifs="$IFS"
     IFS='/'
     set -f
+    # shellcheck disable=SC2086
     set -- $link_target
     set +f
     IFS="$old_ifs"
@@ -385,16 +513,6 @@ verify_symlink_safety() {
 }
 
 # Helper to inspect all symlinks inside archive.
-# T2: the old implementation parsed `tar -tvf` by splitting on spaces, so a
-# symlink named `foo bar` was validated as `bar` and a name/target containing
-# ` -> ` broke the parse entirely. When python3 is available, use its
-# tarfile module instead: it reports each member's name, type and link
-# target structurally, with no text parsing at all. The python check mirrors
-# verify_symlink_safety() exactly (same forbidden/allowed target lists);
-# when python3 is absent, fall back to the old tar -tvf scan as a
-# best-effort pre-check -- the authoritative check is the post-extraction
-# verify_staged_symlinks() below, which inspects the extracted tree
-# directly and runs before anything is committed.
 verify_archive_symlinks() {
     local pkg="$1"
     if command -v python3 >/dev/null 2>&1; then
@@ -403,15 +521,19 @@ import sys, tarfile, fnmatch
 pkg = sys.argv[1]
 TAR_SOCKET_TYPE = b"s"  # tarfile has no socket constant; use the tar typeflag.
 FORBIDDEN = ("/etc/shadow*", "/etc/passwd*", "/etc/sudoers*", "/etc/gshadow*",
-             "/proc/*", "/sys/*", "/dev/*", "/root/*", "/home/*")
+             "/proc", "/proc/*", "/sys", "/sys/*", "/dev", "/dev/*",
+             "/root", "/root/*", "/home", "/home/*")
 ALLOWED = ("/bin/*", "/sbin/*", "/usr/bin/*", "/usr/sbin/*", "/usr/share/*",
            "/lib/*", "/usr/lib/*", "/boot/*", "/opt/*")
 def die(msg):
     print("ERROR: " + msg, file=sys.stderr)
     sys.exit(1)
 def check(link_path, link_target):
-    if link_path.startswith("./.META"):
+    norm = link_path.rstrip("/")
+    if norm == "./.META" or norm.startswith("./.META/"):
         die("Symlinks are strictly forbidden in .META directory: " + link_path)
+    if norm == "./x":
+        die("Symlinks are strictly forbidden for payload root: " + link_path)
     rel = link_path[4:] if link_path.startswith("./x/") else link_path
     if link_target.startswith("/"):
         parts = [p for p in link_target.split("/") if p]
@@ -434,35 +556,98 @@ def check(link_path, link_target):
             cur += 1
 try:
     with tarfile.open(pkg) as tf:
-        for m in tf.getmembers():
+        members = tf.getmembers()
+        sym_dirs = []
+        all_norms = []
+        for m in members:
+            norm = m.name.rstrip("/")
+            all_norms.append((norm, m.name))
+            if norm in ("./x", "./.META") and not m.isdir():
+                if m.issym():
+                    check(m.name, m.linkname)
+                die("Archive root entry must be a directory: " + m.name)
             if m.issym():
                 check(m.name, m.linkname)
+                sym_dirs.append(norm)
             elif m.islnk():
                 die("Archive contains forbidden hard link: " + m.name)
             elif m.isdev() or m.isfifo() or m.type == TAR_SOCKET_TYPE:
                 die("Archive contains forbidden special file (device/FIFO/socket): " + m.name)
+            elif (m.mode & 0o6000) != 0:
+                die("Archive contains forbidden setuid/setgid file: " + m.name)
+        for s in sym_dirs:
+            prefix = s + "/"
+            for norm, raw in all_norms:
+                if norm.startswith(prefix):
+                    die("Archive contains member beneath symlink path: " + raw)
 except tarfile.TarError as e:
     die("Failed to inspect archive symlinks: %s (%s)" % (pkg, e))
 PYEOF
         return 0
     fi
-    local line
-    local tmp_tar
+    local line tail norm_tail
+    local tmp_tar tmp_syms tmp_all
     tmp_tar="$(mktemp "${TMPDIR:-/tmp}/spm-symlinks.XXXXXX")"
-    tar -tvf "$pkg" > "$tmp_tar" 2>/dev/null || { rm -f "$tmp_tar"; die "Failed to inspect archive symlinks: $pkg"; }
+    tmp_syms="$(mktemp "${TMPDIR:-/tmp}/spm-sympaths.XXXXXX")"
+    tmp_all="$(mktemp "${TMPDIR:-/tmp}/spm-allpaths.XXXXXX")"
+    if ! tar -tvf "$pkg" > "$tmp_tar" 2>/dev/null; then
+        rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+        die "Failed to inspect archive symlinks: $pkg"
+    fi
 
     while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
         case "$line" in
+            h*|-*" -> "*)
+                rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+                die "Archive contains forbidden hard link: $line"
+                ;;
+            b*|c*|p*|s*|\?*)
+                rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+                die "Archive contains forbidden special file (device/FIFO/socket): $line"
+                ;;
             l*" -> "*)
                 local before="${line% -> *}"
                 local ltarget="${line#* -> }"
                 local lpath="${before##* }"
-                verify_symlink_safety "$lpath" "$ltarget"
+                if ! verify_symlink_safety "$lpath" "$ltarget"; then
+                    rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+                    exit 1
+                fi
+                printf '%s\n' "${lpath%/}" >> "$tmp_syms"
+                printf '%s\n' "${lpath%/}" >> "$tmp_all"
+                ;;
+            l*)
+                rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+                die "Malformed symlink entry in archive listing: $line"
+                ;;
+            d*)
+                tail="${line##* }"
+                printf '%s\n' "${tail%/}" >> "$tmp_all"
+                ;;
+            *)
+                tail="${line##* }"
+                norm_tail="${tail%/}"
+                if [ "$norm_tail" = "./x" ] || [ "$norm_tail" = "./.META" ]; then
+                    rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+                    die "Archive root entry must be a directory: $tail"
+                fi
+                printf '%s\n' "$norm_tail" >> "$tmp_all"
                 ;;
         esac
     done < "$tmp_tar"
-    rm -f "$tmp_tar"
+
+    if [ -s "$tmp_syms" ]; then
+        local sp
+        while IFS= read -r sp || [ -n "$sp" ]; do
+            [ -n "$sp" ] || continue
+            if grep -q "^${sp}/" "$tmp_all" 2>/dev/null; then
+                rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
+                die "Archive contains member beneath symlink path: $sp"
+            fi
+        done < "$tmp_syms"
+    fi
+    rm -f "$tmp_tar" "$tmp_syms" "$tmp_all"
 }
 
 # Post-extraction, pre-commit audit of the staged tree (T1/T2).
@@ -472,18 +657,29 @@ PYEOF
 # parity/checksum/service validation and before any file is committed.
 verify_staged_payload_types() {
     local staging_root="$1"
+    [ ! -L "$staging_root/x" ] && [ -d "$staging_root/x" ] || die "Archive payload root ./x must be a directory, not a symlink"
+    [ ! -L "$staging_root/.META" ] && [ -d "$staging_root/.META" ] || die "Archive metadata directory ./.META must be a directory, not a symlink"
     local bad
-    bad="$(find "$staging_root/x" ! -type f ! -type d ! -type l 2>/dev/null || true)"
+    bad="$(find -H "$staging_root/x" ! -type f ! -type d ! -type l 2>/dev/null || true)"
     [ -z "$bad" ] || die "Archive contains forbidden special file in payload: $bad"
-    bad="$(find "$staging_root/.META" ! -type f ! -type d 2>/dev/null || true)"
+    bad="$(find -H "$staging_root/.META" ! -type f ! -type d 2>/dev/null || true)"
     [ -z "$bad" ] || die "Archive contains forbidden special file in .META: $bad"
+}
+
+verify_staged_no_hardlinks() {
+    local staging_root="$1"
+    local bad
+    bad="$(find -H "$staging_root/x" ! -type d -links +1 2>/dev/null || true)"
+    [ -z "$bad" ] || die "Archive contains forbidden hard link in payload: $bad"
+    bad="$(find -H "$staging_root/.META" ! -type d -links +1 2>/dev/null || true)"
+    [ -z "$bad" ] || die "Archive contains forbidden hard link in .META: $bad"
 }
 
 verify_staged_symlinks() {
     local staging_root="$1"
     local tmp_list entry rel
     tmp_list="$(mktemp "${TMPDIR:-/tmp}/spm-staged-links.XXXXXX")"
-    find "$staging_root/x" -type l -print > "$tmp_list" 2>/dev/null || true
+    find -H "$staging_root/x" -type l -print > "$tmp_list" 2>/dev/null || true
     while IFS= read -r entry || [ -n "$entry" ]; do
         [ -n "$entry" ] || continue
         rel="${entry#"$staging_root/x/"}"
@@ -504,13 +700,13 @@ validate_manifest_entry() {
             die "Invalid entry in .META/files: double slash forbidden: $fline"
             ;;
     esac
-    if echo "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
+    if printf '%s\n' "$fline" | grep -qE '(^|/)\.\.(/|$)'; then
         die "Path traversal detected in .META/files: $fline"
     fi
-    if echo "$fline" | grep -qE '(^|/)\.(/|$)'; then
+    if printf '%s\n' "$fline" | grep -qE '(^|/)\.(/|$)'; then
         die "Invalid dot component detected in .META/files: $fline"
     fi
-    if ! echo "$fline" | grep -qE '^[a-zA-Z0-9._/+-]+$'; then
+    if ! printf '%s\n' "$fline" | grep -qE '^[a-zA-Z0-9._/+-]+$'; then
         die "Invalid characters detected in .META/files: $fline"
     fi
 }
@@ -521,9 +717,10 @@ verify_manifest_payload_parity() {
     local files_manifest="$staging_root/.META/files"
     local staging_payload="$staging_root/x"
 
-    [ -f "$files_manifest" ] || die "Archive missing metadata manifest .META/files"
+    [ ! -L "$staging_root/.META" ] || die "Archive metadata directory ./.META must not be a symlink"
+    [ ! -L "$files_manifest" ] && [ -f "$files_manifest" ] || die "Archive missing metadata manifest .META/files"
     [ -s "$files_manifest" ] || die "Metadata manifest .META/files is empty"
-    [ -d "$staging_payload" ] || die "Archive missing payload root ./x/"
+    [ ! -L "$staging_payload" ] && [ -d "$staging_payload" ] || die "Archive missing payload root ./x/"
 
     while IFS= read -r fline || [ -n "$fline" ]; do
         validate_manifest_entry "$fline"
@@ -566,7 +763,8 @@ verify_payload_checksums() {
     local sha_manifest="$staging_root/.META/sha256"
     local staging_payload="$staging_root/x"
 
-    [ -f "$sha_manifest" ] || die "Archive is missing mandatory checksum manifest .META/sha256"
+    [ ! -L "$sha_manifest" ] && [ -f "$sha_manifest" ] || die "Archive is missing mandatory checksum manifest .META/sha256"
+    [ ! -L "$staging_payload" ] && [ -d "$staging_payload" ] || die "Archive missing payload root ./x/"
 
     local payload_reg_files="$staging_root/.payload_reg_files"
     (
@@ -581,20 +779,20 @@ verify_payload_checksums() {
     while IFS= read -r sha_line || [ -n "$sha_line" ]; do
         [ -n "$sha_line" ] || die "Invalid empty line in .META/sha256"
 
-        if ! echo "$sha_line" | grep -qE '^[0-9a-fA-F]{64}[[:space:]]+.+$'; then
+        if ! printf '%s\n' "$sha_line" | grep -qE '^[0-9a-fA-F]{64}[[:space:]]+.+$'; then
             die "Malformed checksum entry in .META/sha256: '$sha_line'"
         fi
 
         local exp_hash exp_rel
-        exp_hash="$(echo "$sha_line" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-        exp_rel="$(echo "$sha_line" | sed 's/^[0-9a-fA-F]\{64\}[[:space:]]\+//')"
+        exp_hash="$(printf '%s\n' "$sha_line" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+        exp_rel="$(printf '%s\n' "$sha_line" | sed 's/^[0-9a-fA-F]\{64\}[[:space:]]\+//')"
 
         case "$exp_rel" in
             /*|*//*)
                 die "Path traversal or invalid path in .META/sha256: '$exp_rel'"
                 ;;
         esac
-        if echo "$exp_rel" | grep -qE '(^|/)\.\.(/|$)'; then
+        if printf '%s\n' "$exp_rel" | grep -qE '(^|/)\.\.(/|$)'; then
             die "Path traversal or invalid path in .META/sha256: '$exp_rel'"
         fi
 
@@ -664,9 +862,9 @@ verify_destination_path_safety() {
             cur_path="$cur_path/$part"
         fi
 
-        if [ -L "$cur_path" ]; then
+            if [ -L "$cur_path" ]; then
             local resolved
-            resolved="$(realpath -q "$cur_path" 2>/dev/null || true)"
+            resolved="$(realpath "$cur_path" 2>/dev/null || true)"
             [ -n "$resolved" ] || die "Destination directory symlink cannot be resolved: $cur_path"
 
             if [ "$canon_root" != "/" ]; then
@@ -679,7 +877,7 @@ verify_destination_path_safety() {
                 esac
             else
                 case "$resolved" in
-                    /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc*|/sys*|/dev*)
+                    /etc/shadow*|/etc/passwd*|/etc/sudoers*|/etc/gshadow*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/home|/home/*)
                         die "Symlink escape attack: destination directory component '$cur_path' points to forbidden system target: $resolved"
                         ;;
                 esac
@@ -756,14 +954,16 @@ validate_service_snippets() {
     local staging_root="$1"
     local service_dir="$staging_root/x/usr/share/ninit/services"
     [ -d "$service_dir" ] || return 0
+    [ ! -L "$service_dir" ] || die "Service directory must not be a symlink: $service_dir"
 
-    local sfile sname line_count content tok key val
+    local sfile sname line_count content svc_name rest1 cmd_and_opts cmd_only rest tok key val
     local user_seen=false group_seen=false user_val="" group_val=""
     # Ordinary arguments may be balanced double- or single-quoted strings,
-    # or plain tokens (now including '='). No shell evaluation is performed.
+    # or plain tokens (including '='), but must never contain ':' so they cannot
+    # collide with ninit.c's name:mode:cmd or :option= delimiters.
     local sq="'"
-    local arg_pat="(\"[^\"]*\"|${sq}[^${sq}]*${sq}|[a-zA-Z0-9_/.=+-]+)"
-    local syntax_re="^([a-zA-Z0-9_-]+:)?(once|respawn):[a-zA-Z0-9_/.-]+([[:space:]]+${arg_pat})*([[:space:]]*:[a-zA-Z0-9_=., -]+)*$"
+    local arg_pat="(\"[^\":]*\"|${sq}[^${sq}:]*${sq}|[a-zA-Z0-9_/.=+-]+)"
+    local syntax_re="^[a-zA-Z0-9_-]+:(once|respawn):[a-zA-Z0-9_/.+-]+([[:space:]]+${arg_pat})*([[:space:]]*:[a-zA-Z0-9_]+=[a-zA-Z0-9_., -]*)*$"
 
     for sfile in "$service_dir"/*; do
         [ -e "$sfile" ] || [ -L "$sfile" ] || continue
@@ -784,9 +984,10 @@ validate_service_snippets() {
 
         content="$(tr -d '\r\n' < "$sfile")"
         [ -n "$content" ] || die "Service snippet is empty: $sname"
+        [ "${#content}" -lt 1024 ] || die "Service snippet exceeds MAX_LINE (1023 bytes): $sname"
 
         if ! printf '%s\n' "$content" | grep -qE "$syntax_re"; then
-            die "Invalid service snippet syntax in $sname: must match '[(<name>):](once|respawn):<cmd> [<args>...]'"
+            die "Invalid service snippet syntax in $sname: must match '<name>:(once|respawn):<cmd> [<args>...]'"
         fi
 
         # Check forbidden dangerous keywords
@@ -801,30 +1002,132 @@ validate_service_snippets() {
             die "Forbidden shell metacharacters detected in service snippet: $sname"
         fi
 
-        # Tail options: strict key vocabulary, migration hint for legacy :deps=.
+        # Strictly peel <name>: and <mode>: (works even if <name> is 'once' or 'respawn').
+        svc_name="${content%%:*}"
+        [ "${#svc_name}" -lt 128 ] || die "Service name exceeds 127 bytes in $sname"
+        rest1="${content#*:}"
+        cmd_and_opts="${rest1#*:}"
+        cmd_only="${cmd_and_opts%%:*}"
+        cmd_only="${cmd_only%"${cmd_only##*[![:space:]]}"}"
+        [ "${#cmd_only}" -lt 512 ] || die "Service command exceeds 511 bytes in $sname"
+
         user_seen=false
         group_seen=false
         user_val=""
         group_val=""
-        for tok in $content; do
-            case "$tok" in
-                :*=*)
-                    key="${tok%%=*}"
-                    key="${key#:}"
-                    val="${tok#*=}"
-                    case "$key" in
-                        requires|memory_max|cpu_max|pids_max|timeout|grace|user|group) ;;
+        case "$cmd_and_opts" in
+            *:*)
+                rest="${cmd_and_opts#*:}"
+                while :; do
+                    case "$rest" in
+                        *:*) tok="${rest%%:*}"; rest="${rest#*:}" ;;
+                        *)   tok="$rest"; rest="" ;;
+                    esac
+                    tok="${tok#"${tok%%[![:space:]]*}"}"
+                    tok="${tok%"${tok##*[![:space:]]}"}"
+                    [ -n "$tok" ] || die "Empty service option '::' in $sname"
+                    case "$tok" in
+                        *=*)
+                            key="${tok%%=*}"
+                            val="${tok#*=}"
+                            key="${key#"${key%%[![:space:]]*}"}"
+                            key="${key%"${key##*[![:space:]]}"}"
+                            val="${val#"${val%%[![:space:]]*}"}"
+                            val="${val%"${val##*[![:space:]]}"}"
+                            case "$key" in
+                                requires|memory_max|cpu_max|pids_max|timeout|grace|user|group|on_fail) ;;
+                                *)
+                                    die "Unknown service option ':$key' in $sname; valid options: :requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group=, :on_fail= (use :requires= for dependencies)"
+                                    ;;
+                            esac
+                            case "$key" in
+                                requires)
+                                    [ "${#val}" -lt 256 ] || die "':requires=' exceeds 255 bytes in $sname"
+                                    ;;
+                                user)
+                                    user_seen=true
+                                    user_val="$val"
+                                    if [ "$val" = "0" ]; then
+                                        die "Numeric ':user=0' is forbidden in $sname (use ':user=root')"
+                                    fi
+                                    case "$val" in
+                                        *[[:space:]]*) die "Whitespace is forbidden in ':user=$val' in $sname" ;;
+                                    esac
+                                    ;;
+                                group)
+                                    group_seen=true
+                                    group_val="$val"
+                                    if [ "$val" = "0" ]; then
+                                        die "Numeric ':group=0' is forbidden in $sname (use ':group=root')"
+                                    fi
+                                    case "$val" in
+                                        *[[:space:]]*) die "Whitespace is forbidden in ':group=$val' in $sname" ;;
+                                    esac
+                                    ;;
+                                on_fail)
+                                    case "$val" in
+                                        rescue|fail|none) ;;
+                                        *) die "Invalid ':on_fail=$val' in $sname; expected rescue, fail, or none" ;;
+                                    esac
+                                    ;;
+                                timeout)
+                                    case "$val" in
+                                        0|none|infinity) ;;
+                                        *)
+                                            if ! printf '%s\n' "$val" | grep -qE '^0*[1-9][0-9]*$' || [ "${#val}" -gt 10 ]; then
+                                                die "Invalid ':timeout=$val' in $sname"
+                                            fi
+                                            local tnum
+                                            tnum="$(printf '%s\n' "$val" | sed 's/^0*//')"
+                                            if [ "${#tnum}" -gt 5 ] || [ "$tnum" -gt 86400 ]; then
+                                                die "':timeout=$val' out of range (1-86400) in $sname"
+                                            fi
+                                            ;;
+                                    esac
+                                    ;;
+                                grace)
+                                    if ! printf '%s\n' "$val" | grep -qE '^[0-9]{1,6}$'; then
+                                        die "Invalid ':grace=$val' in $sname"
+                                    fi
+                                    local gnum
+                                    gnum="$(printf '%s\n' "$val" | sed 's/^0*//')"
+                                    [ -n "$gnum" ] || gnum=0
+                                    if [ "${#gnum}" -gt 4 ] || [ "$gnum" -gt 3600 ]; then
+                                        die "':grace=$val' out of range (0-3600) in $sname"
+                                    fi
+                                    ;;
+                                memory_max)
+                                    [ "${#val}" -lt 64 ] || die "':memory_max=' exceeds 63 bytes in $sname"
+                                    if [ "$val" != "max" ]; then
+                                        if ! printf '%s\n' "$val" | grep -qE '^0*[1-9][0-9]*[kKmMgG]?$'; then
+                                            die "Invalid ':memory_max=$val' in $sname"
+                                        fi
+                                    fi
+                                    ;;
+                                pids_max)
+                                    [ "${#val}" -lt 64 ] || die "':pids_max=' exceeds 63 bytes in $sname"
+                                    if [ "$val" != "max" ]; then
+                                        if ! printf '%s\n' "$val" | grep -qE '^0*[1-9][0-9]*$'; then
+                                            die "Invalid ':pids_max=$val' in $sname"
+                                        fi
+                                    fi
+                                    ;;
+                                cpu_max)
+                                    [ "${#val}" -lt 64 ] || die "':cpu_max=' exceeds 63 bytes in $sname"
+                                    if ! printf '%s\n' "$val" | grep -qE '^0*[1-9][0-9]* 0*[1-9][0-9]*$'; then
+                                        die "Invalid ':cpu_max=$val' in $sname (expected '<quota> <period>')"
+                                    fi
+                                    ;;
+                            esac
+                            ;;
                         *)
-                            die "Unknown service option ':$key' in $sname; valid options: :requires=, :memory_max=, :cpu_max=, :pids_max=, :timeout=, :grace=, :user=, :group= (use :requires= for dependencies)"
+                            die "Malformed service option ':$tok' in $sname; expected :key=value"
                             ;;
                     esac
-                    case "$key" in
-                        user)  user_seen=true;  user_val="$val" ;;
-                        group) group_seen=true; group_val="$val" ;;
-                    esac
-                    ;;
-            esac
-        done
+                    [ -n "$rest" ] || break
+                done
+                ;;
+        esac
         if [ "$group_seen" = true ] && [ "$user_seen" = false ]; then
             die "':group=' requires ':user=' in $sname"
         fi
@@ -887,6 +1190,7 @@ cmd_list() {
 cmd_info() {
     [ $# -ge 1 ] || die "Missing package name for 'info' subcommand"
     local pkg_name="$1"
+    validate_pkg_name "$pkg_name"
 
     acquire_shared_lock
     local pdir="$INSTALLED_DIR/$pkg_name"
@@ -973,36 +1277,49 @@ cmd_install() {
     [ -f "$WORLD_FILE" ] || touch "$WORLD_FILE"
 
     log "Step 1/6: Verifying archive format and security invariants..."
-    # Pre-extraction inspection: reject duplicate archive members
-    if tar -tf "$archive_file" 2>/dev/null | sort | uniq -d | grep -q .; then
+    # Pre-extraction inspection: reject duplicate archive members (normalize trailing / and /./)
+    if tar -tf "$archive_file" 2>/dev/null | sed -e 's|/\+$||' -e ':a;s|/\./|/|g;ta' | LC_ALL=C sort | uniq -d | grep -q .; then
         local dup_member
-        dup_member="$(tar -tf "$archive_file" 2>/dev/null | sort | uniq -d | head -n 1 || true)"
+        dup_member="$(tar -tf "$archive_file" 2>/dev/null | sed -e 's|/\+$||' -e ':a;s|/\./|/|g;ta' | LC_ALL=C sort | uniq -d | head -n 1 || true)"
         die "Archive contains duplicate member path: $dup_member"
     fi
 
-    # Pre-extraction inspection: reject hardlinks and setuid/setgid files
+    # Pre-extraction inspection: reject hardlinks (GNU 'h' and BusyBox '-... -> ...'),
+    # special files (devices/FIFOs/sockets), setuid/setgid files, and non-dir root entries
     local tmp_tv
     tmp_tv="$(mktemp "${TMPDIR:-/tmp}/spm-tv.XXXXXX")"
     tar -tvf "$archive_file" > "$tmp_tv" 2>/dev/null || { rm -f "$tmp_tv"; die "Failed to inspect archive: $archive_file"; }
     while IFS= read -r tv_line || [ -n "$tv_line" ]; do
         [ -n "$tv_line" ] || continue
         case "$tv_line" in
-            h*)
+            h*|-*" -> "*)
                 rm -f "$tmp_tv"
                 die "Archive contains forbidden hard link: $tv_line"
                 ;;
             # T1: first character of the mode field is the entry type:
-            # b/c = block/char device, p = FIFO, s = socket.
-            b*|c*|p*|s*)
+            # b/c = block/char device, p = FIFO, s = socket, ? = GNU tar unknown/socket.
+            b*|c*|p*|s*|\?*)
                 rm -f "$tmp_tv"
                 die "Archive contains forbidden special file (device/FIFO/socket): $tv_line"
                 ;;
         esac
         local tv_mode="${tv_line%% *}"
-        if echo "$tv_mode" | grep -qE '^.[rwx-]{2}[sS]|^.[rwx-]{5}[sS]'; then
+        if printf '%s\n' "$tv_mode" | grep -qE '^.[rwx-]{2}[sS]|^.[rwx-]{5}[sS]'; then
             rm -f "$tmp_tv"
             die "Archive contains forbidden setuid/setgid file: $tv_line"
         fi
+        case "$tv_line" in
+            d*) ;;
+            *)
+                local tv_tail="${tv_line##* }"
+                case "${tv_tail%/}" in
+                    ./x|./.META)
+                        rm -f "$tmp_tv"
+                        die "Archive root entry must be a directory: $tv_tail"
+                        ;;
+                esac
+                ;;
+        esac
     done < "$tmp_tv"
     rm -f "$tmp_tv"
 
@@ -1029,66 +1346,84 @@ cmd_install() {
     [ -n "$pkg_release" ] || pkg_release="1"
     [ -n "$pkg_base" ] || pkg_base="false"
 
-    if ! echo "$pkg_name" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
-        die "Invalid package name '$pkg_name'"
-    fi
+    validate_pkg_name "$pkg_name"
+    printf '%s\n' "$pkg_version" | grep -qE '^[a-zA-Z0-9._-]+$' || die "Invalid package version '$pkg_version'"
+    printf '%s\n' "$pkg_release" | grep -qE '^[0-9]+$' || die "Invalid package release '$pkg_release'"
     [ "$pkg_arch" = "x86_64" ] || [ "$pkg_arch" = "all" ] || die "Architecture '$pkg_arch' is not supported (must be 'x86_64' or 'all')"
     [ "$pkg_base" = "true" ] || [ "$pkg_base" = "false" ] || die "Invalid base flag '$pkg_base' (must be 'true' or 'false')"
 
-    # Validate dependencies in manifest dependencies=
+    # Validate and reconcile dependencies from both manifest dependencies= and .META/depends
+    local tmp_mdeps tmp_fdeps tmp_effdeps
+    tmp_mdeps="$(mktemp "${TMPDIR:-/tmp}/spm-mdeps.XXXXXX")"
+    tmp_fdeps="$(mktemp "${TMPDIR:-/tmp}/spm-fdeps.XXXXXX")"
+    tmp_effdeps="$(mktemp "${TMPDIR:-/tmp}/spm-effdeps.XXXXXX")"
+
     if [ -n "$pkg_deps" ]; then
-        local old_ifs="$IFS"
-        IFS=','
-        set -f
-        set -- $pkg_deps
-        set +f
-        IFS="$old_ifs"
-        for dep in "$@"; do
-            dep="$(echo "$dep" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        printf '%s\n' "$pkg_deps" | tr ',' '\n' | while IFS= read -r dep || [ -n "$dep" ]; do
+            dep="$(printf '%s\n' "$dep" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             [ -n "$dep" ] || continue
-            if ! echo "$dep" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+            if ! printf '%s\n' "$dep" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+                rm -f "$tmp_mdeps" "$tmp_fdeps" "$tmp_effdeps"
                 die "Invalid dependency name '$dep'"
             fi
-        done
+            printf '%s\n' "$dep" >> "$tmp_mdeps"
+        done || { rm -f "$tmp_mdeps" "$tmp_fdeps" "$tmp_effdeps"; exit 1; }
     fi
+    LC_ALL=C sort -u "$tmp_mdeps" -o "$tmp_mdeps"
 
-    # Check and validate dependencies in .META/depends
     local deps_content
     deps_content="$(tar -xOf "$archive_file" ./.META/depends 2>/dev/null || true)"
     if [ -n "$deps_content" ]; then
-        local tmp_deps
-        tmp_deps="$(mktemp "${TMPDIR:-/tmp}/spm-deps.XXXXXX")"
-        printf '%s\n' "$deps_content" > "$tmp_deps"
-        while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$deps_content" | while IFS= read -r line || [ -n "$line" ]; do
             local dep
-            dep="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            dep="$(printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
             [ -n "$dep" ] || continue
-            if ! echo "$dep" | grep -qE '^[a-zA-Z0-9_-]+$'; then
-                rm -f "$tmp_deps"
+            if ! printf '%s\n' "$dep" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+                rm -f "$tmp_mdeps" "$tmp_fdeps" "$tmp_effdeps"
                 die "Invalid dependency name '$dep'"
             fi
+            printf '%s\n' "$dep" >> "$tmp_fdeps"
+        done || { rm -f "$tmp_mdeps" "$tmp_fdeps" "$tmp_effdeps"; exit 1; }
+    fi
+    LC_ALL=C sort -u "$tmp_fdeps" -o "$tmp_fdeps"
+
+    if [ -s "$tmp_mdeps" ] && [ -s "$tmp_fdeps" ]; then
+        if ! cmp -s "$tmp_mdeps" "$tmp_fdeps"; then
+            rm -f "$tmp_mdeps" "$tmp_fdeps" "$tmp_effdeps"
+            die "Dependency mismatch between .META/package and .META/depends in '$pkg_name'"
+        fi
+        cp "$tmp_fdeps" "$tmp_effdeps"
+    elif [ -s "$tmp_fdeps" ]; then
+        cp "$tmp_fdeps" "$tmp_effdeps"
+    elif [ -s "$tmp_mdeps" ]; then
+        cp "$tmp_mdeps" "$tmp_effdeps"
+    fi
+    rm -f "$tmp_mdeps" "$tmp_fdeps"
+
+    if [ -s "$tmp_effdeps" ]; then
+        while IFS= read -r dep || [ -n "$dep" ]; do
+            [ -n "$dep" ] || continue
             if [ ! -d "$INSTALLED_DIR/$dep" ]; then
-                rm -f "$tmp_deps"
+                rm -f "$tmp_effdeps"
                 die "Missing dependency: package '$dep' is required by '$pkg_name' but not installed"
             fi
-        done < "$tmp_deps"
-        rm -f "$tmp_deps"
+        done < "$tmp_effdeps"
     fi
 
     log "Step 3/6: Checking for file collisions against providers index..."
     local files_content
-    files_content="$(tar -xOf "$archive_file" ./.META/files 2>/dev/null || die "Archive is missing mandatory .META/files")"
-    [ -n "$files_content" ] || die "Archive metadata .META/files is empty"
+    files_content="$(tar -xOf "$archive_file" ./.META/files 2>/dev/null || { rm -f "$tmp_effdeps"; die "Archive is missing mandatory .META/files"; })"
+    [ -n "$files_content" ] || { rm -f "$tmp_effdeps"; die "Archive metadata .META/files is empty"; }
 
     local tmp_files
     tmp_files="$(mktemp "${TMPDIR:-/tmp}/spm-files.XXXXXX")"
     printf '%s\n' "$files_content" > "$tmp_files"
 
     # Pre-extraction inspection: reject duplicate entries in .META/files
-    if sort "$tmp_files" | uniq -d | grep -q .; then
+    if LC_ALL=C sort "$tmp_files" | uniq -d | grep -q .; then
         local dup_entry
-        dup_entry="$(sort "$tmp_files" | uniq -d | head -n 1)"
-        rm -f "$tmp_files"
+        dup_entry="$(LC_ALL=C sort "$tmp_files" | uniq -d | head -n 1)"
+        rm -f "$tmp_files" "$tmp_effdeps"
         die "Archive metadata .META/files contains duplicate entry: $dup_entry"
     fi
 
@@ -1102,7 +1437,7 @@ cmd_install() {
             */)
                 local dir_disk_path="${TARGET_ROOT}/${fline%/}"
                 if [ -f "$dir_disk_path" ] || [ -L "$dir_disk_path" ]; then
-                    rm -f "$tmp_files"
+                    rm -f "$tmp_files" "$tmp_effdeps"
                     die "Conflict: directory '$fline' clashes with existing non-directory on disk: $dir_disk_path"
                 fi
                 continue
@@ -1112,12 +1447,21 @@ cmd_install() {
         local norm_path="/$fline"
         local disk_path="${TARGET_ROOT}${norm_path}"
 
+        # Reject existing directory or symlink-to-directory at non-dir leaf destination
+        if [ -d "$disk_path" ]; then
+            rm -f "$tmp_files" "$tmp_effdeps"
+            if [ -L "$disk_path" ]; then
+                die "Conflict: non-directory '$fline' clashes with existing symlink-to-directory on disk: $disk_path"
+            fi
+            die "Conflict: non-directory '$fline' clashes with existing directory on disk: $disk_path"
+        fi
+
         # Check providers index
         local owner
         owner="$(awk -v p="$norm_path" -F'\t' '$1 == p { print $2; exit }' "$PROVIDERS_FILE" 2>/dev/null || true)"
         if [ -n "$owner" ]; then
             if [ "$owner" != "$pkg_name" ]; then
-                rm -f "$tmp_files"
+                rm -f "$tmp_files" "$tmp_effdeps"
                 die "File collision: path '$norm_path' is already owned by package '$owner'"
             fi
         else
@@ -1128,7 +1472,7 @@ cmd_install() {
                 elif [ "$pkg_base" = "true" ]; then
                     log "Base package '$pkg_name' claiming pre-existing unowned file: $norm_path"
                 else
-                    rm -f "$tmp_files"
+                    rm -f "$tmp_files" "$tmp_effdeps"
                     die "File collision: path '$norm_path' already exists on disk but is unowned"
                 fi
             fi
@@ -1142,20 +1486,24 @@ cmd_install() {
     rm -rf "$STAGING_DIR"
     mkdir -p "$STAGING_DIR"
     CURRENT_STAGING_DIR="$STAGING_DIR"
+    mv -fT "$tmp_effdeps" "$STAGING_DIR/.effective_deps"
 
     tar -C "$STAGING_DIR" --no-same-owner -xf "$archive_file"
 
-    [ -d "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; die "Archive missing payload root ./x/"; }
-    [ -d "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; die "Archive missing metadata directory ./.META/"; }
+    [ ! -L "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Archive payload root ./x must not be a symlink"; }
+    [ -d "$STAGING_DIR/x" ] || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Archive missing payload root ./x/"; }
+    [ ! -L "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Archive metadata directory ./.META must not be a symlink"; }
+    [ -d "$STAGING_DIR/.META" ] || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Archive missing metadata directory ./.META/"; }
 
-    # Authoritative post-extraction audit (T1/T2): special files and
+    # Authoritative post-extraction audit (T1/T2): special files, hardlinks, and
     # symlinks in the extracted tree, before any other validation or commit.
-    verify_staged_payload_types "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; die "Staged payload type audit failed"; }
-    verify_staged_symlinks "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; die "Staged symlink audit failed"; }
+    verify_staged_payload_types "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Staged payload type audit failed"; }
+    verify_staged_no_hardlinks "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Staged hardlink audit failed"; }
+    verify_staged_symlinks "$STAGING_DIR" || { rm -rf "$STAGING_DIR"; CURRENT_STAGING_DIR=""; die "Staged symlink audit failed"; }
 
     # Post-extraction audit for setuid/setgid files
     local suid_sgid_files
-    suid_sgid_files="$(find "$STAGING_DIR/x" \( -perm -4000 -o -perm -2000 \) 2>/dev/null || true)"
+    suid_sgid_files="$(find -H "$STAGING_DIR/x" \( -perm -4000 -o -perm -2000 \) 2>/dev/null || true)"
     if [ -n "$suid_sgid_files" ]; then
         rm -rf "$STAGING_DIR"
         CURRENT_STAGING_DIR=""
@@ -1172,6 +1520,7 @@ cmd_install() {
     # on this already-validated staging payload.
     validate_service_snippets "$STAGING_DIR" || {
         rm -rf "$STAGING_DIR"
+        CURRENT_STAGING_DIR=""
         die "Service snippet validation failed"
     }
     normalize_service_snippet_modes "$STAGING_DIR"
@@ -1181,34 +1530,46 @@ cmd_install() {
     doas_preflight "$STAGING_DIR" "$pkg_name"
 
     log "Step 5/6: Committing files atomically via rename(2) avoiding ETXTBSY..."
+    # Build complete journal snapshot in .journal.prep BEFORE activating .journal
+    local ROLLBACK_PREP="$STAGING_DIR/.journal.prep"
     local ROLLBACK_JOURNAL="$STAGING_DIR/.journal"
     local ROLLBACK_BACKUP="$ROLLBACK_JOURNAL/backup"
     local ROLLBACK_CREATED="$ROLLBACK_JOURNAL/created"
-    mkdir -p "$ROLLBACK_BACKUP"
-    touch "$ROLLBACK_CREATED"
+    rm -rf "$ROLLBACK_PREP"
+    mkdir -p "$ROLLBACK_PREP/backup"
+    touch "$ROLLBACK_PREP/created"
 
-    # Snapshot DB state for target package before filesystem commit
     if [ -d "$INSTALLED_DIR/$pkg_name" ]; then
-        cp -a "$INSTALLED_DIR/$pkg_name" "$ROLLBACK_JOURNAL/installed_pkg"
-        touch "$ROLLBACK_JOURNAL/had_installed_pkg"
+        cp -a "$INSTALLED_DIR/$pkg_name" "$ROLLBACK_PREP/installed_pkg"
+        touch "$ROLLBACK_PREP/had_installed_pkg"
     else
-        touch "$ROLLBACK_JOURNAL/no_installed_pkg"
+        touch "$ROLLBACK_PREP/no_installed_pkg"
     fi
 
     if [ -f "$PROVIDERS_FILE" ]; then
-        cp -a "$PROVIDERS_FILE" "$ROLLBACK_JOURNAL/providers"
+        cp -a "$PROVIDERS_FILE" "$ROLLBACK_PREP/providers"
+    else
+        touch "$ROLLBACK_PREP/no_providers"
     fi
     if [ -f "$WORLD_FILE" ]; then
-        cp -a "$WORLD_FILE" "$ROLLBACK_JOURNAL/world"
+        cp -a "$WORLD_FILE" "$ROLLBACK_PREP/world"
+    else
+        touch "$ROLLBACK_PREP/no_world"
     fi
     if [ -d "$RDEPS_DIR" ]; then
-        cp -a "$RDEPS_DIR" "$ROLLBACK_JOURNAL/rdeps"
+        cp -a "$RDEPS_DIR" "$ROLLBACK_PREP/rdeps"
+    else
+        touch "$ROLLBACK_PREP/no_rdeps"
     fi
+
+    # Atomically activate .journal in a single rename(2) after all DB snapshots exist
+    mv -fT "$ROLLBACK_PREP" "$ROLLBACK_JOURNAL" || die "Failed to activate rollback journal"
 
     CURRENT_PKG_NAME="$pkg_name"
     IN_TRANSACTION=true
 
     rollback_transaction() {
+        trap '' INT TERM
         warn "Commit failed; executing unified atomic rollback..."
         IN_TRANSACTION=false
         do_rollback "$STAGING_DIR" "$pkg_name"
@@ -1242,6 +1603,9 @@ cmd_install() {
         case "$fline" in
             */)
                 local target_dir="${TARGET_ROOT}/${fline%/}"
+                if [ -L "$target_dir" ] || [ -f "$target_dir" ]; then
+                    rollback_transaction
+                fi
                 if [ ! -d "$target_dir" ]; then
                     mkdir -p "$target_dir" || rollback_transaction
                 fi
@@ -1270,17 +1634,25 @@ cmd_install() {
 
                 mkdir -p "$dst_dir" || rollback_transaction
 
+                # Refuse non-dir leaf colliding with existing directory or symlink-to-directory
+                if [ -d "$dst_path" ]; then
+                    rollback_transaction
+                fi
+
                 if [ -e "$dst_path" ] || [ -L "$dst_path" ]; then
-                    # Backup existing file for rollback without removing it from dst_path
+                    # Backup atomically via staging file outside backup/ so SIGKILL never leaves truncated backup
                     local bak_path="$ROLLBACK_BACKUP/$fline"
+                    local bak_tmp="$ROLLBACK_JOURNAL/.bak_tmp"
                     mkdir -p "$(dirname "$bak_path")"
-                    cp -a "$dst_path" "$bak_path" || rollback_transaction
+                    rm -rf "$bak_tmp"
+                    cp -a "$dst_path" "$bak_tmp" || { rm -rf "$bak_tmp"; rollback_transaction; }
+                    mv -fT "$bak_tmp" "$bak_path" || { rm -rf "$bak_tmp"; rollback_transaction; }
                 else
                     printf '%s\n' "$dst_path" >> "$ROLLBACK_CREATED"
                 fi
 
-                # Atomic replacement via mv (calls rename(2) avoiding ETXTBSY)
-                mv -f "$src_path" "$dst_path" || rollback_transaction
+                # Atomic replacement via mv -fT (never moves into a symlink-to-directory)
+                mv -fT "$src_path" "$dst_path" || rollback_transaction
                 ;;
         esac
     done < "$STAGING_DIR/.META/files"
@@ -1315,7 +1687,7 @@ cmd_install() {
                     local rel_bak="${p#/}"
                     local bak_path="$ROLLBACK_BACKUP/$rel_bak"
                     mkdir -p "$(dirname "$bak_path")"
-                    mv -f "$dst_path" "$bak_path" || rollback_transaction
+                    mv -fT "$dst_path" "$bak_path" || rollback_transaction
                     rmdir "$(dirname "$dst_path")" 2>/dev/null || true
                 fi
             fi
@@ -1335,8 +1707,8 @@ cmd_install() {
         local old_deps_file="$STAGING_DIR/.old_deps"
         local new_deps_file="$STAGING_DIR/.new_deps"
         awk '{ for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if (length($i)) print $i } }' "$pkg_installed_dir/depends" | LC_ALL=C sort -u > "$old_deps_file"
-        if [ -f "$STAGING_DIR/.META/depends" ]; then
-            awk '{ for (i=1; i<=NF; i++) { gsub(/,/, "", $i); if (length($i)) print $i } }' "$STAGING_DIR/.META/depends" | LC_ALL=C sort -u > "$new_deps_file"
+        if [ -s "$STAGING_DIR/.effective_deps" ]; then
+            LC_ALL=C sort -u "$STAGING_DIR/.effective_deps" > "$new_deps_file"
         else
             touch "$new_deps_file"
         fi
@@ -1349,13 +1721,17 @@ cmd_install() {
 
     cp -p "$STAGING_DIR/.META/package" "$pkg_installed_dir/package" || rollback_transaction
     cp -p "$STAGING_DIR/.META/sha256" "$pkg_installed_dir/sha256" || rollback_transaction
-    [ -f "$STAGING_DIR/.META/depends" ] && cp -p "$STAGING_DIR/.META/depends" "$pkg_installed_dir/depends" || touch "$pkg_installed_dir/depends" || rollback_transaction
+    if [ -s "$STAGING_DIR/.effective_deps" ]; then
+        cp -p "$STAGING_DIR/.effective_deps" "$pkg_installed_dir/depends" || rollback_transaction
+    else
+        : > "$pkg_installed_dir/depends" || rollback_transaction
+    fi
     printf '%s-%s\n' "$pkg_version" "$pkg_release" > "$pkg_installed_dir/version" || rollback_transaction
 
     # Write absolute paths into files.list
     awk '{ print "/" $0 }' "$STAGING_DIR/.META/files" > "$pkg_installed_dir/files.list" || rollback_transaction
 
-    # Update providers index
+    # Update providers index atomically
     local tmp_providers="${STAGING_DIR}/.providers.tmp"
     if [ -f "$PROVIDERS_FILE" ]; then
         awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$PROVIDERS_FILE" > "$tmp_providers" || rollback_transaction
@@ -1373,20 +1749,21 @@ cmd_install() {
         esac
     done < "$STAGING_DIR/.META/files"
 
-    LC_ALL=C sort -u "$tmp_providers" -o "$PROVIDERS_FILE" || rollback_transaction
+    LC_ALL=C sort -u "$tmp_providers" -o "${tmp_providers}.sorted" || rollback_transaction
+    mv -fT "${tmp_providers}.sorted" "$PROVIDERS_FILE" || rollback_transaction
     rm -f "$tmp_providers"
 
     # Update reverse dependencies index (rdeps)
     if [ -s "$dropped_deps_file" ]; then
         while IFS= read -r dropped_dep || [ -n "$dropped_dep" ]; do
-            dropped_dep="$(echo "$dropped_dep" | tr -d '[:space:]')"
+            dropped_dep="$(printf '%s\n' "$dropped_dep" | tr -d '[:space:]')"
             [ -n "$dropped_dep" ] || continue
             local rdep_file="$RDEPS_DIR/$dropped_dep"
             if [ -f "$rdep_file" ]; then
                 local tmp_rdep="${STAGING_DIR}/.rdep_${dropped_dep}.tmp"
                 awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$rdep_file" > "$tmp_rdep" || rollback_transaction
                 if [ -s "$tmp_rdep" ]; then
-                    mv -f "$tmp_rdep" "$rdep_file" || rollback_transaction
+                    mv -fT "$tmp_rdep" "$rdep_file" || rollback_transaction
                 else
                     rm -f "$rdep_file" "$tmp_rdep" || rollback_transaction
                 fi
@@ -1396,26 +1773,33 @@ cmd_install() {
 
     if [ -s "$pkg_installed_dir/depends" ]; then
         while IFS= read -r dep || [ -n "$dep" ]; do
-            dep="$(echo "$dep" | tr -d '[:space:]')"
+            dep="$(printf '%s\n' "$dep" | tr -d '[:space:]')"
             [ -n "$dep" ] || continue
             mkdir -p "$RDEPS_DIR" || rollback_transaction
             if [ -e "$RDEPS_DIR/$dep" ] && [ ! -f "$RDEPS_DIR/$dep" ]; then
                 rollback_transaction
             fi
-            printf '%s\t%s\n' "$dep" "$pkg_name" >> "$RDEPS_DIR/$dep" || rollback_transaction
-            LC_ALL=C sort -u "$RDEPS_DIR/$dep" -o "$RDEPS_DIR/$dep" || rollback_transaction
+            local tmp_rdep_add="${STAGING_DIR}/.rdep_add_${dep}.tmp"
+            [ -f "$RDEPS_DIR/$dep" ] && cp -p "$RDEPS_DIR/$dep" "$tmp_rdep_add" || : > "$tmp_rdep_add"
+            printf '%s\t%s\n' "$dep" "$pkg_name" >> "$tmp_rdep_add" || rollback_transaction
+            LC_ALL=C sort -u "$tmp_rdep_add" -o "${tmp_rdep_add}.sorted" || rollback_transaction
+            mv -fT "${tmp_rdep_add}.sorted" "$RDEPS_DIR/$dep" || rollback_transaction
+            rm -f "$tmp_rdep_add"
         done < "$pkg_installed_dir/depends"
     fi
 
-    # Update world manifest
+    # Update world manifest atomically
     local tmp_world="${STAGING_DIR}/.world.tmp"
     [ -f "$WORLD_FILE" ] && cp -p "$WORLD_FILE" "$tmp_world" || touch "$tmp_world" || rollback_transaction
     printf '%s\n' "$pkg_name" >> "$tmp_world"
-    LC_ALL=C sort -u "$tmp_world" -o "$WORLD_FILE" || rollback_transaction
+    LC_ALL=C sort -u "$tmp_world" -o "${tmp_world}.sorted" || rollback_transaction
+    mv -fT "${tmp_world}.sorted" "$WORLD_FILE" || rollback_transaction
     rm -f "$tmp_world"
 
-    # Purge staging directory
+    # Two-phase commit sentinel: atomically rename .journal -> .committed BEFORE rm -rf
+    # so SIGKILL during cleanup never causes recovery to roll back a committed package.
     IN_TRANSACTION=false
+    mv -fT "$ROLLBACK_JOURNAL" "$STAGING_DIR/.committed" || true
     rm -rf "$STAGING_DIR"
     CURRENT_STAGING_DIR=""
     CURRENT_PKG_NAME=""
@@ -1448,6 +1832,7 @@ cmd_remove() {
         esac
     done
     [ -n "$pkg_name" ] || die "Missing package name for 'remove' subcommand"
+    validate_pkg_name "$pkg_name"
 
     acquire_lock
 
@@ -1468,6 +1853,14 @@ cmd_remove() {
         die "Cannot remove base system package '$pkg_name' without --force (marked base=true)"
     fi
 
+    local files_list="$pkg_installed_dir/files.list"
+    if [ "$force" != true ] && [ -f "$files_list" ] &&
+       grep -qxF '/usr/bin/doas' "$files_list" &&
+       doas_existing_is_trusted "${TARGET_ROOT}/usr/bin/doas"; then
+        release_lock
+        die "Cannot remove package '$pkg_name' providing trusted privileged /usr/bin/doas without --force"
+    fi
+
     # Check reverse dependencies
     if [ -f "$RDEPS_DIR/$pkg_name" ] && [ -s "$RDEPS_DIR/$pkg_name" ]; then
         local dependents
@@ -1477,7 +1870,6 @@ cmd_remove() {
     fi
 
     log "Step 1/2: Removing package files bottom-up..."
-    local files_list="$pkg_installed_dir/files.list"
     if [ -f "$files_list" ]; then
         # Sort paths in reverse depth order: files before directories, deepest paths first
         local tmp_sorted_rem="${SPM_DB_DIR}/.sorted_rem.$$"
@@ -1518,13 +1910,13 @@ cmd_remove() {
     # Update reverse dependencies index
     if [ -f "$pkg_installed_dir/depends" ]; then
         while IFS= read -r dep || [ -n "$dep" ]; do
-            dep="$(echo "$dep" | tr -d '[:space:]')"
+            dep="$(printf '%s\n' "$dep" | tr -d '[:space:]')"
             [ -n "$dep" ] || continue
             if [ -f "$RDEPS_DIR/$dep" ]; then
                 local tmp_rdep="${RDEPS_DIR}/.${dep}.tmp.$$"
                 awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$RDEPS_DIR/$dep" > "$tmp_rdep" || true
                 if [ -s "$tmp_rdep" ]; then
-                    mv -f "$tmp_rdep" "$RDEPS_DIR/$dep"
+                    mv -fT "$tmp_rdep" "$RDEPS_DIR/$dep"
                 else
                     rm -f "$RDEPS_DIR/$dep" "$tmp_rdep"
                 fi
@@ -1536,14 +1928,14 @@ cmd_remove() {
     if [ -f "$PROVIDERS_FILE" ]; then
         local tmp_prov="${PROVIDERS_FILE}.tmp.$$"
         awk -v pkg="$pkg_name" -F'\t' '$NF != pkg' "$PROVIDERS_FILE" > "$tmp_prov" || true
-        mv -f "$tmp_prov" "$PROVIDERS_FILE"
+        mv -fT "$tmp_prov" "$PROVIDERS_FILE"
     fi
 
     # Clean world list
     if [ -f "$WORLD_FILE" ]; then
         local tmp_world="${WORLD_FILE}.tmp.$$"
         awk -v pkg="$pkg_name" '$1 != pkg' "$WORLD_FILE" > "$tmp_world" || true
-        mv -f "$tmp_world" "$WORLD_FILE"
+        mv -fT "$tmp_world" "$WORLD_FILE"
     fi
 
     # Clean package installation records
@@ -1559,15 +1951,19 @@ cmd_remove() {
 cmd_validate_source() {
     [ $# -ge 1 ] || die "Usage: spm validate-source DIR"
     local source_dir="$1"
+    [ "$source_dir" != "/" ] && source_dir="${source_dir%/}"
     [ -d "$source_dir" ] || die "Source directory does not exist: $source_dir"
+    [ ! -L "$source_dir/x" ] || die "Source payload root x/ must not be a symlink"
     [ -d "$source_dir/x" ] || die "Source missing payload root: x/"
+    [ ! -L "$source_dir/.META" ] || die "Source metadata directory .META/ must not be a symlink"
     [ -d "$source_dir/.META" ] || die "Source missing metadata directory: .META/"
+    [ ! -L "$source_dir/.META/package" ] || die "Source .META/package must not be a symlink"
     [ -f "$source_dir/.META/package" ] || die "Source missing mandatory .META/package"
 
     VALIDATE_SOURCE_TMP="$(mktemp "${TMPDIR:-/tmp}/spm-src.XXXXXX")" || die "Cannot create temporary list"
 
     # .META: strictly regular files/directories, zero symlinks, no traversal.
-    find "$source_dir/.META" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
+    find -H "$source_dir/.META" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
     local entry rel
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue
@@ -1583,7 +1979,7 @@ cmd_validate_source() {
     # walker. Never dereference a symlink while auditing path components.
     # T1: reject device/FIFO/socket entries here as well, not just in .META/.
     verify_staged_payload_types "$source_dir"
-    find "$source_dir/x" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
+    find -H "$source_dir/x" -mindepth 1 -print > "$VALIDATE_SOURCE_TMP"
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue
         rel="${entry#$source_dir/x/}"

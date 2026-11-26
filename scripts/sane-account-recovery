@@ -5,9 +5,8 @@
 # shadow or doas.conf must never lock the console out: validate first, and
 # rebuild from the baseline if validation fails.
 set -u
-# Overridable for unit tests; production uses the installed CLI and shell.
+# Overridable for unit tests; production uses the installed CLI.
 CLI=${SANE_ACCOUNTS_CLI:-/usr/bin/sane-accounts}
-FALLBACK_SHELL=${SANE_RECOVERY_SHELL:-/bin/sh}
 BUSYBOX=${SANE_RECOVERY_BUSYBOX:-/bin/busybox}
 
 # Older images may ship a BusyBox without awk/mktemp symlinks. sane-accounts
@@ -42,25 +41,29 @@ for applet in awk mktemp; do
 done
 
 if [ ! -x "$CLI" ]; then
-    printf 'recovery: %s missing; cannot validate accounts\n' "$CLI" >&2
-    exit 0
+    printf 'recovery: %s missing or not executable; cannot validate accounts\n' "$CLI" >&2
+    exit 1
 fi
 
-if "$CLI" --skip-owner-check validate >/dev/null 2>&1; then
+run_cli() {
+    if [ "$(id -u 2>/dev/null || true)" = "0" ]; then
+        "$CLI" "$@"
+    else
+        "$CLI" --skip-owner-check "$@"
+    fi
+}
+
+if run_cli validate >/dev/null 2>&1; then
     exit 0
 fi
 
 printf '=== S.A.N.E account recovery: identity files invalid ===\n'
-# Trust assumption: the console is a locally trusted channel (physical access
-# or a trusted VM console). Falling back to an unauthenticated shell is only
-# safe under that assumption; it is intentional so a broken image never becomes
-# a permanent lockout. Do not expose this console on an untrusted network.
-"$CLI" --skip-owner-check recover || {
-    printf 'recovery: rebuild failed; dropping to console shell\n' >&2
-    exec "$FALLBACK_SHELL" -i
+run_cli recover || {
+    printf 'recovery: rebuild failed; failing closed for supervised rescue\n' >&2
+    exit 1
 }
-"$CLI" --skip-owner-check validate || {
-    printf 'recovery: validation still failing; dropping to console shell\n' >&2
-    exec "$FALLBACK_SHELL" -i
+run_cli validate || {
+    printf 'recovery: validation still failing; failing closed for supervised rescue\n' >&2
+    exit 1
 }
 exit 0

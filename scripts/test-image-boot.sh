@@ -289,7 +289,7 @@ run_boot_test() {
         fi
 
         if [ "$service_detected" -eq 0 ]; then
-            if grep -qiE "started sane-hello|started hello|started console|Hello from S.A.N.E Linux" "$console_log" 2>/dev/null; then
+            if grep -qiE "started sane-hello|started hello|started console|started firstboot|=== S\.A\.N\.E Linux first boot ===|Hello from S.A.N.E Linux" "$console_log" 2>/dev/null; then
                 service_detected=1
                 service_ms=$(mark_elapsed)
             fi
@@ -341,10 +341,17 @@ run_boot_test() {
 
     if [ "$service_detected" -eq 1 ]; then
         local matched_svc
-        matched_svc=$(grep -oE "started sane-hello|started hello|started console|Hello from S.A.N.E Linux" "$console_log" 2>/dev/null | head -n 1 || echo "service")
+        matched_svc=$(grep -oE "started sane-hello|started hello|started console|started firstboot|=== S\.A\.N\.E Linux first boot ===|Hello from S.A.N.E Linux" "$console_log" 2>/dev/null | head -n 1 || echo "service")
         printf '  [ OK ]   Execution of service verified: "%s" (%s ms)\n' "$matched_svc" "$service_ms"
     else
         printf '  [FAIL] Execution of hello service or console shell (NOT FOUND)\n'
+        fail_count=$((fail_count + 1))
+    fi
+
+    if grep -qiE "on_fail=rescue|entering rescue" "$console_log" 2>/dev/null; then
+        local rescue_msg
+        rescue_msg=$(grep -iE "on_fail=rescue|entering rescue" "$console_log" 2>/dev/null | head -n 1 || echo "rescue mode")
+        printf '  [FAIL] Unexpected rescue mode entered: %s\n' "$rescue_msg"
         fail_count=$((fail_count + 1))
     fi
 
@@ -423,16 +430,15 @@ run_boot_test() {
 }
 
 archive_test_results() {
-    local doc_dir="$REPO_ROOT/doc"
-    local archives_dir="$doc_dir/archives"
-    mkdir -p "$archives_dir"
-
-    # Ensure docs symlink exists
-    if [ ! -e "$REPO_ROOT/docs" ] && [ ! -L "$REPO_ROOT/docs" ]; then
-        ln -sf doc "$REPO_ROOT/docs"
+    # Never mutate tracked doc/archives/ or create a tracked docs symlink in REPO_ROOT.
+    local archives_dir="${REPORT_DIR:-}"
+    if [ -z "$archives_dir" ]; then
+        archives_dir="$(mktemp -d "${TMPDIR:-/tmp}/sane-image-boot.XXXXXX")"
+    else
+        mkdir -p "$archives_dir"
     fi
 
-    # Archive console logs (always overwrite)
+    # Archive console logs into the report directory
     local bios_console="$DISTRO_DIR/qemu-image-console-bios.log"
     local uefi_console="$DISTRO_DIR/qemu-image-console-uefi.log"
 

@@ -7,26 +7,30 @@
 Format per baris:
 
 ```
-<nama>:<mode>:<perintah>[:requires=<nama1>,<nama2>,...][:memory_max=<nilai>][:cpu_max=<nilai>][:pids_max=<nilai>][:timeout=<detik>]
+<nama>:<mode>:<perintah>[:requires=<nama1>,<nama2>,...][:memory_max=<nilai>][:cpu_max=<nilai>][:pids_max=<nilai>][:timeout=<detik>][:grace=<detik>][:user=<user>][:group=<group>][:on_fail=rescue|fail|none]
 ```
 
 | Bagian | Aturan |
 |---|---|
-| `<nama>` | Maks 127 karakter. Lebih dari itu entri **ditolak** (`Parse err: ... entri ditolak`), bukan dipotong. Tidak boleh memuat karakter `/` (karena nama dipakai sebagai path direktori cgroup). Dipakai sebagai nama log dan nama cgroup `/sys/fs/cgroup/ninit/<nama>`. |
-| `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain diperingatkan dan diperlakukan sebagai `once`. |
-| `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` (dipisah dari tag opsi paling awal). |
+| `<nama>` | Maks 127 karakter. Lebih dari itu entri **ditolak** (`Parse err: ... entri ditolak`), bukan dipotong. Tidak boleh kosong, `.`, `..`, memuat `..`, memuat karakter `/`, atau menduplikasi nama layanan yang sudah terdaftar. Dipakai sebagai nama log dan cgroup leaf `/sys/fs/cgroup/ninit/<nama>`. |
+| `<mode>` | `respawn` (dijalankan ulang otomatis) atau `once` (sekali saja). Mode lain **ditolak** (`Parse err: unknown mode '<mode>' for '<nama>', entry rejected`); bila 0 layanan valid tersisa setelah parsing, PID 1 masuk ke supervised rescue mode. |
+| `<perintah>` | Maks 511 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Dijalankan lewat `/bin/sh -c`. Boleh memuat `:` di luar kutipan (dipisah dari tag opsi paling awal). |
 | `:requires=` | Opsional. Daftar nama layanan (dipisah koma) yang harus diurutkan lebih dulu. Maks 255 karakter. Lebih dari itu entri **ditolak**, bukan dipotong. Layanan `once` harus selesai (`exit 0`) sebelum layanan yang membutuhkannya dijalankan. Layanan `respawn` cukup sudah aktif (`pid > 0`). Bila dependensi `respawn` crash berulang kali hingga `SVC_STATE_FAILED`, atau dependensi `once` gagal/timeout, layanan yang membutuhkannya otomatis dibatalkan (`SVC_STATE_FAILED`). |
 | `:memory_max=` | Opsional. Batas alokasi memori layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/memory.max`. Nilai valid: `max` atau angka desimal positif dengan akhiran satuan tunggal opsional (`K`/`k`, `M`/`m`, `G`/`g`, atau byte murni; contoh: `16M`, `256M`, `1G`, `max`). Pelanggaran batas memori memicu OOM killer kernel secara deterministik (`SIGKILL`, status `0x9`). Format rusak (huruf acak, angka negatif, satuan ganda seperti `64MB`, atau nol) ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Lebih dari 63 karakter entri **ditolak**. |
 | `:cpu_max=` | Opsional. Batas kuota bandwidth CPU CFS (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/cpu.max`. Format valid: `<kuota> <periode>` yaitu dua angka desimal positif yang dipisahkan tepat satu spasi tunggal (contoh: `50000 100000` untuk 50% kuota per periode 100ms). Format rusak (non-numerik, spasi ganda/berlebih, nilai kuota/periode nol atau negatif, tanpa spasi pemisah) ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Lebih dari 63 karakter entri **ditolak**. |
 | `:pids_max=` | Opsional. Batas jumlah proses maksimum dalam cgroup layanan (maks 63 karakter). Ditulis ke leaf cgroup v2 `/sys/fs/cgroup/ninit/<nama>/pids.max`. Format valid: `max` atau angka desimal positif (contoh: `5`, `50`, `max`). Nilai negatif, nol, atau karakter non-numerik ditolak secara graceful saat parsing (diabaikan dengan log peringatan). Upaya `fork()` melebihi batas ini deterministik ditolak oleh kernel dengan `EAGAIN` (`Resource temporarily unavailable`). Lebih dari 63 karakter entri **ditolak**. |
 | `:timeout=` | Opsional (khusus layanan `once`, maks 10 karakter). Batas waktu berjalan layanan dalam detik (contoh: `:timeout=60`, `:timeout=120`). Default: 30 detik (`ONCE_START_TIMEOUT`). Bila layanan berjalan melebihi batas ini, ia dihentikan paksa (`SIGKILL`), ditandai `SVC_STATE_FAILED`, dan seluruh dependennya dibatalkan secara transitif. Nilai `0`, `none`, atau `infinity` menonaktifkan timeout. **Peringatan**: menonaktifkan timeout (`0` atau `none`) berisiko membuat layanan dependen menggantung selamanya bila proses layanan mengalami kebuntuan (hang/deadlock). Format di luar rentang 1–86400s ditolak secara graceful dan memakai default 30 detik. |
+| `:grace=` | Opsional (default `5` detik, rentang `0`–`3600` detik). Jendela grace `SIGTERM`-ke-`SIGKILL` per layanan saat stop/shutdown (`0` melakukan eskalasi segera). Nilai rusak atau di luar rentang memakai default `5` detik dengan log `Parse err:`. |
+| `:user=` | Opsional. Menurunkan hak akses anak ke akun di `/etc/passwd` (termasuk membersihkan supplementary group via `setgroups()`). Nilai kosong, tidak ditemukan, atau numerik `0` **ditolak** fail-closed saat parsing (tulis `:user=root` untuk UID 0). |
+| `:group=` | Opsional primary group dari `/etc/group`. **Harus berpasangan** dengan `:user=` (group tanpa `:user=`, kosong, numerik `0`, atau tidak ditemukan **ditolak** fail-closed saat parsing). |
+| `:on_fail=` | Opsional (`rescue`, `fail`, atau `none`). Nilai bawaan `fail`/`none` hanya membatalkan dependen dan membiarkan PID 1 di loop utama saat layanan berstatus `SVC_STATE_FAILED`. Nilai `:on_fail=rescue` membatalkan dependen, menghentikan layanan aktif lain secara tertib, mengosongkan `/run/log.fifo`, lalu masuk ke supervised rescue shell (`enter_rescue_mode()`). Nilai lain diabaikan dengan peringatan. |
  
 Aturan umum:
  
 - Baris komentar dimulai `#` (spasi/tab di depan diizinkan) dan baris kosong diabaikan.
 - Baris lebih dari 1023 karakter ditolak utuh dan dicatat (`Parse err: baris melebihi MAX_LINE ...`); baris berikutnya tetap diproses. Aturan yang sama berlaku untuk baris `/etc/fstab`.
 - Baris tanpa `:` pertama/kedua dilaporkan `Parse err: ...` lalu dilewati.
-- Tag opsi (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`) dapat ditulis dalam urutan bebas setelah `<perintah>`. Parser memisahkan perintah pada kemunculan tag opsi paling awal, sehingga perintah yang memuat karakter titik dua (misal URL `http://...`) tetap utuh.
+- Tag opsi (`:requires=`, `:memory_max=`, `:cpu_max=`, `:pids_max=`, `:timeout=`, `:grace=`, `:user=`, `:group=`, `:on_fail=`) dapat ditulis dalam urutan bebas setelah `<perintah>`. Parser memisahkan perintah pada kemunculan tag opsi paling awal, sehingga perintah yang memuat karakter titik dua (misal URL `http://...`) tetap utuh.
 - Batasan resource cgroup v2 diterapkan pada leaf node `/sys/fs/cgroup/ninit/<nama>/` sebelum PID layanan dimasukkan ke `cgroup.procs`. Penulisan controller (`+memory +cpu +pids`) ke root cgroup `/sys/fs/cgroup/cgroup.subtree_control` mentoleransi kegagalan atau status partial pada lingkungan nested/container tanpa menggagalkan booting. Bila kernel tidak mengaktifkan controller tertentu, kegagalan penulisan dicatat di log tanpa menggagalkan PID 1.
 - Validasi semantik & penanganan kesalahan graceful: parser memeriksa format nilai `memory_max`, `cpu_max`, dan `pids_max` sebelum diterapkan. Bila format tidak valid/rusak (malformed), ninit mencatat pesan log peringatan informatif (`Parse err: ... tidak valid pada layanan '...', batas diabaikan`) dan mengosongkan batas tersebut. Layanan tetap dijalankan tanpa limit bersangkutan (unconstrained) tanpa membuat PID 1 crash atau masuk rescue shell.
 - Pembersihan siklus hidup orphan (lifecycle orphan cleanup):
@@ -240,6 +244,10 @@ FIFO (mode `0600`) berisi perintah berbasis baris:
 | `reboot` | graceful shutdown, `RB_AUTOBOOT` |
 | `force-poweroff` | force shutdown (`SIGKILL` segera) |
 | `force-reboot` | force reboot (`SIGKILL` segera) |
+| `stop <nama>` | hentikan layanan (`SIGTERM` → eskalasi `SIGKILL` sesuai `:grace=`) dan perbarui `/run/ninit-<nama>.state` |
+| `start <nama>` | jalankan layanan (`initctl_start_service`) |
+| `restart <nama>` | hentikan dengan rapi (bila aktif) lalu mulai ulang `<nama>` |
+| `status [nama]` | kueri dan catat/publikasikan status runtime layanan (`/run/ninit-<nama>.state`) |
 
 ```bash
 echo reboot > /run/initctl
@@ -252,6 +260,7 @@ printf 'poweroff\nreboot\n' > /run/initctl   # hanya baris pertama yang jalan
 ```
 
 - Baris kosong dan spasi/`\r` di ujung diabaikan; perintah tak dikenal dicatat di log.
+- Batas panjang baris FIFO `/run/initctl` adalah **1023 byte** (`MAX_LINE - 1`, `MAX_LINE = 1024`); penulisan tanpa newline tertahan di buffer streaming hingga `\n` tiba atau dibuang bila melebihi 1023 byte.
 - Perintah penutup (`poweroff`, `reboot`, `force-*`) tidak pernah kembali ke event
   loop, jadi perintah penutup pertama yang sudah diproses langsung mengakhiri
   pembacaan. Perintah/baris di depannya selalu tetap dicatat dan diproses —

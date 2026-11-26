@@ -10,6 +10,7 @@ set -eu
 PROG=${0##*/}
 ROOT=/
 VERBOSE=0
+LOCK_OWNED=0
 
 STATE_FILES="etc/passwd etc/group etc/shadow etc/doas.conf etc/init.conf etc/fstab etc/hostname"
 
@@ -34,6 +35,39 @@ EOF
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 note() { [ "$VERBOSE" -eq 1 ] && printf 'ok: %s\n' "$*"; return 0; }
+
+atomic_mv_replace() {
+	amr_src=$1; amr_dst=$2
+	if mv -fT -- "$amr_src" "$amr_dst" 2>/dev/null; then
+		return 0
+	fi
+	if [ -L "$amr_dst" ]; then
+		rm -f -- "$amr_dst" && mv -fT -- "$amr_src" "$amr_dst"
+		return $?
+	fi
+	mv -fT -- "$amr_src" "$amr_dst"
+}
+
+normalize_path() {
+	# normalize_path ABS -- collapse '.' and '..' components of an absolute
+	# path using pure POSIX parameter expansion (no GNU realpath dependency).
+	np_in=$1
+	case "$np_in" in /*) ;; *) return 1 ;; esac
+	np_out=
+	np_rest=${np_in#/}
+	while [ -n "$np_rest" ]; do
+		case "$np_rest" in
+			*/*) np_comp=${np_rest%%/*}; np_rest=${np_rest#*/} ;;
+			*) np_comp=$np_rest; np_rest= ;;
+		esac
+		case "$np_comp" in
+			''|.) continue ;;
+			..) np_out=${np_out%/*} ;;
+			*) np_out="$np_out/$np_comp" ;;
+		esac
+	done
+	printf '%s\n' "${np_out:-/}"
+}
 
 canonicalize_root() {
 	# Resolve ROOT to a canonical physical path with cd -P + pwd (POSIX, no
@@ -76,9 +110,13 @@ canonicalize_root() {
 			esac
 			continue
 		fi
-		cr_base="$cr_base/$cr_comp"
+		if [ "$cr_base" = "/" ]; then
+			cr_base="/$cr_comp"
+		else
+			cr_base="$cr_base/$cr_comp"
+		fi
 	done
-	ROOT=$cr_base
+	ROOT=$(normalize_path "$cr_base") || die "cannot normalize --root: $ROOT"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -156,64 +194,6 @@ valid_rel_path() {
 	return 0
 }
 
-normalize_path() {
-	# normalize_path ABS -- collapse '.' and '..' components of an absolute
-	# path using pure POSIX parameter expansion (no GNU realpath dependency).
-	np_in=$1
-	case "$np_in" in /*) ;; *) return 1 ;; esac
-	np_out=
-	np_rest=${np_in#/}
-	while [ -n "$np_rest" ]; do
-		case "$np_rest" in
-			*/*) np_comp=${np_rest%%/*}; np_rest=${np_rest#*/} ;;
-			*) np_comp=$np_rest; np_rest= ;;
-		esac
-		case "$np_comp" in
-			''|.) continue ;;
-			..) np_out=${np_out%/*} ;;
-			*) np_out="$np_out/$np_comp" ;;
-		esac
-	done
-	printf '%s\n' "${np_out:-/}"
-}
-
-symlink_safe_rel() {
-	# symlink_safe_rel REL -- fail closed if any component of ROOT/REL is a
-	# symlink whose resolution leaves ROOT. Walks each component physically,
-	# resolving symlink chains with readlink and a bounded hop count, and
-	# requires every resolved path to stay under ROOT. Internal-root symlinks
-	# are allowed. REL must already pass valid_rel_path (no '..'/absolute).
-	ssr_rel=$1
-	ssr_root=$ROOT
-	while [ "${ssr_root%/}" != "$ssr_root" ]; do ssr_root=${ssr_root%/}; done
-	ssr_cur=$ssr_root
-	ssr_rest=$ssr_rel
-	while [ -n "$ssr_rest" ]; do
-		case "$ssr_rest" in
-			*/*) ssr_comp=${ssr_rest%%/*}; ssr_rest=${ssr_rest#*/} ;;
-			*) ssr_comp=$ssr_rest; ssr_rest= ;;
-		esac
-		[ -n "$ssr_comp" ] || continue
-		ssr_cur="$ssr_cur/$ssr_comp"
-		ssr_hops=0
-		while [ -L "$ssr_cur" ]; do
-			ssr_hops=$((ssr_hops + 1))
-			[ "$ssr_hops" -le 40 ] || return 1
-			ssr_target=$(readlink "$ssr_cur" 2>/dev/null) || return 1
-			case "$ssr_target" in
-				/*) ssr_cur=$ssr_target ;;
-				*) ssr_cur="$(dirname "$ssr_cur")/$ssr_target" ;;
-			esac
-			ssr_cur=$(normalize_path "$ssr_cur") || return 1
-			case "$ssr_cur/" in
-				"$ssr_root/"*) ;;
-				*) return 1 ;;
-			esac
-		done
-	done
-	return 0
-}
-
 resolve_abs_no_contain() {
 	# resolve_abs_no_contain ABS -- follow an ABSOLUTE symlink target to its
 	# final physical path with the same bounded-hop component walk, WITHOUT
@@ -221,7 +201,7 @@ resolve_abs_no_contain() {
 	# outside ROOT (e.g. /tmp when ROOT is /tmp/fixture/root), so checking
 	# each prefix against ROOT would over-reject an internal absolute link.
 	# The CALLER tests the final resolved path under ROOT. Relative targets
-	# keep the containment-checked walk in symlink_resolve_contained.
+	# keep the containment-checked walk in resolve_contained_under.
 	rac_base=/
 	rac_rest=${1#/}
 	rac_hops=0
@@ -251,76 +231,69 @@ resolve_abs_no_contain() {
 	printf '%s\n' "$rac_base"
 }
 
-symlink_resolve_contained() {
-	# symlink_resolve_contained REL -- bounded-hop resolver for the internal
-	# state preflight. REL is relative (no '..'/absolute) and ROOT is already
-	# canonical. Walk component by component; whenever a component is a
+resolve_contained_under() {
+	# resolve_contained_under BASE_ROOT REL ALLOW_ABS -- bounded-hop restarting
+	# component resolver. BASE_ROOT is canonical and REL is relative (no
+	# '..'/absolute). Walk component by component; whenever a component is a
 	# symlink, expand it and RESTART the walk from the new base with the link
 	# target's components prepended to the remaining ones. Restarting is
 	# essential: resolving a link to "a/b" must still walk "a", which may be
-	# an ancestor symlink pointing outside ROOT even when "b" is ordinary —
-	# a one-shot normalize would wrongly accept that chain. Absolute targets
-	# are resolved fully by resolve_abs_no_contain WITHOUT per-prefix
-	# containment (their prefixes may lie outside ROOT) and their FINAL
-	# resolved path must be under ROOT; relative targets resolve against the
-	# link's directory with per-component containment. Hops are bounded at 40
-	# and '.'/'..' collapse via normalize_path (pure POSIX, identical on the
-	# BusyBox runtime). Nothing is created here.
-	src_rel=$1
-	src_root=$ROOT
-	while [ "${src_root%/}" != "$src_root" ]; do src_root=${src_root%/}; done
-	[ -n "$src_root" ] || src_root=/
-	# canonicalize_root can emit a doubled leading slash for symlinked roots
-	# (abs-target expansion sets base=/ then appends a leading-'/'-stripped
-	# target). Collapse it so the lexical containment check compares the
-	# same spelling as normalize_path's output.
-	src_root=$(normalize_path "$src_root") || return 1
-	src_base=$src_root
-	src_rest=$src_rel
-	src_hops=0
-	while [ -n "$src_rest" ]; do
-		case "$src_rest" in
-			*/*) src_comp=${src_rest%%/*}; src_rest=${src_rest#*/} ;;
-			*) src_comp=$src_rest; src_rest= ;;
+	# an ancestor symlink pointing outside BASE_ROOT even when "b" is ordinary
+	# -- a one-shot normalize would wrongly accept that chain.
+	rcu_root=$(normalize_path "$1") || return 1
+	rcu_rel=$2
+	rcu_allow_abs=${3:-1}
+	rcu_base=$rcu_root
+	rcu_rest=$rcu_rel
+	rcu_hops=0
+	while [ -n "$rcu_rest" ]; do
+		case "$rcu_rest" in
+			*/*) rcu_comp=${rcu_rest%%/*}; rcu_rest=${rcu_rest#*/} ;;
+			*) rcu_comp=$rcu_rest; rcu_rest= ;;
 		esac
-		case "$src_comp" in
+		case "$rcu_comp" in
 			''|.) continue ;;
 		esac
-		src_cand=$(normalize_path "$src_base/$src_comp") || return 1
-		if [ "$src_root" != "/" ]; then
-			case "$src_cand/" in
-				"$src_root/"*) ;;
+		rcu_cand=$(normalize_path "$rcu_base/$rcu_comp") || return 1
+		if [ "$rcu_root" != "/" ]; then
+			case "$rcu_cand/" in
+				"$rcu_root/"*) ;;
 				*) return 1 ;;
 			esac
 		fi
-		if [ -L "$src_cand" ]; then
-			src_hops=$((src_hops + 1))
-			[ "$src_hops" -le 40 ] || return 1
-			src_target=$(readlink "$src_cand" 2>/dev/null) || return 1
-			[ -n "$src_target" ] || return 1
-			case "$src_target" in
+		if [ -L "$rcu_cand" ]; then
+			rcu_hops=$((rcu_hops + 1))
+			[ "$rcu_hops" -le 40 ] || return 1
+			rcu_target=$(readlink "$rcu_cand" 2>/dev/null) || return 1
+			[ -n "$rcu_target" ] || return 1
+			case "$rcu_target" in
 				/*)
-					# Absolute target: resolve every component (including
-					# further symlink hops) WITHOUT per-prefix containment,
-					# then require the FINAL resolved path to stay under
-					# ROOT. Prefixes like /tmp are outside ROOT by design.
-					src_abs=$(resolve_abs_no_contain "$src_target") || return 1
-					if [ "$src_root" != "/" ]; then
-						case "$src_abs/" in
-							"$src_root/"*) ;;
+					[ "$rcu_allow_abs" -eq 1 ] || return 1
+					rcu_abs=$(resolve_abs_no_contain "$rcu_target") || return 1
+					if [ "$rcu_root" != "/" ]; then
+						case "$rcu_abs/" in
+							"$rcu_root/"*) ;;
 							*) return 1 ;;
 						esac
 					fi
-					src_base=$src_abs
+					rcu_base=$rcu_abs
 					;;
-				*)  src_base=$(dirname "$src_cand")
-				    src_rest="$src_target/$src_rest" ;;
+				*)  rcu_base=$(dirname "$rcu_cand")
+				    rcu_rest="$rcu_target/$rcu_rest" ;;
 			esac
 			continue
 		fi
-		src_base=$src_cand
+		rcu_base=$rcu_cand
 	done
 	return 0
+}
+
+symlink_resolve_contained() {
+	resolve_contained_under "$ROOT" "$1" 1
+}
+
+symlink_safe_rel() {
+	resolve_contained_under "$ROOT" "$1" 1
 }
 
 validate_internal_state() {
@@ -373,13 +346,17 @@ symlink_target_inside() {
 		/*) sti_cand=$(normalize_path "$sti_target") || return 1 ;;
 		*) sti_cand=$(normalize_path "$(dirname "$ROOT/$sti_rel")/$sti_target") || return 1 ;;
 	esac
-	sti_root=$ROOT
-	while [ "${sti_root%/}" != "$sti_root" ]; do sti_root=${sti_root%/}; done
-	case "$sti_cand/" in
-		"$sti_root/"*) ;;
-		*) return 1 ;;
-	esac
-	sti_crel=${sti_cand#"$sti_root"/}
+	sti_root=$(normalize_path "$ROOT") || return 1
+	if [ "$sti_root" = "/" ]; then
+		sti_crel=${sti_cand#/}
+	elif [ "$sti_cand" = "$sti_root" ]; then
+		return 0
+	else
+		case "$sti_cand" in
+			"$sti_root"/*) sti_crel=${sti_cand#"$sti_root"/} ;;
+			*) return 1 ;;
+		esac
+	fi
 	symlink_safe_rel "$sti_crel"
 }
 
@@ -426,10 +403,14 @@ write_manifest() {
 	while IFS= read -r wm_line; do
 		[ -n "$wm_line" ] || continue
 		case "$wm_line" in
-			'\'*)
+			'\'*|*'\'*)
 				rm -rf -- "$dir"
 				die "snapshot rejected: backslash/newline filename breaks the manifest grammar: $wm_line" ;;
 		esac
+		if ! printf '%s\n' "$wm_line" | grep -Eq '^[0-9a-f]{64}  \./'; then
+			rm -rf -- "$dir"
+			die "snapshot rejected: backslash/newline filename breaks the manifest grammar: $wm_line"
+		fi
 		wm_path=$(printf '%s\n' "$wm_line" | sed 's/^[^ ]*  //')
 		wm_rel=${wm_path#./}
 		valid_rel_path "$wm_rel" || { rm -rf -- "$dir"; die "unsafe snapshot filename: $wm_path"; }
@@ -492,7 +473,7 @@ do_snapshot() {
 			[ -n "$ds_rel" ] || continue
 			valid_rel_path "$ds_rel" || { rm -rf -- "$ds_tmp"; die "unsafe snapshot path: $ds_rel"; }
 			case "$ds_rel" in
-				symlinks)
+				meta|manifest.sha256|new-files|symlinks)
 					rm -rf -- "$ds_tmp"
 					die "payload target collides with snapshot metadata: $ds_rel" ;;
 			esac
@@ -580,12 +561,12 @@ write_journal() {
 	# write_journal STATE [TAG] [IFACE] -- atomic, mode 0600
 	st=$1; tag=${2:-}; journal_iface=${3:-}
 	tmp=$(mktemp "$STATE/.journal.XXXXXX") || die "cannot create journal temp"
+	chmod 0600 "$tmp" || { rm -f -- "$tmp"; die "cannot set journal mode"; }
 	printf 'state=%s\n' "$st" > "$tmp"
 	[ -n "$tag" ] && printf 'snapshot=%s\n' "$tag" >> "$tmp"
 	[ -n "$journal_iface" ] && printf 'net-iface=%s\n' "$journal_iface" >> "$tmp"
 	printf 'timestamp=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$tmp"
-	mv "$tmp" "$JOURNAL"
-	chmod 0600 "$JOURNAL"
+	atomic_mv_replace "$tmp" "$JOURNAL" || { rm -f -- "$tmp"; die "cannot write journal"; }
 }
 
 journal_get() { sed -n "s/^$1=//p" "$JOURNAL" 2>/dev/null | head -n1; }
@@ -597,7 +578,7 @@ log_event() {
 	if [ -f "$LOGFILE" ]; then
 		size=$(wc -c < "$LOGFILE" | tr -d ' ')
 		if [ "${size:-0}" -ge "$MAX_LOG_BYTES" ]; then
-			mv "$LOGFILE" "$LOGFILE.1" || true
+			atomic_mv_replace "$LOGFILE" "$LOGFILE.1" || true
 			: > "$LOGFILE"
 		fi
 	fi
@@ -623,8 +604,8 @@ restore_files_from() {
 		[ -f "$rf_src" ] || die "snapshot file missing: $rf_rel"
 		mkdir -p "$(dirname "$rf_dst")" || die "cannot create parent for $rf_rel"
 		rf_tmp=$(mktemp "$(dirname "$rf_dst")/.sane-rel.XXXXXX") || die "cannot stage $rf_rel"
-		cp -p "$rf_src" "$rf_tmp" || { rm -f "$rf_tmp"; die "cannot copy $rf_rel"; }
-		mv "$rf_tmp" "$rf_dst" || { rm -f "$rf_tmp"; die "cannot install $rf_rel"; }
+		cp -p -- "$rf_src" "$rf_tmp" || { rm -f -- "$rf_tmp"; die "cannot copy $rf_rel"; }
+		atomic_mv_replace "$rf_tmp" "$rf_dst" || { rm -f -- "$rf_tmp"; die "cannot install $rf_rel"; }
 	done < "$rf_dir/manifest.sha256"
 	# Delete files the upgrade introduced (recorded in new-files), so a
 	# rollback/recover leaves the filesystem consistent with the snapshot.
@@ -634,7 +615,7 @@ restore_files_from() {
 			[ -n "$rf_new" ] || continue
 			valid_rel_path "$rf_new" || die "unsafe new-file path: $rf_new"
 			symlink_safe_rel "$rf_new" || die "new-file symlink escapes root: $rf_new"
-			rm -f "$ROOT/$rf_new"
+			rm -f -- "$ROOT/$rf_new"
 		done < "$rf_dir/new-files"
 	fi
 	# Recreate recorded symlinks (type + target preserved). The metadata is
@@ -658,7 +639,7 @@ restore_files_from() {
 				die "cannot stage symlink: $rf_lpath"
 			ln -s -- "$rf_ltarget" "$rf_ltmp" || \
 				{ rm -f -- "$rf_ltmp"; die "cannot recreate symlink: $rf_lpath"; }
-			mv -fT -- "$rf_ltmp" "$rf_ldst" || \
+			atomic_mv_replace "$rf_ltmp" "$rf_ldst" || \
 				{ rm -f -- "$rf_ltmp"; die "cannot install symlink: $rf_lpath"; }
 		done < "$rf_dir/symlinks"
 	fi
@@ -759,21 +740,25 @@ cmd_net_recover() {
 
 	nr_resolv="$ROOT/etc/resolv.conf"
 	nr_default="$ROOT/etc/resolv.conf.default"
+	symlink_safe_rel "etc/resolv.conf.default" || \
+		net_recover_fail "default resolver symlink escapes root: etc/resolv.conf.default"
+	symlink_safe_rel "etc/resolv.conf" || \
+		net_recover_fail "resolver symlink escapes root: etc/resolv.conf"
 	nr_dir=$(dirname "$nr_resolv")
 	[ -f "$nr_default" ] || net_recover_fail "default resolver is missing: $nr_default"
 	[ -d "$nr_dir" ] || net_recover_fail "resolver directory is missing: $nr_dir"
 	nr_tmp=$(mktemp "$nr_dir/.sane-net-recover.XXXXXX") || \
 		net_recover_fail "cannot stage default resolver in $nr_dir"
 	if ! cat "$nr_default" > "$nr_tmp"; then
-		rm -f "$nr_tmp"
+		rm -f -- "$nr_tmp"
 		net_recover_fail "cannot read default resolver: $nr_default"
 	fi
 	if ! chmod 0644 "$nr_tmp"; then
-		rm -f "$nr_tmp"
+		rm -f -- "$nr_tmp"
 		net_recover_fail "cannot set resolver mode in $nr_dir"
 	fi
-	if ! mv "$nr_tmp" "$nr_resolv"; then
-		rm -f "$nr_tmp"
+	if ! atomic_mv_replace "$nr_tmp" "$nr_resolv"; then
+		rm -f -- "$nr_tmp"
 		net_recover_fail "cannot install default resolver: $nr_resolv"
 	fi
 
@@ -804,7 +789,7 @@ cmd_upgrade() {
 		{ rm -rf -- "$up_stage"; die "cannot stage upgrade manifest"; }
 	# Clean the staged dir on EVERY exit path (die, set -e, signals, success);
 	# release_lock stays part of the EXIT trap owned by the dispatcher.
-	trap 'rm -rf -- "$up_stage"; release_lock' EXIT
+	trap 'rm -rf -- "$up_stage"; rm -f -- "${up_extra:-}"; release_lock' EXIT
 	# Fast-fail pre-check against the staged manifest (legacy error contract).
 	(cd "$payload" && sha256sum -c "$up_stage/manifest.sha256" >/dev/null 2>&1) || \
 		die "payload integrity check failed"
@@ -883,13 +868,13 @@ cmd_upgrade() {
 			printf '%s: fault injection: payload-swap-late\n' "$PROG" >&2
 			printf 'fault-swap-late\n' >> "$up_src"
 		fi
-		cp -p "$up_src" "$up_tmp" || { rm -f "$up_tmp"; recover_internal || true; die "cannot copy $up_rel"; }
+		cp -p -- "$up_src" "$up_tmp" || { rm -f -- "$up_tmp"; recover_internal || true; die "cannot copy $up_rel"; }
 		# Verify the bytes actually staged, not just the source we copied.
 		up_tmp_hash=$(sha256sum "$up_tmp") || \
-			{ rm -f "$up_tmp"; recover_internal || true; die "cannot re-hash staged file: $up_rel"; }
+			{ rm -f -- "$up_tmp"; recover_internal || true; die "cannot re-hash staged file: $up_rel"; }
 		[ "${up_tmp_hash%% *}" = "$up_hash" ] || \
-			{ rm -f "$up_tmp"; recover_internal || true; die "payload changed during upgrade: $up_rel"; }
-		mv "$up_tmp" "$up_dst" || { rm -f "$up_tmp"; recover_internal || true; die "cannot install $up_rel"; }
+			{ rm -f -- "$up_tmp"; recover_internal || true; die "payload changed during upgrade: $up_rel"; }
+		atomic_mv_replace "$up_tmp" "$up_dst" || { rm -f -- "$up_tmp"; recover_internal || true; die "cannot install $up_rel"; }
 	done < "$up_stage/manifest.sha256"
 	rm -rf -- "$up_stage"
 	write_journal 'done' "$tag"
@@ -920,7 +905,9 @@ cmd_backup() {
 		esac
 	done
 	cmd_init
-	[ -e "$archive" ] && [ "$force" -ne 1 ] && die "archive already exists: $archive"
+	if { [ -e "$archive" ] || [ -L "$archive" ]; } && [ "$force" -ne 1 ]; then
+		die "archive already exists: $archive"
+	fi
 	# The lock is process-local runtime state, never backup material: list
 	# persistent members EXPLICITLY so lock/ and lock.stale.* are excluded by
 	# construction. The shipped BusyBox tar has no --exclude/-X support, and
@@ -938,26 +925,9 @@ cmd_backup() {
 
 restore_link_safe() {
 	# restore_link_safe LINK -- fail closed if LINK's target is absolute or
-	# its resolved chain leaves the restore staging root (rt_tmp). Walks the
-	# chain with a bounded hop count like symlink_safe_rel; internal relative
-	# chains (including '..' that normalizes back inside rt_tmp) are allowed.
-	rls_cur=$1
-	rls_hops=0
-	while [ -L "$rls_cur" ]; do
-		rls_hops=$((rls_hops + 1))
-		[ "$rls_hops" -le 40 ] || return 1
-		rls_target=$(readlink "$rls_cur" 2>/dev/null) || return 1
-		case "$rls_target" in
-			/*) return 1 ;;
-			*) rls_cur="$(dirname "$rls_cur")/$rls_target" ;;
-		esac
-		rls_cur=$(normalize_path "$rls_cur") || return 1
-		case "$rls_cur/" in
-			"$rt_tmp/"*) ;;
-			*) return 1 ;;
-		esac
-	done
-	return 0
+	# its resolved chain leaves the restore staging root (rt_tmp). Uses the
+	# shared restarting component walk (bounded 40 hops, allow_abs=0).
+	resolve_contained_under "$rt_tmp" "${1#"$rt_tmp"/}" 0
 }
 
 cmd_restore() {
@@ -965,19 +935,145 @@ cmd_restore() {
 	archive=$1
 	[ -f "$archive" ] || die "archive not found: $archive"
 	rt_tmp=$(mktemp -d) || die "cannot create restore staging dir"
-	# Validate member names BEFORE extraction so a traversal entry cannot
-	# write outside the staging directory.
+	rt_tmp=$(cd -P "$rt_tmp" && pwd) || { rm -rf -- "$rt_tmp"; die "cannot resolve restore staging dir"; }
+	trap 'rm -rf -- "$rt_tmp"; release_lock' EXIT
+	# Validate member names, entry types, permissions (no setuid/setgid),
+	# BusyBox hardlinks ('-... -> target'), and symlink containment BEFORE
+	# extraction so nothing unsafe can touch disk or escape staging.
 	tar -tzf "$archive" > "$rt_tmp/members" 2>/dev/null || \
-		{ rm -rf -- "$rt_tmp"; die "cannot read archive"; }
+		die "cannot read archive"
 	while IFS= read -r rt_member; do
 		[ -n "$rt_member" ] || continue
 		case "$rt_member" in
-			/*|..|../*|*/..|*../*) \
-				{ rm -rf -- "$rt_tmp"; die "unsafe archive member: $rt_member"; } ;;
+			/*|..|../*|*/..|*../*|*'\'*) \
+				die "unsafe archive member: $rt_member" ;;
 		esac
 	done < "$rt_tmp/members"
+	tar -tvzf "$archive" > "$rt_tmp/listing" 2>/dev/null || \
+		die "cannot inspect archive"
+	rt_audit_rc=0
+	rt_audit_bad=$(awk '
+	function check_path_contained(rel,   rest, comp, cur_parts, cur_n, hops, tgt, i, cand, idx) {
+		cur_n = 0
+		rest = rel
+		hops = 0
+		while (rest != "") {
+			idx = index(rest, "/")
+			if (idx > 0) {
+				comp = substr(rest, 1, idx - 1)
+				rest = substr(rest, idx + 1)
+			} else {
+				comp = rest
+				rest = ""
+			}
+			if (comp == "" || comp == ".") continue
+			if (comp == "..") {
+				if (cur_n == 0) return 0
+				cur_n--
+				continue
+			}
+			cur_n++
+			cur_parts[cur_n] = comp
+			cand = cur_parts[1]
+			for (i = 2; i <= cur_n; i++) cand = cand "/" cur_parts[i]
+			if (cand in links) {
+				hops++
+				if (hops > 40) return 0
+				tgt = links[cand]
+				if (substr(tgt, 1, 1) == "/") return 0
+				cur_n--
+				rest = (rest == "" ? tgt : tgt "/" rest)
+			}
+		}
+		return 1
+	}
+	BEGIN { bad = 0; unsafe_sym = ""; nmem = 0 }
+	{
+		line = $0
+		if (!match(line, /^[-dl][rwxstST-]{9}[ \t]+[^ \t]+[ \t]+[0-9]+[ \t]+[0-9]{4}-[0-9]{2}-[0-9]{2}[ \t]+[0-9]{2}:[0-9]{2}(:[0-9]{2})?[ ]/)) {
+			bad = 1
+			next
+		}
+		mode = substr(line, 1, 10)
+		ftype = substr(mode, 1, 1)
+		if (substr(mode, 2, 9) ~ /[sS]/) {
+			bad = 1
+			next
+		}
+		rest = substr(line, RLENGTH + 1)
+		if (ftype == "-") {
+			if (index(rest, " -> ") > 0) {
+				bad = 1
+				next
+			}
+			mpath = rest
+			sub(/^\.\//, "", mpath)
+			if (mpath == "" || substr(mpath, 1, 1) == "/" || mpath ~ /\\/ || ("/" mpath "/") ~ /\/\.\.?\//) {
+				bad = 1
+				next
+			}
+			nmem++
+			members[nmem] = mpath
+		} else if (ftype == "d") {
+			mpath = rest
+			sub(/^\.\//, "", mpath)
+			sub(/\/+$/, "", mpath)
+			if (mpath != "" && mpath != ".") {
+				if (substr(mpath, 1, 1) == "/" || mpath ~ /\\/ || ("/" mpath "/") ~ /\/\.\.?\//) {
+					bad = 1
+					next
+				}
+				nmem++
+				members[nmem] = mpath
+			}
+		} else if (ftype == "l") {
+			pos = index(rest, " -> ")
+			if (pos == 0) {
+				bad = 1
+				next
+			}
+			lpath = substr(rest, 1, pos - 1)
+			ltarget = substr(rest, pos + 4)
+			sub(/^\.\//, "", lpath)
+			if (lpath == "" || substr(lpath, 1, 1) == "/" || lpath ~ /\\/ || ("/" lpath "/") ~ /\/\.\.?\//) {
+				bad = 1
+				next
+			}
+			if (ltarget == "" || substr(ltarget, 1, 1) == "/" || ltarget ~ /\\/) {
+				if (unsafe_sym == "") unsafe_sym = lpath
+				next
+			}
+			links[lpath] = ltarget
+			nmem++
+			members[nmem] = lpath
+		} else {
+			bad = 1
+		}
+	}
+	END {
+		if (bad) exit 2
+		if (unsafe_sym != "") {
+			print unsafe_sym
+			exit 3
+		}
+		for (i = 1; i <= nmem; i++) {
+			if (!check_path_contained(members[i])) {
+				print members[i]
+				exit 3
+			}
+		}
+		exit 0
+	}' "$rt_tmp/listing") || rt_audit_rc=$?
+	case "$rt_audit_rc" in
+		0) ;;
+		3) die "unsafe symlink chain in archive: $rt_audit_bad" ;;
+		*) die "unsafe archive entry" ;;
+	esac
+	[ "$(wc -l < "$rt_tmp/members")" -eq "$(wc -l < "$rt_tmp/listing")" ] || \
+		die "archive listing mismatch"
+
 	tar -xzf "$archive" -C "$rt_tmp" 2>/dev/null || \
-		{ rm -rf -- "$rt_tmp"; die "cannot extract archive"; }
+		die "cannot extract archive"
 	# Archives made by old tool versions still carry the backup holder's
 	# lock/ (and lock.stale.* crash residue). Never restore lock state: strip
 	# every lock* entry from staging right after extraction, before any
@@ -987,39 +1083,54 @@ cmd_restore() {
 		[ -e "$rt_lock" ] || [ -L "$rt_lock" ] || continue
 		rm -rf -- "$rt_lock"
 	done
-	[ -d "$rt_tmp/var/lib/sane/reliability/snapshots" ] || \
-		{ rm -rf -- "$rt_tmp"; die "archive has no reliability snapshots"; }
+	for rt_req_dir in var var/lib var/lib/sane var/lib/sane/reliability var/lib/sane/reliability/snapshots var/log var/log/sane; do
+		[ ! -L "$rt_tmp/$rt_req_dir" ] || die "unsafe symlink directory in archive: $rt_req_dir"
+	done
+	rt_snaps="$rt_tmp/var/lib/sane/reliability/snapshots"
+	[ -d "$rt_snaps" ] || die "archive has no reliability snapshots"
+	# Post-extract tree verification after lock* strip: reject any non-regular/
+	# non-dir/non-symlink entries, setuid/setgid bits, or hardlinked regular files.
+	rt_bad_tree=$(find "$rt_tmp" \( ! -type d ! -type f ! -type l \) -o -perm /6000 -o \( -type f -links +1 \) -print)
+	[ -z "$rt_bad_tree" ] || die "unsafe extracted entry in archive"
 	# Reject absolute targets and symlink chains that leave the staging root
-	# before anything is installed. Each chain is walked with a bounded hop
-	# count (like symlink_safe_rel); internal relative chains, including '..'
-	# that normalizes back inside the staging root, are allowed.
+	# before anything is installed.
 	find "$rt_tmp" -type l -print > "$rt_tmp/links"
 	while IFS= read -r rt_link; do
 		[ -n "$rt_link" ] || continue
 		restore_link_safe "$rt_link" || \
-			{ rm -rf -- "$rt_tmp"; die "unsafe symlink chain in archive: $rt_link"; }
+			die "unsafe symlink chain in archive: $rt_link"
 	done < "$rt_tmp/links"
-	# Verify every snapshot manifest found in the archive.
-	find "$rt_tmp/var/lib/sane/reliability/snapshots" -name manifest.sha256 -print > "$rt_tmp/manifests"
-	while IFS= read -r rt_manifest; do
-		[ -n "$rt_manifest" ] || continue
-		rt_dir=$(dirname "$rt_manifest")
-		validate_manifest "$rt_dir" || { rm -rf -- "$rt_tmp"; die "invalid archive manifest"; }
+	# Every direct entry under snapshots/ must be a snapshot directory carrying
+	# a valid, verified manifest.sha256 covering all regular files within it.
+	rt_non_dir_snap=$(find "$rt_snaps" -mindepth 1 -maxdepth 1 ! -type d -print)
+	[ -z "$rt_non_dir_snap" ] || die "unexpected non-directory in archive snapshots"
+	find "$rt_snaps" -mindepth 1 -maxdepth 1 -type d -print > "$rt_tmp/snapdirs"
+	while IFS= read -r rt_dir; do
+		[ -n "$rt_dir" ] || continue
+		[ -f "$rt_dir/manifest.sha256" ] && [ ! -L "$rt_dir/manifest.sha256" ] || \
+			die "archive snapshot missing manifest.sha256: ${rt_dir##*/}"
+		validate_manifest "$rt_dir" || die "invalid archive manifest"
 		(cd "$rt_dir" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || \
-			{ rm -rf -- "$rt_tmp"; die "archive manifest verification failed"; }
-	done < "$rt_tmp/manifests"
+			die "archive manifest verification failed"
+		(cd "$rt_dir" && find . -type f ! -name manifest.sha256 -print0 | \
+			LC_ALL=C sort -z | tr '\0' '\n' | sed 's|^\./||') > "$rt_tmp/actual.files"
+		sed -n 's/^[^ ]*  //p' "$rt_dir/manifest.sha256" | sed 's|^\./||' | \
+			LC_ALL=C sort > "$rt_tmp/listed.files"
+		cmp -s "$rt_tmp/actual.files" "$rt_tmp/listed.files" || \
+			die "unverified file in archive snapshot: ${rt_dir##*/}"
+	done < "$rt_tmp/snapdirs"
 	mkdir -p "$STATE" "$LOGDIR"
 	cp -a "$rt_tmp/var/lib/sane/reliability/." "$STATE/" || \
-		{ rm -rf -- "$rt_tmp"; die "cannot restore state"; }
+		die "cannot restore state"
 	cp -a "$rt_tmp/var/log/sane/." "$LOGDIR/" || \
-		{ rm -rf -- "$rt_tmp"; die "cannot restore logs"; }
+		die "cannot restore logs"
 	# Never trust the archived journal: an archive captured mid-upgrade carries
 	# state=in-progress + snapshot=X, and the next recover would force a
 	# rollback to X over the freshly restored state. Restore is a terminal
 	# operation: force the journal to idle (state only, no tag or interface).
-	write_journal idle || \
-		{ rm -rf -- "$rt_tmp"; die "cannot reset journal after restore"; }
+	write_journal idle || die "cannot reset journal after restore"
 	rm -rf -- "$rt_tmp"
+	trap 'release_lock' EXIT
 	log_event INFO "archive restored"
 	note "archive restored into $ROOT"
 }
@@ -1058,39 +1169,27 @@ heal_snapshot_swaps() {
 
 release_lock() {
 	# EXIT-trap release, owned by the top-level acquisition only. Remove the
-	# lock only if this process still owns it (lock/pid == $$); a lock stolen
-	# or held by anyone else is never touched.
+	# lock only if this process acquired it (LOCK_OWNED == 1) and still owns
+	# it (lock/pid == $$); a lock stolen or held by anyone else is untouched.
+	[ "$LOCK_OWNED" -eq 1 ] || return 0
 	lk_rel_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
 	if [ "$lk_rel_pid" = "$$" ]; then
 		rm -rf -- "$LOCK_DIR"
 	fi
+	LOCK_OWNED=0
 }
 
 acquire_lock() {
 	# Atomic mkdir lock for ALL commands (every command writes or auto-inits
 	# state, so all writes happen under the lock), acquired ONLY at the
-	# top-level dispatcher entry. Nested calls in the same process (recover
-	# -> cmd_net_recover, rollback/upgrade -> do_snapshot, every command ->
-	# cmd_init) never re-acquire: the pid check below makes the lock
-	# reentrant by pid, and the EXIT-trap release belongs to the top-level
-	# acquisition alone.
-	#
-	# Stale handling: a lock whose pid is dead (kill -0 fails) or garbage is
-	# stolen via an atomic mv aside; the mv loser loops and re-evaluates.
-	# A pidless lock gets a 1s grace (the holder may be between mkdir and the
-	# pid write) before it is treated as crash residue and stolen.
-	#
-	# Limits (documented in doc/reliability.md): stale detection is kill -0
-	# based, so a REUSED pid of a dead holder can look alive and delay
-	# acquisition up to the timeout (fail-closed, never a wrongful steal of a
-	# live same-user holder); kill -0 also fails with EPERM across users, so
-	# the tool assumes single-user/root operation on the state it protects.
+	# top-level dispatcher entry. Nested calls in the same process reuse the
+	# held lock via LOCK_OWNED=1 rather than trusting on-disk lock/pid == $$
+	# (which could match a reused PID after an earlier crash).
 	LOCK_TIMEOUT=${SANE_RELIABILITY_LOCK_TIMEOUT:-30}
 	case "$LOCK_TIMEOUT" in
 		''|*[!0-9]*|0) die "invalid SANE_RELIABILITY_LOCK_TIMEOUT: $LOCK_TIMEOUT" ;;
 	esac
-	lk_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-	[ "$lk_pid" = "$$" ] && return 0
+	[ "$LOCK_OWNED" -eq 1 ] && return 0
 	mkdir -p "$STATE" || die "cannot create reliability state for locking"
 	lk_tries=0
 	lk_empty=0
@@ -1100,14 +1199,19 @@ acquire_lock() {
 		[ "$lk_tries" -le "$lk_max" ] || \
 			die "timed out waiting for reliability lock: $LOCK_DIR"
 		lk_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-		[ "$lk_pid" = "$$" ] && return 0
 		lk_stale=0
 		case "$lk_pid" in
 			'') lk_empty=$((lk_empty + 1))
 			    [ "$lk_empty" -ge 10 ] && lk_stale=1 ;;
 			*[!0-9]*) lk_stale=1 ;;
 			*) lk_empty=0
-			   kill -0 "$lk_pid" 2>/dev/null || lk_stale=1 ;;
+			   if [ "$lk_pid" = "$$" ]; then
+			       # LOCK_OWNED is 0, so a lock file bearing our own PID
+			       # must be crash residue from a reused PID.
+			       lk_stale=1
+			   else
+			       kill -0 "$lk_pid" 2>/dev/null || lk_stale=1
+			   fi ;;
 		esac
 		if [ "$lk_stale" = 1 ]; then
 			if mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
@@ -1120,6 +1224,7 @@ acquire_lock() {
 		fi
 	done
 	printf '%s\n' "$$" > "$LOCK_DIR/pid"
+	LOCK_OWNED=1
 	trap release_lock EXIT
 	trap 'exit 1' HUP INT TERM
 	heal_snapshot_swaps

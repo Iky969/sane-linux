@@ -129,8 +129,6 @@ fi
 if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
     die "sane-install must be run as root (UID 0)"
 fi
-# The installer already runs as root; SUDO is empty for parity with make-image.sh.
-SUDO=""
 
 # Tool lookup helper
 find_tool() {
@@ -174,7 +172,9 @@ SPM_BIN=$(find_tool spm /usr/bin/spm "$SCRIPT_DIR/spm" "$REPO_ROOT/scripts/spm" 
 
 # Target device verification
 [ -n "$TARGET" ] || die "No target device specified. Use --target /dev/vda"
-[ -b "$TARGET" ] || die "Target '$TARGET' is not a valid block device"
+TARGET_CANON=$(readlink -f "$TARGET" 2>/dev/null || true)
+[ -n "$TARGET_CANON" ] && [ -b "$TARGET_CANON" ] || die "Target '$TARGET' is not a valid block device"
+TARGET="$TARGET_CANON"
 
 TGT_BASE=$(basename "$TARGET")
 
@@ -182,19 +182,91 @@ TGT_BASE=$(basename "$TARGET")
 if [ -f "/sys/class/block/$TGT_BASE/partition" ]; then
     die "Target '$TARGET' is a partition, not a whole disk (expected e.g. /dev/vda, not /dev/vda1)"
 fi
-
-# Guard: Fail-closed if target or any of its partitions are active in /proc/mounts
-if grep -qE "^${TARGET}(p?[0-9]+)? " /proc/mounts 2>/dev/null; then
-    die "Target '$TARGET' (or one of its partitions) is currently mounted in /proc/mounts"
+if [ -d /sys/block ] && [ ! -d "/sys/block/$TGT_BASE" ]; then
+    die "Target '$TARGET' is not a whole-disk block device"
 fi
 
-# Guard: Fail-closed if target is active in /proc/swaps
-if grep -qE "^${TARGET}(p?[0-9]+)? " /proc/swaps 2>/dev/null; then
-    die "Target '$TARGET' (or one of its partitions) is currently active in /proc/swaps"
+# Guard: Fail-closed if target or any of its partitions have active device holders (e.g. dm/LVM/MD)
+for hdir in "/sys/block/$TGT_BASE/holders" "/sys/block/$TGT_BASE"/*/holders; do
+    [ -d "$hdir" ] || continue
+    if find "$hdir" -mindepth 1 -maxdepth 1 2>/dev/null | grep -q .; then
+        die "Target '$TARGET' (or one of its partitions) has active device holders ($hdir)"
+    fi
+done
+
+# Collect major:minor IDs of the target disk and all of its partitions so
+# aliases such as /dev/root or symlinks cannot bypass mount/swap checks.
+TGT_DEV_IDS=""
+for devfile in "/sys/block/$TGT_BASE/dev" "/sys/block/$TGT_BASE"/*/dev; do
+    [ -r "$devfile" ] || continue
+    _devid=$(cat "$devfile" 2>/dev/null || true)
+    [ -n "$_devid" ] && TGT_DEV_IDS="$TGT_DEV_IDS $_devid"
+done
+
+matches_target_dev() {
+    _cand="$1"
+    [ -n "$_cand" ] || return 1
+    case "$_cand" in
+        "$TARGET") return 0 ;;
+        "$TARGET"*)
+            _suf=${_cand#"$TARGET"}
+            case "$TARGET" in
+                *[0-9])
+                    case "$_suf" in p[0-9]*) _suf=${_suf#p} ;; *) return 1 ;; esac
+                    ;;
+            esac
+            case "$_suf" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+            ;;
+    esac
+    return 1
+}
+
+dev_matches_target() {
+    _raw="$1"
+    matches_target_dev "$_raw" && return 0
+    case "$_raw" in
+        /*)
+            _canon=$(readlink -f "$_raw" 2>/dev/null || printf '%s' "$_raw")
+            matches_target_dev "$_canon" && return 0
+            if [ -b "$_canon" ]; then
+                _hex_mm=$(stat -c '%t %T' "$_canon" 2>/dev/null || true)
+                if [ -n "$_hex_mm" ]; then
+                    _hmaj=${_hex_mm%% *}
+                    _hmin=${_hex_mm##* }
+                    _dec_mm="$((0x$_hmaj)):$((0x$_hmin))"
+                    for _tid in $TGT_DEV_IDS; do
+                        [ "$_dec_mm" = "$_tid" ] && return 0
+                    done
+                fi
+            fi
+            ;;
+    esac
+    return 1
+}
+
+# Guard: Fail-closed if target or any of its partitions are active in /proc/mounts
+if [ -r /proc/mounts ]; then
+    for _mdev in $(awk '{print $1}' /proc/mounts 2>/dev/null || true); do
+        if dev_matches_target "$_mdev"; then
+            die "Target '$TARGET' (or one of its partitions: $_mdev) is currently mounted in /proc/mounts"
+        fi
+    done
+fi
+
+# Guard: Fail-closed if target or any of its partitions are active in /proc/swaps
+if [ -r /proc/swaps ]; then
+    for _sdev in $(awk 'NR > 1 {print $1}' /proc/swaps 2>/dev/null || true); do
+        if dev_matches_target "$_sdev"; then
+            die "Target '$TARGET' (or one of its partitions: $_sdev) is currently active in /proc/swaps"
+        fi
+    done
 fi
 
 # Guard: Check read-only bit
 if [ -f "/sys/class/block/$TGT_BASE/ro" ] && [ "$(cat "/sys/class/block/$TGT_BASE/ro" 2>/dev/null || echo 0)" = "1" ]; then
+    die "Target '$TARGET' is marked read-only"
+fi
+if [ -f "/sys/block/$TGT_BASE/ro" ] && [ "$(cat "/sys/block/$TGT_BASE/ro" 2>/dev/null || echo 0)" = "1" ]; then
     die "Target '$TARGET' is marked read-only"
 fi
 
@@ -233,13 +305,16 @@ fi
 tgt_bytes=0
 if [ -f "/sys/class/block/$TGT_BASE/size" ]; then
     tgt_sectors=$(cat "/sys/class/block/$TGT_BASE/size" 2>/dev/null || echo 0)
+    case "$tgt_sectors" in ''|*[!0-9]*) tgt_sectors=0 ;; esac
     tgt_bytes=$((tgt_sectors * 512))
-elif command -v blockdev >/dev/null 2>&1; then
+fi
+if [ "$tgt_bytes" -le 0 ] && command -v blockdev >/dev/null 2>&1; then
     tgt_bytes=$(blockdev --getsize64 "$TARGET" 2>/dev/null || echo 0)
+    case "$tgt_bytes" in ''|*[!0-9]*) tgt_bytes=0 ;; esac
 fi
 MIN_DISK_BYTES=268435456  # 256MB
-if [ "$tgt_bytes" -gt 0 ] && [ "$tgt_bytes" -lt "$MIN_DISK_BYTES" ]; then
-    die "Target disk $TARGET is too small ($((tgt_bytes / 1024 / 1024))MB). Minimum required: 256MB ($MIN_DISK_BYTES bytes)"
+if [ "$tgt_bytes" -le 0 ] || [ "$tgt_bytes" -lt "$MIN_DISK_BYTES" ]; then
+    die "Target disk $TARGET size is invalid or too small ($((tgt_bytes / 1024 / 1024))MB). Minimum required: 256MB ($MIN_DISK_BYTES bytes)"
 fi
 
 # Preflight Check 2: Required base packages existence and archive integrity
@@ -312,22 +387,50 @@ if [ -z "$PREFLIGHT_LIMINE_SHARE" ]; then
 fi
 [ -n "$PREFLIGHT_LIMINE_SHARE" ] || die "Preflight: Mandatory Limine payloads (limine-bios.sys and BOOTX64.EFI) not found"
 
-# Track staging directories for clean exit / failure cleanup
+is_mounted() {
+    _mnt="$1"
+    [ -n "$_mnt" ] || return 1
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$_mnt" 2>/dev/null && return 0
+    fi
+    awk -v m="$_mnt" '$2 == m { found = 1; exit } END { exit !found }' /proc/mounts 2>/dev/null
+}
+
+# Track staging directories and temp files for clean exit / failure cleanup
 CLEANUP_MOUNTS=""
+CLEANUP_DIRS=""
+CLEANUP_FILES=""
 cleanup() {
     set +e
     if [ -n "$CLEANUP_MOUNTS" ]; then
         for mnt in $CLEANUP_MOUNTS; do
-            if mountpoint -q "$mnt" 2>/dev/null || grep -q " $mnt " /proc/mounts 2>/dev/null; then
+            if is_mounted "$mnt"; then
                 umount -f "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
             fi
-            if ! mountpoint -q "$mnt" 2>/dev/null && ! grep -q " $mnt " /proc/mounts 2>/dev/null && [ -d "$mnt" ]; then
+            if ! is_mounted "$mnt" && [ -d "$mnt" ]; then
                 rmdir "$mnt" 2>/dev/null || true
             fi
         done
     fi
+    if [ -n "$CLEANUP_DIRS" ]; then
+        for d in $CLEANUP_DIRS; do
+            [ -d "$d" ] && rm -rf "$d" 2>/dev/null || true
+        done
+    fi
+    if [ -n "$CLEANUP_FILES" ]; then
+        for f in $CLEANUP_FILES; do
+            [ -e "$f" ] && rm -f "$f" 2>/dev/null || true
+        done
+    fi
 }
-trap cleanup EXIT INT TERM
+# POSIX shells may run a signal trap after a foreground command returns.  Exit
+# explicitly from cancellation handlers so cleanup cannot resume installation.
+cancelled() {
+    cleanup
+    exit 130
+}
+trap cleanup EXIT
+trap cancelled INT TERM
 
 log "S.A.N.E Linux Offline Installer"
 info "Target Device : $TARGET"
@@ -395,9 +498,12 @@ CLEANUP_MOUNTS="$TARGET_ROOT $CLEANUP_MOUNTS"
 mount "$PART2" "$TARGET_ROOT"
 "$SPM_BIN" --root "$TARGET_ROOT" init >/dev/null
 
-# Track installed packages to avoid duplicate installation if aliases exist
+# Topologically sort .spm.tar.xz packages via .META/depends (fallback: dependencies=).
+PKG_META_TMP=$(mktemp /tmp/sane-pkg-meta.XXXXXX)
+PKG_ORDER_TMP=$(mktemp /tmp/sane-pkg-order.XXXXXX)
+CLEANUP_FILES="$PKG_META_TMP $PKG_ORDER_TMP $CLEANUP_FILES"
 INSTALLED_PKGS=""
-is_pkg_installed() {
+is_pkg_seen() {
     _pname="$1"
     for _inst in $INSTALLED_PKGS; do
         if [ "$_inst" = "$_pname" ]; then
@@ -410,13 +516,101 @@ is_pkg_installed() {
 for pkg in "$PACKAGES_DIR"/*.spm.tar.xz; do
     [ -f "$pkg" ] || continue
     fname=$(basename "$pkg")
-    pkg_name=$(echo "$fname" | sed -E 's/-[0-9]+(\.[0-9]+)*.*//')
-    if ! is_pkg_installed "$pkg_name"; then
-        INSTALLED_PKGS="$INSTALLED_PKGS $pkg_name"
-        info "Installing: $fname"
-        "$SPM_BIN" --root "$TARGET_ROOT" install "$pkg" >/dev/null
+    pkg_manifest=$(tar -xJOf "$pkg" ./.META/package 2>/dev/null || tar -xJOf "$pkg" .META/package 2>/dev/null || true)
+    pkg_name=$(printf '%s\n' "$pkg_manifest" | grep -E '^[[:space:]]*name=' | head -n1 | cut -d= -f2- | tr -d '\r\n' || true)
+    if [ -z "$pkg_name" ]; then
+        pkg_name=$(printf '%s' "$fname" | sed -E 's/-[0-9]+(\.[0-9]+)*.*//')
     fi
+    if is_pkg_seen "$pkg_name"; then
+        continue
+    fi
+    INSTALLED_PKGS="$INSTALLED_PKGS $pkg_name"
+    pkg_deps=$(tar -xJOf "$pkg" ./.META/depends 2>/dev/null || tar -xJOf "$pkg" .META/depends 2>/dev/null || true)
+    pkg_deps=$(printf '%s\n' "$pkg_deps" | tr ',\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+    if [ -z "$pkg_deps" ]; then
+        pkg_deps=$(printf '%s\n' "$pkg_manifest" | grep -E '^[[:space:]]*dependencies=' | head -n1 | cut -d= -f2- | tr ',\r\n' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' || true)
+    fi
+    printf '%s|%s|%s\n' "$pkg_name" "$pkg" "$pkg_deps" >> "$PKG_META_TMP"
 done
+
+_sort_rc=0
+LC_ALL=C sort "$PKG_META_TMP" | awk -F'|' '
+    BEGIN { n = 0 }
+    {
+        name = $1; path = $2; deps_str = $3
+        n++
+        pkgs[n] = name
+        paths[name] = path
+        present[name] = 1
+        dc = split(deps_str, darr, /[[:space:]]+/)
+        dep_cnt[name] = 0
+        for (i = 1; i <= dc; i++) {
+            if (darr[i] != "") {
+                dep_cnt[name]++
+                dep[name, dep_cnt[name]] = darr[i]
+            }
+        }
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            p = pkgs[i]
+            for (j = 1; j <= dep_cnt[p]; j++) {
+                d = dep[p, j]
+                if (!(d in present)) {
+                    printf "ERR|missing dependency %s required by %s\n", d, p
+                    exit 2
+                }
+            }
+        }
+        emitted = 0
+        while (emitted < n) {
+            progressed = 0
+            for (i = 1; i <= n; i++) {
+                p = pkgs[i]
+                if (done[p]) continue
+                ready = 1
+                for (j = 1; j <= dep_cnt[p]; j++) {
+                    d = dep[p, j]
+                    if (!done[d]) { ready = 0; break }
+                }
+                if (ready) {
+                    done[p] = 1
+                    emitted++
+                    order[emitted] = paths[p]
+                    progressed = 1
+                    break
+                }
+            }
+            if (!progressed) {
+                cyc = ""
+                for (i = 1; i <= n; i++) {
+                    if (!done[pkgs[i]]) {
+                        cyc = (cyc == "" ? pkgs[i] : cyc ", " pkgs[i])
+                    }
+                }
+                printf "ERR|dependency cycle among: %s\n", cyc
+                exit 3
+            }
+        }
+        for (i = 1; i <= emitted; i++) {
+            print order[i]
+        }
+    }
+' > "$PKG_ORDER_TMP" || _sort_rc=$?
+rm -f "$PKG_META_TMP"
+if [ "$_sort_rc" -ne 0 ]; then
+    _err=$(grep '^ERR|' "$PKG_ORDER_TMP" | head -n1 | cut -d'|' -f2- || true)
+    rm -f "$PKG_ORDER_TMP"
+    die "Package dependency resolution failed: ${_err:-exit $_sort_rc}"
+fi
+
+while IFS= read -r pkg; do
+    [ -n "$pkg" ] || continue
+    fname=$(basename "$pkg")
+    info "Installing: $fname"
+    "$SPM_BIN" --root "$TARGET_ROOT" install "$pkg" >/dev/null
+done < "$PKG_ORDER_TMP"
+rm -f "$PKG_ORDER_TMP"
 
 # Ensure standard system directories and permissions exist
 mkdir -p "$TARGET_ROOT/boot" "$TARGET_ROOT/proc" "$TARGET_ROOT/sys" "$TARGET_ROOT/dev" \
@@ -428,16 +622,17 @@ log "Step 4/6: Configuring system (/etc/fstab, /etc/init.conf, /etc/hostname)...
 
 cat <<EOF > "$TARGET_ROOT/etc/fstab"
 # /etc/fstab: S.A.N.E Linux filesystem table
-PARTUUID=$PARTUUID / ext4 remount,rw,relatime 0 1
-$PART1 /boot vfat rw 0 2
+# Rootfs (PARTUUID=$PARTUUID) is mounted rw by initramfs before switch_root.
+# Do not add an active '/' entry here: ninit mounts pseudo-filesystems
+# automatically and mount_fstab() detaches recorded entries on shutdown.
 EOF
 
 cat <<'EOF' > "$TARGET_ROOT/etc/init.conf"
 # /etc/init.conf -- S.A.N.E Linux service supervision
-reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':timeout=0
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi":requires=reliability
-recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:timeout=0
-firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':requires=recovery:timeout=0
+reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':on_fail=rescue:timeout=0
+recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:on_fail=rescue:timeout=0
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot':requires=recovery:on_fail=rescue:timeout=0
+network:respawn:/bin/sh -c 'modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; trap "kill \$! 2>/dev/null; exit 0" TERM INT; while [ ! -d /sys/class/net/eth0 ]; do sleep 5 & wait $!; done; exec sane-net dhcp -f eth0':requires=firstboot
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
 EOF
@@ -458,8 +653,11 @@ if [ -f "$TARGET_ROOT/etc/wpa_supplicant.conf" ]; then
 fi
 
 # Install the reliability toolkit used by the reliability boot service.
-$SUDO mkdir -p "$TARGET_ROOT/usr/bin"
-$SUDO install -m 0755 "$REPO_ROOT/scripts/sane-reliability" "$TARGET_ROOT/usr/bin/sane-reliability"
+RELIABILITY_BIN=$(find_tool sane-reliability "$SCRIPT_DIR/sane-reliability" \
+    "$REPO_ROOT/scripts/sane-reliability" /usr/bin/sane-reliability /usr/share/sane-install/sane-reliability || true)
+[ -n "$RELIABILITY_BIN" ] || die "sane-reliability not found"
+mkdir -p "$TARGET_ROOT/usr/bin"
+install -m 0755 "$RELIABILITY_BIN" "$TARGET_ROOT/usr/bin/sane-reliability"
 
 # Single source of truth for identity files + account utilities.
 PROVISION_BIN=$(find_tool provision-accounts.sh "$SCRIPT_DIR/provision-accounts.sh" \
@@ -492,15 +690,25 @@ export HOME="/home/$USER"
 EOF
 chmod 0644 "$TARGET_ROOT/etc/profile"
 
-# Setup kernel module directory for modprobe
-kver_inst=""
-if [ -n "${KERNEL_SRC:-}" ] && [ -f "$KERNEL_SRC" ]; then
-    kver_inst=$(strings "$KERNEL_SRC" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+# Resolve Kernel bzImage before setting up module directory so --kernel is honored
+KERNEL_SRC=""
+if [ -n "$KERNEL_ARG" ] && [ -f "$KERNEL_ARG" ]; then
+    KERNEL_SRC="$KERNEL_ARG"
 elif [ -f "$TARGET_ROOT/boot/bzImage" ]; then
-    kver_inst=$(strings "$TARGET_ROOT/boot/bzImage" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+    KERNEL_SRC="$TARGET_ROOT/boot/bzImage"
 elif [ -f "$TARGET_ROOT/boot/vmlinuz-virt" ]; then
-    kver_inst=$(strings "$TARGET_ROOT/boot/vmlinuz-virt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
+    KERNEL_SRC="$TARGET_ROOT/boot/vmlinuz-virt"
+elif [ -f "/boot/bzImage" ]; then
+    KERNEL_SRC="/boot/bzImage"
+elif [ -f "$REPO_ROOT/distro/cache/vmlinuz-virt" ]; then
+    KERNEL_SRC="$REPO_ROOT/distro/cache/vmlinuz-virt"
+elif [ -f "$REPO_ROOT/packages/kernel/x/boot/vmlinuz-virt" ]; then
+    KERNEL_SRC="$REPO_ROOT/packages/kernel/x/boot/vmlinuz-virt"
 fi
+[ -n "$KERNEL_SRC" ] && [ -f "$KERNEL_SRC" ] || die "Kernel bzImage not found"
+
+# Setup kernel module directory for modprobe
+kver_inst=$(strings "$KERNEL_SRC" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-virt' | head -n1 || true)
 [ -n "$kver_inst" ] || kver_inst="6.6.134-0-virt"
 if [ -d "$TARGET_ROOT/lib/modules" ]; then
     mkdir -p "$TARGET_ROOT/lib/modules/$kver_inst"
@@ -520,22 +728,6 @@ CLEANUP_MOUNTS="$TARGET_BOOT $CLEANUP_MOUNTS"
 mount "$PART1" "$TARGET_BOOT"
 
 # 5.1 Kernel bzImage
-KERNEL_SRC=""
-if [ -n "$KERNEL_ARG" ] && [ -f "$KERNEL_ARG" ]; then
-    KERNEL_SRC="$KERNEL_ARG"
-elif [ -f "$TARGET_ROOT/boot/bzImage" ]; then
-    KERNEL_SRC="$TARGET_ROOT/boot/bzImage"
-elif [ -f "$TARGET_ROOT/boot/vmlinuz-virt" ]; then
-    KERNEL_SRC="$TARGET_ROOT/boot/vmlinuz-virt"
-elif [ -f "/boot/bzImage" ]; then
-    KERNEL_SRC="/boot/bzImage"
-elif [ -f "$REPO_ROOT/distro/cache/vmlinuz-virt" ]; then
-    KERNEL_SRC="$REPO_ROOT/distro/cache/vmlinuz-virt"
-elif [ -f "$REPO_ROOT/packages/kernel/x/boot/vmlinuz-virt" ]; then
-    KERNEL_SRC="$REPO_ROOT/packages/kernel/x/boot/vmlinuz-virt"
-fi
-
-[ -n "$KERNEL_SRC" ] && [ -f "$KERNEL_SRC" ] || die "Kernel bzImage not found"
 cp "$KERNEL_SRC" "$TARGET_BOOT/bzImage"
 info "Copied kernel: $KERNEL_SRC -> $TARGET_BOOT/bzImage"
 
@@ -554,6 +746,7 @@ else
     # Assemble minimal switch_root initramfs on the fly
     info "Assembling minimal switch_root initramfs..."
     IR_TMP="$(mktemp -d /tmp/sane-ir-gen.XXXXXX)"
+    CLEANUP_DIRS="$IR_TMP $CLEANUP_DIRS"
     mkdir -p "$IR_TMP/bin" "$IR_TMP/sbin" "$IR_TMP/proc" "$IR_TMP/sys" "$IR_TMP/dev" "$IR_TMP/run" "$IR_TMP/newroot" "$IR_TMP/etc" "$IR_TMP/lib/modules"
     
     BB_SRC=""
@@ -583,10 +776,10 @@ else
 #!/bin/sh
 set -eu
 mkdir -p /proc /sys /dev /run /newroot
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t proc proc /proc || { echo "ERROR: failed to mount /proc"; exec /bin/sh; }
+mount -t sysfs sysfs /sys || { echo "ERROR: failed to mount /sys"; exec /bin/sh; }
+mount -t devtmpfs devtmpfs /dev || { echo "ERROR: failed to mount /dev"; exec /bin/sh; }
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run || { echo "ERROR: failed to mount /run"; exec /bin/sh; }
 
 for mod in crc32c_generic crc32c-intel libcrc32c crc16 mbcache jbd2 ext4 virtio_blk nls_cp437 nls_iso8859-1 nls_utf8 fat vfat; do
     if [ -f "/lib/modules/${mod}.ko" ]; then
@@ -631,37 +824,47 @@ while [ -z "$RESOLVED_DEV" ] && [ $COUNT -lt 50 ]; do
                 for duevent in /sys/class/block/*/uevent; do
                     [ -f "$duevent" ] || continue
                     if grep -q '^DEVTYPE=disk' "$duevent" 2>/dev/null; then
-                        dname=$(grep '^DEVNAME=' "$duevent" | cut -d= -f2)
-                        dmaj=$(grep '^MAJOR=' "$duevent" | cut -d= -f2)
-                        dmin=$(grep '^MINOR=' "$duevent" | cut -d= -f2)
+                        dname=$(grep '^DEVNAME=' "$duevent" | cut -d= -f2 || true)
+                        dmaj=$(grep '^MAJOR=' "$duevent" | cut -d= -f2 || true)
+                        dmin=$(grep '^MINOR=' "$duevent" | cut -d= -f2 || true)
                         [ -n "$dname" ] || continue
                         [ -b "/dev/$dname" ] || mknod "/dev/$dname" b "$dmaj" "$dmin" 2>/dev/null || true
                         [ -b "/dev/$dname" ] || continue
                         for puevent in /sys/class/block/*/uevent; do
                             [ -f "$puevent" ] || continue
                             if grep -q '^DEVTYPE=partition' "$puevent" 2>/dev/null; then
-                                pname=$(grep '^DEVNAME=' "$puevent" | cut -d= -f2)
-                                pnum=$(grep '^PARTN=' "$puevent" | cut -d= -f2)
-                                pmaj=$(grep '^MAJOR=' "$puevent" | cut -d= -f2)
-                                pmin=$(grep '^MINOR=' "$puevent" | cut -d= -f2)
-                                case "$pname" in
-                                    ${dname}*)
-                                        if [ -n "$pnum" ]; then
-                                            sk=$(( 1024 + (pnum - 1) * 128 + 16 ))
-                                            raw_hex=$(dd if="/dev/$dname" bs=1 skip=$sk count=16 2>/dev/null | hexdump -e '16/1 "%02x "' || true)
-                                            if [ -n "$raw_hex" ]; then
-                                                calc_uuid=$(echo "$raw_hex" | awk '{print $4$3$2$1"-"$6$5"-"$8$7"-"$9$10"-"$11$12$13$14$15$16}')
-                                                if [ -n "$calc_uuid" ] && echo "$calc_uuid" | grep -qi "^${target_uuid}$"; then
-                                                    [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
-                                                    if [ -b "/dev/$pname" ]; then
-                                                        RESOLVED_DEV="/dev/$pname"
-                                                        break 2
-                                                    fi
-                                                fi
-                                            fi
-                                        fi
+                                pname=$(grep '^DEVNAME=' "$puevent" | cut -d= -f2 || true)
+                                pnum=$(grep '^PARTN=' "$puevent" | cut -d= -f2 || true)
+                                pmaj=$(grep '^MAJOR=' "$puevent" | cut -d= -f2 || true)
+                                pmin=$(grep '^MINOR=' "$puevent" | cut -d= -f2 || true)
+                                [ -n "$pname" ] || continue
+                                [ ! -d "/sys/block/$dname" ] || [ -d "/sys/block/$dname/$pname" ] || continue
+                                case "$dname" in
+                                    *[0-9])
+                                        case "$pname" in "${dname}"p[0-9]*) ;; *) continue ;; esac
+                                        psuf=${pname#"${dname}p"}
+                                        ;;
+                                    *)
+                                        case "$pname" in "${dname}"[0-9]*) ;; *) continue ;; esac
+                                        psuf=${pname#"$dname"}
                                         ;;
                                 esac
+                                case "$psuf" in ''|*[!0-9]*) continue ;; esac
+                                case "$pnum" in ''|*[!0-9]*) pnum="" ;; esac
+                                if [ -n "$pnum" ]; then
+                                    sk=$(( 1024 + (pnum - 1) * 128 + 16 ))
+                                    raw_hex=$(dd if="/dev/$dname" bs=1 skip=$sk count=16 2>/dev/null | hexdump -e '16/1 "%02x "' || true)
+                                    if [ -n "$raw_hex" ]; then
+                                        calc_uuid=$(echo "$raw_hex" | awk '{print $4$3$2$1"-"$6$5"-"$8$7"-"$9$10"-"$11$12$13$14$15$16}')
+                                        if [ -n "$calc_uuid" ] && echo "$calc_uuid" | grep -qi "^${target_uuid}$"; then
+                                            [ -b "/dev/$pname" ] || mknod "/dev/$pname" b "$pmaj" "$pmin" 2>/dev/null || true
+                                            if [ -b "/dev/$pname" ]; then
+                                                RESOLVED_DEV="/dev/$pname"
+                                                break 2
+                                            fi
+                                        fi
+                                    fi
+                                fi
                             fi
                         done
                     fi
@@ -691,14 +894,14 @@ if [ -z "$RESOLVED_DEV" ] || [ ! -b "$RESOLVED_DEV" ]; then
     exec /bin/sh
 fi
 
-mount -t ext4 -o rw "$RESOLVED_DEV" /newroot
-mount --move /run /newroot/run
-mount --move /dev /newroot/dev
-mount --move /sys /newroot/sys
-mount --move /proc /newroot/proc
+mount -t ext4 -o rw "$RESOLVED_DEV" /newroot || { echo "ERROR: failed to mount root device $RESOLVED_DEV"; exec /bin/sh; }
+mount --move /run /newroot/run || { echo "ERROR: failed to move /run"; exec /bin/sh; }
+mount --move /dev /newroot/dev || { echo "ERROR: failed to move /dev"; exec /bin/sh; }
+mount --move /sys /newroot/sys || { echo "ERROR: failed to move /sys"; exec /bin/sh; }
+mount --move /proc /newroot/proc || { echo "ERROR: failed to move /proc"; exec /bin/sh; }
 
 echo "switch_root: pivoting to $RESOLVED_DEV"
-exec switch_root /newroot /sbin/init
+exec switch_root /newroot /sbin/init || { echo "ERROR: switch_root failed"; exec /bin/sh; }
 EOF
     chmod 0755 "$IR_TMP/init"
 
@@ -716,7 +919,31 @@ EOF
         CPIO_NULL="-0"
     fi
 
-    ( cd "$IR_TMP" && find . -print0 | cpio $CPIO_NULL -o -H newc $CPIO_OWNER 2>/dev/null | gzip -9 > "$TARGET_BOOT/initramfs.cpio.gz" )
+    IR_CPIO="$TARGET_BOOT/initramfs.cpio.$$"
+    IR_GZ="$TARGET_BOOT/initramfs.cpio.gz.tmp.$$"
+    IR_LIST=$(mktemp /tmp/sane-ir-list.XXXXXX)
+    CLEANUP_FILES="$IR_CPIO $IR_GZ $IR_LIST $CLEANUP_FILES"
+    if ! (
+        cd "$IR_TMP" &&
+        set -- "$CPIO_NULL" -o -H newc &&
+        case "$CPIO_OWNER" in
+            --owner=*) set -- "$@" "$CPIO_OWNER" ;;
+            "-R 0:0") set -- "$@" -R 0:0 ;;
+        esac &&
+        find . -print0 > "$IR_LIST" &&
+        cpio "$@" < "$IR_LIST" > "$IR_CPIO"
+    ); then
+        rm -f "$IR_LIST" "$IR_CPIO" "$IR_GZ"
+        die "Failed to pack initramfs cpio archive"
+    fi
+    rm -f "$IR_LIST"
+    [ -s "$IR_CPIO" ] || { rm -f "$IR_CPIO" "$IR_GZ"; die "Initramfs cpio archive is empty"; }
+    if ! gzip -9 < "$IR_CPIO" > "$IR_GZ" || ! gzip -t "$IR_GZ"; then
+        rm -f "$IR_CPIO" "$IR_GZ"
+        die "Failed to compress initramfs cpio archive"
+    fi
+    rm -f "$IR_CPIO"
+    mv -f "$IR_GZ" "$TARGET_BOOT/initramfs.cpio.gz" || { rm -f "$IR_GZ"; die "Failed to install initramfs"; }
     rm -rf "$IR_TMP"
     info "Assembled initramfs -> $TARGET_BOOT/initramfs.cpio.gz"
 fi
@@ -765,15 +992,19 @@ cp "$TARGET_BOOT/limine.conf" "$TARGET_BOOT/EFI/BOOT/limine.cfg"
 # Step 6: Unmount filesystems & install Limine bootloader to MBR/GPT
 log "Step 6/6: Installing Limine bootloader to MBR/GPT ($TARGET)..."
 sync
-umount "$TARGET_BOOT" 2>/dev/null || true
-umount "$TARGET_ROOT" 2>/dev/null || true
-CLEANUP_MOUNTS=""
-if ! mountpoint -q "$TARGET_BOOT" 2>/dev/null && [ -d "$TARGET_BOOT" ]; then
+if is_mounted "$TARGET_BOOT"; then
+    umount "$TARGET_BOOT" || die "Failed to unmount ESP $TARGET_BOOT cleanly"
+fi
+if [ -d "$TARGET_BOOT" ]; then
     rmdir "$TARGET_BOOT" 2>/dev/null || true
 fi
-if ! mountpoint -q "$TARGET_ROOT" 2>/dev/null && [ -d "$TARGET_ROOT" ]; then
+if is_mounted "$TARGET_ROOT"; then
+    umount "$TARGET_ROOT" || die "Failed to unmount root $TARGET_ROOT cleanly"
+fi
+if [ -d "$TARGET_ROOT" ]; then
     rmdir "$TARGET_ROOT" 2>/dev/null || true
 fi
+CLEANUP_MOUNTS=""
 
 "$LIMINE_BIN" bios-install "$TARGET" >/dev/null
 sync

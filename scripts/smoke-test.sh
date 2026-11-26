@@ -57,6 +57,7 @@ $SUDO mkdir "$SUITE_CG" || fail "failed to create isolation root '$SUITE_CG'"
 SUITE_CG_DEV_INO=$($SUDO stat -c '%d:%i' "$SUITE_CG" 2>/dev/null || true)
 [ -n "$SUITE_CG_DEV_INO" ] || fail "failed to read dev:ino for '$SUITE_CG'"
 SUITE_CG_BASE="$SUITE_CG/ninit"
+$SUDO mkdir -p "$SUITE_CG/init"
 
 is_test_process() {
 	p=$1
@@ -162,18 +163,50 @@ printf 'shell:respawn:/bin/sh\n' > "$ROOT/etc/init.conf"
 printf '== test rootfs : %s\n' "$ROOT"
 printf '== test binary : %s\n' "$BIN"
 
+is_descendant_of() {
+	_cand=$1
+	_anc=$2
+	_hops=0
+	[ -n "$_anc" ] || return 1
+	while [ "$_hops" -lt 32 ]; do
+		[ "$_cand" = "$_anc" ] && return 0
+		[ "$_cand" = "0" ] && return 1
+		_ppid=$(awk '/^PPid:/ { print $2 }' "/proc/$_cand/status" 2>/dev/null || true)
+		[ -n "${_ppid:-}" ] || return 1
+		[ "$_ppid" = "$_anc" ] && return 0
+		[ "$_ppid" = "$_cand" ] && return 1
+		_cand=$_ppid
+		_hops=$((_hops + 1))
+	done
+	return 1
+}
+
 find_init_pid() {
-	if command -v pgrep >/dev/null 2>&1; then
-		pgrep -x ninit 2>/dev/null | head -n 1
-	else
-		ps -eo pid,args 2>/dev/null | awk '$2 == "/ninit" { print $1; exit }'
-	fi
+	target_root=${1:-$ROOT}
+	parent_pid=${2:-${job:-}}
+	cg_procs=$($SUDO cat "$SUITE_CG/init/cgroup.procs" 2>/dev/null || true)
+	for p in $cg_procs; do
+		[ -d "/proc/$p" ] || continue
+		comm=$(cat "/proc/$p/comm" 2>/dev/null || true)
+		[ "$comm" = "ninit" ] || continue
+		p_root=$($SUDO readlink "/proc/$p/root" 2>/dev/null || true)
+		[ "$p_root" = "$target_root" ] || continue
+		is_test_process "$p" || continue
+		if [ -n "$parent_pid" ]; then
+			is_descendant_of "$p" "$parent_pid" || continue
+		fi
+		ns_inner=$(awk '/^NSpid:/ { if (NF >= 2) print $NF }' "/proc/$p/status" 2>/dev/null || true)
+		[ "$ns_inner" = "1" ] || continue
+		printf '%s\n' "$p"
+		return 0
+	done
+	return 1
 }
 
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit" \
+		sh -c "echo \$\$ > '$SUITE_CG/init/cgroup.procs' 2>/dev/null || true; mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit" \
 		>"$LOG" 2>&1
 ) &
 job=$!
@@ -181,7 +214,7 @@ job=$!
 i=0
 pid=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
-	pid=$(find_init_pid || true)
+	pid=$(find_init_pid "$ROOT" "$job" || true)
 	if [ -n "${pid:-}" ] && grep -q 'main loop ready' "$LOG" 2>/dev/null; then
 		break
 	fi
@@ -194,7 +227,9 @@ if [ -z "${pid:-}" ]; then
 fi
 
 t0=$(date +%s%N)
-$SUDO kill -TERM "$pid" || true
+if is_test_process "$pid"; then
+	$SUDO kill -TERM "$pid" || true
+fi
 wait "$job" || true
 t1=$(date +%s%N)
 latency_ms=$(( (t1 - t0) / 1000000 ))

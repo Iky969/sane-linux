@@ -172,10 +172,10 @@ clean_suite_leaves() {
 
 cleanup() {
 	clean_suite_cgroup "${SUITE_CG:-}" "${SUITE_CG_DEV_INO:-}" || printf 'WARN: clean_suite_cgroup failed (status %d), continuing...\n' $? >&2
-	[ -n "${init_pid:-}" ] && $SUDO kill -KILL "$init_pid" 2>/dev/null || true
-	[ -n "${init_pid2:-}" ] && $SUDO kill -KILL "$init_pid2" 2>/dev/null || true
-	[ -n "${init_pid3:-}" ] && $SUDO kill -KILL "$init_pid3" 2>/dev/null || true
-	[ -n "${init_pid4:-}" ] && $SUDO kill -KILL "$init_pid4" 2>/dev/null || true
+	[ -n "${init_pid:-}" ] && is_test_process "$init_pid" && $SUDO kill -KILL "$init_pid" 2>/dev/null || true
+	[ -n "${init_pid2:-}" ] && is_test_process "$init_pid2" && $SUDO kill -KILL "$init_pid2" 2>/dev/null || true
+	[ -n "${init_pid3:-}" ] && is_test_process "$init_pid3" && $SUDO kill -KILL "$init_pid3" 2>/dev/null || true
+	[ -n "${init_pid4:-}" ] && is_test_process "$init_pid4" && $SUDO kill -KILL "$init_pid4" 2>/dev/null || true
 	for d in ${ROOTS:-}; do
 		$SUDO umount "$d/proc" 2>/dev/null || true
 		rm -rf "$d"
@@ -183,6 +183,27 @@ cleanup() {
 	for f in ${LOGS:-}; do rm -f "$f"; done
 }
 trap cleanup EXIT INT TERM
+
+is_descendant_of() {
+	_cand=$1
+	_anc=$2
+	_proot=${3:-/proc}
+	_hops=0
+	[ -n "$_anc" ] || return 1
+	while [ "$_hops" -lt 32 ]; do
+		[ "$_cand" = "$_anc" ] && return 0
+		[ "$_cand" = "0" ] && return 1
+		_ppid=$(awk '/^PPid:/ { print $2 }' "$_proot/$_cand/status" 2>/dev/null || true)
+		[ -n "${_ppid:-}" ] || return 1
+		[ "$_ppid" = "$_anc" ] && return 0
+		[ "$_ppid" = "$_cand" ] && return 1
+		_cand=$_ppid
+		_hops=$((_hops + 1))
+	done
+	return 1
+}
+
+$SUDO mkdir -p "$SUITE_CG/init"
 
 ROOT=$(mktemp -d /tmp/ninit-sigterm.XXXXXX)
 LOG=$(mktemp /tmp/ninit-sigterm-log.XXXXXX)
@@ -209,15 +230,69 @@ printf '== test rootfs : %s\n' "$ROOT"
 printf '== test binary : %s\n' "$BIN"
 
 find_init_pid() {
-	if command -v pgrep >/dev/null 2>&1; then
-		pgrep -x ninit 2>/dev/null | head -n 1
-	else
-		ps -eo pid,args 2>/dev/null | awk '$2 == "/ninit" { print $1; exit }'
-	fi
+	_target_root=${1:-$ROOT}
+	_parent_pid=${2:-}
+	_cg_procs=$($SUDO cat "$SUITE_CG/init/cgroup.procs" 2>/dev/null || true)
+	for _p in $_cg_procs; do
+		[ -d "/proc/$_p" ] || continue
+		_comm=$(cat "/proc/$_p/comm" 2>/dev/null || true)
+		[ "$_comm" = "ninit" ] || continue
+		_p_root=$($SUDO readlink "/proc/$_p/root" 2>/dev/null || true)
+		[ "$_p_root" = "$_target_root" ] || continue
+		is_test_process "$_p" || continue
+		if [ -n "$_parent_pid" ]; then
+			is_descendant_of "$_p" "$_parent_pid" || continue
+		fi
+		_ns_inner=$(awk '/^NSpid:/ { if (NF >= 2) print $NF }' "/proc/$_p/status" 2>/dev/null || true)
+		[ "$_ns_inner" = "1" ] || continue
+		printf '%s\n' "$_p"
+		return 0
+	done
+	return 1
 }
 
 find_service_pid() {
-	ps -eo pid,args 2>/dev/null | awk '/sigterm-service\.sh/ && !/awk/ { print $1; exit }'
+	_target_root=${1:-$ROOT}
+	set -f
+	for _pf in $(find "$SUITE_CG" -type f -name "cgroup.procs" 2>/dev/null); do
+		for _p in $($SUDO cat "$_pf" 2>/dev/null || true); do
+			[ -d "/proc/$_p" ] || continue
+			_p_root=$($SUDO readlink "/proc/$_p/root" 2>/dev/null || true)
+			[ "$_p_root" = "$_target_root" ] || continue
+			is_test_process "$_p" || continue
+			_cmd=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null || true)
+			case "$_cmd" in
+				*sigterm-service.sh*)
+					set +f
+					printf '%s\n' "$_p"
+					return 0
+					;;
+			esac
+		done
+	done
+	set +f
+	return 1
+}
+
+count_scoped_sleep50() {
+	_target_root=$1
+	_cnt=0
+	[ -d "$SUITE_CG" ] || { printf '0\n'; return 0; }
+	set -f
+	for _pf in $(find "$SUITE_CG" -type f -name "cgroup.procs" 2>/dev/null); do
+		for _p in $($SUDO cat "$_pf" 2>/dev/null || true); do
+			[ -d "/proc/$_p" ] || continue
+			_p_root=$($SUDO readlink "/proc/$_p/root" 2>/dev/null || true)
+			[ "$_p_root" = "$_target_root" ] || continue
+			is_test_process "$_p" || continue
+			_cmd=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null || true)
+			case "$_cmd" in
+				*"/bin/sleep 50"*) _cnt=$((_cnt + 1)) ;;
+			esac
+		done
+	done
+	set +f
+	printf '%d\n' "$_cnt"
 }
 
 synblk_has_term() {
@@ -232,14 +307,14 @@ synblk_has_term() {
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit" \
+		sh -c "echo \$\$ > '$SUITE_CG/init/cgroup.procs' 2>/dev/null || true; mount -t proc proc '$ROOT/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT' /ninit" \
 		>"$LOG" 2>&1
 ) &
 job=$!
 
 i=0
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
-	init_pid=$(find_init_pid || true)
+	init_pid=$(find_init_pid "$ROOT" "$job" || true)
 	if [ -n "${init_pid:-}" ] && grep -q 'main loop ready' "$LOG" 2>/dev/null \
 	   && grep -q 'waiting for SIGTERM' "$LOG" 2>/dev/null; then
 		break
@@ -253,7 +328,7 @@ if [ -z "${init_pid:-}" ]; then
 fi
 
 # Service process signal mask: SIGTERM must NOT be blocked here.
-service_pid=$(find_service_pid || true)
+service_pid=$(find_service_pid "$ROOT" || true)
 mask_checked=0
 if [ -n "${service_pid:-}" ]; then
 	mask_checked=1
@@ -348,10 +423,11 @@ cp "$BUSYBOX" "$ROOT2/bin/sleep"
 
 printf 'pipe-svc:once:/bin/sh -c "/bin/sleep 50 | /bin/sleep 50"\n' > "$ROOT2/etc/init.conf"
 
+$SUDO mkdir -p "$SUITE_CG/init"
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT2/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT2' /ninit" \
+		sh -c "echo \$\$ > '$SUITE_CG/init/cgroup.procs' 2>/dev/null || true; mount -t proc proc '$ROOT2/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT2' /ninit" \
 		>"$LOG2" 2>&1
 ) &
 job2=$!
@@ -359,7 +435,7 @@ job2=$!
 i=0
 init_pid2=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
-	init_pid2=$(find_init_pid || true)
+	init_pid2=$(find_init_pid "$ROOT2" "$job2" || true)
 	if [ -n "${init_pid2:-}" ] && grep -q 'main loop ready' "$LOG2" 2>/dev/null \
 	   && grep -q 'started pipe-svc' "$LOG2" 2>/dev/null; then
 		break
@@ -377,7 +453,7 @@ fi
 sleep 0.5
 
 # Make sure the sleep processes are alive before shutdown
-pipe_procs_before=$(ps -eo args 2>/dev/null | grep '/bin/sleep 50' | grep -v grep | wc -l || true)
+pipe_procs_before=$(count_scoped_sleep50 "$ROOT2")
 if [ "$pipe_procs_before" -ge 2 ]; then
 	ok "pipeline processes running ($pipe_procs_before active sleep processes)"
 else
@@ -396,7 +472,7 @@ done
 wait "$job2" 2>/dev/null || true
 
 # Verify no sleep 50 process is left behind
-pipe_procs_after=$(ps -eo args 2>/dev/null | grep '/bin/sleep 50' | grep -v grep | wc -l || true)
+pipe_procs_after=$(count_scoped_sleep50 "$ROOT2")
 if [ "$pipe_procs_after" -eq 0 ]; then
 	ok "all processes in the pipeline are dead after shutdown (group kill -pid)"
 else
@@ -439,10 +515,11 @@ EOSVC
 chmod 0755 "$ROOT3/stubborn-service.sh"
 printf 'stubborn-svc:once:/stubborn-service.sh\n' > "$ROOT3/etc/init.conf"
 
+$SUDO mkdir -p "$SUITE_CG/init"
 (
 	$SUDO timeout -k 5 30 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT3/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT3' /ninit" \
+		sh -c "echo \$\$ > '$SUITE_CG/init/cgroup.procs' 2>/dev/null || true; mount -t proc proc '$ROOT3/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT3' /ninit" \
 		>"$LOG3" 2>&1
 ) &
 job3=$!
@@ -450,7 +527,7 @@ job3=$!
 i=0
 init_pid3=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
-	init_pid3=$(find_init_pid || true)
+	init_pid3=$(find_init_pid "$ROOT3" "$job3" || true)
 	if [ -n "${init_pid3:-}" ] && grep -q 'main loop ready' "$LOG3" 2>/dev/null \
 	   && grep -q 'started stubborn-svc' "$LOG3" 2>/dev/null; then
 		break
@@ -471,25 +548,86 @@ sleep 0.5
 # service writes its namespace pid to /var/stubborn.pid (NOT /tmp or /run: both
 # are overwritten with tmpfs by ninit inside the namespace, so they are not
 # visible from the host); map it to the host pid through the NSpid field in
-# /proc/<pid>/status (the last field = the pid in the innermost namespace; the
-# NF >= 3 requirement rules out host-level processes whose pid number happens
-# to match).
+# /proc/<pid>/status (the last field = the pid in the innermost namespace).
+# Accept NF >= 2 so both non-container hosts and outer-container CI runners
+# resolve correctly, and verify the candidate actually belongs to init_pid3's
+# PID namespace / descendant tree (preventing collisions with host PIDs or
+# unrelated containers).
+extract_ns_pid() {
+	if [ "$#" -ge 1 ]; then
+		awk '/^NSpid:/ { if (NF >= 2) print $NF }' "$1" 2>/dev/null || true
+	else
+		awk '/^NSpid:/ { if (NF >= 2) print $NF }' 2>/dev/null || true
+	fi
+}
+
 child_ns_pid=""
 host_pid_of_ns() {
-	for d in /proc/[0-9]*; do
-		ns=$(awk '/^NSpid:/ { if (NF >= 3) print $NF }' "$d/status" 2>/dev/null || true)
-		if [ -n "${ns:-}" ] && [ "$ns" = "$1" ]; then
-			printf '%s\n' "${d#/proc/}"
-			return 0
+	_target_ns_pid=$1
+	_init_ref=${2:-${init_pid3:-}}
+	_proot=${3:-/proc}
+	_target_ns=""
+	if [ "$_proot" = "/proc" ] && [ -n "$_init_ref" ]; then
+		_target_ns=$($SUDO readlink "$_proot/$_init_ref/ns/pid" 2>/dev/null || true)
+	elif [ -n "$_init_ref" ] && [ -r "$_proot/$_init_ref/ns_pid_id" ]; then
+		_target_ns=$(cat "$_proot/$_init_ref/ns_pid_id" 2>/dev/null || true)
+	fi
+	for _d in "$_proot"/[0-9]*; do
+		[ -d "$_d" ] || continue
+		_hp=${_d##*/}
+		[ -n "$_init_ref" ] && [ "$_hp" = "$_init_ref" ] && [ "$_target_ns_pid" != "1" ] && continue
+		_ns=$(extract_ns_pid "$_d/status")
+		[ -n "${_ns:-}" ] && [ "$_ns" = "$_target_ns_pid" ] || continue
+		if [ -n "$_target_ns" ]; then
+			if [ "$_proot" = "/proc" ]; then
+				_cand_ns=$($SUDO readlink "$_d/ns/pid" 2>/dev/null || true)
+			else
+				_cand_ns=$(cat "$_d/ns_pid_id" 2>/dev/null || true)
+			fi
+			[ -n "$_cand_ns" ] && [ "$_cand_ns" = "$_target_ns" ] || continue
+		elif [ -n "$_init_ref" ]; then
+			is_descendant_of "$_hp" "$_init_ref" "$_proot" || continue
 		fi
+		printf '%s\n' "$_hp"
+		return 0
 	done
 	return 0
 }
 stubborn_alive() {
 	[ -n "${child_ns_pid:-}" ] || return 1
-	hp=$(host_pid_of_ns "$child_ns_pid")
-	[ -n "${hp:-}" ] && kill -0 "$hp" 2>/dev/null
+	hp=$(host_pid_of_ns "$child_ns_pid" "${init_pid3:-}")
+	[ -n "${hp:-}" ] && $SUDO kill -0 "$hp" 2>/dev/null
 }
+
+# Regression check (F1 audit): verify host_pid_of_ns() accepts NF >= 2 NSpid
+# entries and rejects unrelated host/foreign-namespace collisions.
+MOCK_PROC=$(mktemp -d /tmp/ninit-sigterm-mockproc.XXXXXX)
+ROOTS="$ROOTS $MOCK_PROC"
+mkdir -p "$MOCK_PROC/4" "$MOCK_PROC/500" "$MOCK_PROC/18000" "$MOCK_PROC/18022" "$MOCK_PROC/29033"
+printf 'PPid:\t1\nNSpid:\t4\n' > "$MOCK_PROC/4/status"
+printf 'host-ns\n' > "$MOCK_PROC/4/ns_pid_id"
+printf 'PPid:\t1\nNSpid:\t500\t4\n' > "$MOCK_PROC/500/status"
+printf 'foreign-ns\n' > "$MOCK_PROC/500/ns_pid_id"
+printf 'PPid:\t17999\nNSpid:\t18000\t1\n' > "$MOCK_PROC/18000/status"
+printf 'target-ns\n' > "$MOCK_PROC/18000/ns_pid_id"
+printf 'PPid:\t18000\nNSpid:\t18022\t4\n' > "$MOCK_PROC/18022/status"
+printf 'target-ns\n' > "$MOCK_PROC/18022/ns_pid_id"
+printf 'PPid:\t18000\nNSpid:\t99\t18022\t4\n' > "$MOCK_PROC/29033/status"
+printf 'container-ns\n' > "$MOCK_PROC/29033/ns_pid_id"
+if [ "$(host_pid_of_ns 4 18000 "$MOCK_PROC")" = "18022" ]; then
+	ok "host_pid_of_ns resolves 2-field inner NSpid and skips host/foreign PID 4 collisions"
+else
+	bad "host_pid_of_ns failed 2-field NSpid regression check (got '$(host_pid_of_ns 4 18000 "$MOCK_PROC")')"
+fi
+printf 'PPid:\t1\nNSpid:\t4\n' > "$MOCK_PROC/4/status"
+rm -f "$MOCK_PROC/4/ns_pid_id" "$MOCK_PROC/18000/ns_pid_id" "$MOCK_PROC/18022/ns_pid_id"
+if [ "$(printf 'NSpid:\t18022\t4\n' | extract_ns_pid)" = "4" ] && \
+   [ "$(printf 'NSpid:\t4\n' | extract_ns_pid)" = "4" ] && \
+   [ "$(host_pid_of_ns 4 18000 "$MOCK_PROC")" = "18022" ]; then
+	ok "extract_ns_pid accepts NF >= 2 and descendant fallback skips host PID 4"
+else
+	bad "extract_ns_pid NF >= 2 / descendant fallback failed"
+fi
 
 i=0
 while [ "$i" -lt 25 ]; do
@@ -597,10 +735,11 @@ cp "$BUSYBOX" "$ROOT4/bin/sleep"
 printf 'astall:respawn:trap "" TERM; exec /bin/sleep 60\nzdead:once:/bin/sleep 1\n' \
 	> "$ROOT4/etc/init.conf"
 
+$SUDO mkdir -p "$SUITE_CG/init"
 (
 	$SUDO timeout -k 5 40 unshare --pid --fork --kill-child=SIGKILL \
 		--mount --propagation private \
-		sh -c "mount -t proc proc '$ROOT4/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT4' /ninit" \
+		sh -c "echo \$\$ > '$SUITE_CG/init/cgroup.procs' 2>/dev/null || true; mount -t proc proc '$ROOT4/proc' && export NINIT_CGROUP_BASE='$SUITE_CG_BASE' && exec chroot '$ROOT4' /ninit" \
 		>"$LOG4" 2>&1
 ) &
 job4=$!
@@ -608,7 +747,7 @@ job4=$!
 i=0
 init_pid4=""
 while [ "$i" -lt $((READY_TIMEOUT * 5)) ]; do
-	init_pid4=$(find_init_pid || true)
+	init_pid4=$(find_init_pid "$ROOT4" "$job4" || true)
 	if [ -n "${init_pid4:-}" ] && grep -q 'main loop ready' "$LOG4" 2>/dev/null \
 	   && grep -q 'started astall' "$LOG4" 2>/dev/null \
 	   && grep -q 'started zdead' "$LOG4" 2>/dev/null; then

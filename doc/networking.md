@@ -9,7 +9,7 @@ interfaces through the static BusyBox `ip`, `udhcpc`, and `curl` applets.
 ```
 sane-net link IFACE [up|down]                 show or set link state
 sane-net static IFACE IP/CIDR GW [DNS ...]    static address + DNS
-sane-net dhcp IFACE                           start udhcpc (background)
+sane-net dhcp [-f|--foreground] IFACE       start udhcpc (background, or -f foreground)
 sane-net dns SERVER [SERVER ...]              write /etc/resolv.conf atomically
 sane-net dns default                          restore /etc/resolv.conf.default
 sane-net wifi IFACE SSID PSK                  WPA2 config + wpa_supplicant
@@ -61,10 +61,12 @@ resolver/pid/config/script files are confined to the target root.
 
 ## DHCP and reconnect
 
-Boot runs `network:once:/bin/sh -c "... sane-net dhcp eth0"` from
-`/etc/init.conf`. `sane-net dhcp` brings the link up and starts
-`udhcpc -b -R` with `-s /usr/share/udhcpc/default.script`, storing the pid in
-`/run/udhcpc-<iface>.pid`.
+Boot runs `network:respawn:/bin/sh -c "... exec /usr/bin/sane-net dhcp -f eth0":requires=firstboot`
+from `/etc/init.conf`. `sane-net dhcp` brings the link up and runs
+`udhcpc` (`-f -R` in foreground mode `-f`, or `-b -R` in default background mode)
+with `-s /usr/share/udhcpc/default.script`, storing the pid in
+`/run/udhcpc-<iface>.pid` (waiting cleanly via `trap` + `sleep 5 & wait` when the
+interface is not yet present so `ninit` avoids `EAGAIN`/respawn noise and console logs never interleave with `firstboot`).
 
 `sane-net reconnect IFACE [SECONDS]` polls the link for carrier, bringing it
 up each iteration, then restarts DHCP. The carrier limit defaults to 30 seconds

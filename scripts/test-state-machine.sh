@@ -19,6 +19,8 @@
 # Exit: 0 = PASS, 1 = FAIL
 set -eu
 
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SELF_DIR/.." && pwd)
 BIN=${BIN:-}
 if [ -z "$BIN" ]; then
 	if [ -x "./ninit-test" ]; then
@@ -30,7 +32,7 @@ if [ -z "$BIN" ]; then
 	fi
 fi
 BUSYBOX=${BUSYBOX:-/bin/busybox}
-SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SANE_CTL="$REPO_ROOT/packages/ninit/x/usr/bin/sane-ctl"
 [ -x "$BIN" ] || BIN="$SELF_DIR/ninit"
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
@@ -109,17 +111,21 @@ absent_in() { if grep -q "$3" "$2"; then bad "$1"; else ok "$1"; fi; }
 
 new_root() {
 	d=$(mktemp -d /tmp/ninit-verify.XXXXXX)
-	mkdir -p "$d/proc" "$d/sys" "$d/dev" "$d/run" "$d/tmp" "$d/etc" "$d/var/log" "$d/bin"
+	mkdir -p "$d/proc" "$d/sys" "$d/dev" "$d/run" "$d/tmp" "$d/etc" "$d/var/log" "$d/bin" "$d/usr/bin"
 	cp "$BIN" "$d/ninit"
 	cp "$BUSYBOX" "$d/bin/sh"
 	for a in "$@"; do cp "$BUSYBOX" "$d/bin/$a"; done
+	if [ -f "$SANE_CTL" ]; then
+		cp "$SANE_CTL" "$d/usr/bin/sane-ctl"
+		chmod 0755 "$d/usr/bin/sane-ctl"
+	fi
 	: > "$d/dev/null"
 	printf '%s\n' "$d"
 }
 
-# boot_guest <root> <seconds> [pre-exec-shell-fragment]
+# boot_guest <root> <seconds> [pre-exec-shell-fragment] [stdin-path]
 boot_guest() {
-	root=$1; secs=$2; pre=${3:-}
+	root=$1; secs=$2; pre=${3:-}; stdin_p=${4:-/dev/null}
 	inner=$(mktemp /tmp/ninit-verify-inner.XXXXXX)
 	INNER2="$INNER2 $inner"
 	cat > "$inner" <<EOI
@@ -131,7 +137,7 @@ exec chroot $root /ninit
 EOI
 	$SUDO chmod 755 "$inner"
 	$SUDO sh -c "timeout -s KILL $((secs + 5)) unshare --pid --fork --kill-child=SIGKILL \
-		--mount --propagation private /bin/sh $inner" || true
+		--mount --propagation private /bin/sh $inner < '$stdin_p'" || true
 }
 
 printf '== test binary : %s\n' "$BIN"
@@ -262,6 +268,135 @@ check_in "shutdown still graceful for the other service" "$LC" 'graceful shutdow
 
 printf '\n== Scenario C log ==\n'
 sed 's/^/  | /' "$LC"
+
+# ---------------------------------------------------------------- Scenario D
+# P1-5: /run mounted mode=0755,nosuid,nodev (/tmp nosuid,nodev), initial STOPPED
+# state files published at registration so sane-ctl status/stop work for
+# dependency-waiting services, and O_NOFOLLOW blocks symlink overwrite.
+printf '\n== Scenario D: initial STOPPED state + /run mount flags + O_NOFOLLOW ==\n'
+RD=$(new_root sleep cat stat ln grep awk)
+LD=$(mktemp /tmp/ninit-verify-log.XXXXXX)
+ROOTS="$ROOTS $RD"; LOGS="$LOGS $LD"
+cat > "$RD/bin/check_p1_5.sh" << 'EOF'
+#!/bin/sh
+set -u
+st_waiter=$(/usr/bin/sane-ctl status waiter 2>&1 || true)
+echo "WAITER_STATUS=$st_waiter" > /var/p1_5.txt
+/usr/bin/sane-ctl status > /var/p1_5_all.txt 2>&1 || true
+if /usr/bin/sane-ctl stop waiter >/var/p1_5_stop.txt 2>&1; then
+    echo "STOP_WAITER_RC=0" >> /var/p1_5.txt
+else
+    echo "STOP_WAITER_RC=1" >> /var/p1_5.txt
+fi
+echo "RUN_MODE=$(stat -c '%a' /run 2>/dev/null || true)" >> /var/p1_5.txt
+echo "TMP_MODE=$(stat -c '%a' /tmp 2>/dev/null || true)" >> /var/p1_5.txt
+echo "RUN_OPTS=$(awk '$2 == "/run" { print $4 }' /proc/mounts 2>/dev/null)" >> /var/p1_5.txt
+echo "TMP_OPTS=$(awk '$2 == "/tmp" { print $4 }' /proc/mounts 2>/dev/null)" >> /var/p1_5.txt
+
+printf 'SAFE\n' > /var/victim
+rm -f /run/ninit-slow.state
+ln -s /var/victim /run/ninit-slow.state
+i=0
+while ! grep -q 'slow (pid .* exit status=' /var/log/ninit.log 2>/dev/null && [ "$i" -lt 80 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+sleep 0.1
+echo poweroff > /run/initctl
+exit 0
+EOF
+chmod 0755 "$RD/bin/check_p1_5.sh"
+cat > "$RD/etc/init.conf" << 'EOF'
+slow:once:/bin/sleep 2
+waiter:once:/bin/true:requires=slow
+ctl:once:/bin/sh /bin/check_p1_5.sh
+EOF
+boot_guest "$RD" 10 "" >"$LD" 2>&1
+
+check_in "dep-waiting service reports initial STOPPED via sane-ctl status" "$RD/var/p1_5.txt" '^WAITER_STATUS=STOPPED$'
+check_in "sane-ctl status lists waiter as STOPPED" "$RD/var/p1_5_all.txt" 'waiter.*STOPPED'
+check_in "sane-ctl stop waiter succeeds on initial STOPPED service" "$RD/var/p1_5.txt" '^STOP_WAITER_RC=0$'
+check_in "/run tmpfs mounted mode 0755" "$RD/var/p1_5.txt" '^RUN_MODE=755$'
+check_in "/tmp tmpfs mounted mode 1777" "$RD/var/p1_5.txt" '^TMP_MODE=1777$'
+check_in "/run tmpfs has nosuid" "$RD/var/p1_5.txt" '^RUN_OPTS=.*nosuid'
+check_in "/run tmpfs has nodev" "$RD/var/p1_5.txt" '^RUN_OPTS=.*nodev'
+check_in "/tmp tmpfs has nosuid" "$RD/var/p1_5.txt" '^TMP_OPTS=.*nosuid'
+check_in "/tmp tmpfs has nodev" "$RD/var/p1_5.txt" '^TMP_OPTS=.*nodev'
+if [ "$(cat "$RD/var/victim" 2>/dev/null)" = "SAFE" ]; then
+	ok "O_NOFOLLOW protected /var/victim from symlink state overwrite"
+else
+	bad "/var/victim was modified through symlink: '$(cat "$RD/var/victim" 2>/dev/null)'"
+fi
+check_in "O_NOFOLLOW failure logged for symlinked state file" "$LD" 'cannot write state file /run/ninit-slow.state'
+
+# ---------------------------------------------------------------- Scenario E
+# P1-4: sane-ctl stop must honor :grace=N > 5s without hardcoded 5s timeout.
+printf '\n== Scenario E: sane-ctl stop honors :grace=6 (> 5s) ==\n'
+RE=$(new_root sleep cat)
+LE=$(mktemp /tmp/ninit-verify-log.XXXXXX)
+ROOTS="$ROOTS $RE"; LOGS="$LOGS $LE"
+cat > "$RE/bin/stop6.sh" << 'EOF'
+#!/bin/sh
+i=0
+while [ "$(/usr/bin/sane-ctl status stub6 2>/dev/null || true)" != "RUNNING" ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+if /usr/bin/sane-ctl stop stub6 >/var/stop6.out 2>&1; then
+    echo "STOP6_RC=0" > /var/stop6.res
+else
+    echo "STOP6_RC=1" > /var/stop6.res
+fi
+echo "STOP6_STATE=$(/usr/bin/sane-ctl status stub6 2>/dev/null || true)" >> /var/stop6.res
+/usr/bin/sane-ctl poweroff
+exit 0
+EOF
+chmod 0755 "$RE/bin/stop6.sh"
+cat > "$RE/etc/init.conf" << 'EOF'
+stub6:respawn:trap "" TERM; exec /bin/sleep 60:grace=6
+ctl:once:/bin/sh /bin/stop6.sh
+EOF
+boot_guest "$RE" 14 "" >"$LE" 2>&1
+
+check_in "sane-ctl stop waited past 5s and exited 0 for :grace=6" "$RE/var/stop6.res" '^STOP6_RC=0$'
+check_in "stub6 state became STOPPED after :grace=6 SIGKILL" "$RE/var/stop6.res" '^STOP6_STATE=STOPPED$'
+check_in "ninit escalated stop grace at 6s" "$LE" 'stub6: stop grace expired, SIGKILL'
+check_in "stub6 transitioned STOPPING -> STOPPED" "$LE" 'stub6: state STOPPING -> STOPPED'
+check_in "clean graceful shutdown after :grace=6 stop" "$LE" 'graceful shutdown'
+
+# ---------------------------------------------------------------- Scenario F
+# P1-3: timed-out :on_fail=rescue preserves FAILED, stops active services,
+# gates start/restart in rescue_loop, and shuts down cleanly via initctl.
+printf '\n== Scenario F: :on_fail=rescue lifecycle & rescue initctl gating ==\n'
+RF=$(new_root sleep cat)
+LF=$(mktemp /tmp/ninit-verify-log.XXXXXX)
+ROOTS="$ROOTS $RF"; LOGS="$LOGS $LF"
+cat > "$RF/etc/init.conf" << 'EOF'
+bg:respawn:/bin/sleep 30
+crit:once:/bin/sleep 20:on_fail=rescue:timeout=1
+EOF
+mkfifo "$RF/rescue.stdin"
+(
+    i=0
+    while ! grep -q 'Entering rescue mode (shell)' "$LF" 2>/dev/null && [ "$i" -lt 100 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    printf '/usr/bin/sane-ctl start bg\n/usr/bin/sane-ctl restart bg\n/usr/bin/sane-ctl poweroff\n'
+    sleep 3
+) > "$RF/rescue.stdin" &
+FEED_PID=$!
+boot_guest "$RF" 12 "" "$RF/rescue.stdin" >"$LF" 2>&1
+kill "$FEED_PID" 2>/dev/null || true
+wait "$FEED_PID" 2>/dev/null || true
+
+check_in "crit timed out and marked FAILED" "$LF" 'crit: state STOPPING -> FAILED'
+check_in "bg stopped cleanly during rescue handoff" "$LF" 'bg: state STOPPING -> STOPPED'
+absent_in "no illegal transition during rescue handoff" "$LF" 'illegal state transition'
+check_in "start gated in rescue mode" "$LF" "initctl: cannot start service 'bg' in rescue mode"
+check_in "restart gated in rescue mode" "$LF" "initctl: cannot restart service 'bg' in rescue mode"
+check_in "clean graceful shutdown from rescue via sane-ctl poweroff" "$LF" 'graceful shutdown'
+absent_in "no grace expiry stall on shutdown from rescue" "$LF" 'grace expired, SIGKILL'
 
 if [ "$fail_count" -eq 0 ]; then
 	printf '\nRESULT: PASS (all checks)\n'

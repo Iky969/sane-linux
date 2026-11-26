@@ -85,6 +85,19 @@ else
 fi
 check "created applet symlink is present" test -L "$ROOTFS/bin/sh"
 
+# Verify link_applet handles all P1-19 required applets (including mountpoint when compiled)
+ROOTFS="$T/p119"
+mkdir -p "$ROOTFS/bin"
+# shellcheck disable=SC2034
+APPLET_LIST=$(printf '%s\n' cttyhack stty awk mktemp sha256sum gzip mountpoint)
+for req_applet in cttyhack stty awk mktemp sha256sum gzip mountpoint; do
+	if link_applet bin "$req_applet" && test -L "$ROOTFS/bin/$req_applet"; then
+		pass "link_applet creates symlink for $req_applet when present"
+	else
+		fail "link_applet creates symlink for $req_applet when present"
+	fi
+done
+
 # --- Part A2: ensure_sh_link validates a usable busybox link (host-independent)
 ROOTFS="$T/sh"
 mkdir -p "$ROOTFS/bin"
@@ -129,6 +142,53 @@ if [ -n "$BB" ] && [ -x "$BB" ]; then
 	check "prebuilt rootfs /bin/sh is a symlink" test -L "$T/distro/rootfs/bin/sh"
 	check "prebuilt rootfs /bin/busybox is executable" test -x "$T/distro/rootfs/bin/busybox"
 	check "prebuilt initramfs was created" test -s "$T/distro/initramfs.cpio.gz"
+	for req_applet in cttyhack stty awk mktemp sha256sum gzip; do
+		check "prebuilt rootfs provides $req_applet applet" sh -c \
+			"test -L '$T/distro/rootfs/bin/$req_applet' || test -e '$T/distro/rootfs/bin/$req_applet' || \
+			 test -L '$T/distro/rootfs/sbin/$req_applet' || test -e '$T/distro/rootfs/sbin/$req_applet' || \
+			 test -L '$T/distro/rootfs/usr/bin/$req_applet' || test -e '$T/distro/rootfs/usr/bin/$req_applet'"
+	done
+	if "$BB" --list 2>/dev/null | grep -qx mountpoint; then
+		check "prebuilt rootfs provides mountpoint applet" sh -c \
+			"test -L '$T/distro/rootfs/bin/mountpoint' || test -e '$T/distro/rootfs/bin/mountpoint' || \
+			 test -L '$T/distro/rootfs/usr/bin/mountpoint' || test -e '$T/distro/rootfs/usr/bin/mountpoint'"
+	else
+		pass "mountpoint skipped cleanly when absent from prebuilt busybox --list"
+	fi
+	check "init.conf removes firstboot fallback shell" sh -c \
+		"grep -q '^firstboot:once:.*/usr/bin/sane-firstboot'\'':requires=recovery:on_fail=rescue:timeout=0\$' '$T/distro/rootfs/etc/init.conf' && \
+		 ! grep -q '^firstboot:.*exec /bin/sh -i' '$T/distro/rootfs/etc/init.conf'"
+	check "init.conf supervises network dhcp -f after firstboot" sh -c \
+		"grep -q '^network:respawn:.*sane-net dhcp -f eth0.*:requires=firstboot\$' '$T/distro/rootfs/etc/init.conf'"
+
+	# P1-19: BusyBox cpio compatibility (no --quiet) and fail-closed cpio errors.
+	mkdir -p "$T/bbcpio-bin"
+	cat > "$T/bbcpio-bin/cpio" <<EOF
+#!/bin/sh
+for arg in "\$@"; do
+    case "\$arg" in
+        --quiet|--owner*) printf 'cpio: unrecognized option %s\n' "\$arg" >&2; exit 1 ;;
+    esac
+done
+exec "$BB" cpio "\$@"
+EOF
+	chmod 0755 "$T/bbcpio-bin/cpio"
+	if PATH="$T/bbcpio-bin:$PATH" ROOTFS="$T/distro/rootfs" INITRAMFS="$T/bb-initramfs.cpio.gz" \
+		sh -c 'BUILD_ROOTFS_LIB_ONLY=1 . "'"$BUILD"'"; pack_initramfs' >"$T/bbcpio.log" 2>&1; then
+		pass "pack_initramfs succeeds with BusyBox cpio (no --quiet/--owner)"
+	else
+		fail "pack_initramfs succeeds with BusyBox cpio (no --quiet/--owner)"
+	fi
+	check "BusyBox cpio initramfs is valid gzip" gzip -t "$T/bb-initramfs.cpio.gz"
+	cat > "$T/bbcpio-bin/cpio" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+	chmod 0755 "$T/bbcpio-bin/cpio"
+	expect_fail "pack_initramfs fails closed when cpio fails" \
+		env PATH="$T/bbcpio-bin:$PATH" ROOTFS="$T/distro/rootfs" INITRAMFS="$T/fail-initramfs.cpio.gz" \
+		sh -c 'BUILD_ROOTFS_LIB_ONLY=1 . "'"$BUILD"'"; pack_initramfs'
+	check "failed pack_initramfs leaves no empty gzip artifact" test ! -e "$T/fail-initramfs.cpio.gz"
 
 	# X3: the network:once service must find its CLI applets in the image.
 	check "rootfs has executable sane-net" test -x "$T/distro/rootfs/usr/bin/sane-net"
@@ -167,6 +227,8 @@ if [ -n "$BB" ] && [ -x "$BB" ]; then
 			"! grep -q 'sane-net: not found' '$T/qemu-console.log'"
 		check "guest console shows udhcpc lease marker" \
 			grep -q 'lease of 10.0.2.15 obtained' "$T/qemu-console.log"
+		check "guest console shows network dhcp was not exited/SIGKILLed by ninit" sh -c \
+			"! grep -q 'network (pid [0-9]*) exit status' '$T/qemu-console.log'"
 	else
 		printf 'SKIP - qemu-system-x86_64 or pinned virt kernel unavailable\n'
 	fi

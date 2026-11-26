@@ -217,10 +217,10 @@ install_busybox() {
 	APPLET_LIST=$("$ROOTFS/bin/busybox" --list 2>/dev/null || true)
 
 	# Standard symlinks that must exist; skip applets that were not compiled.
-	for a in sh ash cat chmod chown cp cut date dd df dirname dmesg \
-	         du echo env expr false find grep head hostname id kill \
-	         ln login ls mkdir mknod more mount mv od passwd printf ps pwd readlink \
-	         realpath rm rmdir sed seq sleep sort stat sync tail tar tee \
+	for a in sh ash awk cat chmod chown cp cttyhack cut date dd df dirname dmesg \
+	         du echo env expr false find grep gzip head hostname id kill \
+	         ln login ls mkdir mknod mktemp more mount mountpoint mv od passwd printf ps pwd readlink \
+	         realpath rm rmdir sed seq sha256sum sleep sort stat stty sync tail tar tee \
 	         touch tr true umount uname uniq wc wget whoami xargs; do
 		link_applet bin "$a"
 	done
@@ -391,6 +391,15 @@ install_networking() {
 		fi
 	fi
 
+	# openssl (for sane-accounts password hashing in the guest rootfs)
+	if [ -x "$REPO_ROOT/packages/libressl/x/usr/bin/openssl" ]; then
+		mkdir -p "$ROOTFS/usr/bin"
+		install -m 0755 "$REPO_ROOT/packages/libressl/x/usr/bin/openssl" "$ROOTFS/usr/bin/openssl"
+		if ! is_static "$ROOTFS/usr/bin/openssl"; then
+			info "WARNING: $ROOTFS/usr/bin/openssl is not static; in an initramfs it needs a dynamic loader"
+		fi
+	fi
+
 	# ninit network CLI applets used by the network:once service
 	mkdir -p "$ROOTFS/usr/bin"
 	install -m 0755 "$REPO_ROOT/packages/ninit/x/usr/bin/sane-net" "$ROOTFS/usr/bin/sane-net"
@@ -456,10 +465,10 @@ install_reliability() {
 write_etc() {
 	log "writing /etc (init.conf, passwd, group, shadow, doas.conf, issue, hostname, fstab)"
 	cat > "$ROOTFS/etc/init.conf" <<'EOF'
-reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':timeout=0
-network:once:/bin/sh -c "modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; if [ -d /sys/class/net/eth0 ]; then sane-net dhcp eth0; fi":requires=reliability
-recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:timeout=0
-firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot || exec /bin/sh -i':requires=recovery:timeout=0
+reliability:once:/bin/sh -c '/usr/bin/sane-reliability --root / recover || { echo "reliability: recover failed; boot enters rescue" >&2; exit 1; }':on_fail=rescue:timeout=0
+recovery:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-account-recovery':requires=reliability:on_fail=rescue:timeout=0
+firstboot:once:/bin/sh -c 'exec </dev/console >/dev/console 2>&1; /usr/bin/sane-firstboot':requires=recovery:on_fail=rescue:timeout=0
+network:respawn:/bin/sh -c 'modprobe af_packet 2>/dev/null; modprobe e1000 2>/dev/null; modprobe virtio_net 2>/dev/null; ip link set lo up 2>/dev/null; trap "kill \$! 2>/dev/null; exit 0" TERM INT; while [ ! -d /sys/class/net/eth0 ]; do sleep 5 & wait $!; done; exec sane-net dhcp -f eth0':requires=firstboot
 tty1:respawn:/sbin/getty 38400 tty1 linux:requires=firstboot
 console:respawn:cttyhack /sbin/getty -L 115200 - vt100:requires=firstboot
 EOF
@@ -526,20 +535,53 @@ pack_initramfs() {
 	log "packing the rootfs into an initramfs ($INITRAMFS)"
 	mkdir -p "$(dirname -- "$INITRAMFS")"
 	if command -v cpio >/dev/null 2>&1; then
-		CPIO_CMD="cpio"
+		CPIO_BIN="cpio"
+		CPIO_SUB=""
 	else
-		CPIO_CMD="$ROOTFS/bin/busybox cpio"
+		CPIO_BIN="$ROOTFS/bin/busybox"
+		CPIO_SUB="cpio"
 	fi
-	# shellcheck disable=SC2016
+	cpio_help=$("$CPIO_BIN" ${CPIO_SUB:+"$CPIO_SUB"} --help 2>&1 || true)
 	CPIO_OWNER=
-	if [ "$CPIO_CMD" = "cpio" ] && cpio --help 2>&1 | grep -q -- --owner; then
+	if printf '%s\n' "$cpio_help" | grep -q -- '--owner'; then
 		CPIO_OWNER="--owner=+0:+0"
+	elif printf '%s\n' "$cpio_help" | grep -q -- '-R'; then
+		CPIO_OWNER="-R 0:0"
 	fi
+	CPIO_QUIET=
+	if printf '%s\n' "$cpio_help" | grep -q -- '--quiet'; then
+		CPIO_QUIET="--quiet"
+	fi
+
+	tmp_cpio="$INITRAMFS.cpio.$$"
+	tmp_cpio_uid="$INITRAMFS.cpio-uid.$$"
+	tmp_gz="$INITRAMFS.tmp.$$"
+	rm -f "$tmp_cpio" "$tmp_cpio_uid" "$tmp_gz"
+
+	# Stage uncompressed cpio archive first so find/cpio failures are never
+	# masked by gzip in a POSIX sh pipeline without pipefail.
+	if ! (
+		cd "$ROOTFS" &&
+		set -- -o -H newc &&
+		case "$CPIO_OWNER" in
+			--owner=*) set -- "$@" "$CPIO_OWNER" ;;
+			"-R 0:0") set -- "$@" -R 0:0 ;;
+		esac &&
+		[ -z "$CPIO_QUIET" ] || set -- "$@" "$CPIO_QUIET" &&
+		find . -print > "$tmp_cpio.list" &&
+		"$CPIO_BIN" ${CPIO_SUB:+"$CPIO_SUB"} "$@" < "$tmp_cpio.list" > "$tmp_cpio"
+	); then
+		rm -f "$tmp_cpio" "$tmp_cpio.list" "$tmp_cpio_uid" "$tmp_gz"
+		die "initramfs cpio creation failed"
+	fi
+	rm -f "$tmp_cpio.list"
+	[ -s "$tmp_cpio" ] || { rm -f "$tmp_cpio" "$tmp_cpio_uid" "$tmp_gz"; die "initramfs cpio archive is empty"; }
+
+	src_cpio="$tmp_cpio"
 	if [ -n "$CPIO_OWNER" ] && command -v python3 >/dev/null 2>&1; then
-		( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc $CPIO_OWNER --quiet ) \
-			| python3 -c "
+		if ! python3 -c "
 import sys
-buf = bytearray(sys.stdin.buffer.read())
+buf = bytearray(open(sys.argv[1], 'rb').read())
 pos = 0
 while pos < len(buf):
     if buf[pos:pos+6] != b'070701':
@@ -555,12 +597,20 @@ while pos < len(buf):
     pos += hlen + pad1 + filesize
     pad2 = (4 - (filesize % 4)) % 4
     pos += pad2
-sys.stdout.buffer.write(buf)
-" | gzip -9 > "$INITRAMFS" || die "initramfs creation failed"
-	else
-		( cd "$ROOTFS" && find . -print | $CPIO_CMD -o -H newc $CPIO_OWNER --quiet ) \
-			| gzip -9 > "$INITRAMFS" || die "initramfs creation failed"
+open(sys.argv[2], 'wb').write(buf)
+" "$tmp_cpio" "$tmp_cpio_uid"; then
+			rm -f "$tmp_cpio" "$tmp_cpio_uid" "$tmp_gz"
+			die "initramfs UID adjustment failed"
+		fi
+		src_cpio="$tmp_cpio_uid"
 	fi
+
+	if ! gzip -9 < "$src_cpio" > "$tmp_gz" || ! gzip -t "$tmp_gz"; then
+		rm -f "$tmp_cpio" "$tmp_cpio_uid" "$tmp_gz"
+		die "initramfs gzip compression failed"
+	fi
+	rm -f "$tmp_cpio" "$tmp_cpio_uid"
+	mv -f "$tmp_gz" "$INITRAMFS" || { rm -f "$tmp_gz"; die "cannot install $INITRAMFS"; }
 	[ -s "$INITRAMFS" ] || die "initramfs is empty"
 }
 

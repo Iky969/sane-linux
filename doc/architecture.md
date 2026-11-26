@@ -20,31 +20,32 @@ Verify getpid() == 1  ->  umask(022)  ->  Block signals & initialize empty mask 
    ->  mount_fstab()              mounts filesystems from /etc/fstab
    ->  Open /var/log/ninit.log, emit startup banner
    ->  set_hostname()             read from /etc/hostname
-   ->  parse_config(argv[1] or /etc/init.conf)   failure => rescue shell (/bin/sh)
-   ->  validate_dependencies()    missing dependency => rescue shell (/bin/sh)
-   ->  sort_services()            DFS topological sort; cycles => rescue shell (/bin/sh)
+   ->  parse_config(argv[1] or /etc/init.conf)   failure or 0 services => supervised rescue loop
+   ->  validate_dependencies()    missing dependency => supervised rescue loop
+   ->  sort_services()            DFS topological sort; cycles => supervised rescue loop
    ->  setup_initctl() (/run/initctl), setup_log_fifo() (/run/log.fifo)
    ->  spawn_service() for all configured services
-   ->  Log "main loop ready"  ->  for (;;) event loop
+   ->  Log "main loop ready"  ->  for (;;) event loop   (:on_fail=rescue failure => supervised rescue loop)
 ```
 
 Ordering note: `mount_fstab()` is intentionally invoked **before** `/var/log/ninit.log` is opened. Early filesystem messages appear exclusively on the console and `/dev/kmsg`.
 
 ### Rescue Mode (`enter_rescue_mode`)
 
-Three conditions route execution to an emergency shell:
+Five conditions route execution to supervised rescue mode:
 1. Unreadable configuration (`parse_config()` failure),
-2. Missing dependencies referenced in `:requires=`,
-3. Dependency cycles detected during topological sort.
+2. Zero configured/valid services (`num_services == 0`),
+3. Missing dependencies referenced in `:requires=`,
+4. Dependency cycles detected during topological sort,
+5. Terminal failure (`SVC_STATE_FAILED`) of a service configured with `:on_fail=rescue` (tested in `scripts/test-config.sh` scenarios `2d`/`2e` and `scripts/qemu_lifecycle.py` Scenario 9).
 
 All paths invoke `enter_rescue_mode(reason)`:
 1. Logs the failure reason and `Entering rescue mode (shell).`;
-2. Clears the PID 1 signal mask (`sigprocmask(SIG_SETMASK, &empty, NULL)`), ensuring the rescue shell receives `SIGINT` (Ctrl+C works interactively);
-3. Resets `SIGPIPE` disposition to `SIG_DFL`, ensuring pipeline utilities like `yes | head -n 1` function normally;
-4. Closes control file descriptors (FIFO, logs) to prevent leaks to child processes (SANE-06-01);
-5. Replaces the process via `execl("/bin/sh", "sh", NULL)`. If `execl()` fails, `_exit(1)` terminates the process.
+2. Calls `ensure_rescue_fds()` so `/run/initctl` and `/run/log.fifo` are initialized/retained as `O_CLOEXEC` descriptors (allowing operator control over `/run/initctl` while preventing descriptor leaks to the shell child);
+3. Enters `rescue_loop()` as PID 1 (never calling `_exit()`): forks a child `/bin/sh` that clears its signal mask (`sigprocmask(SIG_SETMASK, &empty, NULL)`) and resets `SIGPIPE` and `SIGCHLD` to `SIG_DFL` before `execl("/bin/sh", "sh", NULL)`;
+4. Reaps all zombies while supervising the rescue shell with bounded respawn (`MAX_RESCUE_RESPAWN = 3`, `RESCUE_RESPAWN_COOLDOWN_MS = 2000`, `RESCUE_STABLE_MS = 10000` or `2000` under `NINIT_TESTING`), and services shutdown/reboot commands on `/run/initctl` so PID 1 never dies even if the shell exits or crashes.
 
-This function never returns, guaranteeing that boot never proceeds in an inconsistent half-configured state. Tested in `scripts/test-config.sh` section 4.
+This guarantees that boot never proceeds in an inconsistent half-configured state and PID 1 never exits with a kernel panic. Tested in `scripts/test-config.sh` section 4 (`2d`, `2e`, and section `4`).
 
 ## Event Loop
 
@@ -79,7 +80,7 @@ for (;;) {
 Key architectural points:
 - `ppoll` utilizes `orig` (initialized with `sigemptyset()`), ensuring signals like `SIGTERM` are unblocked while awaiting events regardless of masks inherited from the kernel.
 - `errno` is captured into `perr` immediately after `ppoll()` to prevent subsequent logging routines from clobbering the error state.
-- Commands arriving via `/run/initctl` are processed **line-by-line** by the streaming parser `initctl_parse_stream()`. Trailing whitespace and `\r` are trimmed, and empty lines are ignored. Because `/run/initctl` uses a streaming line buffer, commands **must be newline-terminated** (e.g. `echo poweroff > /run/initctl` or `printf "poweroff\n" > /run/initctl`). Partial writes without a newline are buffered until a `\n` arrives, or discarded if the line exceeds 255 bytes (`MAX_LINE - 1`). A valid termination command triggers `shutdown_all()` immediately.
+- Commands arriving via `/run/initctl` are processed **line-by-line** by the streaming parser `initctl_parse_stream()`. Trailing whitespace and `\r` are trimmed, and empty lines are ignored. Because `/run/initctl` uses a streaming line buffer, commands **must be newline-terminated** (e.g. `echo poweroff > /run/initctl` or `printf "poweroff\n" > /run/initctl`). Partial writes without a newline are buffered until a `\n` arrives, or discarded if the line exceeds 1023 bytes (`MAX_LINE - 1`, `MAX_LINE = 1024`). Supports `poweroff`, `reboot`, `force-poweroff`, `force-reboot`, `stop <svc>`, `start <svc>`, `restart <svc>`, and `status [svc]`. A valid termination command triggers `shutdown_all()` immediately.
 
 ## Service Management
 
@@ -170,9 +171,9 @@ Implementation details:
 |---|---|---|
 | Set `shutting_down = 1` | ✅ | ✅ |
 | Send `SIGTERM` to all active services | ✅ | — |
-| Wait up to 50 × 100 ms (max 5s): reap processes & drain log FIFO | ✅ | — |
+| Wait up to per-service `:grace=N` (default `5` s, range `0`–`3600` s): reap processes & drain log FIFO | ✅ | — |
 | Send `SIGKILL` to remaining services | ✅ | Immediate |
-| Remount `/` read-only + `umount2(MNT_DETACH)` recorded fstab entries | ✅ | ✅ |
+| `umount2(..., MNT_DETACH)` recorded fstab entries (reverse order), then remount `/` read-only | ✅ | ✅ |
 | `sync()` → `reboot(cmd)` → `while(1) pause()` | ✅ | ✅ |
 
 `cmd` is either `RB_POWER_OFF` (SIGTERM/USR1) or `RB_AUTOBOOT` (SIGINT/USR2). If `reboot()` fails (common in unprivileged test containers), the error is logged and init sleeps indefinitely via `pause()`.

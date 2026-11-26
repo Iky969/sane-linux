@@ -4,30 +4,39 @@
 
 ## Build
 
-Butuh `build-essential`:
+Butuh `build-essential`, `busybox-static`, `python3`, `shellcheck`, dan `openssl`:
 
 ```bash
-sudo apt-get update && sudo apt-get install build-essential busybox-static
-make            # -> ./ninit  (gcc -static -O2 -Wall)
+sudo apt-get update && sudo apt-get install build-essential busybox-static python3 shellcheck openssl
+make            # -> ./ninit  (gcc -static -O2 -Wall -Werror -fstack-protector-strong)
 ```
 
 - Biner harus **statis** agar bisa dipakai tanpa loader di rootfs minimal.
-- Target `main` bebas warning; verifikasi dengan `-Werror`:
-  `make clean && make CFLAGS="-static -O2 -Wall -Werror"`.
+- `Makefile` kini mengaktifkan `-Werror` secara default agar tidak ada kompilasi yang meloloskan warning (`make clean && make`).
 - Pada distro tanpa libc statis glibc (mis. Alpine): `make CC=musl-gcc`.
 - `make clean` menghapus `./ninit`. Biner hasil build diabaikan `.gitignore`.
 
 ## Uji otomatis
 
 ```bash
-make test                              # menjalankan enam script pertama (7 butuh QEMU: make integration)
-sudo sh ./scripts/smoke-test.sh        # 1) smoke test PID 1
-sudo sh ./scripts/test-sigterm.sh      # 2) SIGTERM sampai ke layanan
-sudo sh ./scripts/test-config.sh       # 3) urut dependensi + rescue mode + initctl
-sh ./scripts/test-qemu-report.sh       # 4) pemeriksaan harness run-qemu.sh (tanpa root)
-sudo sh ./scripts/test-spawn-failure.sh # 5) jalur kegagalan spawn (fork EAGAIN + deps di respawn)
-sudo sh ./scripts/test-cgroup-limits.sh # 6) batasan cgroup v2, validasi & siklus hidup orphan (8 skenario)
-sudo sh ./scripts/test-integration.sh  # 7) integrasi lintas lapisan via boot QEMU (make integration)
+make lint                                     # lint pola/format + ShellCheck pada 13 skrip produksi
+make test                                     # 13 suite TEST_SCRIPTS: 8 butuh root/sudo + 5 tanpa root
+sudo -E BIN=./ninit-test sh ./scripts/smoke-test.sh          # 1) smoke test PID 1 (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-sigterm.sh        # 2) SIGTERM sampai ke layanan (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-config.sh         # 3) dependensi + rescue + :on_fail=rescue + initctl (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-zombie-reap-500.sh # 4) PID 1 memanen 500 anak yatim -> 0 zombie (root)
+sh ./scripts/test-qemu-report.sh                             # 5) pemeriksaan harness run-qemu.sh (tanpa root)
+sudo -E BIN=./ninit-test sh ./scripts/test-spawn-failure.sh  # 6) jalur kegagalan spawn (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-cgroup-limits.sh  # 7) batasan cgroup v2 & siklus orphan (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-respawn-cleanup.sh # 8) pembersihan respawn & grandchild (root)
+sudo -E BIN=./ninit-test sh ./scripts/test-state-machine.sh   # 9) transisi state-machine & :grace= (root)
+sh ./scripts/test-accounts.sh                                # 10) siklus akun & policy doas (tanpa root; root menguji owner)
+sh ./scripts/test-network.sh                                 # 11) jaringan sane-net, DNS/DHCP, TLS (tanpa root)
+sh ./scripts/test-network-fault.sh                           # 12) injeksi fault & pemulihan jaringan (tanpa root)
+sh ./scripts/test-reliability.sh                             # 13) snapshot, rollback, recovery Phase C (tanpa root)
+# Terpisah dari make test:
+make integration                                             # integrasi lintas lapisan via 1 boot QEMU
+make test-lifecycle                                          # 9 skenario lifecycle QEMU (scripts/qemu_lifecycle.py)
 ```
 
 ### 1. Smoke test PID 1 (`scripts/smoke-test.sh`)
@@ -106,18 +115,21 @@ penanda `[ -- ]`; pemeriksaan lain tetap menentukan hasil. Contoh log yang lulus
 
 ### 3. Uji konfigurasi & IPC (`scripts/test-config.sh`)
 
-Uji ini mengunci empat perbaikan reliabilitas sekaligus (tujuh run ninit
-terpisah, tiap run memakai rootfs sendiri):
+Uji ini mengunci reliabilitas parser, `:on_fail=rescue`, supervised rescue mode,
+dan streaming `/run/initctl` across isolated rootfs runs:
 
 | Bagian | Yang diperiksa |
 |---|---|
 | 1a | dependensi berlian (`a:requires=b,c` + `b:requires=c`) dijalankan berurutan `c → b → a` dan **tidak** dilaporkan sebagai cycle |
 | 1b | konfigurasi padat tepat 64 layanan (`root` butuh `s2..s64`, `s63` butuh `s62,s61`) → 64/64 dijalankan tanpa `FATAL` |
-| 2 | `web:once:echo web:requires=db` → `FATAL: Dependensi 'db' untuk 'web' tidak ditemukan` + rescue shell; `main loop siap` tidak pernah muncul |
+| 2 | `web:once:echo web:requires=db` → `FATAL: Dependency 'db' for 'web' not found` + supervised rescue shell; `main loop ready` tidak pernah muncul |
+| 2d | kehabisan fork-retry (`pids.max=2`, `:on_fail=rescue`) → `SVC_STATE_FAILED` masuk ke supervised rescue shell (`Enter rescue`, `/run/initctl` tetap hidup) |
+| 2e | respawn crash-loop menuju `SVC_STATE_FAILED` dengan `:on_fail=rescue` → membatalkan dependen & masuk ke supervised rescue shell |
 | 3a | `printf 'poweroff\nreboot\n' > /run/initctl` → hanya baris pertama yang dieksekusi (`reboot` tidak pernah dilaporkan) |
-| 3b | `printf 'status\npoweroff\n' > /run/initctl` → baris tak dikenal tetap dicatat dan `poweroff` di baris kedua tidak hilang tanpa jejak |
-| 4a | config tidak bisa dibuka → `Config gagal dibaca/di-parse!` + rescue shell; `main loop siap` tidak pernah muncul (regresi lama: hanya di-log lalu boot dengan nol layanan) |
+| 3b | `printf 'status\npoweroff\n' > /run/initctl` → baris pertama tetap dicatat (`initctl cmd: 'status'`) dan `poweroff` di baris kedua tetap dieksekusi |
+| 4a | config tidak bisa dibuka (dan config dengan 0 layanan valid) → `Config failed to read/parse!` / no valid services + supervised rescue shell; `main loop ready` tidak pernah muncul |
 | 4b | siklus `a:requires=b` + `b:requires=a` → `FATAL: CYCLE DETECTED` + rescue shell, dan `SigBlk` shell itu `0` (Ctrl+C berfungsi; biner lama mewarisi `0000000000014a02`) |
+| 4c | keluar dari rescue shell (`EOF`/`exit`) → PID 1 tetap hidup memanen exit shell dan me-respawn shell secara terbatas |
 
 **Kenapa bagian 1b penting.** `sort_services()` versi lama menandai node saat
 di-*expand*, bukan saat di-*push*, sehingga layanan yang masih "pending" di stack
@@ -140,7 +152,10 @@ stack sekali. Bagian 1b juga menjaga agar konfigurasi valid selalu berakhir di
 menulis `config gagal, masuk rescue mode` lalu **melanjutkan boot** dengan nol
 layanan, dan rescue shell (jalur dependensi/siklus) mewarisi signal mask PID 1 —
 `SIGINT` tetap diblokir sehingga Ctrl+C di shell darurat tidak berfungsi.
-`enter_rescue_mode()` mengosongkan mask lalu `execl("/bin/sh", "sh", NULL)`.
+`enter_rescue_mode()` memanggil `ensure_rescue_fds()` (mempertahankan `/run/initctl`
+dan `/run/log.fifo` dengan `O_CLOEXEC`) lalu masuk ke `rescue_loop()` untuk
+men-fork `/bin/sh` berulang dengan mask sinyal dan `SIGPIPE`/`SIGCHLD` bersih,
+sehingga PID 1 tidak pernah mati meski rescue shell keluar.
 Bagian 4b membaca `/proc/<pid>/status` shell darurat dan menuntut `SigBlk=0`;
 pada biner lama nilainya `0000000000014a02` (bit `SIGINT` + `SIGTERM` + `SIGCHLD`
 + `SIGUSR1` + `SIGUSR2` terpasang).
@@ -331,22 +346,12 @@ minimal (BusyBox statis) + initramfs di-boot QEMU dengan konsol serial; lihat
 
 ## CI (`.github/workflows/ci.yml`)
 
-Workflow terdiri dari tiga job di runner `ubuntu-latest` (dengan action SHA-pinned):
+Workflow berjalan di runner `ubuntu-latest` dengan seluruh action ter-pin SHA pada lima job:
 - `security-scan`: pemindaian riwayat komit untuk mencegah kebocoran secret atau kredensial via Gitleaks (`gitleaks-action`).
-- `build-and-smoke-test`: install `build-essential` + `busybox-static` →
-`make` → cek biner statis lewat `readelf` (tidak boleh ada `INTERP`) →
-`sudo sh ./scripts/smoke-test.sh` → `sudo sh ./scripts/test-sigterm.sh` →
-`sudo sh ./scripts/test-config.sh` → `sh ./scripts/test-qemu-report.sh` →
-`sudo sh ./scripts/test-spawn-failure.sh` →
-`sudo sh ./scripts/test-cgroup-limits.sh` →
-`make CFLAGS="-static -O2 -Wall -Werror"`.
-- `rootfs-distro`: menjaga jalur distro yang tidak dipakai script di atas:
-install `bzip2` + `cpio` + `qemu-system-x86` → `sudo sh ./scripts/build-rootfs.sh`
-(kompilasi BusyBox dari sumber + initramfs) → `sudo SECS=20 sh ./scripts/run-qemu.sh`
-(boot initramfs dengan konsol serial; selain penanda boot, harness juga menuntut
-console tetap hidup — lihat bagian 4) → `sudo SECS=40 sh ./scripts/test-integration.sh`
-(satu boot kedua dengan fstab + init.conf uji — lihat bagian 7). QEMU di runner memakai TCG karena tidak ada
-`/dev/kvm`; kernel guest diunduh dari Alpine netboot ke `distro/cache/`.
+- `build-and-smoke-test`: install `build-essential`, `busybox-static`, `python3`, `shellcheck`, `openssl` → `make` (default `-Werror -fstack-protector-strong`) → cek biner statis lewat `readelf` (tidak boleh ada `INTERP`) → `make lint` (pola/format + `lint-shell` pada 13 skrip produksi) → `make ninit-test` → menjalankan seluruh **13** suite `make test` (8 root lewat `sudo -E BIN=./ninit-test` plus `sudo -E sh ./scripts/test-accounts.sh` untuk pemeriksaan kepemilikan root, dan 4 suite tanpa root lainnya) serta memeriksa tidak ada kebocoran cgroup `/sys/fs/cgroup/ninit*` → fuzz harness.
+- `rootfs-distro`: membangun `rootfs`, menjalankan boot QEMU (`sudo SECS=20 sh ./scripts/run-qemu.sh`, dengan kernel Alpine terverifikasi SHA-256), `test-integration.sh`, serta regresi kernel-panic dengan `BIN=./ninit-test`.
+- `boot-lifecycle`: membangun image disk dan menjalankan ke-9 skenario QEMU (`make test-lifecycle`, gagal eksplisit bila `CI=true` dan prasyarat tidak terpenuhi).
+- `clawrza-packages`: membangun tiga resep paket self-hosting dan memasangnya dengan `spm` ke root sementara sambil memverifikasi checksum payload.
 
 ## Troubleshooting
 

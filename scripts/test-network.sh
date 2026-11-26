@@ -52,9 +52,11 @@ export PATH
 # Stage sane-net with all writable paths redirected into the temp root so the
 # host /etc is never touched.
 STAGED="$T/bin/sane-net-stage"
-sed -e "s|^RESOLV=.*|RESOLV=$T/etc/resolv.conf|" \
+sed -e "s|^SYS_NET=.*|SYS_NET=$T/sys-net|" \
+    -e "s|^RESOLV=.*|RESOLV=$T/etc/resolv.conf|" \
     -e "s|^RESOLV_DEFAULT=.*|RESOLV_DEFAULT=$T/etc/resolv.conf.default|" \
     -e "s|^WPACONF=.*|WPACONF=$T/etc/wpa_supplicant.conf|" \
+    -e "s|^WPARUN=.*|WPARUN=$T/run/wpa_supplicant|" \
     -e "s|^CABUNDLE=.*|CABUNDLE=$T/etc/ssl/certs/ca-certificates.crt|" \
     "$NET" > "$STAGED"
 chmod 0755 "$STAGED"
@@ -64,11 +66,19 @@ run_net() { sh "$STAGED" "$@"; }
 check "sane-net is present" test -f "$NET"
 check "sane-net passes shell syntax" sh -n "$NET"
 
-# --- Ethernet / link -------------------------------------------------------
+# --- Ethernet / link & IFACE validation ------------------------------------
 check "link up calls ip" run_net link eth0 up
 check "ip link set up recorded" grep -q '^ip link set eth0 up$' "$LOG"
 check "link show works" run_net link eth0
 expect_fail "link without interface rejected" run_net link
+for bad_if in ../evil .. . -eth0 --help eth0/sub eth0123456789abcdef; do
+	expect_fail "link rejects unsafe interface '$bad_if'" run_net link "$bad_if" up
+	expect_fail "dhcp rejects unsafe interface '$bad_if'" run_net dhcp "$bad_if"
+	expect_fail "check rejects unsafe interface '$bad_if'" run_net check "$bad_if"
+	expect_fail "reconnect rejects unsafe interface '$bad_if'" run_net reconnect "$bad_if" 1
+done
+check "rejected unsafe interfaces never invoked ip/udhcpc" sh -c \
+	"! grep -qE '(--help|-eth0|\.\.|eth0/sub|eth0123456789abcdef)' '$LOG'"
 
 # --- Static + DNS ----------------------------------------------------------
 expect_fail "static without required args rejected" run_net static eth0 10.0.0.2/24
@@ -118,14 +128,48 @@ check "rejected hostname did not change resolv.conf" sh -c \
 
 # --- DHCP / reconnect ------------------------------------------------------
 check "dhcp starts udhcpc with script" run_net dhcp eth0
-check "udhcpc uses default.script" grep -q 'udhcpc .*-s /usr/share/udhcpc/default.script' "$LOG"
+check "udhcpc uses default.script" grep -q 'udhcpc -b .*-s /usr/share/udhcpc/default.script' "$LOG"
+check "dhcp -f starts foreground udhcpc" run_net dhcp -f eth0
+check "dhcp -f passes -f flag to udhcpc" grep -q 'udhcpc -f .*-s /usr/share/udhcpc/default.script' "$LOG"
+check "dhcp --foreground starts foreground udhcpc" run_net dhcp --foreground eth0
 # Seed a lease state so the bounded post-check sees an address + default route
 # even if no earlier static configuration populated the stateful stub.
 printf 'inet 10.0.0.2/24 scope global eth0\n' > "$T/ip-addr"
 printf 'default via 10.0.0.1 dev eth0 proto static\n' > "$T/ip-route"
 check "reconnect starts DHCP when carrier is up" run_net reconnect eth0 2
 check "reconnect recorded a udhcpc call" sh -c \
-	"[ \$(grep -c '^udhcpc ' '$LOG') -ge 2 ]"
+	"[ \$(grep -c '^udhcpc ' '$LOG') -ge 4 ]"
+
+# --- BusyBox ip link show output format parity (P1-18) --------------------
+mkdir -p "$T/bb-bin" "$T/sys-net/eth0"
+cat > "$T/bb-bin/ip" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *"link show dev eth0"*) cat "${BB_LINK_OUT_FILE:?}" ;;
+  *"addr show dev eth0"*) printf '    inet 10.0.0.2/24 brd 10.0.0.255 scope global eth0\n' ;;
+  *"route show default dev eth0"*) printf 'default via 10.0.0.1 dev eth0\n' ;;
+esac
+exit 0
+EOF
+chmod 0755 "$T/bb-bin/ip"
+printf '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast qlen 1000\n' > "$T/bb-link.out"
+check "check accepts BusyBox <...,UP,LOWER_UP> format without 'state UP'" \
+	env BB_LINK_OUT_FILE="$T/bb-link.out" PATH="$T/bb-bin:$PATH" sh "$STAGED" check eth0
+check "reconnect accepts BusyBox <...,UP,LOWER_UP> format" \
+	env BB_LINK_OUT_FILE="$T/bb-link.out" PATH="$T/bb-bin:$PATH" sh "$STAGED" reconnect eth0 1
+printf '3: eth0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue\n' > "$T/bb-link.out"
+expect_fail "check rejects BusyBox <NO-CARRIER,...,UP> format" \
+	env BB_LINK_OUT_FILE="$T/bb-link.out" PATH="$T/bb-bin:$PATH" sh "$STAGED" check eth0
+printf '3: eth0: <BROADCAST,MULTICAST> mtu 1500 qdisc noqueue\n' > "$T/bb-link.out"
+expect_fail "check rejects BusyBox admin-down format without UP" \
+	env BB_LINK_OUT_FILE="$T/bb-link.out" PATH="$T/bb-bin:$PATH" sh "$STAGED" check eth0
+printf '2: eth0: <BROADCAST,MULTICAST,UP> mtu 1500\n' > "$T/bb-link.out"
+printf 'up\n' > "$T/sys-net/eth0/operstate"
+check "check accepts <...,UP> with sysfs operstate=up" \
+	env BB_LINK_OUT_FILE="$T/bb-link.out" PATH="$T/bb-bin:$PATH" sh "$STAGED" check eth0
+printf 'down\n' > "$T/sys-net/eth0/operstate"
+expect_fail "check rejects <...,UP> with sysfs operstate=down" \
+	env BB_LINK_OUT_FILE="$T/bb-link.out" PATH="$T/bb-bin:$PATH" sh "$STAGED" check eth0
 
 # --- Wi-Fi -----------------------------------------------------------------
 check "wifi writes configuration and starts supplicant" run_net wifi eth0 home-net secretpass
@@ -169,8 +213,10 @@ check "deconfig restore is atomic (0644)" \
 
 # --- build integration -----------------------------------------------------
 for tpl in build-rootfs.sh make-image.sh sane-install.sh; do
-	check "$tpl boots networking via sane-net" sh -c \
-		"grep -q 'sane-net dhcp eth0' '$REPO_ROOT/scripts/$tpl'"
+	check "$tpl supervises network dhcp -f after firstboot" sh -c \
+		"grep -Eq '^network:respawn:.*sane-net dhcp -f eth0.*:requires=firstboot\$' '$REPO_ROOT/scripts/$tpl'"
+	check "$tpl removes firstboot fallback /bin/sh -i" sh -c \
+		"! grep -q '^firstboot:.*exec /bin/sh -i' '$REPO_ROOT/scripts/$tpl'"
 done
 for tpl in make-image.sh sane-install.sh; do
 	check "$tpl creates a default resolver" sh -c \

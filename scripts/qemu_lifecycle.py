@@ -10,6 +10,8 @@ import argparse
 import os
 import pty
 import re
+import shutil
+import signal
 import tempfile
 import select
 import socket
@@ -18,6 +20,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+_ACTIVE_BOOTS: set[Boot] = set()
+_STOPPING_SIGNAL = False
 
 ROOT_PW = "LifecycleRoot2026"
 USER_PW = "LifecycleUser2026"
@@ -73,12 +78,23 @@ class Image:
     def _mount(self):
         loop = run(sudo(["losetup", "--find", "--show", "--partscan", str(self.path)]),
                    check=True).stdout.strip()
-        run(sudo(["mount", "-o", "rw", loop + self.part, str(self.mnt)]), check=True)
+        try:
+            run(sudo(["mount", "-o", "rw", loop + self.part, str(self.mnt)]), check=True)
+        except Exception:
+            run(sudo(["losetup", "-d", loop]), check=False)
+            raise
         return loop
 
     def _unmount(self, loop):
-        run(sudo(["umount", str(self.mnt)]), check=False)
-        run(sudo(["losetup", "-d", loop]), check=False)
+        umount_p = run(sudo(["umount", str(self.mnt)]), check=False)
+        losetup_p = run(sudo(["losetup", "-d", loop]), check=False)
+        errs = []
+        if umount_p.returncode:
+            errs.append(f"umount {self.mnt} failed ({umount_p.returncode}): {umount_p.stdout or ''}")
+        if losetup_p.returncode:
+            errs.append(f"losetup -d {loop} failed ({losetup_p.returncode}): {losetup_p.stdout or ''}")
+        if errs:
+            raise RuntimeError("; ".join(errs))
 
     def close(self):
         pass
@@ -110,7 +126,7 @@ class Image:
         loop = self._mount()
         try:
             target = self._host(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
+            run(sudo(["mkdir", "-p", str(target.parent)]), check=True)
             with tempfile.TemporaryDirectory(prefix="sane-lifecycle-") as d:
                 fd, tmpname = tempfile.mkstemp(dir=d)
                 try:
@@ -127,7 +143,7 @@ class Image:
     def exists(self, path):
         loop = self._mount()
         try:
-            return self._host(path).exists()
+            return run(sudo(["test", "-e", str(self._host(path))]), check=False).returncode == 0
         finally:
             self._unmount(loop)
 
@@ -152,9 +168,10 @@ class Boot:
         self.buf = ""
         self.pos = 0
         self.timeout = timeout
-        self.monitor_path = str(self.log.with_suffix(".monitor.sock"))
-        if os.path.exists(self.monitor_path):
-            os.unlink(self.monitor_path)
+        self._stopped = False
+        # Keep the AF_UNIX monitor socket path well under Linux's 107-byte sun_path limit.
+        self._mon_dir = tempfile.mkdtemp(prefix="sane-mon-", dir="/tmp")
+        self.monitor_path = os.path.join(self._mon_dir, "m.sock")
         master, slave = pty.openpty()
         self.master = master
         # Match the other QEMU harnesses in this repo (test-image-boot.sh,
@@ -167,10 +184,17 @@ class Boot:
                     "-no-reboot", "-nographic", "-monitor",
                     f"unix:{self.monitor_path},server,nowait",
                     "-drive", f"file={image},format=raw,if=virtio", "-boot", "order=c"] + accel
-        self.proc = subprocess.Popen(
-            self.cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        try:
+            self.proc = subprocess.Popen(
+                self.cmd, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        except Exception:
+            os.close(slave)
+            os.close(master)
+            shutil.rmtree(self._mon_dir, ignore_errors=True)
+            raise
         os.close(slave)
         self._dead_diag_printed = False
+        _ACTIVE_BOOTS.add(self)
 
     def _print_dead_diag(self):
         """Surface a QEMU startup failure in the CI log, not just the log file."""
@@ -219,7 +243,14 @@ class Boot:
         return str(self.log)
 
     def stop(self):
-        self.save()
+        if self._stopped:
+            return
+        self._stopped = True
+        _ACTIVE_BOOTS.discard(self)
+        try:
+            self.save()
+        except OSError:
+            pass
         if self.proc.poll() is None:
             # Ask the guest to power down cleanly so ext4 commits its journal.
             try:
@@ -244,7 +275,13 @@ class Boot:
         except OSError:
             pass
         if os.path.exists(self.monitor_path):
-            os.unlink(self.monitor_path)
+            try:
+                os.unlink(self.monitor_path)
+            except OSError:
+                pass
+        if self._mon_dir:
+            shutil.rmtree(self._mon_dir, ignore_errors=True)
+            self._mon_dir = None
 
 
 class Runner:
@@ -281,17 +318,21 @@ class Runner:
         if not boot.expect(r"=== S\.A\.N\.E Linux first boot ==="):
             return False
         if wrong_first:
-            boot.expect(r"New password for root:")
+            if not boot.expect(r"New password for root:"):
+                return False
             boot.send(ROOT_PW + "WRONG")
-            boot.expect(r"Retype password for root:")
+            if not boot.expect(r"Retype password for root:"):
+                return False
             boot.send(USER_PW + "WRONG")
             if not boot.expect(r"ERROR: password was rejected|ERROR: passwords do not match"):
                 return False
             # The for-loop below consumes the fresh "New password for root:" prompt.
         for user, pw in (("root", ROOT_PW), ("sane", USER_PW)):
-            boot.expect(rf"New password for {user}:")
+            if not boot.expect(rf"New password for {user}:"):
+                return False
             boot.send(pw)
-            boot.expect(rf"Retype password for {user}:")
+            if not boot.expect(rf"Retype password for {user}:"):
+                return False
             boot.send(pw)
             if not boot.expect(rf"Password set for {user}\."):
                 return False
@@ -377,6 +418,7 @@ class Runner:
         b = Boot(self.image.path, self.logdir, "s3-first")
         try:
             reached = b.expect(r"New password for root:")
+            self.check("S3 setup prompt reached before reboot", reached, b.save())
             b.send(ROOT_PW)
             self.stop(b)
         finally:
@@ -473,13 +515,67 @@ class Runner:
         self.check("S8 journal marked recovered",
                    "state=recovered" in self.image.cat(RELIABILITY_JOURNAL))
 
+    def scenario_9_on_fail_rescue(self):
+        self.check("S9 setup prerequisite is self-contained",
+                   self.ensure_setup("s9-setup"))
+        # Point the reliability boot service (:on_fail=rescue) at a missing
+        # snapshot so recover fails nonzero and ninit enters supervised rescue.
+        self.image.run_tool(["init"])
+        self.image.write(RELIABILITY_JOURNAL,
+                         "state=in-progress\nsnapshot=missing-rescue-snapshot\n", mode="0600")
+        b = Boot(self.image.path, self.logdir, "s9-on-fail-rescue")
+        try:
+            entered_rescue = b.expect(r"Entering rescue mode \(shell\)")
+            self.check("S9 reliability failure triggers ninit supervised rescue shell",
+                       entered_rescue
+                       and b.has(r"reliability: recover failed; boot enters rescue")
+                       and b.has(r"FATAL: service 'reliability' failed \(on_fail=rescue\)"),
+                       b.save())
+            if entered_rescue:
+                b.send("printf 'RESCUE_SHELL_%s\\n' ALIVE")
+                self.check("S9 supervised rescue shell accepts interactive commands",
+                           b.expect(r"RESCUE_SHELL_ALIVE", timeout=30), b.save())
+                # BusyBox ash registers `poweroff` as a built-in applet, so a bare
+                # `poweroff` sends SIGUSR2 (force reboot) and never reaches the
+                # /sbin/poweroff wrapper. Exercise the documented control channel
+                # directly, as the rest of the test suite does.
+                b.send("echo poweroff > /run/initctl")
+                self.check("S9 rescue shell retains clean poweroff via /run/initctl",
+                           b.expect(r"graceful shutdown|Power down", timeout=30), b.save())
+            else:
+                self.check("S9 supervised rescue shell accepts interactive commands", False, b.save())
+                self.check("S9 rescue shell retains clean poweroff via /run/initctl", False, b.save())
+            self.check("S9 getty login did not start after :on_fail=rescue",
+                       not b.has(r"login:"), b.save())
+        finally:
+            self.stop(b)
+            self.image.write(RELIABILITY_JOURNAL, "state=idle\n", mode="0600")
+
+
+def _install_signal_handlers():
+    def _on_signal(signum, _frame):
+        global _STOPPING_SIGNAL
+        if _STOPPING_SIGNAL:
+            return
+        _STOPPING_SIGNAL = True
+        for b in list(_ACTIVE_BOOTS):
+            try:
+                b.stop()
+            except Exception:
+                pass
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
 
 def main():
+    _install_signal_handlers()
     ap = argparse.ArgumentParser()
     ap.add_argument("image", type=Path)
     ap.add_argument("--logdir", type=Path, default=Path("/tmp/sane-lifecycle-logs"))
-    ap.add_argument("--scenario", action="append", type=int, choices=range(1, 9),
-                    help="run only this scenario number (1-8), repeatable")
+    ap.add_argument("--scenario", action="append", type=int, choices=range(1, 10),
+                    help="run only this scenario number (1-9), repeatable")
     args = ap.parse_args()
     args.logdir.mkdir(parents=True, exist_ok=True)
     r = Runner(args.image.resolve(), args.logdir)
@@ -492,6 +588,7 @@ def main():
         6: r.scenario_6_repeated_reboots,
         7: r.scenario_7_recovery,
         8: r.scenario_8_reliability_recover_after_reboot,
+        9: r.scenario_9_on_fail_rescue,
     }
     wanted = args.scenario or list(scenarios)
     try:

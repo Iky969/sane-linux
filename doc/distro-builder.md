@@ -41,7 +41,7 @@ Working directories (all `.gitignore`d): `distro/cache/` (tarballs & downloaded 
 
 1. `KERNEL=/path/vmlinuz` when specified explicitly.
 2. `KERNEL_MODE=host` → `/boot/vmlinuz-$(uname -r)` (often absent in containers/sandboxes).
-3. `KERNEL_MODE=auto` (default) → Host kernel if available; otherwise downloads Alpine `vmlinuz-virt` (`ALPINE_BRANCH=v3.20`, `ALPINE_FLAVOR=virt`). SHA-256 checksums are verified against `distro/cache/vmlinuz-*.sha256`.
+3. `KERNEL_MODE=auto` (default) → Host kernel if available; otherwise downloads Alpine `vmlinuz-virt` (`ALPINE_BRANCH=v3.20`, `ALPINE_RELEASE=3.20.10`, `ALPINE_FLAVOR=virt`). Downloads are verified against a pinned SHA-256 (`KERNEL_SHA256`, failing closed on empty/non-hex checksums or digest mismatches on either fresh downloads or cached images) and recorded in `distro/cache/vmlinuz-*.sha256`.
 
 ## QEMU Invocations
 
@@ -150,7 +150,8 @@ Commands executed on the serial console after shell readiness:
 |---|---|---|
 | `SECS` | *(empty)* | Automated boot timeout in seconds; interactive if omitted |
 | `KERNEL` / `KERNEL_MODE` | — / `auto` | Kernel selection |
-| `ALPINE_BRANCH` / `ALPINE_FLAVOR` | `v3.20` / `virt` | Alpine kernel download source |
+| `ALPINE_BRANCH` / `ALPINE_RELEASE` / `ALPINE_FLAVOR` | `v3.20` / `3.20.10` / `virt` | Alpine kernel download source |
+| `KERNEL_SHA256` | Pinned default for `v3.20`/`3.20.10`/`virt` | Required 64-hex SHA-256 checksum enforced fail-closed on Alpine downloads & cache hits |
 | `MEM` | `256` | Guest RAM allocation (MB) |
 | `NO_REBOOT` | `1` | `0` = omit `-no-reboot` so guest reboots reset the VM |
 | `REBUILD` | `0` | `1` = rebuild rootfs prior to booting |
