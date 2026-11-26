@@ -423,7 +423,14 @@ cleanup() {
         done
     fi
 }
-trap cleanup EXIT INT TERM
+# POSIX shells may run a signal trap after a foreground command returns.  Exit
+# explicitly from cancellation handlers so cleanup cannot resume installation.
+cancelled() {
+    cleanup
+    exit 130
+}
+trap cleanup EXIT
+trap cancelled INT TERM
 
 log "S.A.N.E Linux Offline Installer"
 info "Target Device : $TARGET"

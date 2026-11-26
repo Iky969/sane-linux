@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 DISTRO_DIR="${DISTRO_DIR:-$REPO_ROOT/distro}"
 PACKAGES_DIR="${PACKAGES_DIR:-$DISTRO_DIR/packages}"
-INSTALLER_BIN="$REPO_ROOT/scripts/sane-install.sh"
+INSTALLER_BIN="${INSTALLER_BIN_OVERRIDE:-$REPO_ROOT/scripts/sane-install.sh}"
 
 TIMEOUT_SECS=30
 QUICK_MODE=0
@@ -214,6 +214,62 @@ if [ "$rc" -ne 0 ]; then
 else
     die "Guard 5: Installer accepted an undersized target disk (<256MB)"
 fi
+
+# Test 1.6: TERM after the installer starts must cancel, not continue formatting
+truncate -s 300M "$TEST_IMG"
+LOOP_GUARD="$(losetup -Pf --show "$TEST_IMG")"
+[ -n "$LOOP_GUARD" ] && [ -b "$LOOP_GUARD" ] || die "Signal guard: Failed to attach loop device"
+SIG_BASE="$(basename "$LOOP_GUARD")"
+SIG_LOG="$TEST_IMG.installer-signal.log"
+: > "$SIG_LOG"
+"$INSTALLER_BIN" \
+    --target "$LOOP_GUARD" \
+    --packages-dir "$PACKAGES_DIR" \
+    --unattended \
+    --no-reboot > "$SIG_LOG" 2>&1 &
+SIG_PID=$!
+
+banner_seen=0
+for _ in $(seq 1 200); do
+    if grep -q 'S.A.N.E Linux Offline Installer' "$SIG_LOG" 2>/dev/null; then
+        banner_seen=1
+        break
+    fi
+    kill -0 "$SIG_PID" 2>/dev/null || break
+    sleep 0.05
+done
+if [ "$banner_seen" -ne 1 ]; then
+    kill -KILL "$SIG_PID" 2>/dev/null || true
+    wait "$SIG_PID" 2>/dev/null || true
+    die "Signal guard: installer did not reach its cancellation trap"
+fi
+
+kill -TERM "$SIG_PID" 2>/dev/null || true
+for _ in $(seq 1 100); do
+    kill -0 "$SIG_PID" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "$SIG_PID" 2>/dev/null; then
+    kill -KILL "$SIG_PID" 2>/dev/null || true
+fi
+wait "$SIG_PID" 2>/dev/null || true
+
+partition_created=0
+for _ in $(seq 1 20); do
+    if [ -e "/sys/block/$SIG_BASE/${SIG_BASE}p1" ]; then
+        partition_created=1
+        break
+    fi
+    sleep 0.1
+done
+rm -f "$SIG_LOG"
+losetup -d "$LOOP_GUARD" || true
+LOOP_GUARD=""
+rm -f "$TEST_IMG"
+if [ "$partition_created" -ne 0 ]; then
+    die "Signal guard: installer continued partitioning after TERM"
+fi
+pass "Signal guard: TERM after trap cleanup exits without partitioning"
 
 # -------------------------------------------------------------
 # Test Group 2: End-to-End Installation on Raw Disk
