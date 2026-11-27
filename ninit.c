@@ -19,6 +19,54 @@
  *           numeric 0 is rejected -- write :user=root / :group=root instead,
  *           so a typo can never silently keep a service running as root.
  */
+/*
+ * ---------------------------------------------------------------------------
+ * SECTION INDEX / SPLIT BLUEPRINT
+ * ---------------------------------------------------------------------------
+ * Keep ninit.c as ONE translation unit: PID 1 stays a single static binary.
+ * The order below is the proposed module split if maintenance ever requires
+ * it. Find a block by its banner:
+ *     grep -n '^/\* ----------' ninit.c
+ *
+ *   prelude                    config macros, svc_state_t, service_t,  -> ninit_core.c
+ *                              shared globals and forward declarations
+ *   logging                    init_log(), trim()                     -> ninit_logging.c
+ *   timing helpers             monotonic_ms(), sleep_ms()             -> ninit_util.c
+ *   service state machine      svc_set_state() is the ONLY writer     -> ninit_state.c
+ *   signal handlers            five flags-only setters                -> ninit_signals.c
+ *   mount helpers              is_mounted, pseudo fs, hostname        -> ninit_mount.c
+ *                              (enable_cgroup_subtree belongs to ninit_cgroup.c)
+ *   cgroups v2                 setup/cleanup/kill/signal              -> ninit_cgroup.c
+ *   config parser              validators + parse_config()            -> ninit_config.c
+ *   dependencies               find_service, validate, topo sort      -> ninit_deps.c
+ *   process management         spawn/reap/respawn/timeouts/cleanup    -> ninit_process.c
+ *   shutdown                   shutdown_all()                         -> ninit_shutdown.c
+ *   setup IPC                  initctl setup + command dispatch       -> ninit_ipc.c
+ *   /etc/fstab                 parse_mount_flags, mount_fstab         -> ninit_fstab.c
+ *   supervised rescue mode     rescue shell + rescue event loop       -> ninit_rescue.c
+ *   main                       main() + event loop                    -> ninit_main.c
+ *
+ * Shared state lives in the prelude and is the split seam:
+ *   services[], num_services           config/state/deps/process/ipc/main
+ *   sigchld/sigterm/sigint/sigusr*     signals/process/main
+ *   log_file_fd, g_log_fifo_fd         log/ipc/process/shutdown
+ *   initctl_fd                         ipc/main
+ *   shutting_down, rescue_*            process/rescue/main
+ *   g_seen_mnt[], g_seen_cnt           fstab/shutdown
+ *
+ * Tooling coupled to the single file. Leave ALL of it untouched during the
+ * unity phase; convert every consumer in the FINAL, separate per-TU commit:
+ *   Makefile, packages/ninit/build.sh, tests/fuzz/fuzz_parse.c,
+ *   .github/workflows/ci.yml (cppcheck), scripts/lint-log-patterns.py,
+ *   scripts/verify-format-strings.py, scripts/test-config.sh,
+ *   scripts/test-spawn-failure.sh, scripts/test-build-rootfs.sh,
+ *   scripts/test-ci-workflow.py, .github/CODEOWNERS.
+ * scripts/check-ninit-c-refs.sh fails CI if any NEW file joins this list.
+ * Unity phase hides static/extern and missing-header errors by design; the
+ * final per-TU commit is where they surface and get fixed.
+ * Invariant at every step: ONE static /sbin/init, same size and behavior.
+ * ---------------------------------------------------------------------------
+ */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
