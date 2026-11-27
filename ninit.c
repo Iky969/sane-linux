@@ -2503,6 +2503,31 @@ static int service_still_alive(service_t *svc)
     return 0;
 }
 
+/* T8E: MS_REMOUNT with NULL source and fstype fails with EINVAL on several
+   rootfs types. Recover the root mount's real identity from /proc/mounts
+   (source mountpoint fstype options dump pass) and use it for the remount. */
+static int root_mount_identity(char *src, size_t srclen,
+                               char *fstype, size_t typelen)
+{
+    FILE *f = fopen("/proc/mounts", "r");
+    char line[MAX_LINE];
+    int found = -1;
+
+    if (!f) return -1;
+    while (fgets(line, sizeof(line), f)) {
+        char dev[MAX_LINE], mnt[MAX_LINE], type[MAX_LINE];
+        if (sscanf(line, "%1023s %1023s %1023s", dev, mnt, type) != 3)
+            continue;
+        if (strcmp(mnt, "/") != 0) continue;
+        snprintf(src, srclen, "%s", dev);
+        snprintf(fstype, typelen, "%s", type);
+        found = 0;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
 /* T8E: prepare filesystems before reboot. Remount / read-only first to prevent
    further writes to the rootfs, then detach fstab entries recorded by
    mount_fstab() with MNT_DETACH (safe even if processes still reference them).
@@ -2529,10 +2554,29 @@ static void prepare_filesystems(void)
         }
     }
 
-    if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) < 0)
-        init_log("shutdown: remount / read-only failed: %s", strerror(errno));
-    else
-        init_log("shutdown: / remounted read-only");
+    {
+        char src[MAX_LINE], fstype[MAX_LINE];
+        int remounted = 0, first_errno = 0;
+
+        if (root_mount_identity(src, sizeof(src), fstype, sizeof(fstype)) == 0) {
+            if (mount(src, "/", fstype, MS_REMOUNT | MS_RDONLY, NULL) == 0)
+                remounted = 1;
+            else
+                first_errno = errno;
+        }
+        /* Compatibility fallback: some rootfs types accept the NULL form. */
+        if (!remounted) {
+            if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0)
+                remounted = 1;
+            else if (!first_errno)
+                first_errno = errno;
+        }
+        if (remounted)
+            init_log("shutdown: / remounted read-only");
+        else
+            init_log("shutdown: FATAL: remount / read-only failed: %s; root left writable",
+                     strerror(first_errno));
+    }
 }
 
 /* Graceful SIGTERM -> per-service grace wait -> SIGKILL sweep shared between
