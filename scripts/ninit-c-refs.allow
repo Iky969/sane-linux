@@ -1,0 +1,16 @@
+.github/workflows/ci.yml
+.github/workflows/codeql.yml
+Makefile
+ninit.c
+packages/ninit/build.sh
+scripts/check-ninit-c-refs.sh
+scripts/fuzz-parsers.sh
+scripts/lint-log-patterns.py
+scripts/test-build-package.sh
+scripts/test-build-rootfs.sh
+scripts/test-ci-workflow.py
+scripts/test-config.sh
+scripts/test-spawn-failure.sh
+scripts/test-spm.sh
+scripts/verify-format-strings.py
+tests/fuzz/fuzz_parse.c
