@@ -178,6 +178,8 @@ cleanup() {
 	[ -n "${init_pid4:-}" ] && is_test_process "$init_pid4" && $SUDO kill -KILL "$init_pid4" 2>/dev/null || true
 	for d in ${ROOTS:-}; do
 		$SUDO umount "$d/proc" 2>/dev/null || true
+		$SUDO mount -o remount,rw "$d" 2>/dev/null || true
+		$SUDO umount "$d" 2>/dev/null || true
 		rm -rf "$d"
 	done
 	for f in ${LOGS:-}; do rm -f "$f"; done
@@ -209,6 +211,10 @@ ROOT=$(mktemp -d /tmp/ninit-sigterm.XXXXXX)
 LOG=$(mktemp /tmp/ninit-sigterm-log.XXXXXX)
 ROOTS="$ROOTS $ROOT"
 LOGS="$LOGS $LOG"
+
+# '/' must be a real mountpoint: inside a plain chroot MS_REMOUNT on '/' fails
+# EINVAL because the chroot directory itself is not a mount root.
+$SUDO mount -t tmpfs tmpfs "$ROOT" || fail "cannot mount tmpfs test root"
 
 mkdir -p "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp" \
          "$ROOT/etc" "$ROOT/var/log" "$ROOT/bin"
@@ -397,6 +403,12 @@ else
 	ok "shutdown remount does not fail with EBUSY (log fd closed cleanly)"
 fi
 
+if grep -q 'shutdown: / remounted read-only' "$LOG"; then
+	ok "shutdown remounted / read-only"
+else
+	bad "shutdown did not remount / read-only (root left writable)"
+fi
+
 if [ -n "$ack_ms" ] && [ "$ack_ms" -lt 4000 ]; then
 	ok "service shutdown before the grace window: ${ack_ms}ms (grace = 5000ms)"
 elif [ -n "$ack_ms" ]; then
@@ -414,6 +426,8 @@ ROOT2=$(mktemp -d /tmp/ninit-sigterm-pipe.XXXXXX)
 LOG2=$(mktemp /tmp/ninit-sigterm-pipe-log.XXXXXX)
 ROOTS="$ROOTS $ROOT2"
 LOGS="$LOGS $LOG2"
+
+$SUDO mount -t tmpfs tmpfs "$ROOT2" || fail "cannot mount tmpfs test root (scenario 2)"
 
 mkdir -p "$ROOT2/proc" "$ROOT2/sys" "$ROOT2/dev" "$ROOT2/run" "$ROOT2/tmp" \
          "$ROOT2/etc" "$ROOT2/var/log" "$ROOT2/bin"
@@ -488,6 +502,8 @@ ROOT3=$(mktemp -d /tmp/ninit-sigterm-stubborn.XXXXXX)
 LOG3=$(mktemp /tmp/ninit-sigterm-stubborn-log.XXXXXX)
 ROOTS="$ROOTS $ROOT3"
 LOGS="$LOGS $LOG3"
+
+$SUDO mount -t tmpfs tmpfs "$ROOT3" || fail "cannot mount tmpfs test root (scenario 3)"
 
 mkdir -p "$ROOT3/proc" "$ROOT3/sys" "$ROOT3/dev" "$ROOT3/run" "$ROOT3/tmp" \
          "$ROOT3/etc" "$ROOT3/var/log" "$ROOT3/bin"
@@ -711,6 +727,8 @@ ROOT4=$(mktemp -d /tmp/ninit-sigterm-stalepgid.XXXXXX)
 LOG4=$(mktemp /tmp/ninit-sigterm-stalepgid-log.XXXXXX)
 ROOTS="$ROOTS $ROOT4"
 LOGS="$LOGS $LOG4"
+
+$SUDO mount -t tmpfs tmpfs "$ROOT4" || fail "cannot mount tmpfs test root (scenario 4)"
 
 mkdir -p "$ROOT4/proc" "$ROOT4/sys" "$ROOT4/dev" "$ROOT4/run" "$ROOT4/tmp" \
          "$ROOT4/etc" "$ROOT4/var/log" "$ROOT4/bin"
