@@ -25,7 +25,7 @@
  * ---------------------------------------------------------------------------
  * Keep ninit.c as ONE translation unit: PID 1 stays a single static binary.
  * The order below is the proposed module split if maintenance ever requires
- * it (see sane.md). Find a block by its banner:
+ * it. Find a block by its banner:
  *     grep -n '^/\* ----------' ninit.c
  *
  *   prelude                    config macros, svc_state_t, service_t,  -> ninit_core.c
