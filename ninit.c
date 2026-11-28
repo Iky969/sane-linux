@@ -454,11 +454,9 @@ static void svc_set_state(service_t *svc, svc_state_t new_state)
 }
 
 /* ---------- signal handlers ---------- */
-static void on_sigchld(int s) { (void)s; sigchld_flag = 1; }
-static void on_sigterm(int s) { (void)s; sigterm_flag = 1; }
-static void on_sigint (int s) { (void)s; sigint_flag  = 1; }
-static void on_sigusr1(int s) { (void)s; sigusr1_flag = 1; }
-static void on_sigusr2(int s) { (void)s; sigusr2_flag = 1; }
+/* Unity phase: implementation lives in ninit_signals.c, included here so
+ * this stays one translation unit. */
+#include "ninit_signals.c"
 
 /* ---------- mount helpers ---------- */
 /* Check whether tgt is already a mountpoint (e.g. from initramfs before
