@@ -15,6 +15,13 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
 
 
+def copy_ninit_modules(tmp: Path) -> None:
+    """Copy the single compilation entry point and unity-phase modules."""
+    shutil.copy2(ROOT / "ninit.c", tmp / "ninit.c")
+    for module in ROOT.glob("ninit_*.c"):
+        shutil.copy2(module, tmp / module.name)
+
+
 def job_block() -> str:
     text = WORKFLOW.read_text()
     start = text.index("  build-and-smoke-test:\n")
@@ -66,9 +73,7 @@ def test_static_gate() -> str | None:
             return "static gate returned success without ninit\n" + missing.stdout + missing.stderr
 
         shutil.copy2(ROOT / "Makefile", tmp / "Makefile")
-        shutil.copy2(ROOT / "ninit.c", tmp / "ninit.c")
-        for module in ROOT.glob("ninit_*.c"):
-            shutil.copy2(module, tmp / module.name)
+        copy_ninit_modules(tmp)
         env = os.environ.copy()
         env.pop("BIN", None)
         env.update(job_environment())
@@ -90,9 +95,7 @@ def test_workflow_builds_and_runs_both_binaries() -> str | None:
     with tempfile.TemporaryDirectory(prefix="sane-ci-build-") as tmp_name:
         tmp = Path(tmp_name)
         shutil.copy2(ROOT / "Makefile", tmp / "Makefile")
-        shutil.copy2(ROOT / "ninit.c", tmp / "ninit.c")
-        for module in ROOT.glob("ninit_*.c"):
-            shutil.copy2(module, tmp / module.name)
+        copy_ninit_modules(tmp)
         outputs = []
         for args in (["make", "--no-print-directory"],
                      ["make", "--no-print-directory", "ninit-test"]):
