@@ -67,6 +67,8 @@ def test_static_gate() -> str | None:
 
         shutil.copy2(ROOT / "Makefile", tmp / "Makefile")
         shutil.copy2(ROOT / "ninit.c", tmp / "ninit.c")
+        for module in ROOT.glob("ninit_*.c"):
+            shutil.copy2(module, tmp / module.name)
         env = os.environ.copy()
         env.pop("BIN", None)
         env.update(job_environment())
@@ -89,6 +91,8 @@ def test_workflow_builds_and_runs_both_binaries() -> str | None:
         tmp = Path(tmp_name)
         shutil.copy2(ROOT / "Makefile", tmp / "Makefile")
         shutil.copy2(ROOT / "ninit.c", tmp / "ninit.c")
+        for module in ROOT.glob("ninit_*.c"):
+            shutil.copy2(module, tmp / module.name)
         outputs = []
         for args in (["make", "--no-print-directory"],
                      ["make", "--no-print-directory", "ninit-test"]):
